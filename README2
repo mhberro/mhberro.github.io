@@ -79,45 +79,33 @@ class BoxDataSet(Dataset):
 
     # Strategy 1 & 4: This method's concern is generating just one sequence.
     def _create_single_sequence(self) -> np.ndarray:
-        """Creates a single sequence of frames with a moving and growing box."""
+        """
+        Creates a single sequence of frames with a STATIONARY and growing box.
+        NOTE: This logic has been modified from the original to keep the box
+        in a fixed position instead of moving.
+        """
         sequence = np.zeros(
             (self.total_seq_len, _NUM_CHANNELS, _IMAGE_SIZE, _IMAGE_SIZE),
             dtype=np.float32
         )
 
-        # Per original code, an initial offset is chosen once per sequence.
-        initial_x_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
-        initial_y_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
-        
-        # A constant shift value is chosen once per sequence.
-        start_corner = np.random.randint(0, _NUM_CORNERS)
-        shift_per_frame = np.random.randint(_MIN_SHIFT_PER_FRAME, _MAX_SHIFT_PER_FRAME + 1)
+        # --- LOGIC CHANGE FOR STATIONARY BOX ---
+        # 1. Calculate the maximum size the box will ever reach in the sequence.
+        max_box_size = _INITIAL_BOX_SIZE + self.total_seq_len - 1
+
+        # 2. Pick a single, fixed top-left position for the entire sequence.
+        #    The range ensures the box can grow to its max size without leaving the frame.
+        x_pos = np.random.randint(0, _IMAGE_SIZE - max_box_size + 1)
+        y_pos = np.random.randint(0, _IMAGE_SIZE - max_box_size + 1)
 
         for time_step in range(self.total_seq_len):
-            # Box size grows linearly with each time step.
+            # Box size still grows linearly with each time step, as in the original.
             box_size = _INITIAL_BOX_SIZE + time_step
-            
-            # This logic now correctly matches the original code:
-            # The total shift at time_step `t` is `t * shift_per_frame`.
-            total_shift = time_step * shift_per_frame
 
-            # Calculate box position based on start corner, initial offset, and total shift.
-            if start_corner == 0:  # Top-left
-                y_pos = initial_y_offset + total_shift
-                x_pos = initial_x_offset + total_shift
-            elif start_corner == 1:  # Top-right
-                y_pos = initial_y_offset + total_shift
-                x_pos = _IMAGE_SIZE - (initial_x_offset + total_shift) - box_size
-            elif start_corner == 2:  # Bottom-left
-                y_pos = _IMAGE_SIZE - (initial_y_offset + total_shift) - box_size
-                x_pos = initial_x_offset + total_shift
-            else:  # Bottom-right
-                y_pos = _IMAGE_SIZE - (initial_y_offset + total_shift) - box_size
-                x_pos = _IMAGE_SIZE - (initial_x_offset + total_shift) - box_size
-
-            # Draw the box, clipping coordinates to stay within image bounds.
-            y_start, y_end = max(0, y_pos), min(_IMAGE_SIZE, y_pos + box_size)
-            x_start, x_end = max(0, x_pos), min(_IMAGE_SIZE, x_pos + box_size)
+            # 3. Draw the box. The x_pos and y_pos are now the same for every
+            #    iteration, so the box only grows in place.
+            y_start, y_end = y_pos, y_pos + box_size
+            x_start, x_end = x_pos, x_pos + box_size
             
             sequence[time_step, 0, y_start:y_end, x_start:x_end] = 1.0
         

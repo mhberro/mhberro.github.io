@@ -79,36 +79,53 @@ class BoxDataSet(Dataset):
 
     def _create_single_sequence(self) -> np.ndarray:
         """
-        Creates a single sequence of frames with a STATIONARY and growing box.
+        Creates a single sequence of frames with a box that is anchored in a
+        random corner and grows in the opposite direction, remaining stationary.
         
-        To ensure the box is never cut off as it grows, its fixed position
-        is always chosen within the top-left quadrant.
+        This version uses mathematical logic instead of if/elif statements
+        to determine coordinates, making the code more concise.
         """
         sequence = np.zeros(
             (self.total_seq_len, _NUM_CHANNELS, _IMAGE_SIZE, _IMAGE_SIZE),
             dtype=np.float32
         )
 
-        # 1. Calculate the maximum size the box will reach in the sequence.
-        #    This is used to determine a safe starting position.
-        max_box_size = _INITIAL_BOX_SIZE + self.total_seq_len - 1
+        # 1. Initialization: Choose a random corner and offset.
+        start_corner = np.random.randint(0, _NUM_CORNERS)
+        initial_x_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
+        initial_y_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
+        
+        # 2. Determine the fixed anchor point using mathematical modifiers.
+        # This replaces the first if/elif block.
+        is_bottom_corner = start_corner // 2  # 0 for top, 1 for bottom
+        is_right_corner = start_corner % 2   # 0 for left, 1 for right
 
-        # 2. Pick a single, fixed top-left position for the entire sequence.
-        #    The random range ensures the box can grow to its maximum size
-        #    without ever moving out of the image frame.
-        x_pos = np.random.randint(0, _IMAGE_SIZE - max_box_size + 1)
-        y_pos = np.random.randint(0, _IMAGE_SIZE - max_box_size + 1)
+        # fixed_y is offset from the top edge (y=0) unless it's a bottom corner.
+        fixed_y = (is_bottom_corner * (_IMAGE_SIZE - initial_y_offset) +
+                   (1 - is_bottom_corner) * initial_y_offset)
+                   
+        # fixed_x is offset from the left edge (x=0) unless it's a right corner.
+        fixed_x = (is_right_corner * (_IMAGE_SIZE - initial_x_offset) +
+                   (1 - is_right_corner) * initial_x_offset)
 
         for time_step in range(self.total_seq_len):
             # 3. The box size grows linearly with each time step.
             box_size = _INITIAL_BOX_SIZE + time_step
 
-            # 4. Draw the box. The (x_pos, y_pos) coordinates are the same
-            #    for every iteration. Only the size changes.
-            y_start, y_end = y_pos, y_pos + box_size
-            x_start, x_end = x_pos, x_pos + box_size
+            # 4. Calculate the top-left (y_start, x_start) using the same modifiers.
+            # This replaces the second if/elif block.
             
-            sequence[time_step, 0, y_start:y_end, x_start:x_end] = 1.0
+            # For bottom corners, y_start moves up (subtracts box_size).
+            y_start = fixed_y - (is_bottom_corner * box_size)
+            
+            # For right corners, x_start moves left (subtracts box_size).
+            x_start = fixed_x - (is_right_corner * box_size)
+
+            # 5. Draw the box, clipping coordinates to ensure they are within bounds.
+            y_start_clipped, y_end_clipped = max(0, y_start), min(_IMAGE_SIZE, y_start + box_size)
+            x_start_clipped, x_end_clipped = max(0, x_start), min(_IMAGE_SIZE, x_start + box_size)
+            
+            sequence[time_step, 0, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped] = 1.0
         
         return sequence
 

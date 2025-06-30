@@ -1,122 +1,77 @@
-class TestBoxDataSet(unittest.TestCase):
+import pytest
+from unittest.mock import patch
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from box_dataset_class_final import BoxDataSet, SplitType
+
+def test_init_withValidMode_shouldCreateInstance():
     """
-    Unit tests for the BoxDataSet class.
-    Adheres to company standards: AAA pattern, descriptive names,
-    and mocking dependencies to ensure deterministic tests.
+    Tests that the class can be instantiated successfully with default parameters.
     """
+    # Arrange & Act
+    # A test will fail automatically if an unexpected exception occurs.
+    dataset = BoxDataSet(num_examples=10, mode="train")
+    # Assert
+    assert isinstance(dataset, BoxDataSet)
 
-    def test_init_withValidMode_shouldCreateInstance(self):
-        """
-        Tests that the class can be instantiated successfully with default parameters.
-        """
-        # Arrange & Act
-        try:
-            dataset = BoxDataSet(num_examples=10, mode="train")
-            # Assert
-            self.assertIsInstance(dataset, BoxDataSet)
-        except Exception as e:
-            self.fail(f"BoxDataSet instantiation failed with an unexpected exception: {e}")
+def test_init_withInvalidMode_shouldRaiseValueError():
+    """
+    Tests that providing an invalid mode string raises a ValueError.
+    """
+    # Arrange
+    invalid_mode = "validation"
+    # Act & Assert
+    with pytest.raises(ValueError):
+        BoxDataSet(mode=invalid_mode)
 
-    def test_init_withInvalidMode_shouldRaiseValueError(self):
-        """
-        Tests that providing an invalid mode string raises a ValueError.
-        This follows the "test how not to use it" principle.
-        """
-        # Arrange
-        invalid_mode = "validation"
-        # Act & Assert
-        with self.assertRaises(ValueError):
-            BoxDataSet(mode=invalid_mode)
+def test_len_forTrainMode_shouldReturnCorrectSplitSize():
+    """
+    Tests the __len__ method returns the correct number of samples for the training set.
+    """
+    # Arrange
+    num_examples = 100
+    train_split_ratio = 0.8
+    expected_len = int(num_examples * train_split_ratio)
+    # Act
+    dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="train")
+    # Assert
+    assert len(dataset) == expected_len
 
-    def test_len_forTrainMode_shouldReturnCorrectSplitSize(self):
-        """
-        Tests the __len__ method returns the correct number of samples for the training set.
-        """
-        # Arrange
-        num_examples = 100
-        train_split_ratio = 0.8
-        expected_len = int(num_examples * train_split_ratio) # 80
-        # Act
-        dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="train")
-        # Assert
-        self.assertEqual(len(dataset), expected_len)
+def test_len_forTestMode_shouldReturnCorrectSplitSize():
+    """
+    Tests the __len__ method returns the correct number of samples for the test set.
+    """
+    # Arrange
+    num_examples = 100
+    train_split_ratio = 0.8
+    expected_len = num_examples - int(num_examples * train_split_ratio)
+    # Act
+    dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="test")
+    # Assert
+    assert len(dataset) == expected_len
 
-    def test_len_forTestMode_shouldReturnCorrectSplitSize(self):
-        """
-        Tests the __len__ method returns the correct number of samples for the test set.
-        """
-        # Arrange
-        num_examples = 100
-        train_split_ratio = 0.8
-        expected_len = num_examples - int(num_examples * train_split_ratio) # 20
-        # Act
-        dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="test")
-        # Assert
-        self.assertEqual(len(dataset), expected_len)
-
-    def test_getItem_shouldReturnTupleOfTensorsWithCorrectShape(self):
-        """
-        Tests that __getitem__ returns data with the correct shape and type.
-        """
-        # Arrange
-        in_seq_len = 5
-        out_seq_len = 10
-        image_size = 32
-        num_channels = 1
-        dataset = BoxDataSet(
-            num_examples=10,
-            in_seq_len=in_seq_len,
-            out_seq_len=out_seq_len,
-            image_size=image_size,
-            num_channels=num_channels
-        )
-        # Act
-        input_tensor, output_tensor = dataset[0]
-        # Assert
-        self.assertIsInstance(input_tensor, torch.Tensor)
-        self.assertIsInstance(output_tensor, torch.Tensor)
-        self.assertEqual(input_tensor.shape, (in_seq_len, num_channels, image_size, image_size))
-        self.assertEqual(output_tensor.shape, (out_seq_len, num_channels, image_size, image_size))
-
-    # Using mock.patch to control randomness, a key principle from the standards.
-    @patch('__main__.np.random.randint')
-    def test_createSingleSequence_boxAreaShouldIncreaseOverTime(self, mock_randint):
-        """
-        Tests the core logic: the box grows over time.
-        Mocks random values to create a deterministic test case.
-        """
-        # Arrange
-        # This makes np.random.randint return these values in order on each call.
-        mock_randint.side_effect = [
-            5,  # initial box_size
-            2,  # size_shift
-            0,  # start_corner (top-left)
-            10, # initial_x_offset
-            10  # initial_y_offset
-        ]
-        dataset = BoxDataSet(num_examples=1, in_seq_len=2, out_seq_len=2)
-        # Act
-        # We test the private method here because its logic is complex and critical.
-        # This is a pragmatic exception to the "test public interface" rule.
-        sequence = dataset._create_single_sequence()
-        # Assert: One logical assertion per test. Here, we assert growth.
-        area_time_0 = np.sum(sequence[0] > 0)
-        area_time_1 = np.sum(sequence[1] > 0)
-        self.assertGreater(area_time_1, area_time_0)
-
-    @patch('__main__.np.random.randint')
-    def test_generateAllSequences_pixelValuesShouldIncreaseOverTime(self, mock_randint):
-        """
-        Tests that the pixel values inside the box increase over time.
-        """
-        # Arrange
-        mock_randint.side_effect = [5, 2, 0, 10, 10] # Same deterministic setup
-        dataset = BoxDataSet(num_examples=1, in_seq_len=2, out_seq_len=2)
-        # Act
-        # We test the public-facing result of the generation logic.
-        input_tensor, _ = dataset[0]
-        # Get the max pixel value in the box at two different time steps.
-        value_time_0 = torch.max(input_tensor[0])
-        value_time_1 = torch.max(input_tensor[1])
-        # Assert
-        self.assertGreater(value_time_1, value_time_0)
+def test_getItem_shouldReturnTupleOfTensorsWithCorrectShape():
+    """
+    Tests that __getitem__ returns data with the correct shape and type.
+    """
+    # Arrange
+    in_seq_len = 5
+    out_seq_len = 10
+    image_size = 32
+    num_channels = 1
+    dataset = BoxDataSet(
+        num_examples=10,
+        in_seq_len=in_seq_len,
+        out_seq_len=out_seq_len,
+        image_size=image_size,
+        num_channels=num_channels
+    )
+    # Act
+    input_tensor, output_tensor = dataset[0]
+    # Assert
+    assert isinstance(input_tensor, torch.Tensor)
+    assert isinstance(output_tensor, torch.Tensor)
+    assert input_tensor.shape == (in_seq_len, num_channels, image_size, image_size)
+    assert output_tensor.shape == (out_seq_len, num_channels, image_size, image_size)

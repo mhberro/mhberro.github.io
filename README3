@@ -1,175 +1,1298 @@
-# Copyright 2023 Lockheed Martin Corporation
+LAIC Software Standards
+
+Table of Contents
+
+LAIC Software Standards
+Table of Contents
+Introduction
+
+General Source Code and Repository Practices
+Repository Naming
+GitLab Repository Configuration
+README Documentation
+Source Code Intellectual Property Marking
+Commit, Push, and Pull Early and Often
+Write High-Quality Conventional Commit Messages
+Use Semantic Versioning
+Branching and Tagging Strategy
+Merging Standards and Code Reviews
+Pipelines
+Don't Store Non-Essential Files in Git
+Coding Style
+Use of Third-Party Libraries
+Recommended Software Development Environment
+
+
+
+Unit Testing
+TDD (Test-Driven Development)
+Test Coverage
+AAA (Arrange, Act, Assert)
+One Logical Assertion Per Test
+Test Naming
+Test Code Quality is Paramount
+Use Dependency Injection and Test Doubles
+
+
+
+C++ Specific Guidance
+Style Guide
+Recommended C++ Toolchain
+Recommended Minimum C++ CI/CD Pipeline
+Directory Structure
+No Errors or Warnings
+Unit Test Framework
+Const Correctness
+Const Pointers vs. Const Values
+Casts Usually Indicate a Design Problem
+If You Must Cast, Use C++ Casts Instead of C-Style Casts
+Yes, Unfortunately, Avoid Using Exceptions When Possible
+Non-Virtual Interface (NVI) Idiom
+PIMPL Idiom for Dependency Hiding
+
+Interoperability, Reusability, and Driving Adoption
+Minimize or Hide Dependencies
+Keep Public Interfaces Simple and Standard
+Ensure Compatibility with All Common Compilers and Standard Library Implementations
+Don't Require a Specific Development Environment
+
+
+
+
+
+Python-Specific Guidance
+Style Guide
+Recommended Python Toolchain
+Recommended Minimum Python CI/CD Pipeline
+Directory Hierarchy
+Use Modern Python Dependency Management and Configuration
+Automatic Formatting
+Linter
+Unit Test Framework
+Class Member Order
+
+
+
+Software Engineering Principles
+Code is a Liability
+
+SOLID Principles of Object-Oriented Design
+Single Responsibility Principle (SRP)
+Open/Closed Principle (OCP)
+Liskov Substitution Principle (LSP)
+Interface Segregation Principle (ISP)
+Dependency Inversion Principle (DIP)
+
+
+Component Cohesion Principles
+Reuse/Release Equivalency Principle (REP)
+Common Closure Principle (CCP)
+Common Reuse Principle (CRP)
+Use Self-Explanatory Names from the Problem Domain
+Principle of Least Astonishment
+Avoid Premature Optimization
+KISS (Keep It Simple and Standard)
+YAGNI (You Aren't Gonna Need It)
+DRY (Don't Repeat Yourself)
+Slow is Smooth and Smooth is Fast
+Avoid Magic Constants
+Suffix Variable Names with Units
+Loose Coupling via Dependency Injection
+Information Hiding
+Tell, Don't Ask
+Don't Mix Debug and Production Code
+Comments and Self-Documenting Code
+Small Functions
+Avoid Flag Arguments to Functions
+
+Handle Errors with Care and Attention
+Never Ignore Function Return Values
+Bubble Successes and Errors Up to the Calling Application
+
+
+RAII (Resource Acquisition Is Initialization)
+Don't Reinvent the Wheel
+Composition is Often More Appropriate than Inheritance
+No Dead Code
+Write Idiomatic Code
+The Code Belongs to the Team
+The Boy Scout Rule
+Write Standards-Compliant, Portable Code
+Use Assertions to Protect Yourself, Not Clients or Users
+Don't Overuse String Values
+Separation of Concerns in Microservices
+
+
+
+Recommended Reading
+DoD Software Acquisition and Practices (SWAP) Study
+Books
+Guides and Standards
+Development Environment Configuration at Lockheed Martin
+Articles and Sites
+
+
+
+
+Introduction
+This guide establishes software standards for code development at the Lockheed Martin AI Center. These standards are the key to implementing high-quality, maintainable, reusable, portable, and performant software systems.
+
+General Source Code and Repository Practices
+
+Repository Naming
+Always give repositories meaningful and descriptive names, even if they're only for what seem at the moment to be throwaway prototypes. This helps keep GitLab clean and well organized, avoids confusion, and enables easy onboarding of new team members.
+For consistency with other projects and to maintain a clean, professional, and organized GitLab, always set the Project Name field of your GitLab projects to a properly spaced and capitalized name (e.g. Geospatial Toolkit for a project with the repository path geospatial-toolkit). Additionally, always set the project Description field to a concise and meaningful explanation of the project's purpose and contents. The Project Name and Description fields can be found under Settings -> General.
+
+GitLab Repository Configuration
+Configure GitLab repositories as follows to ensure compliance with the software standards:
+
+In order to encourage storage of documentation with the code, the Wiki and Snippets features shall be disabled.
+To avoid codebase splintering, forks shall be disabled.
+All other unused features of the project shall be disabled.
+Projects shall be configured to enforce the Code Review and Merging Standards.
+
+Merge requests shall be configured as follows:
+
+Merge method: Merge commit
+Enable "Delete source branch" option by default: Enabled
+Squash commits when merging: Allow
+Merge checks:
+
+Pipelines must succeed: Enabled
+Skipped pipelines are considered successful: Disabled
+All threads must be resolved: Enabled
+Status checks must succeed: Enabled
+
+
+
+
+Merge request approvals shall be configured as follows:
+
+Approval rules:
+
+Eligible users - Approvals required: 1
+Coverage-Check: Enabled
+
+
+The following approval settings shall be enabled:
+
+Prevent approval by author.
+Prevent approval by users who add commits.
+Prevent editing approval rules in merge requests.
+Remove all approvals when commits are added to the source branch.
+
+
+The repository shall have the following push rules set:
+
+Reject unverified users
+Do not allow users to remove Git tags with git push
+
+Check whether the commit author is a GitLab user
+Prevent pushing secret files
+
+
+The master or main branch shall be protected as follows:
+
+Allowed to merge: Maintainers
+Allowed to push: No one
+Allowed to force push: Disabled
+Code owner approval: Disabled
+
+
+
+
+
+
+
+
+README Documentation
+All code repositories shall have a README containing at minimum the following:
+
+A detailed description of the repository's purpose.
+A description of any Lockheed Martin Proprietary Information (LMPI), Export Controlled Information (ECI), or Controlled Unclassified Information (CUI) contained in the repository.
+How to use the repository, including build instructions if applicable and, for executable applications, run instructions.
+If any external documentation exists, links to it.
+For libraries, links to files in the repository that contain the public interfaces to the library.
+
+
+Source Code Intellectual Property Marking
+The first line of all source code files shall contain a comment as follows, with XXXX replaced by the current year:
+Python:
+
+# Copyright XXXX Lockheed Martin Corporation
+
+
+C++ and Go:
+
+// Copyright XXXX Lockheed Martin Corporation
+
+
+The second line of all source code files containing Lockheed Martin Proprietary Information (LMPI) shall contain a comment as follows:
+Python:
+
 # Lockheed Martin Proprietary Information
 
-"""Torch Dataset Definition for Mutating Box."""
 
-import torch
-import numpy as np
-from torch.utils.data import Dataset
-from typing import Tuple
-from enum import Enum
+C++ and Go:
+
+// Lockheed Martin Proprietary Information
 
 
-DEFAULT_IMAGE_SIZE = 64
-DEFAULT_NUM_CHANNELS = 1
-DEFAULT_NUM_EXAMPLES = 1000 
-DEFAULT_IN_SEQ_LEN = 3
-DEFAULT_OUT_SEQ_LEN = 5
-DEFAULT_PIXEL_VALUE_MULTIPLIER = 0.08
-DEFAULT_TRAIN_SPLIT_RATIO = 0.8
+Immediately following copyright and LMPI markings, all source code files containing Export Controlled Information or Controlled Unclassified Information shall include comment lines as follows:
+Python:
 
-class SplitType(str, Enum):
-    """Types of Splits for the Dataset."""
+# Export Controlled Information
 
-    TRAIN = "train"
-    VALID = "valid"
-    TEST = "test"
 
-class BoxDataSet(Dataset):
-    """A class that generates a synthetic sequence of images."""
+and/or
 
-    def __init__(self,
-                 num_examples: int = DEFAULT_NUM_EXAMPLES,
-                 in_seq_len: int = DEFAULT_IN_SEQ_LEN,
-                 out_seq_len: int = DEFAULT_OUT_SEQ_LEN,
-                 image_size: int = DEFAULT_IMAGE_SIZE,
-                 num_channels: int = DEFAULT_NUM_CHANNELS,
-                 train_split_ratio: int = DEFAULT_TRAIN_SPLIT_RATIO,
-                 mode: str = "train",
-                 split: SplitType = SplitType.TRAIN
-    ) -> None:
+# Controlled Unclassified Information
 
-        """Generates a synthetic dataset of image sequences for forecasting models.
 
-        Each sequence shows a box anchored in a random corner. The box remains
-        stationary at its anchor but grows larger over time, with the direction
-        of growth depending on the anchor corner. The pixel values within the
-        box also increase linearly throughout the sequence.
+C++ and Go:
 
-        Args:
-            num_examples (int): The total number of example sequences to generate.
-            in_seq_len (int): The number of frames in the input sequence.
-            out_seq_len (int): The number of frames in the output (target) sequence.
-            image_size (int): The height and width of each image frame in pixels.
-            num_channels (int): The number of channels for each image.
-            train_split_ratio (int): The ratio for calculating the required sizes
-                for the split.  
-            mode (str): The dataset mode, either "train" or "test". Determines
-                        which subset of the data is used.
-        """
+// Export Controlled Information
 
-        if mode not in ("train", "test"):
-            raise ValueError("Mode must be either 'train' or 'test'.")
 
-        self.in_seq_len = in_seq_len
-        self.out_seq_len = out_seq_len
-        self.num_examples = num_examples
-        self.image_size = image_size
-        self.num_channels = num_channels        
-        self.total_seq_len = in_seq_len + out_seq_len
-        self.train_split_ratio = train_split_ratio
-        self.mode = mode
+and/or
 
-        all_sequences = self._generate_all_sequences(num_examples)
-        self._split_and_assign_data(all_sequences)
+// Controlled Unclassified Information
 
-    def _generate_all_sequences(self, num_examples: int) -> np.ndarray:
-        """Generates the complete dataset of moving box sequences."""
-        # Pre-allocate memory for all sequences.
-        sequences = np.zeros(
-            (num_examples, self.total_seq_len, self.num_channels, self.image_size, self.image_size),
-            dtype=np.float32
-        )
 
-        for i in range(num_examples):
-            sequences[i] = self._create_single_sequence()            
+Lockheed Martin Proprietary Information, Export Controlled Information, and Controlled Unclassified Information must be identified by the Research Lead or Software Lead for the project before being marked as such in source code. If you suspect a particular section of code is LMPI, ECI, or CUI, you must seek and obtain approval from the project Research or Software Lead to demarcate such code accordingly. This is to prevent over-restriction that may hamper later integration efforts and/or code reuse.
 
-        time_step_multipliers = (np.arange(1, self.total_seq_len + 1) *
-                                 DEFAULT_PIXEL_VALUE_MULTIPLIER)
+Commit, Push, and Pull Early and Often
+Commit and push your code changes as frequently as you can. This practice ensures that if you happen to be sick, out of office, or otherwise unavailable, another engineer has a better chance of picking up where you left off.
+Similarly, pull early and often to ensure that you are working with the latest code and to save yourself and the team headaches when it's time to merge your changes.
+
+Write High-Quality Conventional Commit Messages
+Write high-quality git commit messages following the Conventional Commits standard. Conventional Commits have a machine-readable format that enables automate processes like semantic release and automated changelog generation in CI/CD pipelines.
+Be sure to write concise, descriptive commit messages that will not only enable other engineers to understand the code history but create high-quality changelog entries for consumption by the larger community around your project. As in the Conventional Commits examples, use imperative mood (e.g. "send an email to the customer when a product is shipped") for the commit description. Use the optional body section to explain the what and why of the change as opposed to how it's implemented.
+
+Use Semantic Versioning
+All software releases shall use Semantic Versioning for all for easy and effective dependency management and compatibility tracking.
+
+Branching and Tagging Strategy
+Create feature branches by creating merge requests from GitLab Issues for each feature or fix to be developed.
+The master or main branch of any tactical code repository shall be protected with only Maintainers allowed to merge and no one allowed to push. The primary Maintainers of a repository shall be selected by the Software Lead responsible for the project to which it belongs.
+Releases shall be tagged with the semantic version number, e.g. 1.0.0.
+Ad-hoc integration branches may be created as needed for convenience, but these must be descriptively named and short-lived. Please delete branches as soon as they are no longer needed.
+
+Merging Standards and Code Reviews
+Prior to merging to the master or main branch, all tactical code shall be reviewed by at least one other engineer. Projects may establish more strict review policies (e.g. more required reviewers, architect approval, etc.) when appropriate given their criticality and staffing.
+Code reviews are very important to creating high-quality software and must be performed conscientiously. Avoid the temptation to treat code reviews as a "rubber stamp" process.
+Code merged to master or main shall have the following attributes:
+
+The code compiles without errors or warnings.
+All automated unit tests pass.
+Unit test coverage is deemed sufficient by the author and reviewers. Strive for 100%.
+Static and dynamic analysis reveal no code quality issues. In cases of false positives or unavoidable violations, use the tool's narrowest-scoped suppression mechanism to suppress the offending lines.
+
+GitLab repositories shall be configured with the master or main branch protected to disallow direct pushes and allow  merges only by project maintainers. GitLab projects shall be configured to enforce the merge request review and approval policy.
+Be sure to delete feature and ad-hoc branches once they have been merged to master or main.
+
+Pipelines
+All code repositories shall have continuous integration pipelines that perform at least the following steps:
+
+For compiled languages, compiling the code;
+Automated unit test execution;
+Unit test coverage calculation;
+Static analysis for code quality via tooling suitable to the languages and frameworks used;
+Static Application Security Testing (SAST), e.g. SonarQube, Fortify SCA;
+If tooling exists for the language, dynamic analysis that runs on the code or tests (e.g. Valgrind on the unit tests in C++);
+Software Bill of Materials (SBOM) generation, as required by corporate policy STD-108.9.1.
+
+For new projects, use the standardized pipelines in the LAIC Pipeline Modules which provide these and additional pipeline stages (e.g. semantic release).
+NOTE: CI pipelines are recommended but not required for throwaway, educational, or experimental research code that is intended neither for reuse nor transition to a production library. If there is any doubt about whether a particular codebase requires CI pipelines, please confirm with your project leadership.
+
+Don't Store Non-Essential Files in Git
+Be careful not to clutter repositories with binaries, log outputs, large input files, IDE user settings files, or other files that are not essential for your project to build. These artifacts make repositories take up more space and take longer to clone than necessary, and in the case of IDE user settings files, can conflict with other engineers' configurations. Instead, share such files using other file-sharing tools.
+The best way to prevent accidental commits of unintended files is to use .gitignore files. A widely-used collection of useful .gitignore templates for a wide variety of languages, frameworks, and environments is available at the gitignore repository on GitHub.
+
+Coding Style
+All source code shall adhere to the appropriate language style guide defined in this document. Code shall be written in a manner that is idiomatic for the language and uses language features, constructs, and design patterns that are common in the language and would not surprise a typical developer in that language.
+All source code shall be written in a standards-compliant fashion for the language in use and shall not use proprietary language extensions that may be offered by any particular compiler or interpreter implementation. Code shall be constructed to be as portable as practical and shall not use language features or libraries that hinder portability.
+All source code should be frequently compiled and/or run against suitable versions of the major compilers and interpreters for the code's language (e.g. GCC and Clang for C++) to ensure that full compatibility is maintained and the code is as easily adopted or reused as possible.
+
+Use of Third-Party Libraries
+Use of well-supported, high-quality Free and Open Source Software (FOSS) that is approved as part of the Enterprise FOSS (eFOSS) library is highly encouraged. Avoid the temptation to reinvent the wheel.
+Avoid using FOSS software that is either not present in the eFOSS library or has been explicitly denied approval in eFOSS, including specific versions of software so characterized. FOSS that is Under Review in eFOSS may be used, but such usage must be approved by your team's software lead and portfolio manager and must comply with the guidelines in FOSS Package Management Approvals.
+All FOSS shall be handled in accordance with the FOSS Package Management Approvals guidelines. All FOSS used in LAIC software shall be reviewed by the developers and team Softare Lead for compliance with open source licensing.
+Software developers shall always seek approved eFOSS solutions prior to implementing custom code. If no eFOSS solutions exist to solve a given problem, then Commercial Off-the-Shelf (COTS) solutions should be considered and weighed against a custom implementation in terms of cost, schedule, security, maintainability, supportability, software quality, and license encumbrance. The final decision on the use of any COTS product shall be made by the portfolio manager and principal architect in consultation with the appropriate corporate legal and security resources.
+
+Recommended Software Development Environment
+Visual Studio Code is the recommended software development environment. Use extensions appropriate to the languages used to enable code autocompletion and static analysis, integrated software builds, Git integration, Jupyter Notebook support, Docker integration, remote (SSH and remote container) development, and automatic source code formatting and linting.
+Software development on shared resources such as GPU servers shall be done exclusively inside containers to maintain a consistent configuration and avoid resource contention. Use the Remote Development Pack extension to connect to remote containers in Visual Studio Code.
+
+Unit Testing
+Automated unit testing is a core discipline in writing maintainable, refactorable, reusable, and extensible software.
+Increasingly, the question is becoming not "how do you test your code," but "what tool suite are you using for unit tests, regression testing, functional tests, security scans, and deployment certification?" (see Defense Innovation Board SWAP Study Concept Paper "DIB Guide: Detecting Agile BS", Questions to Ask Programming Teams.) To stay competitive in the software landscape, it's critical that we consider testing a first-class priority when developing tactical software.
+NOTE: Unit tests are recommended but not strictly required for throwaway, educational, or experimental code that is intended neither for reuse nor transition to a production library. If there is any doubt about whether a particular codebase requires unit tests, please confirm with your project leadership.
+
+TDD (Test-Driven Development)
+Practice Test-Driven Development when writing tactical code.
+
+Don't write any production code until you've first written a failing test (and not compiling is failing).
+Always write the simplest possible code to make that particular test pass, even if that code seems trivial or outright wrong. Resist the urge to take the next step in generalizing the implementation until you've written a subsequent test that justifies it. This is critical for achieving high test coverage and avoiding flawed implementations that fail to account for all cases.
+Tests should be independent from one another and able to run correctly in any order.
+Tests should run fast.
+Test only via the public interface to your class. Testing private implementation details makes your tests brittle. You can still achieve 100% coverage by testing observable properties of your public interface.
+Use unchanging values as test values. Tests should be consistently repeatable, so avoid using random or generated data.
+
+
+Test Coverage
+Strive for 100% automated unit test coverage on all components. This can sometimes be difficult, especially with low-level systems code, but with disciplined use of Test-Driven Development and a focus on testability, test coverage of approximately 100% is usually possible.
+Unit tests provide a safety net for refactoring, preventing regressions, and naturally helping you design for testability. Designing for testability inherently supports many of the principles in this guide, and code designed for testability is also code that's easy to use correctly.
+High test coverage is more important than ever as the DoD evolves its focus to modern metrics for evaluating software quality. For example, the Defense Innovation Board Metrics for Software Development asserts that real-time hardware and software code should have 100% automated test coverage. To remain competitive, we need to ensure that we're targeting and accomplishing key metrics that our customers are increasingly using to evaluate our products.
+Beyond the obvious benefits of comprehensive testing, well-designed unit tests are executable documentation. They show exactly how the code is designed to be used, and since they're executable, they don't diverge from reality as easily as external documentation can.
+
+AAA (Arrange, Act, Assert)
+Arrange, Act, Assert is perhaps the most common and idiomatic pattern for writing unit tests. Use this pattern to make your tests clear, readable, and maintainable.
+C++ example:
+
+TEST(Adder, AddsPositiveNumbersCorrectly) {
+    // Arrange.
+    const Adder adder;
+    const auto addend1 = 1;
+    const auto addend2 = 1;
+    const auto expected_result = 2;
+
+    // Act.
+    const auto actual_result = adder.add(addend1, addend2);
+
+    // Assert.
+    ASSERT_EQ(expected_result, actual_result);
+}
+
+
+
+One Logical Assertion Per Test
+When writing unit tests, be sure that each test tests one and only one thing. Usually, this will mean a single assert statement. Sometimes, multiple assert statements may be necessary to test the a single logical operation, but be careful -- multiple asserts can often indicate a test that's too broad and should be broken up.
+
+Test Naming
+There are many conventions for formatting test names, but the most important considerations are as follows:
+
+Tests should read like English and be understandable for not only developers working in the code but outside developers, non-technical managers, and even the customer. Remember, tests are executable documentation!
+Test names should describe what is being tested, under what conditions, and what the result should be (e.g. TestMyFunctionRaisesExceptionWhenInputIsNull).
+Within a given project, the test naming convention and format should be consistent and, when possible, idiomatic for the language and test framework in use.
+Test names must be specific enough to be useful but not so descriptive of the underlying implementation that they're brittle. This is a judgment call and part of the art and discipline of writing good tests!
+
+Good test names intuitively convey how the code under test is intended to be used (and indeed how is it not to be used). Taken together, the tests should present a clear picture of how each class or component behaves and instill a sense of confidence in its public interface.
+Here are some articles describing popular unit test naming schemes. Choose one (or decide on your own) that is straightforward, readable, as compliant with your language's style guide as possible, and consistent with the conventions of your test framework and tools.
+
+7 Popular Unit Test Naming Conventions
+Unit Test Naming: The 3 Most Important Parts
+Unit Test Naming Conventions
+
+
+Test Code Quality is Paramount
+The functional code and its tests are NOT separate entities. They are inseparable parts of one unified codebase, and the test code quality should be just as high or higher than the production code quality. Avoid skimping or taking shortcuts when writing test code thinking, "oh, it's just test code," or the more insidious, "oh, I'll fix the tests later." Such notions lead to poor quality tests that do more harm than good.
+
+Use Dependency Injection and Test Doubles
+Whenever you write a class or free function that has an external dependency, ensure that your class constructor or function takes a parameter of an abstract interface type that the external dependency implements. This is called dependency injection, and it makes your code more testable by enabling the easy use of a test double in place of the real dependency in your unit tests. By doing so, you ensure that you're testing only your code, not your code plus whatever it depends on (which would be an integration test, not a unit test).
+There are several kinds of test doubles that are useful in different scenarios. Martin Fowler has reasonable descriptions of these types here.
+For details on how to use test doubles in your code, see the following references:
+
+For C++, consult the Google Mock documentation.
+For Python, consult the unittest.mock documentation.
+
+Even more importantly, dependency injection eliminates the coupling between your code and the details of the particular implementation of the interface. This makes it trivial to use a different concrete implementation of that interface should the need later arise without requiring your code to be modified.
+
+C++ Specific Guidance
+
+Style Guide
+Tactical C++ code shall follow the Google C++ Style Guide and the C++ Core Guidelines. Where incompatibilities may exist, this guide supersedes the Google C++ Style Guide, and the Google C++ Style Guide supersedes the C++ Core Guidelines.
+Yes, this style guide will contain decisions with which you don't agree, but by simply adopting it anyway, we eliminate all possible arguments about style. Many of the factors that led Google to create this style guide also apply to tactical systems, and this style guide has been used successfully in real-time software. After a couple weeks, you'll be used to it, and you'll no longer seethe over the parts you find distasteful.
+One of the advantages of using a widely-adopted style guide is that there exists mature tooling that supports it. Use cpplint.py, clang-format, and clang-tidy to ensure that your code is as compliant as possible.
+
+Recommended C++ Toolchain
+
+
+
+Purpose
+Tool
+
+
+
+
+IDE
+Visual Studio Code
+
+
+Compiler
+GCC 7.5.0+Clang 12.0.0+
+
+
+Debugger
+GDB 8.1.1+LLDB 12.0.0+
+
+
+Build
+CMake 3.20+, Ninja 1.10.2+
+
+
+Code Formatting
+clang-format
+
+
+Static Analysis
+
+cppcheckclang-tidyclang-static-analyzer
+
+
+
+Dynamic Analysis
+Valgrind 3.18.1+
+
+
+
+
+Recommended Minimum C++ CI/CD Pipeline
+
+
+
+Stage
+Contents
+
+
+
+
+build
+
+cmake configuration and build with code coverage
+
+
+test
+
+Google Test automated unit tests
+
+
+sast
+
+static-code-scan.py LM Software Factory static code scanning (SAST)
+
+
+
+static analysis
+
+cppcheck static analysisclang-format code formatting checkclang-tidy code lintingclang-static-analyzer static analysisblade-toif vulnerability detection
+
+
+dynamic analysis
+
+valgrind dynamic analysis on unit tests
+
+
+deploy
+
+doxygen documentation generation and publishing to GitLab Pages
+
+
+
+
+Directory Structure
+C++ code shall be organized in the following directory hierarchy convention:
+
+repository-root/
+    config/
+        default_config.json
+    include/
+        outernamespace/
+            innernamespace/
+                example.h
+                internal/
+                    internal_class_not_intended_for_client_use.h
+    lib/
+        CMakeLists.txt
+        internal_dependency/
+            include/
+                dependencynamespace/
+                    dependency.h
+            src/
+                dependency.cc
+            tests/
+                CMakeLists.txt
+                dependency_tests.cc
+            CMakeLists.txt
+    src/
+        CMakeLists.txt
+        example.cc
+        internal_class_not_intended_for_client_use.cc
+    tests/
+        CMakeLists.txt
+        example_tests.cc
+    .gitignore
+    .gitlab-ci.yml
+    CMakeLists.txt
+
+
+Note that include files are organized in subdirectories from include that match the namespace hierarchy. With good namespace names and organization, this makes lists of includes easier to understand and maintain.
+
+No Errors or Warnings
+Tactical C++ code shall compile without errors or warnings using compile flags -fno-rtti -Wall -Wextra -pedantic -Wconversion.
+
+Unit Test Framework
+Tactical C++ code shall use Google Test for unit tests and test doubles.
+
+Const Correctness
+The const keyword is your friend and ally in C++. It helps the compiler help you avoid bugs, and it makes the intent of your code explicit to other engineers. Use it everywhere you can, including function parameters and class methods.
+
+Const Pointers vs. Const Values
+When working with pointers, there are two things that can be const -- the pointer itself (the memory address where the value is stored) and the value to which the pointer points. The const on the left of the * applies to the value, while the const on the right of the * applies to the pointer itself.
+As a memory aid, it can help to read from right to left.
+const Type* const is a const pointer to a const value. This means neither the memory address nor the value in that memory can be changed. You can read this from right to left as "const pointer to const Type".
+const Type* is a non-const pointer to a const value. This means that the memory address in the pointer itself can change, but the value to which it points cannot. You can read this from right to left as "pointer to const Type".
+Type* const is a const pointer to a non-const value. This means that the memory address in the pointer itself cannot change, but the value to which it points can. You can read this from right to left as "const pointer to Type".
+
+Casts Usually Indicate a Design Problem
+Try to avoid casting variables to other types. The need for a cast often indicates a design problem. When writing low-level software and interacting with drivers, casts are sometimes necessary, but each time you are tempted to cast should be a trigger to think very carefully about your design.
+
+If You Must Cast, Use C++ Casts Instead of C-Style Casts
+If you can't avoid a type conversion, use only C++ casts static_cast<T> and, if necessary to work with a third-party library that is not const-correct, const_cast<T>.
+Do not use dynamic_cast<T> -- if you think you need it, you have a design problem.
+Do not use reinterpret_cast<T> -- it's unsafe, non-portable, and implementation-dependent. In the exceptionally rare circumstance that you can't directly static_cast<T>, use static-cast-through-void (e.g. static_cast<int*>(static_cast<void*>(variable))).
+
+Yes, Unfortunately, Avoid Using Exceptions When Possible
+Exceptions can be problematic in real-time systems with tight performance and determinism requirements, and some of the systems for which our products may be well-suited have such requirements.
+Using exceptions effectively in any system requires a deep knowledge of the exception safety guarantees and rigorous attention to detail in designing a coherent exception handling strategy. These traits are unfortunately not as common as would be ideal in typical C++ programmers, particularly those who frequently work on real-time systems where exceptions are not used.
+To keep our software easy to adopt for tactical systems, to eliminate a potential vector for difficult-to-isolate performance problems, and to avoid maintainability issues that come from undisciplined use of exceptions, we will avoid using exceptions unless necessary when working with 3rd-party libraries or when there is otherwise no clean alternative.
+
+Non-Virtual Interface (NVI) Idiom
+The Non-Virtual Interface (NVI) idiom is an application of the Template Method design pattern (unrelated to the C++ template keyword) recommended by prominent C++ expert Herb Sutter in his article, Virtuality.
+By making virtual methods private and delegating work to them from a public non-virtual method, a base class gains "...complete control of its interface and policy, and can enforce interface preconditions and postconditions, insert instrumentation, and do any similar work all in a single convenient reusable place - the non-virtual interface function".
+Follow the guidelines that Sutter proposes to better separate interface from implementation and make your base classes less fragile to change:
+
+Guideline 1: Prefer to make interfaces non-virtual using Template Method.
+Guideline 2: Prefer to make virtual functions private.
+Guideline 3: Only if derived classes need to invoke the base implementation of a virtual function should you make the virtual function protected.
+Guideline 4: A base class destructor should be either public and virtual or protected and non-virtual.
+
+For example:
+
+class Widget {
+public:
+ Widget();
+
+ // Guideline 4. This class is intended to be used polymorphically.
+ virtual ~Widget();
+
+ // Guideline 1: non-virtual method delegates to a private virtual method.
+ void Work() {
+   DoWork();
+ }
+
+private:
+ // Guideline 2: virtual function is private so inheriting classes can provide
+ // an implementation without taking control of the public interface.
+ virtual void DoWork() = 0;
+};
+
+
+
+PIMPL Idiom for Dependency Hiding
+The PIMPL (Pointer-to-IMPLementation) idiom is a common design pattern used to hide a class's internal implementation and dependencies from a client, avoiding the common issue of clients having transitive dependencies on the dependencies of libraries they're using.
+This pattern has useful properties. In addition to reducing compile times, it removes compilation dependencies on internal class implementation and therefore preserves binary compatibility of your API between versions. In other words, it allows shared library binaries to be updated without requiring that clients relink against them when their internal implementations change, since the header files don't need to change as long as the public interface hasn't changed.
+There are tradeoffs to the PIMPL idiom, so it should be used judiciously. See the seminal article GotW #100: Compilation Firewalls by Herb Sutter for more details.
+An example of the PIMPL idiom follows:
+
+// example.h
+
+class Example {
+ public:
+  Example();
+  ~Example();
+  void ExampleMethod() const;
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> pimpl_;
+};
+
+
+
+// example.cc
+
+class Example::Impl {
+  void ExampleMethod() const {
+    // Implementation details.
+  }
+};
+
+class Example {
+  Example() : pimpl_{std::make_unique<Impl>()} {}
+
+  ~Example() {}
+
+  void ExampleMethod() const {
+      pimpl_->ExampleMethod();
+  }
+};
+
+
+
+Interoperability, Reusability, and Driving Adoption
+There is a high probability that both we and other business areas will want to learn from and reuse the tactical codebases we produce. As a result, it's critical that we make our software easy to use correctly, difficult to use incorrectly, easy to adopt, modular, compatible with a wide variety of systems, loosely coupled, and minimal in terms of core dependencies.
+
+Minimize or Hide Dependencies
+Use the PIMPL idiom, the Dependency Inversion Principle, and Loose Coupling via Dependency Injection to avoid introducing transitive dependencies that clients of our components would be required to adopt along with our code. This dramatically aids the reusability of our components by eliminating friction when clients integrate our code, and it enables us to provide binary updates instead of source updates to shared libraries -- which won't require clients to recompile -- when we make changes to internal implementations.
+It isn't always possible to accomplish this level of cleanliness in tactical components, but it should be a goal whenever possible.
+
+Keep Public Interfaces Simple and Standard
+Public class interfaces should be as simple, straightforward, and most importantly, standard as possible. Following the principles in this guide will help with designing high quality, dependency-free interfaces, but care must be taken to ensure that interfaces don't require constructs from newer versions of C++ or the C++ Standard Library than systems with which they're likely to integrate will support.
+In public interfaces, err on the side of simpler data structures -- including built-in data types and even raw C-style arrays when appropriate -- over complex homegrown structures or features from emerging standards. Of course, in private implementations, use the best data structures for the purpose.
+The minimum version of C++ to support in a public interface is a judgment call that must be made on a component to component basis. If a component is really only likely to be used with newer versions of C++ for its expected lifetime, then decide on a minimum version and design public interfaces accordingly.
+
+Ensure Compatibility with All Common Compilers and Standard Library Implementations
+All software should be tested against the most common compilers and standard library implementations of both the target compiler versions used in development of a given system and the latest compiler versions, to assure forward compatibility. It's recommended but not required to implement multiple compiler testing in continuous integration pipelines.
+For example, in C++, this means frequently building and testing your software using both GCC and Clang, preferably in an automated fashion as part of your CI/CD pipeline. GCC and Clang, and indeed particular versions of each, have particular quirks in implementation, warning triggers and descriptions, and performance. Frequently testing against both will help ensure that your code is as standards compliant and widely compatible as possible, and it may detect otherwise hard-to-find instances of poor code.
+
+Don't Require a Specific Development Environment
+While it can be a useful convenience to preconfigure repositories with Docker to create a containerized development environment containing all of the dependencies and system configuration for development, great care must be taken not to create software that can only run in that environment. All code written must be standards compliant and loosely coupled to its dependencies such that all unit tests should run successfully on any platform that supports the language used. Only conformance tests, integration tests, system-level tests, acceptance tests, and non-test execution of the software may require external dependencies or target system characteristics.
+
+Python-Specific Guidance
+
+Style Guide
+Tactical Python code shall follow the Google Python Style Guide and PEP 8 -- Style Guide for Python Code. Where the very few incompatibilities may exist, this guide supersedes the Google Python Style Guide, and the Google Python Style Guide supersedes PEP 8.
+Note: The old style TODO format in the Google Python Style Guide (e.g. # TODO(Last Name, First Name):) may still be used for LAIC code, but if there is a GitLab Issue associated with the TODO, it should also be linked from the comment. If the GitLab Issue is assigned to an individual, then it is not necessary to provide a name in the TODO comment as the Issue itself identifies the individual with knowledge of the TODO context.
+Whenever possible, code should employ PEP 484 -- Type Hints and use the additional syntax added in PEP 526 -- Syntax for Variable Annotations and PEP 585 -- Type Hinting Generics in Standard Collections.
+
+Recommended Python Toolchain
+
+
+
+Purpose
+Tool
+
+
+
+
+IDE
+Visual Studio Code
+
+
+Interpreter
+CPython 3.8+
+
+
+Code Formatting
+
+ruff format code formatting
+
+
+Documentation Generation
+sphinx
+
+
+Code Linting and Static Analysis
+
+ruffmypy
+
+
+
+Testing
+
+minimockpytestpytest-covpytest-mock
+
+
+
+
+
+Recommended Minimum Python CI/CD Pipeline
+Use the standardized pipelines in the LAIC Pipeline Modules for all Python projects. Use Mario for your project's CI pipeline. You can build a pipeline using Mario Web. If you're not sure where to start, consult the Mario README.
+
+Directory Hierarchy
+Python code shall be organized in one of the following directory hierarchy conventions:
+
+repository-root/
+    package_name/
+        subpackage_name/
+            __init__.py
+            subpackage_module_name.py
+        __init__.py
+        module_name.py
         
-        # Reshape for broadcasting: (1, total_seq_len, 1, 1, 1)
-        reshaped_multipliers = time_step_multipliers.reshape(1, self.total_seq_len, 1, 1, 1)
+    tests/
+        subpackage_name/
+            __init__.py
+            test_subpackage_module_name.py
+        __init__.py
+        test_module_name.py
+    .gitignore
+    .gitlab-ci.yml
+    pyproject.toml
+    README.md
 
-        # The sequences currently have 1s for the boxes. This scales them.
-        return sequences * reshaped_multipliers
 
-    def _create_single_sequence(self) -> np.ndarray:
-        """
-        Creates a single sequence of frames with a box that is anchored in a
-        random corner and grows in the opposite direction, remaining stationary.
-        """
-        sequence = np.zeros(
-            (self.total_seq_len, self.num_channels, self.image_size, self.image_size),
-            dtype=np.float32
-        )
+or, if using tools like tox or nox:
 
-        # Randomly initialize box size, corner, and offset
-        box_size = np.random.randint(3, 8)
-        self.size_shift = np.random.randint(2, 5)       
-        start_corner = np.random.randint(0, 4)
-        initial_x_offset = np.random.randint(0, 20)
-        initial_y_offset = np.random.randint(0, 20)
-        
-        # Determine the fixed anchor point.
-        is_bottom_corner = start_corner // 2  # 0 for top, 1 for bottom
-        is_right_corner = start_corner % 2   # 0 for left, 1 for right
+repository-root/
+    src/
+        package_name/
+            subpackage_name/
+                __init__.py
+                subpackage_module_name.py
+            __init__.py
+        module_name.py
+    tests/
+        subpackage_name/
+           __init__.py
+            test_subpackage_module_name.py
+        __init__.py
+        test_module_name.py
+    .gitignore
+    .gitlab-ci.yml
+    pyproject.toml
+    README.md
 
-        # fixed_y is offset from the top edge (y=0) unless it's a bottom corner.
-        fixed_y = (is_bottom_corner * (self.image_size - initial_y_offset) +
-                   (1 - is_bottom_corner) * initial_y_offset)
-                   
-        # fixed_x is offset from the left edge (x=0) unless it's a right corner.
-        fixed_x = (is_right_corner * (self.image_size - initial_x_offset) +
-                   (1 - is_right_corner) * initial_x_offset)
 
-        for time_step in range(self.total_seq_len):
-            # Calculate the top-left (y_start, x_start) using the same modifiers.            
-            # For bottom corners, y_start moves up (subtracts box_size).
-            y_start = fixed_y - (is_bottom_corner * box_size)
-            
-            # For right corners, x_start moves left (subtracts box_size).
-            x_start = fixed_x - (is_right_corner * box_size)
+The use of a src level separating the repository root from the package code is mandatory for repositories that use tools like tox or nox for testing against multiple Python environments; otherwise, it may be omitted. Be consistent with the other repositories in use on your project.
 
-            # 5. Draw the box, clipping coordinates to ensure they are within bounds.
-            y_start_clipped, y_end_clipped = max(0, y_start), min(self.image_size, y_start + box_size)
-            x_start_clipped, x_end_clipped = max(0, x_start), min(self.image_size, x_start + box_size)
-            
-            sequence[time_step, 0, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped] = 1.0
+Use Modern Python Dependency Management and Configuration
+Use pyproject.toml as the means of specifying the project's dependencies and toolchain configuration settings. Do not use requirements.txt or variants thereof to store project dependencies.
+If a requirements.txt file is required for CI/CD pipeline stages, generate it at the time of need using pip-compile from the pip-tools package. This should rarely be required as most tools natively support pyproject.toml now.
+Do not store requirements.txt files in the repository, as it may diverge from pyproject.toml and introduce inconsistency in the project's dependency management, workflow, and pipeline. Treat it as a temporary artifact only, and generate it only when and if it's strictly required.
 
-            box_size = box_size + self.size_shift
-        
-        return sequence
+Automatic Formatting
+Configure your IDE to automatically run the Ruff Formatter for automatic formatting when you save your source files. The Ruff Formatter, a drop-in replacement for Black, is opinionated and minimally configurable, sparing us the need to argue over formatting or go down the rabbit hole of tweaking. To comply with the Google Python Style Guide, configure formatting for line length 80.
 
-    def _split_and_assign_data(self, all_sequences: np.ndarray) -> None:
-        """Splits the generated data into train/test and input/output sets."""
-        num_examples = all_sequences.shape[0]
-        split_index = int(num_examples * self.train_split_ratio)
+Linter
+Configure your IDE to automatically run ruff when you save your source files. Ruff wraps a number of different code auditing tools for Python and is extensible via plugins to include additional tools, and it will help you find and fix code style and quality issues before you push changesets to GitLab.
 
-        if self.mode == 'train':
-            dataset_split = all_sequences[:split_index]
-        else: # mode == 'test'
-            dataset_split = all_sequences[split_index:]
+Unit Test Framework
+Tactical Python code shall implement unit tests using pytest. Test doubles shall be implemented using unittest.mock.
+Docstrings for public interfaces intended for client use should contain example usage in doctest format. Using Doctest enables automatic testing of the example usage snippets to ensure that they remain up to date.
 
-        # Assign the final data subsets to be used by __getitem__
-        self.input_sequences = dataset_split[:, :self.in_seq_len]
-        self.output_sequences = dataset_split[:, self.in_seq_len:]
+Class Member Order
+Place class members in the following order:
 
-    def __len__(self) -> int:
-        """Returns the number of examples in the current dataset mode (train/test)."""
-        return self.input_sequences.shape[0]
+Python magic methods, starting with __init__() and then proceeding in alphabetical order;
+Public interface methods and intended to be used by the client in the order that makes the interface easiest to understand;
+Public properties;
+"Protected" methods intended to be used only in subclasses of the class, in the order that makes the class easiest for a developer to understand,
+"Protected" properties;
+"Private" methods not intended for client use, in the order that makes the class easiest for a developer to understand,
+"Private" properties.
 
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Retrieves one example sequence at the specified index.
 
-        Args:
-            index (int): The index of the data point to retrieve.
+Software Engineering Principles
+This section documents core principles that shall be followed to create high-quality, maintainable, testable, and reusable tactical code. The language in this guide is intended to be informal and to distill software craftsmanship principles into concise reminders that can be used as a quick reference during software development. This is not a substitute for reading the relevant literature on this topic, some of which is linked either inline or under Recommended Reading.
 
-        Returns:
-            A tuple containing the input sequence tensor and the output
-            (target) sequence tensor.
-        """
-        # Convert numpy arrays to float tensors for PyTorch model consumption.
-        in_seq_tensor = torch.from_numpy(self.input_sequences[index]).float()
-        out_seq_tensor = torch.from_numpy(self.output_sequences[index]).float()
-        return in_seq_tensor, out_seq_tensor
+Code is a Liability
+As software engineers, we enjoy writing code, and our job is ostensibly to create as much useful code as we can. What we must realize, however, is that code is a liability. Every line of code we write must be tested and maintained for the entire life of the products that use it, which in defense systems can be longer than anyone expects. Code can be extremely expensive to maintain, and those costs can be difficult to accurately measure. And indeed, every line of code potentially houses the next million-dollar bug in fielded code, or worse, failed missions or security vulnerabilities.
+It's much better, then, that we generate as little code as possible while meeting our objectives, and that we delete code early and often. This will be a recurring theme in this guide, and it's a key concept to creating maintainable systems.
+Remember, bugs and vulnerabilities can't live in code that doesn't exist.
+
+SOLID Principles of Object-Oriented Design
+The SOLID principles are fundamental to the discipline of writing clean, maintainable, reusable, and extensible object-oriented code.
+
+Single Responsibility Principle (SRP)
+The Single Responsibility Principle states that a class should have one and only one reason to change. Classes that do more than one thing violate this principle by potentially requiring changes when any of a number of system requirements of specifications change.
+
+Open/Closed Principle (OCP)
+The Open-Closed Principle states that software entities (e.g. classes, modules, functions, etc.) should be open for extension but closed for modification. The most common example of this principle is using abstract base classes as interfaces so that interface specifications can be reused through inheritance while concrete implementations need not be.
+
+Liskov Substitution Principle (LSP)
+The Liskov Substitution Principle can be summarized by saying that subtypes of a given type should be interchangeable with the base type or each other without affecting the correctness of the program.
+For example, consider a type FileInterface and subtypes CSVFileInterface and JSONFileInterface that inherit from FileInterface. A design conforming to this principle would behave correctly and maintain its desirable characteristics if you substituted objects of type FileInterface with objects of type CSVFileInterface or JSONFileInterface.
+
+Interface Segregation Principle (ISP)
+The Interface Segregation Principle states that no client should be forced to depend on methods it does not use. In other words, interfaces should be as small and cohesive as possible to avoid coupling between unrelated features and the resulting unnecessary dependencies.
+
+Dependency Inversion Principle (DIP)
+The Dependency Inversion Principle states the following:
+
+High-level modules should not depend on low-level modules. Both should depend on abstractions (e.g. interfaces).
+Abstractions should not depend on details. Details (concrete implementations) should depend on abstractions.
+
+
+Component Cohesion Principles
+The principles of component cohesion can be thought of as the SOLID principles applied at the component level. They are also known as the package principles.
+
+Reuse/Release Equivalency Principle (REP)
+The granule of reuse is the granule of release.
+Classes and modules that are grouped together into a component should be releasable together. The fact that they share the same version number and the same release tracking, and are included under the same release documentation, should make sense to both the author and to the users.
+
+Common Closure Principle (CCP)
+Gather into components those classes that change for the same reasons and at the same times. Separate into different components those classes that change at different times and for different reasons.
+This is the Single Responsibility Principle (SRP) restated for components. Just as the SRP says that a class should not contain multiple reasons to change, so the CCP says that a component should not have multiple reasons to change.
+
+Common Reuse Principle (CRP)
+Don't force users of a component to depend on things they don't need.
+Classes are seldom used in isolation. More typically, reusable classes collaborate with other classes that are part of the reusable abstraction. The CRP states that these classes belong together in the same component. In such a component, we would expect to see classes that have lots of dependencies on each other.
+Put another way, we want to make sure that the classes that we put into a component are inseparable -- that it is virtually impossible to depend on some and not others.
+The CRP is the generic version of the Interface Segregation Principle (ISP). Just as we avoid bloating interfaces with methods used for unrelated purposes and having different reasons to change, so we avoid bloating components with classes used for unrelated purposes and having different reasons to change. This way, clients of the component are only impacted when functionality they actually use changes, which reduces both unnecessary breakage risk and the frequency of the need to recompile, revalidate, and redeploy when new versions of dependencies are released.
+
+Use Self-Explanatory Names from the Problem Domain
+When naming variables, functions, classes, and components, use specific names from the problem domain (i.e. terms from system requirements and specifications) rather than the solution domain (i.e. programming jargon).
+Where acronyms or abbreviations would be either ambiguous or confusing to someone new to the subject, prefer spelling them out even if it makes the names a little longer than usual.
+For example:
+Bad:
+
+list_of_ints = data_manager.GetData()
+a, b, c = value_aggregate.GetValues()
+
+
+Better:
+
+iq_samples = radio_frequency_receiver.GetIQSamples()
+range_m, azimuth_rad, elevation_rad = sim_target.GetRAECoordinates()
+
+
+
+Principle of Least Astonishment
+Consider how astonished another engineer, who may be less experienced than you, would be if they saw the code you've written. Do your absolute best to write code that is not surprising. The key to maintainable systems is understandable, explainable code that behaves exactly as you'd expect, and it's extremely important that other engineers can understand the code. That includes future you, who will inevitably forget how the code works sooner than you think.
+
+Avoid Premature Optimization
+"Premature optimization is the root of all evil (or at least most of it) in programming." - Donald E. Knuth
+In the absence of a specific, well-defined performance requirement that your code doesn't currently meet, avoid manual attempts to optimize code. Time spent optimizing code that doesn't need to be optimized is wasted, and many ways of optimizing code make it less understandable and less maintainable.
+Further, unless you're using a profiler and high-precision timers, it's very difficult to predict where the bottlenecks are, particularly with modern C++ compilers that are already very good at optimizing code. Avoid the temptation to optimize based on gut feeling. If optimization is truly necessary to meet a performance requirement, use a profiler and timers to target your efforts.
+
+KISS (Keep It Simple and Standard)
+Don't overcomplicate things. The goal is to implement the simplest thing that could possibly work. Managing complexity in tactical systems is difficult under the best of circumstances, and there's no reason to make it even more difficult by introducing unnecessary complexity in the implementation. Strive to write code that is easy to reason about, easy to use correctly, and difficult to use incorrectly.
+
+YAGNI (You Aren't Gonna Need It)
+Don't implement features until and unless you need them, and ruthlessly delete features that are no longer needed. Disciplined practice of TDD (Test-Driven Development) will naturally prevent you from implementing unnecessary features, since you won't have written any code that didn't first have a failing test based on the requirements.
+
+DRY (Don't Repeat Yourself)
+"Copy and paste is a design error." - David L. Parnas
+If you find yourself copying and pasting code, writing the same or very similar code more than once, or duplicating functionality in another component, you are likely violating the DRY principle. Usually, this means you need to factor out the functionality into a function or class that can be used in each of the required places. Code that isn't DRY requires that engineers remember to change multiple places whenever there's a reason for the feature to change, which is a disaster for maintainability. Keep code DRY at all costs.
+This principle applies to system documentation, project plans, and other artifacts. To quote Dave Thomas and Andy Hunt in The Pragmatic Programmer, "every piece of knowledge must have a single, unambiguous, authoritative representation with a system."
+
+Slow is Smooth and Smooth is Fast
+The special operations community has a motto: slow is smooth and smooth is fast. This applies just as much to engineering quality software as it does to warfare. Avoid the temptation to cut corners, introduce dependencies, skip writing tests, or otherwise compromise key software engineering principles to chase the illusion of delivering functionality sooner. The software that results from a rushed approach is a mirage, and you will pay for it in delays later. High quality software is faster and less expensive to build than low quality software over its lifetime.
+
+Avoid Magic Constants
+Don't use magic, hardcoded constants in your code. If the constants may change frequently, pass them in via configuration files or command line parameters instead. For constants that are not expected to change, give them explicit, descriptive names by declaring a variable or constant to hold the value and then using that named variable or constant in the functional code.
+For example:
+Bad:
+
+calibrated_range_m = measured_range_m * .019382
+
+
+Better:
+
+# Give the constant a meaningful name.
+RANGE_CALIBRATION_MULTIPLIER_M = .019382
+
+calibrated_range_m = measured_range_m * RANGE_CALIBRATION_MULTIPLIER_M
+
+
+One exception is that hardcoded constants are acceptable in tests, since your objective is determinism across known inputs and outputs.
+
+Suffix Variable Names with Units
+Units discrepancies have caused a great many frustrations and failures in complex systems, none more famous than the Mars Climate Orbiter disaster. Confusion between the two systems over units caused a $327.6 million dollar failure.
+One of the best ways to combat units confusion in software is to always suffix variable names with their units. This applies at all levels of code, from network interfaces to public interfaces to local variables. Always specify units as close to the code as possible!
+For example:
+Bad:
+
+double target_range;
+double target_azimuth;
+double target_elevation;
+
+
+Also bad! Comments often diverge from reality as a system develops:
+
+// meters
+double target_range;
+
+// degrees
+double target_azimuth;
+
+// degrees
+double target_elevation;
+
+
+Better:
+
+double target_range_m;
+double target_azimuth_deg;
+double target_elevation_deg;
+
+
+This practice also makes it easier to confirm that math in the code is correct:
+
+// Oops!
+const auto area_of_circle_m2 = PI * pow(radius_ft, 2);
+
+// Correct.
+const auto area_of_circle_m2 = PI * pow(radius_m, 2);
+
+
+
+Loose Coupling via Dependency Injection
+Software entities (e.g. module, component, class, function, etc.) should never have a direct dependency on the concrete implementation of other entities. Instead, they should depend on abstract interfaces, and concrete implementations of those interfaces should be provided via dependency injection.
+Keeping loose coupling through dependency injection leads to more testable code because it allows injection of test doubles in place of dependencies. It also makes software entities easier to reuse, because clients don't need to carry along all of the transitive dependencies of the library it wishes to use. Rather, clients can provide their own implementations of the dependencies, so long as they fulfill the required abstract interfaces.
+For example:
+Bad:
+
+// Bad: creates transitive dependency for clients.
+#include "third_party_library.h"
+
+class Worker {
+ public:
+  Worker();
+  DoWork(float* const samples);
+
+ private:
+  DoWork(float* const samples) {
+    // Bad: direct dependency on third party library.
+    thirdpartylibrary::SampleProcessor sample_processor;
+    sample_processor.Process(samples);
+  }
+};
+
+
+Better:
+
+// sample_processor_interface.h
+
+class SampleProcessorInterface {
+  void ProcessSamples(float* const samples) = 0;
+};
+
+
+
+// worker.h
+
+// No dependency on third party library!
+#include "sample_processor_interface.h"
+
+class Worker {
+ public:
+  // Dependency injection. This class will work with any type that
+  // implements the SampleProcessorInterface. For unit tests, this
+  // means you can pass in a test double so that you are only testing
+  // Worker, not Worker AND a concrete implementation of a sample processor
+  // (which would be an integration test, not a unit test). Further,
+  // clients can choose which kind of SampleProcessor they want to pass
+  // in. Perhaps one based on IPP, or one based on CUDA, or one of
+  // their own! As long as their class inherits from SampleProcessorInterface
+  // and implements the ProcessSamples method, it can be used with Worker.
+  // This property is also a good example of the Dependency Inversion
+  // Principle.
+  Worker(std::unique_ptr<SampleProcessorInterface> sample_processor)
+      : sample_processor_(std::move(sample_processor)) {}
+  DoWork(float* const samples);
+
+ private:
+  std::unique_ptr<SampleProcessorInterface> sample_processor_;
+
+  DoWork(float* const samples) {
+    sample_processor_.ProcessSamples(samples)
+  }
+};
+
+
+
+// client_specific_sample_processor.h in client application
+
+#include "sample_processor_interface.h"
+#include "third_party_library.h"
+
+// Client implements their own special version of SampleProcessor that
+// uses a third party library, and Worker doesn't even know it exists.
+// As long as it inherits from SampleProcessorInterface and implements
+// ProcessSamples, it'll work with Worker! Loose coupling!
+class ClientSpecificSampleProcessor : public SampleProcessorInterface {
+  void ProcessSamples(float* const samples) {
+    thirdpartylibrary::SampleProcessor sample_processor;
+    sample_processor.Process(samples);
+  }
+};
+
+
+
+// main.cpp in client application
+
+#include "worker.h"
+#include "client_specific_sample_processor.h"
+
+int main() {
+  // Dependency injection!
+  Worker worker{std::make_unique<ClientSpecificSampleProcessor>()};
+  ...
+  worker.DoWork(samples);
+};
+
+
+
+Information Hiding
+This term is often used interchangeably with encapsulation, but they're different concepts. Information hiding is a more general, language-agnostic principle. Avoid exposing any implementation details to clients of your code; instead, provide a well-defined interface through which clients can treat your component as a black box.
+Encapsulation -- that is, in C++, making sure implementation details are private -- is one tool in the toolbox for achieving information hiding, but it's very possible to have an encapsulated class with a poorly designed interface that exposes unnecessary details to clients. Often, this takes the form of a class with many getters and setters. Getters and setters may do a good job of protecting the class invariants, but allowing clients to get and set internal state of the class is often a sign that you're exposing implementation details that the client shouldn't need to worry about (see Tell, Don't Ask). Another common example is when a public interface requires flags or other arguments pertaining to the underlying implementation. Such details should be hidden from clients who are instead given an abstraction that doesn't require them to know what's under the hood.
+If the language you're using has idiomatic constructs for implementing encapsulation, it's good practice to use them, but take care to ensure that your use of encapsulation does an effective job at hiding implementation details from clients of your code.
+In languages without encapsulation constructs, like Python, follow appropriate conventions (e.g. leading underscores) to signal to clients that certain implementation details are internal and not intended for their use.
+
+Tell, Don't Ask
+When you start your car engine, do you first query each of the engine components (pistons, crankshaft, fuel pump, etc.) for their running or not running status, set initial values on them, and then start each one individually, hopefully in the right order? Of course not. Similarly, users of an Engine class shouldn't need to use getters and setters to retrieve and set the state of the class or call functions to start different parts of it.
+When designing the interface to a class, do so in a way that clients can tell your class what it should do, not ask about its state.
+For example:
+Bad:
+
+class Engine {
+ public:
+  using OnOff = bool;
+
+  Engine(std::unique_ptr<FuelPump> fuel_pump,
+         std::unique_ptr<FuelPump> crankshaft,
+         std::unique_ptr<FuelPump> pistons)
+      : fuel_pump_(std::move(fuel_pump)),
+        crankshaft_(std::move(crankshaft)),
+        pistons_(std::move(pistons)) {}
+
+  // Don't call this until after you check whether any
+  // engine components are running and set the initial
+  // values.
+  EngineErrorCode Start();
+
+  // Get running status of engine components.
+  // Careful not to start engine if any parts are already running!
+  OnOff GetPistonRunningStatus() const;
+  OnOff GetFuelPumpRunningStatus() const;
+  OnOff GetCrankshaftRunningStatus() const;
+
+  // All initial values must be set before calling the Start method.
+  SetInitialPistonExplosivityConstant(int);
+  SetInitialFuelPumpSpeed(int);
+  SetInitialCrankshaftRotationalVelocity(int);
+
+ private:
+   std::unique_ptr<FuelPump> fuel_pump_;
+   std::unique_ptr<Crankshaft> crankshaft_;
+   std::unique_ptr<Pistons> pistons_;
+};
+
+
+Better:
+
+class Engine {
+ public:
+  enum class EngineErrorCode { kStarted, kStartFailed, kInitializationFailed };
+
+  Engine(std::unique_ptr<FuelPump> fuel_pump,
+         std::unique_ptr<Crankshaft> crankshaft,
+         std::unique_ptr<Pistons> pistons)
+      : fuel_pump_(std::move(fuel_pump)),
+        crankshaft_(std::move(crankshaft)),
+        pistons_(std::move(pistons)) {}
+
+  // Tell the engine to start!
+  EngineErrorCode Start() {
+    const auto engine_init_failed =
+        InitializeEngine() == EngineErrorCode::kInitializationFailed;
+    if (engine_init_failed) {
+        return EngineErrorCode::kStartFailed;
+    }
+
+    StartFuelPump();
+    StartCrankshaft();
+    StartPistons();
+
+    return EngineErrorCode::kStarted;
+  }
+
+ private:
+   EngineErrorCode InitializeEngine();
+   void StartFuelPump();
+   void StartCrankshaft();
+   void StartPistons();
+
+   std::unique_ptr<FuelPump> fuel_pump_;
+   std::unique_ptr<Crankshaft> crankshaft_;
+   std::unique_ptr<Pistons> pistons_;
+};
+
+
+
+Don't Mix Debug and Production Code
+It can be tempting to leave debug tooling (e.g. print statements, extra logging, code that dumps data to disk, etc.) in the code for convenience as you're doing development, but doing so creates extra cruft that reduces the maintainability and test coverage of the system. Nothing should live in production code except for the minimum code necessary to perform the required tactical function.
+Remember the recurring theme of this guide: code is a liability. We want as little of it as possible while still achieving our objectives. Be sure to remove any code not strictly necessary.
+
+Comments and Self-Documenting Code
+The best documentation is self-documenting code, as it can't diverge from the reality of how the system works as easily as comments and external documentation can.
+Old school doctrine used to suggest that more comments naturally meant better code quality. A frequent recommendation was a 1:1 ratio of comments to code. Documentation always sounds like a good idea, right? In reality, comments are frequently a sign that the code has not been written in a sufficiently self-documenting manner.
+Strive to have your code read like English by using meaningful and specific names for variables, functions, and classes. If you find yourself tempted to add a comment describing what a block of code does, ask yourself if it would be better to create a descriptively-named function instead.
+Of course, comments may be the right tool for the job in some cases. For example, comments are justified:
+
+When they're required by the Style Guide;
+When they're required for documentation generation systems (e.g. Doxygen, Sphinx) in use on your project;
+When demarcating a TODO;
+To annotate code that might be surprising without context or explanation, e.g. complex algorithms, important performance optimizations, unusual language constructs required to interact with other libraries, etc.
+
+If you do write a comment, please use proper capitalization, punctuation, and grammar.
+
+Small Functions
+"The first rule of functions is that they should be small. The second rule of functions is that they should be smaller than that. Functions should not be 100 lines long. Functions should hardly ever be 20 lines long." - Robert C. Martin
+Endeavor to write short, concise functions with low cyclomatic complexity (as few branches as possible) that do one thing well, are easy to understand, and have a transparently obvious purpose. Functions should have as few arguments as possible.
+When read together, function calls should tell you a clear and compelling story about what the code is doing.
+
+Avoid Flag Arguments to Functions
+Avoid arguments that tell a function which way to behave in a given call. Such arguments increase the cyclomatic complexity of the function and are a sign that the function is doing more than one thing, which violates the Single Responsibility Principle and the separation of concerns between configuration and executing an action.
+For example:
+Bad:
+
+void ProcessSamples(float* const samples, const bool decimate_before_processing) {
+  // Bad -- raises cyclomatic complexity of the function by introducing a
+  // branch, and now the function both does more than one thing and has more
+  // than one reason to change (if the requirements for either processing or
+  // decimation change), which violates the Single Responsibility Principle.
+  if (decimate_before_processing) {
+    ...
+  }
+  ...
+}
+
+...
+
+// Bad: what does true mean? You could make a variable for clarity, but would
+// you really expect processing to include decimation? This might be surprising.
+ProcessSamples(samples, true);
+
+
+Better:
+
+void DecimateSamples(float* const samples) {
+  ...
+}
+
+void ProcessSamples(float* const samples) {
+  ...
+}
+
+...
+
+// Reads like English and doesn't do anything surprising.
+DecimateSamples(samples);
+ProcessSamples(samples);
+
+
+
+Handle Errors with Care and Attention
+Error handling is a critical area of tactical system design and must never be an afterthought.
+
+Never Ignore Function Return Values
+Many functions return values that indicate whether they executed successfully. Never assume that a function ran successfully without checking its return value, if applicable, even if that function "should always work."
+
+Bubble Successes and Errors Up to the Calling Application
+Libraries should bubble success and error codes up to the calling application, and the calling application should decide how to present error and log messages to the user. Libraries should not themselves create log entries or output to the user, as this violates the separation of concerns by mixing UI functionality with other features.
+
+RAII (Resource Acquisition Is Initialization)
+In Python, use context managers whenever possible. In C++, use smart pointers, and whenever you design a class that owns or allocates resources, ensure that those resources are freed when the object goes out of scope (e.g. in the destructor). Avoid requiring that users of a class explicitly call "close" style methods as this is a common source of bugs and resource leaks.
+
+Don't Reinvent the Wheel
+Don't reimplement features that exist in the C++ Standard Library, Python Standard Library, or other high-quality open source libraries such as, to give a few C++ examples, Boost, Eigen, POCO, etc.
+Prefer the C++ Standard Library or Python Standard Library over third-party libraries whenever possible.
+It can be tempting to think you're facing a unique problem that can't be solved using existing libraries, but that's very unlikely to be the case. Every time we use a standard library feature, it's code we don't have to write or maintain, and it's unlikely that you will, in any reasonable amount of time, be able to write as high-quality or well-tested a feature as exists in these libraries. Leverage the work of the best experts in the field by employing widely-used and well-supported libraries.
+
+Composition is Often More Appropriate than Inheritance
+Limit inheritance from concrete classes to cases where there's a true "is-a" relationship (e.g. Apple is a kind of Fruit) between the subclass and its parent class. In many cases, composition (i.e. using dependency injection to introduce an object of the other type as a class member) is more appropriate.
+
+No Dead Code
+Do not use commenting to disable lines of code. This poor practice reduces code readability and maintainability (e.g. "what was that for again?" and "hmm, was that step important?"), and it's redundant with version control. Especially avoid committing and pushing changesets containing dead code, and mercilessly delete them if you find them while writing or reviewing code.
+
+Write Idiomatic Code
+Strive to write code that is idiomatic (i.e. typical and not surprising) for the language in which you're programming. Use language features, constructs, and design patterns that are common in the language and would not surprise a typical developer in that language.
+This extends to your overall approach to development. For example, the "Look Before You Leap" approach (i.e. checking all preconditions and invariants before performing an operation) is idiomatic and necessary in C++, while the "Ask Forgiveness, Not Permission" approach is idiomatic for Python.
+
+The Code Belongs to the Team
+Eschew the notion that code "belongs" to any one individual, even if it was written or maintained by a single author. Embrace the idea of others working in, reviewing, changing, improving, or even deleting your code.
+At the same time, make a conscious effort to learn, understand, and contribute to code that is unfamiliar to you. This helps encourage collaboration, improves your system knowledge and programming skills, reduces friction when someone takes over another's work, and reduces the impact to a project when an individual is reassigned or otherwise becomes unavailable.
+
+The Boy Scout Rule
+Leave the campground cleaner than you found it.
+If you're working in a section of code that could use refactoring or other cleanup, take the time to do so. It can be tempting to focus solely on getting a feature done as quickly as possible, but don't underestimate the compounding effect of small cleanup efforts on the long-term cost and maintainability of a system.
+
+Write Standards-Compliant, Portable Code
+Always write standards-compliant code in the language you're using. Never use proprietary language extensions that may be offered by your particular compiler or interpreter implementation. Take care to ensure that your code is portable and does not use language features or libraries that hinder portability.
+All code should be frequently compiled and/or run against suitable versions of the major compilers and interpreters for the code's language (e.g. GCC and Clang for C++) to ensure that full compatibility is maintained and the code is as easily adopted or reused as possible.
+
+Use Assertions to Protect Yourself, Not Clients or Users
+Use assertions to protect against programmer mistakes and to document preconditions and invariants. Do not use assertions to check run-time values like function arguments or for any kind of error handling. When running optimized code, assert statements will be ignored, so you cannot rely on them for checking dynamic values.
+
+Don't Overuse String Values
+Prefer enumerations in your project language over magic strings. A common example is as follows:
+Bad:
+
+# Bad: what behavior would you expect if you pass in "chartreuse"?
+def draw_axis(color : str) -> None:   
+  """Draws the chart axis in a particular color."""
+  pen_color_num = 0
+  if (color == "red"):  # Bad: what about "Red" or any other value?
+    pen_color_num = 1
+  elif (color == "green"):
+    pen_color_num = 2
+  elif (color == "blue"):
+    pen_color_num = 3
+  draw(pen_color_num)
+
+
+Better:
+
+import enum
+
+class Color(enum.Enum):
+  RED = 1,
+  GREEN = 2,
+  BLUE = 3
+
+def draw_axis(color : Color) -> None:
+  """Draws the chart axis in a particular color."""
+  draw(color.value)
+
+
+Prefer first-class data objects such as dataclass or named_tuple over strings containing JSON or other such formats.
+
+Separation of Concerns in Microservices
+When developing a microservice architecture, each component within the microservice must be:
+
+Fully testable through its public interface by automated means without requiring that the entire microservice be run, and
+Completely decoupled from the microservice's process management and messaging components such that it would be trivial to extract the component from the microservice or use it in another context without affecting the correctness of its behavior.
+
+Public interfaces to classes and components must be well-defined and should be strongly typed to the extent possible in the language. For Python, all class attributes, method parameters, and return values shall use Type Hints validated by mypy as part of the CI/CD pipeline.
+Whenever possible, classes, components, and services should not have opaque interfaces consisting of arbitrary strings, dictionaries, or binary data.
+A way to conceptualize this is to think to consider the core capability of your microservice a library that your microservice uses by wrapping it in a lightweight messaging service. Yes, you should still have integration and system tests that test your full microservice-based system, but you shouldn't need to run any microservices to test the underlying libraries those microservices use to implement their capabilities.
+Concretely, you don't need to run a whole slew of microservices to use, or run the tests for, libraries like numpy or boost, right? Similarly, the core capability your microservice wraps should stand alone and be reusable and testable on its own. This separation of concerns helps us maximize reuse and insulates our core capability code from ever-changing mechanisms for messaging and process management.
+
+Recommended Reading
+
+DoD Software Acquisition and Practices (SWAP) Study
+
+SWAP Main Page
+SWAP Concept Paper: Metrics for Software Development
+SWAP Concept Paper: Detecting Agile BS
+
+
+Books
+
+
+Clean Code by Robert C. Martin
+
+The Clean Coder by Robert C. Martin
+
+Clean Architecture by Robert C. Martin
+
+Clean C++: Sustainable Software Development Patterns and Practices with C++17 by Stephan Roth
+
+
+Guides and Standards
+
+
+JSF-AV C++ Coding Standards - While this document predates C++11, many of the rules and concepts for writing reliable, testable, and maintainable code still hold.
+
+Google Cloud API Design Guide - Excellent resource for designing simple, consistent, and easy-to-use networked APIs.
+
+
+Development Environment Configuration at Lockheed Martin
+
+AiMLabs: Dev Environment Config
+AiMLabs: Using Python at LM - MacOS
+
+
+Articles and Sites
+
+Anti-Patterns and Code Smells
+Strongly Typed vs. Stringly Typed
+The Little Book of Python Anti-Patterns
+Machine Learning: The High-Interest Credit Card of Technical Debt
+Hypermodern Python
+Jupyter Notebook Best Practices
+

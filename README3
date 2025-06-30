@@ -1,1 +1,175 @@
-sd
+# Copyright 2023 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
+
+"""Torch Dataset Definition for Mutating Box."""
+
+import torch
+import numpy as np
+from torch.utils.data import Dataset
+from typing import Tuple
+from enum import Enum
+
+
+DEFAULT_IMAGE_SIZE = 64
+DEFAULT_NUM_CHANNELS = 1
+DEFAULT_NUM_EXAMPLES = 1000 
+DEFAULT_IN_SEQ_LEN = 3
+DEFAULT_OUT_SEQ_LEN = 5
+DEFAULT_PIXEL_VALUE_MULTIPLIER = 0.08
+DEFAULT_TRAIN_SPLIT_RATIO = 0.8
+
+class SplitType(str, Enum):
+    """Types of Splits for the Dataset."""
+
+    TRAIN = "train"
+    VALID = "valid"
+    TEST = "test"
+
+class BoxDataSet(Dataset):
+    """A class that generates a synthetic sequence of images."""
+
+    def __init__(self,
+                 num_examples: int = DEFAULT_NUM_EXAMPLES,
+                 in_seq_len: int = DEFAULT_IN_SEQ_LEN,
+                 out_seq_len: int = DEFAULT_OUT_SEQ_LEN,
+                 image_size: int = DEFAULT_IMAGE_SIZE,
+                 num_channels: int = DEFAULT_NUM_CHANNELS,
+                 train_split_ratio: int = DEFAULT_TRAIN_SPLIT_RATIO,
+                 mode: str = "train",
+                 split: SplitType = SplitType.TRAIN
+    ) -> None:
+
+        """Generates a synthetic dataset of image sequences for forecasting models.
+
+        Each sequence shows a box anchored in a random corner. The box remains
+        stationary at its anchor but grows larger over time, with the direction
+        of growth depending on the anchor corner. The pixel values within the
+        box also increase linearly throughout the sequence.
+
+        Args:
+            num_examples (int): The total number of example sequences to generate.
+            in_seq_len (int): The number of frames in the input sequence.
+            out_seq_len (int): The number of frames in the output (target) sequence.
+            image_size (int): The height and width of each image frame in pixels.
+            num_channels (int): The number of channels for each image.
+            train_split_ratio (int): The ratio for calculating the required sizes
+                for the split.  
+            mode (str): The dataset mode, either "train" or "test". Determines
+                        which subset of the data is used.
+        """
+
+        if mode not in ("train", "test"):
+            raise ValueError("Mode must be either 'train' or 'test'.")
+
+        self.in_seq_len = in_seq_len
+        self.out_seq_len = out_seq_len
+        self.num_examples = num_examples
+        self.image_size = image_size
+        self.num_channels = num_channels        
+        self.total_seq_len = in_seq_len + out_seq_len
+        self.train_split_ratio = train_split_ratio
+        self.mode = mode
+
+        all_sequences = self._generate_all_sequences(num_examples)
+        self._split_and_assign_data(all_sequences)
+
+    def _generate_all_sequences(self, num_examples: int) -> np.ndarray:
+        """Generates the complete dataset of moving box sequences."""
+        # Pre-allocate memory for all sequences.
+        sequences = np.zeros(
+            (num_examples, self.total_seq_len, self.num_channels, self.image_size, self.image_size),
+            dtype=np.float32
+        )
+
+        for i in range(num_examples):
+            sequences[i] = self._create_single_sequence()            
+
+        time_step_multipliers = (np.arange(1, self.total_seq_len + 1) *
+                                 DEFAULT_PIXEL_VALUE_MULTIPLIER)
+        
+        # Reshape for broadcasting: (1, total_seq_len, 1, 1, 1)
+        reshaped_multipliers = time_step_multipliers.reshape(1, self.total_seq_len, 1, 1, 1)
+
+        # The sequences currently have 1s for the boxes. This scales them.
+        return sequences * reshaped_multipliers
+
+    def _create_single_sequence(self) -> np.ndarray:
+        """
+        Creates a single sequence of frames with a box that is anchored in a
+        random corner and grows in the opposite direction, remaining stationary.
+        """
+        sequence = np.zeros(
+            (self.total_seq_len, self.num_channels, self.image_size, self.image_size),
+            dtype=np.float32
+        )
+
+        # Randomly initialize box size, corner, and offset
+        box_size = np.random.randint(3, 8)
+        self.size_shift = np.random.randint(2, 5)       
+        start_corner = np.random.randint(0, 4)
+        initial_x_offset = np.random.randint(0, 20)
+        initial_y_offset = np.random.randint(0, 20)
+        
+        # Determine the fixed anchor point.
+        is_bottom_corner = start_corner // 2  # 0 for top, 1 for bottom
+        is_right_corner = start_corner % 2   # 0 for left, 1 for right
+
+        # fixed_y is offset from the top edge (y=0) unless it's a bottom corner.
+        fixed_y = (is_bottom_corner * (self.image_size - initial_y_offset) +
+                   (1 - is_bottom_corner) * initial_y_offset)
+                   
+        # fixed_x is offset from the left edge (x=0) unless it's a right corner.
+        fixed_x = (is_right_corner * (self.image_size - initial_x_offset) +
+                   (1 - is_right_corner) * initial_x_offset)
+
+        for time_step in range(self.total_seq_len):
+            # Calculate the top-left (y_start, x_start) using the same modifiers.            
+            # For bottom corners, y_start moves up (subtracts box_size).
+            y_start = fixed_y - (is_bottom_corner * box_size)
+            
+            # For right corners, x_start moves left (subtracts box_size).
+            x_start = fixed_x - (is_right_corner * box_size)
+
+            # 5. Draw the box, clipping coordinates to ensure they are within bounds.
+            y_start_clipped, y_end_clipped = max(0, y_start), min(self.image_size, y_start + box_size)
+            x_start_clipped, x_end_clipped = max(0, x_start), min(self.image_size, x_start + box_size)
+            
+            sequence[time_step, 0, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped] = 1.0
+
+            box_size = box_size + self.size_shift
+        
+        return sequence
+
+    def _split_and_assign_data(self, all_sequences: np.ndarray) -> None:
+        """Splits the generated data into train/test and input/output sets."""
+        num_examples = all_sequences.shape[0]
+        split_index = int(num_examples * self.train_split_ratio)
+
+        if self.mode == 'train':
+            dataset_split = all_sequences[:split_index]
+        else: # mode == 'test'
+            dataset_split = all_sequences[split_index:]
+
+        # Assign the final data subsets to be used by __getitem__
+        self.input_sequences = dataset_split[:, :self.in_seq_len]
+        self.output_sequences = dataset_split[:, self.in_seq_len:]
+
+    def __len__(self) -> int:
+        """Returns the number of examples in the current dataset mode (train/test)."""
+        return self.input_sequences.shape[0]
+
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Retrieves one example sequence at the specified index.
+
+        Args:
+            index (int): The index of the data point to retrieve.
+
+        Returns:
+            A tuple containing the input sequence tensor and the output
+            (target) sequence tensor.
+        """
+        # Convert numpy arrays to float tensors for PyTorch model consumption.
+        in_seq_tensor = torch.from_numpy(self.input_sequences[index]).float()
+        out_seq_tensor = torch.from_numpy(self.output_sequences[index]).float()
+        return in_seq_tensor, out_seq_tensor

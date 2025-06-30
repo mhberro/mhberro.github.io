@@ -1,165 +1,122 @@
-import torch
-import numpy as np
-from torch.utils.data import Dataset
-from typing import Tuple
-
-# Strategy 2: Eliminate Magic Values by defining named constants.
-# These constants make the code's intent clear and easier to modify.
-_IMAGE_SIZE = 64
-_NUM_CHANNELS = 1
-_INITIAL_BOX_SIZE = 2
-_MAX_INITIAL_OFFSET = 20
-_MIN_SHIFT_PER_FRAME = 2
-_MAX_SHIFT_PER_FRAME = 5
-_PIXEL_VALUE_MULTIPLIER = 0.02
-_TRAIN_SPLIT_RATIO = 0.8
-_NUM_CORNERS = 4
-
-
-class BoxDataSet(Dataset):
+class TestBoxDataSet(unittest.TestCase):
     """
-    A PyTorch Dataset that generates a synthetic sequence of images.
-
-    Each sequence depicts a square that moves diagonally and grows in size over
-    time. The pixel values within the square also increase linearly throughout
-    the sequence. This dataset is intended for testing sequence-based
-    forecasting models.
-
-    Args:
-        num_examples (int): The total number of example sequences to generate.
-        in_seq_len (int): The number of frames in the input sequence.
-        out_seq_len (int): The number of frames in the output (target) sequence.
-        mode (str): The dataset mode, either "train" or "test". Determines
-                    which subset of the data is used.
+    Unit tests for the BoxDataSet class.
+    Adheres to company standards: AAA pattern, descriptive names,
+    and mocking dependencies to ensure deterministic tests.
     """
 
-    # Strategy 3: Improve Readability with clear type hinting.
-    def __init__(self,
-                 num_examples: int,
-                 in_seq_len: int,
-                 out_seq_len: int,
-                 mode: str = "train"):
+    def test_init_withValidMode_shouldCreateInstance(self):
+        """
+        Tests that the class can be instantiated successfully with default parameters.
+        """
+        # Arrange & Act
+        try:
+            dataset = BoxDataSet(num_examples=10, mode="train")
+            # Assert
+            self.assertIsInstance(dataset, BoxDataSet)
+        except Exception as e:
+            self.fail(f"BoxDataSet instantiation failed with an unexpected exception: {e}")
 
-        if mode not in ("train", "test"):
-            raise ValueError("Mode must be either 'train' or 'test'.")
+    def test_init_withInvalidMode_shouldRaiseValueError(self):
+        """
+        Tests that providing an invalid mode string raises a ValueError.
+        This follows the "test how not to use it" principle.
+        """
+        # Arrange
+        invalid_mode = "validation"
+        # Act & Assert
+        with self.assertRaises(ValueError):
+            BoxDataSet(mode=invalid_mode)
 
-        self.in_seq_len = in_seq_len
-        self.out_seq_len = out_seq_len
-        self.total_seq_len = in_seq_len + out_seq_len
-        self.mode = mode
+    def test_len_forTrainMode_shouldReturnCorrectSplitSize(self):
+        """
+        Tests the __len__ method returns the correct number of samples for the training set.
+        """
+        # Arrange
+        num_examples = 100
+        train_split_ratio = 0.8
+        expected_len = int(num_examples * train_split_ratio) # 80
+        # Act
+        dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="train")
+        # Assert
+        self.assertEqual(len(dataset), expected_len)
 
-        # Strategy 1 & 4: SRP and Separation of Concerns.
-        # The __init__ method now coordinates calls to focused helper methods.
-        all_sequences = self._generate_all_sequences(num_examples)
-        self._split_and_assign_data(all_sequences)
+    def test_len_forTestMode_shouldReturnCorrectSplitSize(self):
+        """
+        Tests the __len__ method returns the correct number of samples for the test set.
+        """
+        # Arrange
+        num_examples = 100
+        train_split_ratio = 0.8
+        expected_len = num_examples - int(num_examples * train_split_ratio) # 20
+        # Act
+        dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="test")
+        # Assert
+        self.assertEqual(len(dataset), expected_len)
 
-    # Strategy 1 & 4: This method has a Single Responsibility: generate all data.
-    def _generate_all_sequences(self, num_examples: int) -> np.ndarray:
-        """Generates the complete dataset of moving box sequences."""
-        # Pre-allocate memory for all sequences.
-        sequences = np.zeros(
-            (num_examples, self.total_seq_len, _NUM_CHANNELS, _IMAGE_SIZE, _IMAGE_SIZE),
-            dtype=np.float32
+    def test_getItem_shouldReturnTupleOfTensorsWithCorrectShape(self):
+        """
+        Tests that __getitem__ returns data with the correct shape and type.
+        """
+        # Arrange
+        in_seq_len = 5
+        out_seq_len = 10
+        image_size = 32
+        num_channels = 1
+        dataset = BoxDataSet(
+            num_examples=10,
+            in_seq_len=in_seq_len,
+            out_seq_len=out_seq_len,
+            image_size=image_size,
+            num_channels=num_channels
         )
+        # Act
+        input_tensor, output_tensor = dataset[0]
+        # Assert
+        self.assertIsInstance(input_tensor, torch.Tensor)
+        self.assertIsInstance(output_tensor, torch.Tensor)
+        self.assertEqual(input_tensor.shape, (in_seq_len, num_channels, image_size, image_size))
+        self.assertEqual(output_tensor.shape, (out_seq_len, num_channels, image_size, image_size))
 
-        for i in range(num_examples):
-            sequences[i] = self._create_single_sequence()
-
-        # Strategy 3: Use descriptive variable names.
-        # Original logic: Apply a multiplier to scale pixel values over time.
-        time_step_multipliers = (np.arange(1, self.total_seq_len + 1) *
-                                 _PIXEL_VALUE_MULTIPLIER)
-        
-        # Reshape for broadcasting: (1, total_seq_len, 1, 1, 1)
-        # This allows NumPy to multiply each frame by its corresponding time step value.
-        reshaped_multipliers = time_step_multipliers.reshape(1, self.total_seq_len, 1, 1, 1)
-
-        # The sequences currently have 1s for the boxes. This scales them.
-        return sequences * reshaped_multipliers
-
-    def _create_single_sequence(self) -> np.ndarray:
+    # Using mock.patch to control randomness, a key principle from the standards.
+    @patch('__main__.np.random.randint')
+    def test_createSingleSequence_boxAreaShouldIncreaseOverTime(self, mock_randint):
         """
-        Creates a single sequence of frames with a box that is anchored in a
-        random corner and grows in the opposite direction, remaining stationary.
-        
-        This version uses mathematical logic instead of if/elif statements
-        to determine coordinates, making the code more concise.
+        Tests the core logic: the box grows over time.
+        Mocks random values to create a deterministic test case.
         """
-        sequence = np.zeros(
-            (self.total_seq_len, _NUM_CHANNELS, _IMAGE_SIZE, _IMAGE_SIZE),
-            dtype=np.float32
-        )
+        # Arrange
+        # This makes np.random.randint return these values in order on each call.
+        mock_randint.side_effect = [
+            5,  # initial box_size
+            2,  # size_shift
+            0,  # start_corner (top-left)
+            10, # initial_x_offset
+            10  # initial_y_offset
+        ]
+        dataset = BoxDataSet(num_examples=1, in_seq_len=2, out_seq_len=2)
+        # Act
+        # We test the private method here because its logic is complex and critical.
+        # This is a pragmatic exception to the "test public interface" rule.
+        sequence = dataset._create_single_sequence()
+        # Assert: One logical assertion per test. Here, we assert growth.
+        area_time_0 = np.sum(sequence[0] > 0)
+        area_time_1 = np.sum(sequence[1] > 0)
+        self.assertGreater(area_time_1, area_time_0)
 
-        # 1. Initialization: Choose a random corner and offset.
-        start_corner = np.random.randint(0, _NUM_CORNERS)
-        initial_x_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
-        initial_y_offset = np.random.randint(0, _MAX_INITIAL_OFFSET + 1)
-        
-        # 2. Determine the fixed anchor point using mathematical modifiers.
-        # This replaces the first if/elif block.
-        is_bottom_corner = start_corner // 2  # 0 for top, 1 for bottom
-        is_right_corner = start_corner % 2   # 0 for left, 1 for right
-
-        # fixed_y is offset from the top edge (y=0) unless it's a bottom corner.
-        fixed_y = (is_bottom_corner * (_IMAGE_SIZE - initial_y_offset) +
-                   (1 - is_bottom_corner) * initial_y_offset)
-                   
-        # fixed_x is offset from the left edge (x=0) unless it's a right corner.
-        fixed_x = (is_right_corner * (_IMAGE_SIZE - initial_x_offset) +
-                   (1 - is_right_corner) * initial_x_offset)
-
-        for time_step in range(self.total_seq_len):
-            # 3. The box size grows linearly with each time step.
-            box_size = _INITIAL_BOX_SIZE + time_step
-
-            # 4. Calculate the top-left (y_start, x_start) using the same modifiers.
-            # This replaces the second if/elif block.
-            
-            # For bottom corners, y_start moves up (subtracts box_size).
-            y_start = fixed_y - (is_bottom_corner * box_size)
-            
-            # For right corners, x_start moves left (subtracts box_size).
-            x_start = fixed_x - (is_right_corner * box_size)
-
-            # 5. Draw the box, clipping coordinates to ensure they are within bounds.
-            y_start_clipped, y_end_clipped = max(0, y_start), min(_IMAGE_SIZE, y_start + box_size)
-            x_start_clipped, x_end_clipped = max(0, x_start), min(_IMAGE_SIZE, x_start + box_size)
-            
-            sequence[time_step, 0, y_start_clipped:y_end_clipped, x_start_clipped:x_end_clipped] = 1.0
-        
-        return sequence
-
-    # Strategy 1 & 5: This method's responsibility is to split data, clarifying the flow.
-    def _split_and_assign_data(self, all_sequences: np.ndarray) -> None:
-        """Splits the generated data into train/test and input/output sets."""
-        num_examples = all_sequences.shape[0]
-        split_index = int(num_examples * _TRAIN_SPLIT_RATIO)
-
-        if self.mode == 'train':
-            dataset_split = all_sequences[:split_index]
-        else: # mode == 'test'
-            dataset_split = all_sequences[split_index:]
-
-        # Assign the final data subsets to be used by __getitem__
-        self.input_sequences = dataset_split[:, :self.in_seq_len]
-        self.output_sequences = dataset_split[:, self.in_seq_len:]
-
-    def __len__(self) -> int:
-        """Returns the number of examples in the current dataset mode (train/test)."""
-        return self.input_sequences.shape[0]
-
-    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    @patch('__main__.np.random.randint')
+    def test_generateAllSequences_pixelValuesShouldIncreaseOverTime(self, mock_randint):
         """
-        Retrieves one example sequence at the specified index.
-
-        Args:
-            index (int): The index of the data point to retrieve.
-
-        Returns:
-            A tuple containing the input sequence tensor and the output
-            (target) sequence tensor.
+        Tests that the pixel values inside the box increase over time.
         """
-        # Convert numpy arrays to float tensors for PyTorch model consumption.
-        in_seq_tensor = torch.from_numpy(self.input_sequences[index]).float()
-        out_seq_tensor = torch.from_numpy(self.output_sequences[index]).float()
-        return in_seq_tensor, out_seq_tensor
+        # Arrange
+        mock_randint.side_effect = [5, 2, 0, 10, 10] # Same deterministic setup
+        dataset = BoxDataSet(num_examples=1, in_seq_len=2, out_seq_len=2)
+        # Act
+        # We test the public-facing result of the generation logic.
+        input_tensor, _ = dataset[0]
+        # Get the max pixel value in the box at two different time steps.
+        value_time_0 = torch.max(input_tensor[0])
+        value_time_1 = torch.max(input_tensor[1])
+        # Assert
+        self.assertGreater(value_time_1, value_time_0)

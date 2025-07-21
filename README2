@@ -1,151 +1,107 @@
-# Copyright 2023 Lockheed Martin Corporation
-# Lockheed Martin Proprietary Information
 
-"""Module for LSTM Torch Predictor Configuration and Hyperparameter Tuning."""
+"""Module for the LSTM Predictor Model."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
-from feature_sets.enums.feature_type import FeatureType
-from feature_sets.feature import Feature
-from lm_ai_torch_architecture.model_architecture import ModelArchitecture
-
-from lm_ai_torch_data.dataforms.series import Series
-from prediction.mlearn.lstm.model import LSTMModel
-from prediction.mlearn.lstm.params import LSTMParam
-
-if TYPE_CHECKING:  # pragma: no cover
-    from feature_sets.feature_array import FeatureArray
-    from generative.data.dataforms.base_form import BaseForm
-
-# Defaults from original model.
-DEFAULT_N_LAYERS = 1
-DEFAULT_BATCH_SIZE = 32
-DEFAULT_DROP_PROB = 0.2
-DEFAULT_LEARNING_RATE = 0.001
-DEFAULT_SEQUENCE_LENGTH = 50
-DEFAULT_OUTPUT_DIM = 1
+import torch
+from torch import nn
+from torch.autograd import Variable
 
 
-class LSTMArchitecture(ModelArchitecture):
-    """LSTM Torch Hyperparameter Configuration."""
+class LSTMModel(nn.Module):
+    """Base class that defines an LSTM model forward pass and validation."""
 
     def __init__(
         self,
         hidden_dim: int,
-        output_dim: int = DEFAULT_OUTPUT_DIM,
-        n_layers: int = DEFAULT_N_LAYERS,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        drop_prob: float = DEFAULT_DROP_PROB,
-        learning_rate: float = DEFAULT_LEARNING_RATE,
-        sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
-        features: list[Feature] | None = None,
-        nested_feature_sets: list[FeatureArray] | None = None,
+        output_dim: int,
+        n_layers: int,
+        batch_size: int,
+        drop_prob: float,
+        learning_rate: float,
+        sequence_length: int,
     ) -> None:
-        """Initializes a LSTM Torch Prediction Model Configuration.
+        """Initialization method.
 
         Args:
-            hidden_dim: The number of features in the hidden state `h`.
+            hidden_dim: The number of features in the hidden state 'h'.
             output_dim: Size of each output sample.
-            n_layers: Number of recurrent layers. E.g., setting ``num_layers=2``
-                    would mean stacking two LSTMs together to form a `stacked
-                    LSTM`, with the second LSTM taking in outputs of the first
+            n_layers: Number of recurrent layers. E.g., setting 'num_layers=2'
+                    would mean stacking two LSTMs together to form a 'stacked
+                    LSTM', with the second LSTM taking in outputs of the first
                     LSTM and computing the final results. Default: 1.
             batch_size: Defines the number of samples that will be propagated
-                        through the network in a single iteration.
+                    through the network in a single iteration.
             drop_prob: Drop probability (counters dataset overfitting).
             learning_rate: Defines the speed at which weight updates occur.
-            sequence_length: The number of values in an input and output
-                sequence input to the model.
-                The number of expected features in the input `x`.
-            features: Additional features.
-            nested_feature_sets: Additional feature sets.
+            sequence_length: The number of values in the sequence input
+                to the model.
         """
-        input_data_spec: BaseForm = Series(
-            series_length=sequence_length,
-            n_features=output_dim,
+        super().__init__()
+
+        self.hidden_dim = hidden_dim
+        self.drop_prob = drop_prob
+        self.learning_rate = learning_rate
+        self.n_layers = n_layers
+        self.batch_size = batch_size
+        self.output_dim = output_dim
+        self.sequence_length = sequence_length
+
+        self.lstm = nn.LSTM(
+            self.sequence_length,
+            self.hidden_dim,
+            self.n_layers,
+            batch_first=True,
+            dropout=self.drop_prob,
         )
 
-        # Features.
-        _hidden_dim = Feature(
-            name=LSTMParam.HIDDEN_DIM.name,
-            value=hidden_dim,
-            ftype=FeatureType.DISCRETE_FEATURE,
-            fixed=True,
-        )
+        self.fc1 = nn.Linear(self.hidden_dim, 128)
+        self.fc2 = nn.Linear(in_features=128, out_features=self.output_dim)
+        self.relu = nn.ReLU()
 
-        _output_dim = Feature(
-            name=LSTMParam.OUTPUT_DIM.name,
-            value=output_dim,
-            ftype=FeatureType.DISCRETE_FEATURE,
-            fixed=True,
-        )
+    def build_model(self) -> None:
+        """Initialize model."""
 
-        _n_layers = Feature(
-            name=LSTMParam.N_LAYERS.name,
-            value=n_layers,
-            ftype=FeatureType.DISCRETE_FEATURE,
-            fixed=True,
-        )
+    def forward(self, x: torch.Tensor) -> Any:
+        """Forward pass through LSTM model.
 
-        _batch_size = Feature(
-            name=LSTMParam.BATCH_SIZE.name,
-            value=batch_size,
-            ftype=FeatureType.DISCRETE_FEATURE,
-            fixed=True,
-        )
+        Args:
+          x: Input torch tensor.
 
-        _drop_prob = Feature(
-            name=LSTMParam.DROP_PROB.name,
-            value=drop_prob,
-            ftype=FeatureType.CONTINUOUS_FEATURE,
-            fixed=True,
-        )
-
-        _learning_rate = Feature(
-            name=LSTMParam.LEARNING_RATE.name,
-            value=learning_rate,
-            ftype=FeatureType.CONTINUOUS_FEATURE,
-            fixed=True,
-        )
-
-        _sequence_length = Feature(
-            name=LSTMParam.SEQUENCE_LENGTH.name,
-            value=sequence_length,
-            ftype=FeatureType.DISCRETE_FEATURE,
-            fixed=True,
-        )
-
-        # Add features.
-        features = [
-            _hidden_dim,
-            _output_dim,
-            _n_layers,
-            _batch_size,
-            _drop_prob,
-            _learning_rate,
-            _sequence_length,
-        ]
-
-        super().__init__(
-            input_data_spec=input_data_spec,
-            features=features,
-            nested_feature_sets=None,
-        )
-
-    def get_model(self) -> LSTMModel:
-        """Retrieves a neural network model for a LSTM algorithm.
-
-        Returns:
-            A neural network model as a torch module.
+        Return:
+          Output torch tensor.
         """
-        return LSTMModel(
-            hidden_dim=self.get_param(LSTMParam.HIDDEN_DIM),
-            output_dim=self.get_param(LSTMParam.OUTPUT_DIM),
-            n_layers=self.get_param(LSTMParam.N_LAYERS),
-            batch_size=self.get_param(LSTMParam.BATCH_SIZE),
-            drop_prob=self.get_param(LSTMParam.DROP_PROB),
-            learning_rate=self.get_param(LSTMParam.LEARNING_RATE),
-            sequence_length=self.get_param(LSTMParam.SEQUENCE_LENGTH),
+        # Initialize Hidden State with zeros.
+        hidden_state = Variable(
+            torch.zeros(
+                self.n_layers,
+                x.size(0),
+                self.hidden_dim,
+                requires_grad=True,
+                device=x.device,
+                dtype=torch.float32,
+            )
         )
+        # Initialize Cell State with zeros.
+        cell_state = Variable(
+            torch.zeros(
+                self.n_layers,
+                x.size(0),
+                self.hidden_dim,
+                requires_grad=True,
+                device=x.device,
+                dtype=torch.float32,
+            )
+        )
+
+        # Get output.
+        lstm_out, (hn, cn) = self.lstm(
+            x.to(torch.float32).permute(0, 2, 1), (hidden_state, cell_state)
+        )
+        hn = hn.view(-1, self.hidden_dim)
+        out = self.relu(hn)
+        out = self.fc1(out)
+        out = self.relu(out)
+        return self.fc2(out)

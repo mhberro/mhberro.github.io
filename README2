@@ -1,241 +1,184 @@
-# Copyright 2022 Lockheed Martin Corporation
+# Copyright 2023 Lockheed Martin Corporation
 # Lockheed Martin Proprietary Information
 
-"""Base class for LSTM model."""
+"""LSTM Encoder network structure."""
 
 from __future__ import annotations
-
-from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
-from lm_ai_torch_data.dataforms.profile_name import ProfileName
-from lm_ai_torch_data.dataforms.series import Series
-from lm_ai_torch_data.dataforms.spec_manager import SpecManager
-from lm_ai_torch_data.inference.output_type import OutputType
-from lm_ai_torch_data.torch_data_manager import TorchDataManager
-from lm_ai_torch_training.device_type import DeviceType
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
-)
-from lm_ai_torch_training.nn_model import NNModel
-from lm_ai_torch_training.trainable_module import TrainableModule
-
-if TYPE_CHECKING:  # pragma: no cover
-    import numpy as np
-    from torch.utils.data import Dataset
-
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from prediction.mlearn.lstm.architecture import (
-        LSTMArchitecture,
-    )
+from lm_ai_torch_models.activations import ACTIVATION_MAP, Activation
 
 
-class LSTMPredictor(NNModel):
-    """LSTM Model.
-
-    This calls an instance of the LSTM_torch class.
-    It contains the wrappers for the fit and infer functions.
-    """
+class LSTMEncoder(nn.Module):
+    """An LSTM module that converts a sample into a vector representation."""
 
     def __init__(
         self,
-        architecture: LSTMArchitecture,
-        training_configuration: TrainingConfiguration,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        n_layers: int,
+        recurrent_dropout_rate: float = 0.0,  # Normal torch LSTM dropout rate.
+        output_dropout_rate: float | None = None,
+        activation: Activation | None = None,
     ) -> None:
-        """Initializes an LSTM from an input configuration.
+        """Initializes an LSTM encoder.
 
         Args:
-            architecture: A configuration defining the underlying LSTM model.
-            training_configuration: Specification of model training
-                hyperparameters.
+            input_dim: The number of input dimensions.
+            hidden_dim: The number of dimensions in the hidden vector.
+            output_dim: The number of dimensions in the output vector.
+            n_layers: The number of LSTM layers.
+            recurrent_dropout_rate: The fraction dropout for LSTM layers.
+                This dropout is applied to all LSTM layers except the
+                last one.
+            output_dropout_rate: The fraction dropout for linear layer(s).
+                This is applied to linear layer(s) after the initial
+                LSTM layer(s).
+            activation: The activation function to use after the LSTM.
+                If None, no activation will be applied.
         """
-        super().__init__(architecture, training_configuration)
+        super().__init__()
 
-    def build_model(self) -> None:
-        """Initialize Model."""
-        self.model = TrainableModule(
-            module=self.architecture.get_model(),
-            training_config=self._training_config,
+        self.hidden_dim: int = hidden_dim
+        self.output_dim: int = output_dim
+        self.n_layers: int = n_layers
+        minimum_dropout: float = 0.0
+        self.recurrent_dropout_rate: float = (
+            recurrent_dropout_rate if self.n_layers > 1 else minimum_dropout
         )
 
-    def fit(
-        self,
-        train_dataset: Dataset,
-        val_dataset: Dataset | None = None,
-        val_frac: float | None = None,
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
+        self.lstm: nn.LSTM = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.n_layers,
+            batch_first=True,
+            dropout=self.recurrent_dropout_rate,
+        )
+        self.fc: nn.Linear = nn.Linear(
+            in_features=self.hidden_dim, out_features=output_dim
+        )
 
-        Note that either val_dataset, val_frac or neither should be passed, but
-        not both.
+        self.activation: nn.Module | None = None
+        if activation is not None:
+            self.activation = ACTIVATION_MAP[activation]()
+
+        self.dropout: nn.Dropout | None = None
+        if (
+            output_dropout_rate is not None
+            and output_dropout_rate > minimum_dropout
+        ):
+            self.dropout = nn.Dropout(output_dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Performs a forward pass through an LSTM encoder.
 
         Args:
-            train_dataset: A Torch dataset to train on.
-            val_dataset: A Torch dataset for validation metrics during training.
-            val_frac:  The fraction of the input train_dataset to split off
-                for a validation set during training. This parameter is useful
-                when validation is desired and there is no reason that the user
-                would like to manually perform the train/val split themselves.
-
+            x: An input torch tensor.
 
         Returns:
-            A dictionary of training losses and metrics.
+            An output torch tensor.
         """
-        self._initialize_losses()
-
-        self._standard_fit(
-            train_dataset=train_dataset,
-            data_profile=ProfileName.FIT,
-            val_dataset=val_dataset,
-            val_frac=val_frac,
+        hidden_state: torch.Tensor = torch.zeros(
+            self.n_layers,
+            x.size(0),
+            self.hidden_dim,
+            device=x.device,
         )
+        cell_state: torch.Tensor = torch.zeros(
+            self.n_layers,
+            x.size(0),
+            self.hidden_dim,
+            device=x.device,
+        )
+        lstm_out: torch.Tensor = self.lstm(x, (hidden_state, cell_state))[0]
 
-        metrics: dict[str, list[float]] = self.metric_counter.metrics
+        out: torch.Tensor = lstm_out[:, -1]
 
-        return metrics
+        if self.activation is not None:
+            out = self.activation(out)
 
-    def fit_batch(
+        out = self.fc(out)
+        if self.dropout is not None:
+            out = self.dropout(out)
+
+        return out
+
+
+class LSTMGenerator(nn.Module):
+    """An LSTM module that converts a vector representation into a sample."""
+
+    def __init__(
         self,
-        batch: list[torch.Tensor],  # type: ignore [override]
-        batch_num: int,
-    ) -> dict[str, torch.Tensor]:
-        """Fits a LSTM model to a batch of input data.
-
-        Args:
-            batch: Input data of the form (inputs, targets).
-            batch_num: The number/index of the batch within an epoch.
-
-        Returns:
-            A dictionary with loss terms.
-        """
-        # Parse the input batch.
-        inputs, targets = batch
-
-        # Pass the inputs to the model and calculate loss.
-        outputs = self.model(inputs.float())
-        loss = self.criterion(outputs, targets.squeeze(-1).float())
-
-        # Backprop the loss.
-        self.model.backprop(loss)
-
-        return {"loss": loss}
-
-    def infer(
-        self, input_data: Dataset, output_type: OutputType = OutputType.TENSOR
-    ) -> tuple[
-        Dataset | torch.Tensor | np.ndarray,
-        Dataset | torch.Tensor | np.ndarray,
-    ]:
-        """Generates predictions for an input dataset.
-
-        Args:
-            input_data: The data to use for generating model predictions. This
-                dataset is expected to be a torch.utils.data.Dataset containing
-                a __getitem__ call that returns one sequence of numbers, an
-                input sequence to infer an output or target value. This
-                method can use the same dataset class as the fit method, but
-                the second returned sequence will be ignored. This sequence
-                should be shape (sequence_length, n_features).
-                These dimensions should match what was configured in the
-                LSTMArchitecture input to this class.
-            output_type: Data inference output format.
-
-        Returns:
-            Predictions for the supplied inputs in a user-specified form
-            (OutputType) and the associated inputs.
-        """
-        data_loader = self.infer_data_mgr.convert_to_dataloader(
-            user_data=input_data,
-            data_spec=ProfileName.INFER,
-            batch_size=self.batch_size,
-            num_workers=self.num_workers,
-        )
-
-        supplied_inputs: list[torch.Tensor] = []
-        inferred_outputs: list[torch.Tensor] = []
-        for batch_tuple in data_loader:
-            batch = [item.float().to(self._device) for item in batch_tuple]
-
-            # Pass the inputs to the model.
-            inputs = batch[0]
-            with torch.no_grad():
-                outputs = self.model(inputs)
-
-            # Add inputs and outputs to list of returns.
-            supplied_inputs.append(inputs)
-            inferred_outputs.append(outputs)
-
-        # Return the inputs and outputs.
-        return_inputs = self._tensor_to_output_type(
-            torch.cat(supplied_inputs, dim=0), output_type=output_type
-        )
-        return_outputs = self._tensor_to_output_type(
-            torch.cat(inferred_outputs, dim=0), output_type=output_type
-        )
-
-        return return_inputs, return_outputs
-
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        n_timesteps: int,
+        n_layers: int,
+        recurrent_dropout_rate: float = 0.0,  # Normal torch LSTM dropout rate.
+        output_dropout_rate: float | None = None,
     ) -> None:
-        """Loads model from file.
+        """Initializes an LSTM generator.
 
         Args:
-            directory: The directory to load the model from.
-            model_name: The name of the model (without an extension).
-            device_type: The hardware device to use for model loading.
+            input_dim: The number of input (latent) dimensions.
+            hidden_dim: The number of dimensions in the hidden vector.
+            output_dim: The number of features in the output.
+            n_timesteps: The number of elements in each time sequence.
+            n_layers: The number of LSTM layers.
+            recurrent_dropout_rate: The fraction dropout for LSTM layers.
+                This dropout is applied to all LSTM layers except the
+                last one.
+            output_dropout_rate: The fraction dropout for linear layer(s).
+                This is applied to linear layer(s) after the initial
+                LSTM layer(s).
         """
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-        loader.load(name="optimizer", component=self.optimizer)
+        super().__init__()
+        self.output_dim = output_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+        self.n_timesteps = n_timesteps
+        minimum_dropout: float = 0.0
+        self.recurrent_dropout_rate: float = (
+            recurrent_dropout_rate if self.n_layers > 1 else minimum_dropout
+        )
 
-    def save(self, directory: str, model_name: str) -> None:
-        """Saves a model or a collection of models to one torch file.
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.n_layers,
+            batch_first=True,
+            dropout=self.recurrent_dropout_rate,
+        )
+        self.fc = nn.Linear(
+            in_features=self.hidden_dim, out_features=self.output_dim
+        )
+
+        self.dropout: nn.Dropout | None = None
+        if (
+            output_dropout_rate is not None
+            and output_dropout_rate > minimum_dropout
+        ):
+            self.dropout = nn.Dropout(output_dropout_rate)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Performs a forward pass through an LSTM generator.
 
         Args:
-            directory: The directory to save the model to.
-            model_name: The name of the model (without an extension).
+            x: An input torch tensor.
+
+        Returns:
+            An output torch tensor.
         """
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.add_component(name="optimizer", component=self.optimizer)
-        model_saver.save(directory, model_name)
+        repeated: torch.Tensor = x.unsqueeze(1).repeat(1, self.n_timesteps, 1)
+        lstm_out: torch.Tensor = self.lstm(repeated)[0]
 
-    def initialize_data_manager(self) -> None:
-        """Creates the data managers for the fit and infer methods."""
-        # Set fit data specifications.
-        fit_spec_mgr = SpecManager(profile_names=[ProfileName.FIT])
-        fit_spec_mgr.add_data_element(
-            dataform=self.architecture.input_data_spec,
-            nickname="inputs",
-            required_by_profiles=[ProfileName.FIT],
-        )
-        fit_spec_mgr.add_data_element(
-            dataform=Series(n_features=1, series_length=1),
-            nickname="outputs",
-            required_by_profiles=[ProfileName.FIT],
-        )
+        out: torch.Tensor = lstm_out.view(-1, self.n_timesteps, self.hidden_dim)
+        out = self.fc(out)
 
-        # Create data managers.
-        self.data_mgr = TorchDataManager(fit_spec_mgr)
+        if self.dropout is not None:
+            out = self.dropout(out)
 
-        # Set infer data specifications.
-        infer_spec_mgr = SpecManager(profile_names=[ProfileName.INFER])
-        infer_spec_mgr.add_data_element(
-            dataform=self.architecture.input_data_spec,
-            nickname="inputs",
-            required_by_profiles=[ProfileName.INFER],
-        )
-
-        # Create data managers.
-        self.infer_data_mgr = TorchDataManager(infer_spec_mgr)
-
-    def _initialize_losses(self) -> None:
-        """Initializes the losses for the Convolutional LSTM."""
-        self.criterion = nn.MSELoss().to(self._device)
+        return out

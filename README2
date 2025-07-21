@@ -1,77 +1,241 @@
-import pytest
-from unittest.mock import patch
-import numpy as np
+# Copyright 2022 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
+
+"""Base class for LSTM model."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
-from torch.utils.data import Dataset
+from torch import nn
 
-from box_dataset_class_final import BoxDataSet, SplitType
+from lm_ai_torch_data.dataforms.profile_name import ProfileName
+from lm_ai_torch_data.dataforms.series import Series
+from lm_ai_torch_data.dataforms.spec_manager import SpecManager
+from lm_ai_torch_data.inference.output_type import OutputType
+from lm_ai_torch_data.torch_data_manager import TorchDataManager
+from lm_ai_torch_training.device_type import DeviceType
+from lm_ai_torch_training.model_management import (
+    TorchModelLoader,
+    TorchModelSaver,
+)
+from lm_ai_torch_training.nn_model import NNModel
+from lm_ai_torch_training.trainable_module import TrainableModule
 
-def test_init_withValidMode_shouldCreateInstance():
-    """
-    Tests that the class can be instantiated successfully with default parameters.
-    """
-    # Arrange & Act
-    # A test will fail automatically if an unexpected exception occurs.
-    dataset = BoxDataSet(num_examples=10, mode="train")
-    # Assert
-    assert isinstance(dataset, BoxDataSet)
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np
+    from torch.utils.data import Dataset
 
-def test_init_withInvalidMode_shouldRaiseValueError():
-    """
-    Tests that providing an invalid mode string raises a ValueError.
-    """
-    # Arrange
-    invalid_mode = "validation"
-    # Act & Assert
-    with pytest.raises(ValueError):
-        BoxDataSet(mode=invalid_mode)
-
-def test_len_forTrainMode_shouldReturnCorrectSplitSize():
-    """
-    Tests the __len__ method returns the correct number of samples for the training set.
-    """
-    # Arrange
-    num_examples = 100
-    train_split_ratio = 0.8
-    expected_len = int(num_examples * train_split_ratio)
-    # Act
-    dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="train")
-    # Assert
-    assert len(dataset) == expected_len
-
-def test_len_forTestMode_shouldReturnCorrectSplitSize():
-    """
-    Tests the __len__ method returns the correct number of samples for the test set.
-    """
-    # Arrange
-    num_examples = 100
-    train_split_ratio = 0.8
-    expected_len = num_examples - int(num_examples * train_split_ratio)
-    # Act
-    dataset = BoxDataSet(num_examples=num_examples, train_split_ratio=train_split_ratio, mode="test")
-    # Assert
-    assert len(dataset) == expected_len
-
-def test_getItem_shouldReturnTupleOfTensorsWithCorrectShape():
-    """
-    Tests that __getitem__ returns data with the correct shape and type.
-    """
-    # Arrange
-    in_seq_len = 5
-    out_seq_len = 10
-    image_size = 32
-    num_channels = 1
-    dataset = BoxDataSet(
-        num_examples=10,
-        in_seq_len=in_seq_len,
-        out_seq_len=out_seq_len,
-        image_size=image_size,
-        num_channels=num_channels
+    from lm_ai_torch_training.configuration import TrainingConfiguration
+    from prediction.mlearn.lstm.architecture import (
+        LSTMArchitecture,
     )
-    # Act
-    input_tensor, output_tensor = dataset[0]
-    # Assert
-    assert isinstance(input_tensor, torch.Tensor)
-    assert isinstance(output_tensor, torch.Tensor)
-    assert input_tensor.shape == (in_seq_len, num_channels, image_size, image_size)
-    assert output_tensor.shape == (out_seq_len, num_channels, image_size, image_size)
+
+
+class LSTMPredictor(NNModel):
+    """LSTM Model.
+
+    This calls an instance of the LSTM_torch class.
+    It contains the wrappers for the fit and infer functions.
+    """
+
+    def __init__(
+        self,
+        architecture: LSTMArchitecture,
+        training_configuration: TrainingConfiguration,
+    ) -> None:
+        """Initializes an LSTM from an input configuration.
+
+        Args:
+            architecture: A configuration defining the underlying LSTM model.
+            training_configuration: Specification of model training
+                hyperparameters.
+        """
+        super().__init__(architecture, training_configuration)
+
+    def build_model(self) -> None:
+        """Initialize Model."""
+        self.model = TrainableModule(
+            module=self.architecture.get_model(),
+            training_config=self._training_config,
+        )
+
+    def fit(
+        self,
+        train_dataset: Dataset,
+        val_dataset: Dataset | None = None,
+        val_frac: float | None = None,
+    ) -> dict[str, list[float]]:
+        """Fits a model to a dataset.
+
+        Note that either val_dataset, val_frac or neither should be passed, but
+        not both.
+
+        Args:
+            train_dataset: A Torch dataset to train on.
+            val_dataset: A Torch dataset for validation metrics during training.
+            val_frac:  The fraction of the input train_dataset to split off
+                for a validation set during training. This parameter is useful
+                when validation is desired and there is no reason that the user
+                would like to manually perform the train/val split themselves.
+
+
+        Returns:
+            A dictionary of training losses and metrics.
+        """
+        self._initialize_losses()
+
+        self._standard_fit(
+            train_dataset=train_dataset,
+            data_profile=ProfileName.FIT,
+            val_dataset=val_dataset,
+            val_frac=val_frac,
+        )
+
+        metrics: dict[str, list[float]] = self.metric_counter.metrics
+
+        return metrics
+
+    def fit_batch(
+        self,
+        batch: list[torch.Tensor],  # type: ignore [override]
+        batch_num: int,
+    ) -> dict[str, torch.Tensor]:
+        """Fits a LSTM model to a batch of input data.
+
+        Args:
+            batch: Input data of the form (inputs, targets).
+            batch_num: The number/index of the batch within an epoch.
+
+        Returns:
+            A dictionary with loss terms.
+        """
+        # Parse the input batch.
+        inputs, targets = batch
+
+        # Pass the inputs to the model and calculate loss.
+        outputs = self.model(inputs.float())
+        loss = self.criterion(outputs, targets.squeeze(-1).float())
+
+        # Backprop the loss.
+        self.model.backprop(loss)
+
+        return {"loss": loss}
+
+    def infer(
+        self, input_data: Dataset, output_type: OutputType = OutputType.TENSOR
+    ) -> tuple[
+        Dataset | torch.Tensor | np.ndarray,
+        Dataset | torch.Tensor | np.ndarray,
+    ]:
+        """Generates predictions for an input dataset.
+
+        Args:
+            input_data: The data to use for generating model predictions. This
+                dataset is expected to be a torch.utils.data.Dataset containing
+                a __getitem__ call that returns one sequence of numbers, an
+                input sequence to infer an output or target value. This
+                method can use the same dataset class as the fit method, but
+                the second returned sequence will be ignored. This sequence
+                should be shape (sequence_length, n_features).
+                These dimensions should match what was configured in the
+                LSTMArchitecture input to this class.
+            output_type: Data inference output format.
+
+        Returns:
+            Predictions for the supplied inputs in a user-specified form
+            (OutputType) and the associated inputs.
+        """
+        data_loader = self.infer_data_mgr.convert_to_dataloader(
+            user_data=input_data,
+            data_spec=ProfileName.INFER,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
+
+        supplied_inputs: list[torch.Tensor] = []
+        inferred_outputs: list[torch.Tensor] = []
+        for batch_tuple in data_loader:
+            batch = [item.float().to(self._device) for item in batch_tuple]
+
+            # Pass the inputs to the model.
+            inputs = batch[0]
+            with torch.no_grad():
+                outputs = self.model(inputs)
+
+            # Add inputs and outputs to list of returns.
+            supplied_inputs.append(inputs)
+            inferred_outputs.append(outputs)
+
+        # Return the inputs and outputs.
+        return_inputs = self._tensor_to_output_type(
+            torch.cat(supplied_inputs, dim=0), output_type=output_type
+        )
+        return_outputs = self._tensor_to_output_type(
+            torch.cat(inferred_outputs, dim=0), output_type=output_type
+        )
+
+        return return_inputs, return_outputs
+
+    def load(
+        self,
+        directory: str,
+        model_name: str,
+        device_type: DeviceType = DeviceType.CPU,
+    ) -> None:
+        """Loads model from file.
+
+        Args:
+            directory: The directory to load the model from.
+            model_name: The name of the model (without an extension).
+            device_type: The hardware device to use for model loading.
+        """
+        loader = TorchModelLoader(directory, model_name, device_type)
+        loader.load(name="model", component=self.model)
+        loader.load(name="optimizer", component=self.optimizer)
+
+    def save(self, directory: str, model_name: str) -> None:
+        """Saves a model or a collection of models to one torch file.
+
+        Args:
+            directory: The directory to save the model to.
+            model_name: The name of the model (without an extension).
+        """
+        model_saver = TorchModelSaver()
+        model_saver.add_component(name="model", component=self.model)
+        model_saver.add_component(name="optimizer", component=self.optimizer)
+        model_saver.save(directory, model_name)
+
+    def initialize_data_manager(self) -> None:
+        """Creates the data managers for the fit and infer methods."""
+        # Set fit data specifications.
+        fit_spec_mgr = SpecManager(profile_names=[ProfileName.FIT])
+        fit_spec_mgr.add_data_element(
+            dataform=self.architecture.input_data_spec,
+            nickname="inputs",
+            required_by_profiles=[ProfileName.FIT],
+        )
+        fit_spec_mgr.add_data_element(
+            dataform=Series(n_features=1, series_length=1),
+            nickname="outputs",
+            required_by_profiles=[ProfileName.FIT],
+        )
+
+        # Create data managers.
+        self.data_mgr = TorchDataManager(fit_spec_mgr)
+
+        # Set infer data specifications.
+        infer_spec_mgr = SpecManager(profile_names=[ProfileName.INFER])
+        infer_spec_mgr.add_data_element(
+            dataform=self.architecture.input_data_spec,
+            nickname="inputs",
+            required_by_profiles=[ProfileName.INFER],
+        )
+
+        # Create data managers.
+        self.infer_data_mgr = TorchDataManager(infer_spec_mgr)
+
+    def _initialize_losses(self) -> None:
+        """Initializes the losses for the Convolutional LSTM."""
+        self.criterion = nn.MSELoss().to(self._device)

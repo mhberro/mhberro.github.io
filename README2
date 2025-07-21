@@ -1,184 +1,151 @@
 # Copyright 2023 Lockheed Martin Corporation
 # Lockheed Martin Proprietary Information
 
-"""LSTM Encoder network structure."""
+"""Module for LSTM Torch Predictor Configuration and Hyperparameter Tuning."""
 
 from __future__ import annotations
 
-import torch
-from torch import nn
+from typing import TYPE_CHECKING
 
-from lm_ai_torch_models.activations import ACTIVATION_MAP, Activation
+from feature_sets.enums.feature_type import FeatureType
+from feature_sets.feature import Feature
+from lm_ai_torch_architecture.model_architecture import ModelArchitecture
 
+from lm_ai_torch_data.dataforms.series import Series
+from prediction.mlearn.lstm.model import LSTMModel
+from prediction.mlearn.lstm.params import LSTMParam
 
-class LSTMEncoder(nn.Module):
-    """An LSTM module that converts a sample into a vector representation."""
+if TYPE_CHECKING:  # pragma: no cover
+    from feature_sets.feature_array import FeatureArray
+    from generative.data.dataforms.base_form import BaseForm
 
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
-        n_layers: int,
-        recurrent_dropout_rate: float = 0.0,  # Normal torch LSTM dropout rate.
-        output_dropout_rate: float | None = None,
-        activation: Activation | None = None,
-    ) -> None:
-        """Initializes an LSTM encoder.
-
-        Args:
-            input_dim: The number of input dimensions.
-            hidden_dim: The number of dimensions in the hidden vector.
-            output_dim: The number of dimensions in the output vector.
-            n_layers: The number of LSTM layers.
-            recurrent_dropout_rate: The fraction dropout for LSTM layers.
-                This dropout is applied to all LSTM layers except the
-                last one.
-            output_dropout_rate: The fraction dropout for linear layer(s).
-                This is applied to linear layer(s) after the initial
-                LSTM layer(s).
-            activation: The activation function to use after the LSTM.
-                If None, no activation will be applied.
-        """
-        super().__init__()
-
-        self.hidden_dim: int = hidden_dim
-        self.output_dim: int = output_dim
-        self.n_layers: int = n_layers
-        minimum_dropout: float = 0.0
-        self.recurrent_dropout_rate: float = (
-            recurrent_dropout_rate if self.n_layers > 1 else minimum_dropout
-        )
-
-        self.lstm: nn.LSTM = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.n_layers,
-            batch_first=True,
-            dropout=self.recurrent_dropout_rate,
-        )
-        self.fc: nn.Linear = nn.Linear(
-            in_features=self.hidden_dim, out_features=output_dim
-        )
-
-        self.activation: nn.Module | None = None
-        if activation is not None:
-            self.activation = ACTIVATION_MAP[activation]()
-
-        self.dropout: nn.Dropout | None = None
-        if (
-            output_dropout_rate is not None
-            and output_dropout_rate > minimum_dropout
-        ):
-            self.dropout = nn.Dropout(output_dropout_rate)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Performs a forward pass through an LSTM encoder.
-
-        Args:
-            x: An input torch tensor.
-
-        Returns:
-            An output torch tensor.
-        """
-        hidden_state: torch.Tensor = torch.zeros(
-            self.n_layers,
-            x.size(0),
-            self.hidden_dim,
-            device=x.device,
-        )
-        cell_state: torch.Tensor = torch.zeros(
-            self.n_layers,
-            x.size(0),
-            self.hidden_dim,
-            device=x.device,
-        )
-        lstm_out: torch.Tensor = self.lstm(x, (hidden_state, cell_state))[0]
-
-        out: torch.Tensor = lstm_out[:, -1]
-
-        if self.activation is not None:
-            out = self.activation(out)
-
-        out = self.fc(out)
-        if self.dropout is not None:
-            out = self.dropout(out)
-
-        return out
+# Defaults from original model.
+DEFAULT_N_LAYERS = 1
+DEFAULT_BATCH_SIZE = 32
+DEFAULT_DROP_PROB = 0.2
+DEFAULT_LEARNING_RATE = 0.001
+DEFAULT_SEQUENCE_LENGTH = 50
+DEFAULT_OUTPUT_DIM = 1
 
 
-class LSTMGenerator(nn.Module):
-    """An LSTM module that converts a vector representation into a sample."""
+class LSTMArchitecture(ModelArchitecture):
+    """LSTM Torch Hyperparameter Configuration."""
 
     def __init__(
         self,
-        input_dim: int,
         hidden_dim: int,
-        output_dim: int,
-        n_timesteps: int,
-        n_layers: int,
-        recurrent_dropout_rate: float = 0.0,  # Normal torch LSTM dropout rate.
-        output_dropout_rate: float | None = None,
+        output_dim: int = DEFAULT_OUTPUT_DIM,
+        n_layers: int = DEFAULT_N_LAYERS,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        drop_prob: float = DEFAULT_DROP_PROB,
+        learning_rate: float = DEFAULT_LEARNING_RATE,
+        sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+        features: list[Feature] | None = None,
+        nested_feature_sets: list[FeatureArray] | None = None,
     ) -> None:
-        """Initializes an LSTM generator.
+        """Initializes a LSTM Torch Prediction Model Configuration.
 
         Args:
-            input_dim: The number of input (latent) dimensions.
-            hidden_dim: The number of dimensions in the hidden vector.
-            output_dim: The number of features in the output.
-            n_timesteps: The number of elements in each time sequence.
-            n_layers: The number of LSTM layers.
-            recurrent_dropout_rate: The fraction dropout for LSTM layers.
-                This dropout is applied to all LSTM layers except the
-                last one.
-            output_dropout_rate: The fraction dropout for linear layer(s).
-                This is applied to linear layer(s) after the initial
-                LSTM layer(s).
+            hidden_dim: The number of features in the hidden state `h`.
+            output_dim: Size of each output sample.
+            n_layers: Number of recurrent layers. E.g., setting ``num_layers=2``
+                    would mean stacking two LSTMs together to form a `stacked
+                    LSTM`, with the second LSTM taking in outputs of the first
+                    LSTM and computing the final results. Default: 1.
+            batch_size: Defines the number of samples that will be propagated
+                        through the network in a single iteration.
+            drop_prob: Drop probability (counters dataset overfitting).
+            learning_rate: Defines the speed at which weight updates occur.
+            sequence_length: The number of values in an input and output
+                sequence input to the model.
+                The number of expected features in the input `x`.
+            features: Additional features.
+            nested_feature_sets: Additional feature sets.
         """
-        super().__init__()
-        self.output_dim = output_dim
-        self.hidden_dim = hidden_dim
-        self.n_layers = n_layers
-        self.n_timesteps = n_timesteps
-        minimum_dropout: float = 0.0
-        self.recurrent_dropout_rate: float = (
-            recurrent_dropout_rate if self.n_layers > 1 else minimum_dropout
+        input_data_spec: BaseForm = Series(
+            series_length=sequence_length,
+            n_features=output_dim,
         )
 
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=self.hidden_dim,
-            num_layers=self.n_layers,
-            batch_first=True,
-            dropout=self.recurrent_dropout_rate,
-        )
-        self.fc = nn.Linear(
-            in_features=self.hidden_dim, out_features=self.output_dim
+        # Features.
+        _hidden_dim = Feature(
+            name=LSTMParam.HIDDEN_DIM.name,
+            value=hidden_dim,
+            ftype=FeatureType.DISCRETE_FEATURE,
+            fixed=True,
         )
 
-        self.dropout: nn.Dropout | None = None
-        if (
-            output_dropout_rate is not None
-            and output_dropout_rate > minimum_dropout
-        ):
-            self.dropout = nn.Dropout(output_dropout_rate)
+        _output_dim = Feature(
+            name=LSTMParam.OUTPUT_DIM.name,
+            value=output_dim,
+            ftype=FeatureType.DISCRETE_FEATURE,
+            fixed=True,
+        )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Performs a forward pass through an LSTM generator.
+        _n_layers = Feature(
+            name=LSTMParam.N_LAYERS.name,
+            value=n_layers,
+            ftype=FeatureType.DISCRETE_FEATURE,
+            fixed=True,
+        )
 
-        Args:
-            x: An input torch tensor.
+        _batch_size = Feature(
+            name=LSTMParam.BATCH_SIZE.name,
+            value=batch_size,
+            ftype=FeatureType.DISCRETE_FEATURE,
+            fixed=True,
+        )
+
+        _drop_prob = Feature(
+            name=LSTMParam.DROP_PROB.name,
+            value=drop_prob,
+            ftype=FeatureType.CONTINUOUS_FEATURE,
+            fixed=True,
+        )
+
+        _learning_rate = Feature(
+            name=LSTMParam.LEARNING_RATE.name,
+            value=learning_rate,
+            ftype=FeatureType.CONTINUOUS_FEATURE,
+            fixed=True,
+        )
+
+        _sequence_length = Feature(
+            name=LSTMParam.SEQUENCE_LENGTH.name,
+            value=sequence_length,
+            ftype=FeatureType.DISCRETE_FEATURE,
+            fixed=True,
+        )
+
+        # Add features.
+        features = [
+            _hidden_dim,
+            _output_dim,
+            _n_layers,
+            _batch_size,
+            _drop_prob,
+            _learning_rate,
+            _sequence_length,
+        ]
+
+        super().__init__(
+            input_data_spec=input_data_spec,
+            features=features,
+            nested_feature_sets=None,
+        )
+
+    def get_model(self) -> LSTMModel:
+        """Retrieves a neural network model for a LSTM algorithm.
 
         Returns:
-            An output torch tensor.
+            A neural network model as a torch module.
         """
-        repeated: torch.Tensor = x.unsqueeze(1).repeat(1, self.n_timesteps, 1)
-        lstm_out: torch.Tensor = self.lstm(repeated)[0]
-
-        out: torch.Tensor = lstm_out.view(-1, self.n_timesteps, self.hidden_dim)
-        out = self.fc(out)
-
-        if self.dropout is not None:
-            out = self.dropout(out)
-
-        return out
+        return LSTMModel(
+            hidden_dim=self.get_param(LSTMParam.HIDDEN_DIM),
+            output_dim=self.get_param(LSTMParam.OUTPUT_DIM),
+            n_layers=self.get_param(LSTMParam.N_LAYERS),
+            batch_size=self.get_param(LSTMParam.BATCH_SIZE),
+            drop_prob=self.get_param(LSTMParam.DROP_PROB),
+            learning_rate=self.get_param(LSTMParam.LEARNING_RATE),
+            sequence_length=self.get_param(LSTMParam.SEQUENCE_LENGTH),
+        )

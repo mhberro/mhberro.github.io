@@ -1,4 +1,15 @@
-Hey Brad -- good morning sir! I literally was just about to message this group chat with an update from my end. Since this is my first task involving our LSTM model implementations -- and model deep-dive in general -- I've been taking a bit more time to dive into how things are structured across PCM and torch-models. I want to make sure I'm not just gathering links, but also truly understanding differences and what might be worth consolidating. I'm genuinely interested in how these models are built and reused.
+Brad: Please link when you have a draft. I was thinking for now, we could just throw some links in this chat. Main questions would be how many examples in PCM are using the old LSTM predictor. I think having links to all relevants examples and the two models would be helpful.
+
+Me: Cool! So please let me know if this is your line of thinking... I have found that notebooks lstm_time_series_predictor_output_size_example.ipynb and lstm_time_series_predict_to_impact_example.ipynb use the TimeSeriesPredictor class, which is located in the time_series_predictor.py file. This file builds the LSTM model using tensorflow, which -- correct me if I'm wrong -- is the indicator that the notebook is using the old LSTM predictor. So in this case you would be interested in those two notebooks since they use TimeSeriesPredictor
  
-That said I completely understand if there's a target timeline you'd like me to keep in mind -- the sprint deadline is the 28th so I'm shooting to have it completed by then, but happy to adjust accordingly  
+However, I also found notebook lstm_simple_noisy_sine_example.ipynb, which uses both TimeSeriesPredictor and LSTMPredictor, where LSTMPredictor is a class from the lstm.py file. This file uses torch to build its LSTM model, which -- also correct me if I'm wrong -- is the indicator that the notebook is using the new LSTM predictor. But, since this notebook example also uses TimeSeriesPredictor you would be interested in this notebook also.
  
+Please let me know if I'm mistaken anywhere in the above commentary 
+
+Abe: That all looks right to me, thanks for digging through, Mo!
+ 
+Just adding a couple things for your consideration:
+Looks like the LSTMPredictor is based on its own architecture and nn.Module implementation in PCM.
+The main LSTM implementation we want to standardize on / consolidate into is this one in torch-models. This way, any of the CMs could just pull an LSTM from this one place.
+It may be worth understanding if there are any differences between the 3 different LSTM model implementations listed here. In particular, are there any good unique things in the PCM implementations that should be brought into the torch-models implementation to improve our common LSTM baseline.
+Brad feel free to pop in / amend anything too. I honestly haven't used any of our LSTMs, at least not in a while, and certainly not out of the PCM, so I could be missing something

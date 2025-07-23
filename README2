@@ -1,107 +1,12 @@
+investigate: Assess redundancy in LSTM implementations, notebooks
 
-"""Module for the LSTM Predictor Model."""
+There are different LSTM implementations in the PCM and then in torch-models. These different implementations are then used in different notebooks. We'd like to standardize on a single LSTM model implementation in torch-models that gets reused across all other CMs and notebooks.
 
-from __future__ import annotations
+For this first investigation, let's:
 
-from typing import Any
-
-import torch
-from torch import nn
-from torch.autograd import Variable
-
-
-class LSTMModel(nn.Module):
-    """Base class that defines an LSTM model forward pass and validation."""
-
-    def __init__(
-        self,
-        hidden_dim: int,
-        output_dim: int,
-        n_layers: int,
-        batch_size: int,
-        drop_prob: float,
-        learning_rate: float,
-        sequence_length: int,
-    ) -> None:
-        """Initialization method.
-
-        Args:
-            hidden_dim: The number of features in the hidden state 'h'.
-            output_dim: Size of each output sample.
-            n_layers: Number of recurrent layers. E.g., setting 'num_layers=2'
-                    would mean stacking two LSTMs together to form a 'stacked
-                    LSTM', with the second LSTM taking in outputs of the first
-                    LSTM and computing the final results. Default: 1.
-            batch_size: Defines the number of samples that will be propagated
-                    through the network in a single iteration.
-            drop_prob: Drop probability (counters dataset overfitting).
-            learning_rate: Defines the speed at which weight updates occur.
-            sequence_length: The number of values in the sequence input
-                to the model.
-        """
-        super().__init__()
-
-        self.hidden_dim = hidden_dim
-        self.drop_prob = drop_prob
-        self.learning_rate = learning_rate
-        self.n_layers = n_layers
-        self.batch_size = batch_size
-        self.output_dim = output_dim
-        self.sequence_length = sequence_length
-
-        self.lstm = nn.LSTM(
-            self.sequence_length,
-            self.hidden_dim,
-            self.n_layers,
-            batch_first=True,
-            dropout=self.drop_prob,
-        )
-
-        self.fc1 = nn.Linear(self.hidden_dim, 128)
-        self.fc2 = nn.Linear(in_features=128, out_features=self.output_dim)
-        self.relu = nn.ReLU()
-
-    def build_model(self) -> None:
-        """Initialize model."""
-
-    def forward(self, x: torch.Tensor) -> Any:
-        """Forward pass through LSTM model.
-
-        Args:
-          x: Input torch tensor.
-
-        Return:
-          Output torch tensor.
-        """
-        # Initialize Hidden State with zeros.
-        hidden_state = Variable(
-            torch.zeros(
-                self.n_layers,
-                x.size(0),
-                self.hidden_dim,
-                requires_grad=True,
-                device=x.device,
-                dtype=torch.float32,
-            )
-        )
-        # Initialize Cell State with zeros.
-        cell_state = Variable(
-            torch.zeros(
-                self.n_layers,
-                x.size(0),
-                self.hidden_dim,
-                requires_grad=True,
-                device=x.device,
-                dtype=torch.float32,
-            )
-        )
-
-        # Get output.
-        lstm_out, (hn, cn) = self.lstm(
-            x.to(torch.float32).permute(0, 2, 1), (hidden_state, cell_state)
-        )
-        hn = hn.view(-1, self.hidden_dim)
-        out = self.relu(hn)
-        out = self.fc1(out)
-        out = self.relu(out)
-        return self.fc2(out)
+Gather a list of all the different LSTM implementations and notebooks in PCM and torch-models. (Future work may be to investigate other CMs.)
+Identify the differences between the multiple different LSTM model implementations.
+In particular, are there any good unique things in the PCM implementations that should be brought into the torch-models implementation to improve our common LSTM baseline? If we consolidate LSTMs, we don't want to lose any helpful features / capability in that process.
+Assess the ease of using a single common LSTM baseline across the PCM LSTM notebooks. Will this be smooth? Are there nuances in a notebook or two that would require some custom LSTM implementation different from the baseline?
+Write up the above so we can assess next steps involving code changes. Include links to the different implementations and links.
+Bullet points with links are fine; does not need to be an extensive "report" - just enough where we can clearly decide what to bring in from each LSTM implementation into a common LSTM baseline (if anything not already in torch-models).

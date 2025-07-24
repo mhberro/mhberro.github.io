@@ -1,57 +1,7 @@
-•  prediction/mlearn/lstm/lstm.py
-Loaded the PyTorch LSTM implementation to identify core model classes and data pipelines.
-•  prediction/mlearn/lstm/architecture.py
-Opened the TensorFlow/Keras architecture definitions to locate preprocessing, model‐build, and config classes.
-•  prediction/mlearn/lstm/params.py
-Inspected the hyperparameter dataclass to understand parameter engines and defaults.
-•  prediction/notebooks/lstm_simple_noisy_sine_example.ipynb
-Reviewed the end to end Keras notebook to see training, callbacks, and inference flow.
-•  prediction/mlearn/time_series_predictor.py
-Checked the wrapper class for .fit(), .infer(), and persistence logic in the PyTorch pipeline.
-
-
-Unique, Beneficial Features in old LSTM implementation
--	(model.py) Two stage MLP head: Here the LSTMModel adds an intermediate linear layer of size 128 with ReLU before the final output, which can increase representational power over a single linear layer. This extra hidden layer with ReLU improves non linear capacity and helps the model learn more complex mappings
-o	lm_ai_torch_model Shortcoming: Its LSTMEncoder uses a single nn.Linear(hidden_dim, output_dim) (or a single optional activation) with no intermediate bottleneck. As a result, it lacks that extra representational “boost,” which can limit its ability to fit intricate time series patterns or capture higher order interactions among features
--	Configurable hyperparameter abstraction: The LSTMParam enum plus LSTMArchitecture enable programmatic hyperparameter enumeration, validation, and tuning pipelines. It validates parameter ranges, (b) enumerates combinations for grid/random search, and (c) constructs models programmatically.
-o	lm_ai_torch_model Implementation’s Shortcoming: It requires you to pass raw integers/floats directly into constructors. There is no shared schema or validation layer. You must manually track which arguments correspond to which hyperparameter, making reproducibility harder and automated HPO pipelines more verbose.
--	(lstm.py) Model persistence with optimizer state: lstm.py’s `.save(path)` serializes both `model.state_dict()` and `optimizer.state_dict()` into one checkpoint and `.load(path)`restores both, thus persisting both model and optimizer in one file, ensuring training can resume seamlessly. Also LR schedulers and momentum buffers resume exactly, which is important for long running jobs and hyper parameter searches
-o	Y’s Shortcoming: Y has no built in save/load methods; users must remember to save and load both model and optimizer state manually. This manual process often leads to mismatched optimizer parameters or forgotten scheduler states when resuming training.
--	(model.py) Self-contained Training Pipeline: `TrainableModule` in X wraps models with automatic loss initialization, metric tracking, a `fit()` method with internal validation split, and built-in optimizer/scheduler setup.
-o	Y’s Shortcoming: Y provides no training loop at all — you have to manually instantiate optimizers, loop over epochs, compute gradients, and manage validation. Wrapping Y's model in X’s TrainableModule and tying it to LR schedulers would drastically reduce training friction and make it easier to deploy robust training pipelines.
--	(model.py) Data spec & validation layer: `SpecManager` +`SeriesSpec` catch shape/feature mismatches before the first epoch. It supports batch splitting and full pipeline creation through `TorchDataManager`.
-o	Y Shortcoming: Y expects the user to prepare fully shaped tensors and Dataloaders externally. There's no schema validation, no automatic detection of misaligned sequences, no split utilities.
--	(lstm.py) Flexible inference interface: X includes support for `OutputType` that allows for model outputs to be returned as numpy arrays (for plotting) or tensors (for chaining) without extra casting. This reduces post processing friction in notebooks and production services.
-o	Y Shortcoming: Y’s model does only a standard `forward()` with tensor input and output. Any transformation (to numpy, post-processing) must be done manually, often duplicated across scripts.
--	End to end training & inference API: The LSTMPredictor wrapper uses `TrainableModule`to provide fitting (with optional validation split) through inference (with flexible output types), metric logging, and built in MSELoss initialization and optimizer/scheduler setup. 
-o	Y’s Shortcoming: Y is purely an `nn.Module`. You must write separate training loops, validation logic, no_grad() inference code, and metric tracking each time.
-
-
-Using the common Y baseline out of the box will cover only the core forward() logic—your pure LSTMEncoder/LSTMGenerator—but the notebook relies heavily on X’s high level abstractions and utilities, so it will not plug in smoothly without augmentation. Here are the key nuances:
--	Dependence on X’s Predictor & Config API: It expects a unified .fit()/.infer() loop, plus TrainingConfiguration and optimized AdamOptimizer classes .
-o	Y baseline shortfall: Y is just an nn.Module. You’d have to write your own wrapper to:
-•	Accept a config object
-•	Construct the model
-•	Manage the optimizer, loss, device placement
-•	Implement training/validation loops and metric logging
-•	Expose .fit()/.infer() methods
--	Stochastic (VED style) Predictor: 
-o	Notebook usage: It creates both a DeterministicPredictor and a StochasticPredictor, the latter sampling multiple trajectories (VED encoder→decoder) and plotting them .
-•	Y baseline shortfall: Y includes only a single LSTMGenerator (vector→sequence), with no built in latent sampling, KL divergence, or multi trajectory inference. You’d need to re implement the VED wrapper around your encoder+generator.
--	ONNX Export & Inference Helpers
-o	Y baseline shortfall: Y provides no ONNX export API or inference helper. You’d have to add:
-	A .to_onnx() method or external script
-	Input/output name conventions
-	Inference wrapper for onnxruntime
-
-
-
-
--	Custom Loss & Data‑Manager Integration
-o	Notebook usage: Uses custom_loss_no_negatives and X’s TorchDataManager to auto‑build DataLoaders with the right transforms/profiles.
-o	Y baseline shortfall: 
-
-	No integration with a SpecManager or data profiles—you must manually wrap datasets in DataLoader.
-	You must also wire in any bespoke loss functions.
-
-
+If I'm understanding things correctly, I think we'd want to:
+Keep the torch-training nn.Module implementation as our core common LSTM implementation, and eventually discard all other implementations of nn.Modules (basically anything actually creating the layers and defining the forward() pass).
+Have 1 (?) place where we implement the NNModel with fit() etc, probably in PCM for regression-style outputs. (Maybe we eventually want a separate one in CCM for classification-style outputs?)
+And in practice, maybe that might be the following steps?
+In PCM mlearn/lstm/, could we get rid of architecture.py and/or model.py, and instead have the lstm.py NNModel reference the torch-training architecture.py and lstm.py nn.Module under the hood instead? Optionally with something in PCM to put some regression on top.
+Update one notebook in PCM to use this new stack, which may or may not require code changes in the notebook. It's possible that any existing references to the PCM lstm NNModel might "just work" even if we change things under the hood as mentioned above right?
+I might be missing something though, please correct me if I'm wrong

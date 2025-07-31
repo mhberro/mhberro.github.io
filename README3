@@ -1,7 +1,97 @@
-If I'm understanding things correctly, I think we'd want to:
-Keep the torch-training nn.Module implementation as our core common LSTM implementation, and eventually discard all other implementations of nn.Modules (basically anything actually creating the layers and defining the forward() pass).
-Have 1 (?) place where we implement the NNModel with fit() etc, probably in PCM for regression-style outputs. (Maybe we eventually want a separate one in CCM for classification-style outputs?)
-And in practice, maybe that might be the following steps?
-In PCM mlearn/lstm/, could we get rid of architecture.py and/or model.py, and instead have the lstm.py NNModel reference the torch-training architecture.py and lstm.py nn.Module under the hood instead? Optionally with something in PCM to put some regression on top.
-Update one notebook in PCM to use this new stack, which may or may not require code changes in the notebook. It's possible that any existing references to the PCM lstm NNModel might "just work" even if we change things under the hood as mentioned above right?
-I might be missing something though, please correct me if I'm wrong
+Here’s the **final GitLab ticket** with **labels and milestones/priority tags** added, making it fully ready to paste into GitLab:
+
+---
+
+**Title:** Investigate and Refactor Old LSTM Implementation to Reference Core Torch-Training LSTM Implementation
+
+**Description:**
+We need to determine if it is possible to refactor an **old LSTM implementation** so that it references the **core torch-training LSTM implementation**, aligning with the goal of standardizing on a single `nn.Module` implementation.
+
+---
+
+### **Scope of Work:**
+
+#### **1. Feasibility Investigation**
+
+* [ ] Assess whether the old LSTM can be refactored to reference the torch-training `nn.Module` implementation (`lstm.py`) and `ar.py`.
+* [ ] Identify dependencies between the old LSTM code and its current architecture.
+* [ ] Confirm alignment with the following objectives:
+
+  * [ ] Keep the torch-training `nn.Module` implementation as the **core LSTM implementation** and discard redundant `nn.Module` definitions.
+  * [ ] Centralize `NNModel` implementations (with `fit()` etc.) in PCM for regression outputs, with potential future CCM support for classification.
+
+#### **2. Refactor Implementation (If Feasible)**
+
+* [ ] Remove redundant files (`ar.py` and/or `mod.py`) if confirmed safe.
+* [ ] Update the old LSTM to reference torch-training `ar.py` and the new `lstm.py` nn.Module.
+* [ ] Optionally add regression support on top of the old LSTM if required for compatibility.
+
+#### **3. Notebook Impact Assessment & Updates**
+
+* [ ] Identify notebooks dependent on the old LSTM implementation.
+* [ ] Investigate and resolve incongruencies caused by the refactor.
+* [ ] Update notebooks to align with the standardized LSTM and centralized NNModel architecture.
+
+---
+
+### **Acceptance Criteria:**
+
+* [ ] Feasibility study completed with documented findings.
+* [ ] Old LSTM references torch-training `ar.py` and new `lstm.py` nn.Module.
+* [ ] Confirmation and safe removal of `mod.py` (if applicable).
+* [ ] All redundant `nn.Module` definitions eliminated per consolidation goals.
+* [ ] Notebooks updated and validated for compatibility.
+
+---
+
+### **Deliverables:**
+
+* [ ] Feasibility report documenting findings or blockers.
+* [ ] Refactored old LSTM implementation referencing core torch-training modules.
+* [ ] Updated notebooks compatible with consolidated LSTM/NNModel design.
+
+---
+
+### **Related Links:**
+
+* **Old LSTM Implementation Files:**
+
+  * [`ar.py`](link-to-old-ar.py)
+  * [`mod.py`](link-to-old-mod.py)
+  * [`old_lstm.py`](link-to-old-lstm.py)
+
+* **Torch-Training Core Modules:**
+
+  * [`lstm.py` (nn.Module)](link-to-new-lstm.py)
+  * [`ar.py`](link-to-torch-ar.py)
+
+* **Relevant Notebooks:**
+
+  * [Notebook 1](link-to-notebook-1)
+  * [Notebook 2](link-to-notebook-2)
+
+---
+
+### **Labels:**
+
+* `refactor`
+* `architecture`
+* `LSTM`
+* `notebooks`
+* `feasibility`
+
+---
+
+### **Milestone:**
+
+* **Sprint X (or specify milestone here)**
+
+---
+
+### **Priority:**
+
+* **High** – This task aligns with our ongoing LSTM consolidation effort and is a prerequisite for eliminating redundant implementations.
+
+---
+
+Would you like me to also **add a "Testing Plan" section** (e.g., unit tests, notebook execution validation) to formalize how completion will be verified?

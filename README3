@@ -1,21 +1,15 @@
-Here’s a clearer and more impactful rewording of your message:
+from pathlib import Path
+import unicodedata as ud
 
----
+print("CWD:", Path.cwd())
 
-It appears these LSTM implementations were created with different design philosophies.
+p = Path("examples/jupyter_notebooks") / "M M.png"
+print("Target repr:", repr(str(p)))
+print("Parent exists?", p.parent.exists())
+print("File exists?", p.exists())
 
-The **mlearn/lstm** implementation follows a more conventional LSTM approach. Its architecture (defined in `mlearn/architecture.py`) is straightforward, specifying hyperparameters and initializing an `LSTMModel` with them. The `mlearn/lstm.py` file contains `LSTMPredictor`, which drives the implementation, invoking `get_model()` from `mlearn/architecture.py` to return an `LSTMModel`. This model handles inference, saving/loading, and other tasks. A key point is that all inference logic is tied to the LSTM model in `mlearn/lstm.py`.
-
-By contrast, the **ai\_torch\_models** implementation is built around an **Autoencoder** (`LSTMEncoder` and `LSTMGenerator`) rather than a direct LSTM predictor. It includes additional architecture variations, such as forecasting (predicting future timesteps) versus standard configurations. Each variant has its own architecture requirements, meaning inference resides within the autoencoder model classes (e.g., `ForecastingAE`), not in `mlearn/lstm.py`.
-
-To refactor `mlearn/lstm.py` for compatibility, we must replace its inference logic with code that:
-
-1. Determines the required LSTM variant (e.g., forecasting or standard),
-2. Initializes the architecture for that variant, and
-3. Creates a new autoencoder object specific to that version.
-
-This will align `mlearn/lstm` with the more flexible, variant-driven structure of `ai_torch_models`.
-
----
-
-Would you like me to also provide a **bullet-point version** (more concise for quick review) or keep it in this polished narrative style?
+# List what's actually there, with codepoints:
+for f in sorted(p.parent.glob("*")):
+    name = f.name
+    cps = " ".join(hex(ord(c)) for c in name)
+    print(repr(name), "->", cps, "| normalized:", ud.normalize("NFC", name))

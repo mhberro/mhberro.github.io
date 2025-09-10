@@ -3,98 +3,78 @@ import pytest
 SAMPLE_L1 = 40.0
 SAMPLE_L2 = 240.0
 
-# Adjust these to your real module/package names
-import yourpkg.segment_definitions as segmod
 from yourpkg.segment_definitions import SegmentDefinitions
 
 
-def _valid_input(report_count=1):
+def _base_supp_info():
     return {
-        "report_count": report_count,
-        "supp_infos": [
-            {
-                "1": 30.0,
-                "2": 230.0,
-                "3": SAMPLE_L1,
-                "4": SAMPLE_L2,
-            }
-        ],
+        "1": 30.0,
+        "2": 230.0,
+        "3": SAMPLE_L1,
+        "4": SAMPLE_L2,
     }
 
 
-def test_postprocess_field_dict_happy_path(monkeypatch):
-    """Valid dict + valid module-level types → no continues from guards."""
-    # Patch module-level vars the method reads
-    monkeypatch.setattr(segmod, "d_l", 5, raising=False)          # int ok
-    monkeypatch.setattr(segmod, "c_l", 1.5, raising=False)        # float ok
-    monkeypatch.setattr(segmod, "delta_l2", 2, raising=False)     # int ok
-    monkeypatch.setattr(segmod, "d_l2", 3.0, raising=False)       # float ok
+def test_postprocess_field_dict_happy_path():
+    """Valid dict and correct d_l/c_l/delta_l2/d_l2 types → processes normally."""
+    inp = {
+        "report_count": 1,
+        "supp_infos": [_base_supp_info()],
+        "d_l": 5,          # int
+        "c_l": 1.5,        # float
+        "delta_l2": 2,     # int
+        "d_l2": 3.0,       # float
+    }
 
     segdefs = SegmentDefinitions()
-    output_fields = segdefs.segment._postprocess_field_dict(_valid_input())
+    out = segdefs.segment._postprocess_field_dict(inp)
 
-    supp_info = output_fields["supp_infos"][0]
+    supp_info = out["supp_infos"][0]
     assert isinstance(supp_info, dict)
     assert supp_info["3"] == SAMPLE_L1
     assert supp_info["4"] == SAMPLE_L2
 
 
-def test_postprocess_field_dict_skips_non_dict(monkeypatch):
-    """Second entry is not a dict → triggers first guard and is left unchanged."""
-    monkeypatch.setattr(segmod, "d_l", 5, raising=False)
-    monkeypatch.setattr(segmod, "c_l", 1.5, raising=False)
-    monkeypatch.setattr(segmod, "delta_l2", 2, raising=False)
-    monkeypatch.setattr(segmod, "d_l2", 3.0, raising=False)
-
-    segdefs = SegmentDefinitions()
+def test_postprocess_field_dict_skips_non_dict():
+    """Second entry not a dict → skipped unchanged."""
     inp = {
         "report_count": 2,
         "supp_infos": [
-            _valid_input()["supp_infos"][0],
+            _base_supp_info(),
             "not_a_dict",
         ],
+        "d_l": 5,
+        "c_l": 1.5,
+        "delta_l2": 2,
+        "d_l2": 3.0,
     }
-    outp = segdefs.segment._postprocess_field_dict(inp)
-
-    # valid element processed
-    good = outp["supp_infos"][0]
-    assert isinstance(good, dict)
-    assert good["3"] == SAMPLE_L1
-    assert good["4"] == SAMPLE_L2
-
-    # non-dict element skipped/unchanged
-    bad = outp["supp_infos"][1]
-    assert not isinstance(bad, dict)
-    assert bad == "not_a_dict"
-
-
-def test_postprocess_field_dict_type_guards_continue(monkeypatch):
-    """
-    Wrong module-level types for d_l / c_l / delta_l2 / d_l2 → guard triggers
-    and loop iteration continues (no processing of that entry).
-    """
-    # Deliberately wrong types to trip the guards
-    monkeypatch.setattr(segmod, "d_l", "5", raising=False)        # not int
-    monkeypatch.setattr(segmod, "c_l", "1.5", raising=False)      # not float
-    monkeypatch.setattr(segmod, "delta_l2", "x", raising=False)   # not int
-    monkeypatch.setattr(segmod, "d_l2", None, raising=False)      # not float
 
     segdefs = SegmentDefinitions()
-    inp = {
-        "report_count": 2,
-        "supp_infos": [
-            _valid_input()["supp_infos"][0],  # would be processed if guards pass
-            {
-                # any dict; the guard should make the loop continue before touching it
-                "1": 0.0,
-                "2": 0.0,
-                "3": 999.0,
-                "4": 888.0,
-            },
-        ],
-    }
-    outp = segdefs.segment._postprocess_field_dict(inp)
+    out = segdefs.segment._postprocess_field_dict(inp)
 
-    # Because the type guards are tripped, both entries should remain as they came in
-    assert outp["supp_infos"][0] == inp["supp_infos"][0]
-    assert outp["supp_infos"][1] == inp["supp_infos"][1]
+    assert isinstance(out["supp_infos"][0], dict)
+    assert out["supp_infos"][1] == "not_a_dict"
+
+
+def test_postprocess_field_dict_type_guards_continue():
+    """Wrong types for d_l/c_l/delta_l2/d_l2 → entries skipped/unchanged."""
+    bad_info = {
+        "1": 0.0,
+        "2": 0.0,
+        "3": 999.0,
+        "4": 888.0,
+    }
+    inp = {
+        "report_count": 1,
+        "supp_infos": [bad_info],
+        "d_l": "5",         # str instead of int
+        "c_l": "1.5",       # str instead of float
+        "delta_l2": None,   # not int
+        "d_l2": "oops",     # not float
+    }
+
+    segdefs = SegmentDefinitions()
+    out = segdefs.segment._postprocess_field_dict(inp)
+
+    # Should be skipped: unchanged dict
+    assert out["supp_infos"][0] == bad_info

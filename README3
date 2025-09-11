@@ -1,80 +1,49 @@
 import pytest
+from yourpkg.segment_definitions import SegmentDefinitions  # adjust import
 
-SAMPLE_L1 = 40.0
-SAMPLE_L2 = 240.0
-
-from yourpkg.segment_definitions import SegmentDefinitions
-
-
-def _base_supp_info():
-    return {
-        "1": 30.0,
-        "2": 230.0,
-        "3": SAMPLE_L1,
-        "4": SAMPLE_L2,
-    }
-
-
-def test_postprocess_field_dict_happy_path():
-    """Valid dict and correct d_l/c_l/delta_l2/d_l2 types → processes normally."""
-    inp = {
-        "report_count": 1,
-        "supp_infos": [_base_supp_info()],
-        "d_l": 5,          # int
-        "c_l": 1.5,        # float
-        "delta_l2": 2,     # int
-        "d_l2": 3.0,       # float
-    }
-
+@pytest.mark.parametrize(
+    "inp_fields, supp_infos, expect_processed, expect_unchanged_idx",
+    [
+        pytest.param(
+            # 1) Happy path: correct types → processed
+            {"d_l": 5, "c_l": 1.5, "delta_l2": 2, "d_l2": 3.0},
+            [{"1": 10.0, "2": 20.0, "3": None, "4": None}],
+            True,
+            None,
+            id="happy-path",
+        ),
+        pytest.param(
+            # 2) Non-dict guard: second item is NOT a dict → skipped unchanged
+            {"d_l": 5, "c_l": 1.5, "delta_l2": 2, "d_l2": 3.0},
+            [{"1": 10.0, "2": 20.0, "3": None, "4": None}, "not_a_dict"],
+            True,
+            1,
+            id="non-dict-skipped",
+        ),
+        pytest.param(
+            # 3) Type guard: wrong types in inp → entry remains unchanged
+            {"d_l": "5", "c_l": "1.5", "delta_l2": None, "d_l2": "3.0"},
+            [{"1": 0.0, "2": 0.0, "3": 999, "4": 888.0}],
+            False,
+            0,
+            id="type-guard-skipped",
+        ),
+    ],
+)
+def test__postprocess_field_dict_parametrized(inp_fields, supp_infos, expect_processed, expect_unchanged_idx):
     segdefs = SegmentDefinitions()
+    inp = {"report_count": len(supp_infos), "supp_infos": supp_infos, **inp_fields}
+
     out = segdefs.segment._postprocess_field_dict(inp)
+    out_infos = out["supp_infos"]
 
-    supp_info = out["supp_infos"][0]
-    assert isinstance(supp_info, dict)
-    assert supp_info["3"] == SAMPLE_L1
-    assert supp_info["4"] == SAMPLE_L2
+    # If processed, the first dict should have "3" (d_l) and "4" (d_l2) set from inp_fields
+    if expect_processed:
+        processed = out_infos[0]
+        assert isinstance(processed, dict)
+        assert processed["3"] == inp_fields["d_l"]      # "3" is d_l (int)
+        assert processed["4"] == inp_fields["d_l2"]     # "4" is d_l2 (float)
 
-
-def test_postprocess_field_dict_skips_non_dict():
-    """Second entry not a dict → skipped unchanged."""
-    inp = {
-        "report_count": 2,
-        "supp_infos": [
-            _base_supp_info(),
-            "not_a_dict",
-        ],
-        "d_l": 5,
-        "c_l": 1.5,
-        "delta_l2": 2,
-        "d_l2": 3.0,
-    }
-
-    segdefs = SegmentDefinitions()
-    out = segdefs.segment._postprocess_field_dict(inp)
-
-    assert isinstance(out["supp_infos"][0], dict)
-    assert out["supp_infos"][1] == "not_a_dict"
-
-
-def test_postprocess_field_dict_type_guards_continue():
-    """Wrong types for d_l/c_l/delta_l2/d_l2 → entries skipped/unchanged."""
-    bad_info = {
-        "1": 0.0,
-        "2": 0.0,
-        "3": 999.0,
-        "4": 888.0,
-    }
-    inp = {
-        "report_count": 1,
-        "supp_infos": [bad_info],
-        "d_l": "5",         # str instead of int
-        "c_l": "1.5",       # str instead of float
-        "delta_l2": None,   # not int
-        "d_l2": "oops",     # not float
-    }
-
-    segdefs = SegmentDefinitions()
-    out = segdefs.segment._postprocess_field_dict(inp)
-
-    # Should be skipped: unchanged dict
-    assert out["supp_infos"][0] == bad_info
+    # If a particular index should remain unchanged (due to guard), confirm exact equality
+    if expect_unchanged_idx is not None:
+        assert out_infos[expect_unchanged_idx] == supp_infos[expect_unchanged_idx]

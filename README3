@@ -6,15 +6,21 @@ from sklearn.preprocessing import StandardScaler
 from pathlib import Path
 import numpy as np
 
+# Optional interactive table dependency
+_AGGRID_OK = True
+try:
+    from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+except Exception:
+    _AGGRID_OK = False
+
 st.set_page_config(layout="wide")
-st.title("Anomaly Detection Dashboard (Multi-CSV)")
+st.title("Anomaly Detection Dashboard (Multi-CSV, Linked Table ⇄ Plot)")
 
 # ---- CONFIG ----
 DATA_DIR = Path("data/V/Report")   # directory containing multiple CSVs
 REQUIRED_BASE = {"te_id","script_file_name","passes","fails","blocks","unattempts","simulation_host"}
 OPTIONAL = {"total_init_time","t_v","s_number","build","capability"}
 
-# Map common names -> canonical names used in app
 RENAME_MAP = {
     "te_id": "Test_Run_ID",
     "script_file_name": "Script_File",
@@ -51,22 +57,16 @@ def list_csvs(data_dir: Path):
 @st.cache_data
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # normalize column names: strip spaces, lower for matching, keep original casing later
-    df.columns = df.columns.str.strip().str.lower()
+    df.columns = df.columns.str.strip().str.lower()  # normalize
     missing = REQUIRED_BASE - set(df.columns)
     if missing:
         raise ValueError(f"{path.name}: missing required columns {missing}")
-    # keep only needed columns if present
-    cols_to_keep = list(REQUIRED_BASE | OPTIONAL)
-    cols_to_keep = [c for c in cols_to_keep if c in df.columns]
+    cols_to_keep = list((REQUIRED_BASE | OPTIONAL) & set(df.columns))
     df = df[cols_to_keep].copy()
-    # rename to canonical names the rest of the app expects
     df.rename(columns=RENAME_MAP, inplace=True)
-    # minimal type cleaning
     for c in ["P","F","B","U","total_init_time"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    # ensure strings
     if "Simulation_Host" in df.columns:
         df["Simulation_Host"] = df["Simulation_Host"].astype(str)
     if "s_number" in df.columns:
@@ -75,27 +75,21 @@ def load_csv(path: Path) -> pd.DataFrame:
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # drop rows without a host (as in original)
     if "Simulation_Host" in df.columns:
         df = df.dropna(subset=["Simulation_Host"])
-    # simulation node from host
     if "Simulation_Host" in df.columns:
         df["Simulation_Node"] = df["Simulation_Host"].astype(str).str.split("-", n=1).str[0]
-    # totals & failure rate
     for c in ["P","F","B","U"]:
         if c not in df.columns:
             df[c] = 0
     df["Num_Tests"] = df[["P","F","B","U"]].sum(axis=1)
-    # FR = F / total; if denom==0 set to 1 (as in original)
     denom = df["Num_Tests"].replace(0, np.nan)
     df["FR"] = (df["F"] / denom).fillna(1.0)
-    # time feature default
     if "total_init_time" not in df.columns:
         df["total_init_time"] = 0.0
     return df
 
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Return the numeric matrix used for PCA/scoring."""
     feats = ["P","F","B","U","total_init_time","FR","Num_Tests"]
     return df[feats].fillna(0.0).astype(float)
 
@@ -108,25 +102,37 @@ def fit_pca_scaled(X: np.ndarray, n_components: int = 3):
     return scaler, pca, Xz, PCs
 
 def compute_anomaly_scores(PCs: np.ndarray) -> np.ndarray:
-    # keep original logic but robust to zero variance
     mean = PCs.mean(axis=0)
     std = PCs.std(axis=0)
-    m = std.max()
+    m = float(std.max()) if np.isfinite(std).any() else 1.0
     if m == 0:
         m = 1.0
-    scores = np.linalg.norm(PCs - mean, axis=1) / m
-    return scores
+    return np.linalg.norm(PCs - mean, axis=1) / m
 
-def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str) -> go.Figure:
+def make_marker(highlight_idx: list[int] | None, base_len: int, color_vals=None, cmin=None, cmax=None, colorscale=None):
+    # base sizes/lines
+    size = np.full(base_len, 6.0)
+    line_width = np.zeros(base_len)
+    if highlight_idx:
+        size[highlight_idx] = 12.0
+        line_width[highlight_idx] = 2.5
+    marker = dict(size=size, line=dict(width=line_width, color="black"))
+    if color_vals is not None:
+        marker.update(color=color_vals, cmin=cmin, cmax=cmax, colorscale=colorscale, showscale=True)
+    return marker
+
+def build_hover(df: pd.DataFrame, scores: np.ndarray):
+    return [
+        f"Test Run ID: {trid}<br>Failure Rate: {fr:.3f}<br>Total Tests: {nt}"
+        f"<br>Total Time: {tt}<br>Anomaly Score: {s:.3f}"
+        for trid, fr, nt, tt, s in zip(df.get("Test_Run_ID", ""), df["FR"], df["Num_Tests"], df["total_init_time"], scores)
+    ]
+
+def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str, highlight_idx=None) -> go.Figure:
     selected_label = LABEL_DICT[selected_label_name]
     scores = compute_anomaly_scores(PCs)
-
-    # choose 3D or 2D based on available components
     is_3d = PCs.shape[1] >= 3
-
-    # shared hover base
-    base_cols = ["Test_Run_ID","FR","Num_Tests","total_init_time"]
-    for c in base_cols:
+    for c in ["Test_Run_ID","FR","Num_Tests","total_init_time"]:
         if c not in df.columns:
             df[c] = np.nan
 
@@ -143,12 +149,8 @@ def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str) -> 
             colorscale = [[0, 'blue'], [1, 'red']]
             cmin, cmax = 0, 1
 
-        hovertext = [
-            f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>Total Time: {tt},<br>Anomaly Score: {s:.3f}"
-            for trid, fr, nt, tt, s in zip(df["Test_Run_ID"], df["FR"], df["Num_Tests"], df["total_init_time"], scores)
-        ]
-
-        marker = dict(color=color_vals, cmin=cmin, cmax=cmax, colorscale=colorscale, showscale=True)
+        hovertext = build_hover(df, scores)
+        marker = make_marker(highlight_idx, len(df), color_vals, cmin, cmax, colorscale)
 
         if is_3d:
             fig = go.Figure(go.Scatter3d(
@@ -164,73 +166,125 @@ def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str) -> 
             fig.update_layout(xaxis_title='PC1', yaxis_title='PC2')
 
     else:
-        # categorical split
         vals = df[selected_label]
         uniq = vals.dropna().unique()
         if is_3d:
             fig = go.Figure()
             for label in uniq:
                 idx = vals == label
-                hovertext = [
-                    f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>{selected_label}: {label},<br>Anomaly Score: {s:.3f}"
-                    for trid, fr, nt, s in zip(df.loc[idx,"Test_Run_ID"], df.loc[idx,"FR"], df.loc[idx,"Num_Tests"], compute_anomaly_scores(PCs[idx]))
-                ]
+                sel_idx = [i for i, ok in enumerate(idx.values) if ok]
+                # within-group highlighting: intersect indices
+                group_highlight = sorted(set(sel_idx) & set(highlight_idx or []))
+                marker = make_marker(group_highlight, len(sel_idx))
+                hovertext = build_hover(df.loc[idx], scores[idx])
                 fig.add_trace(go.Scatter3d(
                     x=PCs[idx,0], y=PCs[idx,1], z=PCs[idx,2],
-                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text"
+                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text", marker=marker
                 ))
             fig.update_layout(scene=dict(xaxis_title='PC1', yaxis_title='PC2', zaxis_title='PC3'))
         else:
             fig = go.Figure()
             for label in uniq:
                 idx = vals == label
-                hovertext = [
-                    f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>{selected_label}: {label},<br>Anomaly Score: {s:.3f}"
-                    for trid, fr, nt, s in zip(df.loc[idx,"Test_Run_ID"], df.loc[idx,"FR"], df.loc[idx,"Num_Tests"], compute_anomaly_scores(PCs[idx]))
-                ]
+                sel_idx = [i for i, ok in enumerate(idx.values) if ok]
+                group_highlight = sorted(set(sel_idx) & set(highlight_idx or []))
+                marker = make_marker(group_highlight, len(sel_idx))
+                hovertext = build_hover(df.loc[idx], scores[idx])
                 fig.add_trace(go.Scatter(
                     x=PCs[idx,0], y=PCs[idx,1],
-                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text"
+                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text", marker=marker
                 ))
             fig.update_layout(xaxis_title='PC1', yaxis_title='PC2')
 
     fig.update_layout(width=1600, height=800, margin=dict(l=10,r=10,t=50,b=10))
     return fig
 
-# ---- UI controls (apply to all files) ----
+# ---- SIDEBAR: Controls ----
 st.sidebar.header("Controls")
-label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()))
-show_top = st.sidebar.number_input("Show Top-N anomalies table per file (0 to hide)", min_value=0, max_value=1000, value=10, step=1)
 
-# ---- Load all CSVs ----
 csv_paths = list_csvs(DATA_DIR)
 if not csv_paths:
-    st.warning(f"No CSV files found in: {DATA_DIR.resolve()}")
+    st.sidebar.warning(f"No CSV files found in: {DATA_DIR.resolve()}")
     st.stop()
 
-tabs = st.tabs([p.name for p in csv_paths])
+# New: dataset picker lives in sidebar
+default_pick = [p.name for p in csv_paths]
+picked = st.sidebar.multiselect("Datasets (CSV files) to display", default_pick, default=default_pick)
 
-for tab, path in zip(tabs, csv_paths):
-    with tab:
-        st.subheader(path.name)
-        try:
-            raw = load_csv(path)
-            df = engineer_features(raw)
-            X = build_features(df)
-            if X.shape[0] < 3:
-                st.info(f"Not enough rows to compute 3D PCA (rows={X.shape[0]}). Showing 2D if possible.")
-            scaler, pca, Xz, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
-            # anomaly scores (same logic across files)
-            scores = compute_anomaly_scores(PCs)
-            df["anomaly_score"] = scores
+label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()))
+top_n = st.sidebar.number_input("Top-N anomalies table per dataset (0=hide)", min_value=0, max_value=1000, value=10, step=1)
 
-            fig = plot_for_df(df, PCs, label_choice)
+if not _AGGRID_OK:
+    st.sidebar.warning("Install `streamlit-aggrid` for interactive row selection (pip install streamlit-aggrid). "
+                       "Fallback table is read-only; plot highlighting by selection will be disabled.")
+
+# ---- MAIN: loop selected datasets ----
+for path in csv_paths:
+    if path.name not in picked:
+        continue
+
+    st.markdown(f"### {path.name}")
+    try:
+        raw = load_csv(path)
+        df = engineer_features(raw)
+        # stable row id to map table selections back to points
+        df = df.reset_index(drop=True)
+        df["_row_id"] = np.arange(len(df))
+
+        X = build_features(df)
+        if X.shape[0] < 3:
+            st.info(f"Not enough rows to compute 3D PCA (rows={X.shape[0]}). Falling back to 2D if needed.")
+        _, _, _, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
+        scores = compute_anomaly_scores(PCs)
+        df["anomaly_score"] = scores
+
+        # --- Table (left) + Plot (right) layout
+        left, right = st.columns([1, 2], gap="large")
+
+        # LEFT: interactive table with selection -> returns selected row ids
+        if _AGGRID_OK:
+            show_cols = ["_row_id","Test_Run_ID","FR","Num_Tests","total_init_time",
+                         "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build","anomaly_score"]
+            show_cols = [c for c in show_cols if c in df.columns]
+            dshow = df[show_cols].copy()
+
+            gob = GridOptionsBuilder.from_dataframe(dshow)
+            gob.configure_selection(selection_mode="multiple", use_checkbox=True)
+            gob.configure_grid_options(domLayout='normal')
+            gob.configure_column("_row_id", headerName="Row", width=80)
+            grid = AgGrid(
+                dshow,
+                height=450,
+                gridOptions=gob.build(),
+                update_mode=GridUpdateMode.SELECTION_CHANGED,
+                allow_unsafe_jscode=False,
+                fit_columns_on_grid_load=True,
+                theme="alpine",
+            )
+            selected_rows = grid.get("selected_rows", [])
+            highlight_idx = sorted([int(r["_row_id"]) for r in selected_rows]) if selected_rows else []
+        else:
+            # Fallback: no selection possible
+            st.dataframe(
+                df[["Test_Run_ID","FR","Num_Tests","total_init_time","Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build","anomaly_score"]]
+                .fillna(""),
+                use_container_width=True,
+                height=450
+            )
+            highlight_idx = []
+
+        with right:
+            fig = plot_for_df(df, PCs, label_choice, highlight_idx=highlight_idx)
             st.plotly_chart(fig, use_container_width=True)
 
-            if show_top > 0:
-                top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-                st.markdown("**Top anomalies**")
-                st.dataframe(top[["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score","Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]].fillna(""), use_container_width=True)
+        if top_n > 0:
+            top = df.sort_values("anomaly_score", ascending=False).head(top_n)
+            st.markdown("**Top anomalies**")
+            st.dataframe(top[["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score",
+                              "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]].fillna(""),
+                         use_container_width=True)
 
-        except Exception as e:
-            st.error(f"Failed to process {path.name}: {e}")
+        st.divider()
+
+    except Exception as e:
+        st.error(f"Failed to process {path.name}: {e}")

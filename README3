@@ -1,248 +1,169 @@
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from pathlib import Path
-import numpy as np
+# =========================
+# Anomaly methods (helpers)
+# =========================
+from sklearn.ensemble import IsolationForest
+from sklearn.neighbors import LocalOutlierFactor
+from sklearn.neural_network import MLPRegressor
 
-st.set_page_config(layout="wide")
-st.title("Anomaly Detection Dashboard (Multi-CSV)")
-
-# ---- CONFIG ----
-DATA_DIR = Path("data/V/Report")   # directory containing multiple CSVs
-REQUIRED_BASE = {"te_id","script_file_name","passes","fails","blocks","unattempts","simulation_host"}
-OPTIONAL = {"total_init_time","t_v","s_number","build","capability"}
-
-# Map common names -> canonical names used in app
-RENAME_MAP = {
-    "te_id": "Test_Run_ID",
-    "script_file_name": "Script_File",
-    "passes": "P",
-    "fails": "F",
-    "blocks": "B",
-    "unattempts": "U",
-    "t_v": "V",
-    "capability": "Capability",
-    "simulation_host": "Simulation_Host",
-    "build": "Build",
-    "s_number": "s_number",
-    "total_init_time": "total_init_time",
-}
-
-CONTINUOUS_LABELS = {"FR", "Num_Tests", "total_init_time"}
-LABEL_DICT = {
-    "Failure Rate": "FR",
-    "Total Tests": "Num_Tests",
-    "Total Time": "total_init_time",
-    "Simulation Host": "Simulation_Host",
-    "Simulation Node": "Simulation_Node",
-    "Capability": "Capability",
-    "Script File": "Script_File",
-    "V": "V",
-    "S Number": "s_number",
-    "Build": "Build",
-}
-
-@st.cache_data
-def list_csvs(data_dir: Path):
-    return sorted([p for p in data_dir.glob("*.csv") if p.is_file()])
-
-@st.cache_data
-def load_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    # normalize column names: strip spaces, lower for matching
-    df.columns = df.columns.str.strip().str.lower()
-    missing = REQUIRED_BASE - set(df.columns)
-    if missing:
-        raise ValueError(f"{path.name}: missing required columns {missing}")
-    # keep only needed columns if present
-    cols_to_keep = list(REQUIRED_BASE | OPTIONAL)
-    cols_to_keep = [c for c in cols_to_keep if c in df.columns]
-    df = df[cols_to_keep].copy()
-    # rename to canonical names the rest of the app expects
-    df.rename(columns=RENAME_MAP, inplace=True)
-    # minimal type cleaning
-    for c in ["P","F","B","U","total_init_time"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    # ensure strings
-    if "Simulation_Host" in df.columns:
-        df["Simulation_Host"] = df["Simulation_Host"].astype(str)
-    if "s_number" in df.columns:
-        df["s_number"] = df["s_number"].astype(str)
-    return df
-
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    # drop rows without a host (as in original)
-    if "Simulation_Host" in df.columns:
-        df = df.dropna(subset=["Simulation_Host"])
-    # simulation node from host
-    if "Simulation_Host" in df.columns:
-        df["Simulation_Node"] = df["Simulation_Host"].astype(str).str.split("-", n=1).str[0]
-    # totals & failure rate
-    for c in ["P","F","B","U"]:
-        if c not in df.columns:
-            df[c] = 0
-    df["Num_Tests"] = df[["P","F","B","U"]].sum(axis=1)
-    # FR = F / total; if denom==0 set to 1 (as in original)
-    denom = df["Num_Tests"].replace(0, np.nan)
-    df["FR"] = (df["F"] / denom).fillna(1.0)
-    # time feature default
-    if "total_init_time" not in df.columns:
-        df["total_init_time"] = 0.0
-    return df
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Return the numeric matrix used for PCA/scoring."""
-    feats = ["P","F","B","U","total_init_time","FR","Num_Tests"]
-    return df[feats].fillna(0.0).astype(float)
-
-def fit_pca_scaled(X: np.ndarray, n_components: int = 3):
+def scale_features(df: pd.DataFrame) -> tuple[np.ndarray, StandardScaler]:
+    X = build_features(df).to_numpy(dtype=float)
     scaler = StandardScaler()
     Xz = scaler.fit_transform(X)
-    k = max(1, min(n_components, Xz.shape[0], Xz.shape[1]))
-    pca = PCA(n_components=k)
-    PCs = pca.fit_transform(Xz)
-    return scaler, pca, Xz, PCs
+    return Xz, scaler
 
-def compute_anomaly_scores(PCs: np.ndarray) -> np.ndarray:
-    # keep original logic but robust to zero variance
-    mean = PCs.mean(axis=0)
-    std = PCs.std(axis=0)
-    m = std.max()
-    if m == 0:
-        m = 1.0
-    scores = np.linalg.norm(PCs - mean, axis=1) / m
-    return scores
+def score_isolation_forest(Xz: np.ndarray, contamination: float = 0.02, n_estimators: int = 300, random_state: int = 0):
+    if contamination <= 0 or contamination >= 0.5:
+        contamination = "auto"
+    model = IsolationForest(
+        n_estimators=n_estimators,
+        contamination=contamination,
+        random_state=random_state,
+        n_jobs=-1,
+    )
+    model.fit(Xz)
+    # higher = more normal; use negative to make higher = more anomalous
+    raw_scores = -model.score_samples(Xz)
+    return model, raw_scores
 
-def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str) -> go.Figure:
-    selected_label = LABEL_DICT[selected_label_name]
-    scores = compute_anomaly_scores(PCs)
+def score_lof(Xz: np.ndarray, n_neighbors: int = 20):
+    # LOF needs n_neighbors < n_samples
+    n_neighbors = max(5, min(n_neighbors, max(5, Xz.shape[0] - 1)))
+    model = LocalOutlierFactor(
+        n_neighbors=n_neighbors,
+        novelty=False,  # standard LOF (fit_predict only)
+        n_jobs=-1
+    )
+    # negative_outlier_factor_ (more negative = more anomalous)
+    _ = model.fit_predict(Xz)
+    raw = -model.negative_outlier_factor_
+    return model, raw
 
-    # choose 3D or 2D based on available components
-    is_3d = PCs.shape[1] >= 3
+def score_autoencoder(Xz: np.ndarray, hidden=(16, 8, 16), alpha=1e-4, max_iter=400, random_state=0):
+    """
+    Autoencoder via MLPRegressor: train to reconstruct Xz -> Xz.
+    Score = reconstruction MSE per row.
+    """
+    model = MLPRegressor(
+        hidden_layer_sizes=hidden,
+        activation="relu",
+        solver="adam",
+        alpha=alpha,
+        max_iter=max_iter,
+        random_state=random_state,
+        shuffle=True,
+        early_stopping=True,
+        n_iter_no_change=15,
+        verbose=False,
+    )
+    model.fit(Xz, Xz)
+    Xz_hat = model.predict(Xz)
+    mse = ((Xz - Xz_hat) ** 2).mean(axis=1)
+    return model, mse
 
-    # shared hover base
-    base_cols = ["Test_Run_ID","FR","Num_Tests","total_init_time"]
-    for c in base_cols:
-        if c not in df.columns:
-            df[c] = np.nan
+def normalize_scores(scores: np.ndarray) -> np.ndarray:
+    """
+    Map arbitrary positive scores to [0,1] robustly (IQR-based).
+    """
+    s = np.asarray(scores, dtype=float)
+    s = np.nan_to_num(s, nan=np.nanmedian(s))
+    q1, q3 = np.percentile(s, [25, 75])
+    iqr = max(q3 - q1, 1e-9)
+    z = (s - q1) / iqr
+    z = np.clip(z, 0, None)
+    # squashing to [0,1] with 99th percentile cap
+    cap = np.percentile(z, 99)
+    cap = cap if cap > 0 else 1.0
+    return (z / cap).clip(0, 1)
 
-    if selected_label in CONTINUOUS_LABELS:
-        val = df[selected_label].values
-        if selected_label == "FR":
-            colorscale = [[0, 'green'], [1, 'red']]
-            cmin, cmax = 0, 1
-            color_vals = val
-        else:
-            vmax = np.nanmax(val) if np.isfinite(val).any() else 1.0
-            vmax = vmax if vmax > 0 else 1.0
-            color_vals = np.sqrt(np.clip(val, 0, None) / vmax)
-            colorscale = [[0, 'blue'], [1, 'red']]
-            cmin, cmax = 0, 1
-
-        hovertext = [
-            f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>Total Time: {tt},<br>Anomaly Score: {s:.3f}"
-            for trid, fr, nt, tt, s in zip(df["Test_Run_ID"], df["FR"], df["Num_Tests"], df["total_init_time"], scores)
-        ]
-
-        marker = dict(color=color_vals, cmin=cmin, cmax=cmax, colorscale=colorscale, showscale=True)
-
-        if is_3d:
-            fig = go.Figure(go.Scatter3d(
-                x=PCs[:,0], y=PCs[:,1], z=PCs[:,2],
-                mode="markers", hovertext=hovertext, hoverinfo="text", marker=marker
-            ))
-            fig.update_layout(scene=dict(xaxis_title='PC1', yaxis_title='PC2', zaxis_title='PC3'))
-        else:
-            fig = go.Figure(go.Scatter(
-                x=PCs[:,0], y=PCs[:,1],
-                mode="markers", hovertext=hovertext, hoverinfo="text", marker=marker
-            ))
-            fig.update_layout(xaxis_title='PC1', yaxis_title='PC2')
-
-    else:
-        # categorical split
-        vals = df[selected_label]
-        uniq = vals.dropna().unique()
-        if is_3d:
-            fig = go.Figure()
-            for label in uniq:
-                idx = vals == label
-                hovertext = [
-                    f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>{selected_label}: {label},<br>Anomaly Score: {s:.3f}"
-                    for trid, fr, nt, s in zip(df.loc[idx,"Test_Run_ID"], df.loc[idx,"FR"], df.loc[idx,"Num_Tests"], compute_anomaly_scores(PCs[idx]))
-                ]
-                fig.add_trace(go.Scatter3d(
-                    x=PCs[idx,0], y=PCs[idx,1], z=PCs[idx,2],
-                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text"
-                ))
-            fig.update_layout(scene=dict(xaxis_title='PC1', yaxis_title='PC2', zaxis_title='PC3'))
-        else:
-            fig = go.Figure()
-            for label in uniq:
-                idx = vals == label
-                hovertext = [
-                    f"Test Run ID: {trid},<br>Failure Rate: {fr:.3f},<br>Total Tests: {nt},<br>{selected_label}: {label},<br>Anomaly Score: {s:.3f}"
-                    for trid, fr, nt, s in zip(df.loc[idx,"Test_Run_ID"], df.loc[idx,"FR"], df.loc[idx,"Num_Tests"], compute_anomaly_scores(PCs[idx]))
-                ]
-                fig.add_trace(go.Scatter(
-                    x=PCs[idx,0], y=PCs[idx,1],
-                    mode="markers", name=str(label), hovertext=hovertext, hoverinfo="text"
-                ))
-            fig.update_layout(xaxis_title='PC1', yaxis_title='PC2')
-
-    fig.update_layout(width=1600, height=800, margin=dict(l=10,r=10,t=50,b=10))
-    return fig
-
-# ---- Load all CSVs ----
-csv_paths = list_csvs(DATA_DIR)
-if not csv_paths:
-    st.warning(f"No CSV files found in: {DATA_DIR.resolve()}")
-    st.stop()
-
-# ---- Sidebar Controls (dataset selection now in left panel) ----
+# =========================
+# Sidebar (new controls)
+# =========================
 st.sidebar.header("Controls")
+
+method = st.sidebar.selectbox(
+    "Anomaly method",
+    ["Isolation Forest", "Local Outlier Factor", "Autoencoder (reconstruction)"],
+    index=0
+)
+
+# Method-specific params
+if method == "Isolation Forest":
+    if_contam = st.sidebar.slider("Contamination (expected anomaly %)", 0.0, 0.2, 0.02, 0.005)
+    if_trees = st.sidebar.slider("Trees (n_estimators)", 100, 1000, 300, 50)
+elif method == "Local Outlier Factor":
+    lof_k = st.sidebar.slider("Neighbors (n_neighbors)", 5, 100, 20, 1)
+else:  # Autoencoder
+    ae_w1 = st.sidebar.slider("Hidden size 1", 4, 64, 16, 2)
+    ae_w2 = st.sidebar.slider("Hidden size bottleneck", 2, 32, 8, 1)
+    ae_w3 = st.sidebar.slider("Hidden size 3", 4, 64, 16, 2)
+    ae_iter = st.sidebar.slider("Max epochs", 100, 1000, 400, 50)
+
+# Existing dataset UI (keep as-is, shown here for continuity)
 dataset_names = [p.name for p in csv_paths]
+# If you already built dataset_labels with file_name suffix, keep that instead:
+# dataset_names = dataset_labels
 selected_idx = st.sidebar.selectbox("Dataset", options=list(range(len(dataset_names))),
                                     format_func=lambda i: dataset_names[i], index=0)
 show_all = st.sidebar.checkbox("Show all datasets", value=False)
-
 label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()))
 show_top = st.sidebar.number_input("Show Top-N anomalies table per dataset (0 to hide)",
                                    min_value=0, max_value=1000, value=10, step=1)
 
+# =========================
+# render_one: fit/score per method, visualize
+# =========================
 def render_one(path: Path):
     try:
         raw = load_csv(path)
         df = engineer_features(raw)
-        X = build_features(df)
-        if X.shape[0] < 3:
-            st.info(f"Not enough rows to compute 3D PCA for {path.name} (rows={X.shape[0]}). Showing 2D if possible.")
-        _, _, _, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
-        scores = compute_anomaly_scores(PCs)
-        df["anomaly_score"] = scores
 
-        st.subheader(path.name)
-        fig = plot_for_df(df, PCs, label_choice)
-        st.plotly_chart(fig, use_container_width=True)
+        # 1) Scale features once for all methods
+        Xz, scaler = scale_features(df)
 
+        # 2) PCA ONLY for visualization
+        _, _, _, PCs = fit_pca_scaled(build_features(df).to_numpy(), n_components=3)
+
+        # 3) Score with selected method
+        if method == "Isolation Forest":
+            _, raw_scores = score_isolation_forest(Xz, contamination=if_contam, n_estimators=if_trees)
+        elif method == "Local Outlier Factor":
+            _, raw_scores = score_lof(Xz, n_neighbors=lof_k)
+        else:
+            _, raw_scores = score_autoencoder(Xz, hidden=(ae_w1, ae_w2, ae_w3), max_iter=ae_iter)
+
+        # 4) Normalize scores to [0,1] (higher = more anomalous)
+        scores01 = normalize_scores(raw_scores)
+        df["anomaly_score"] = scores01
+        df["raw_anomaly_score"] = raw_scores
+
+        st.subheader(f"{path.name} · {method}")
+
+        # --- Top anomalies table with selection -> highlight on plot ---
+        highlight_pos = None
         if show_top > 0:
-            cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score",
+            cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score","raw_anomaly_score",
                          "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
             cols_keep = [c for c in cols_keep if c in df.columns]
             top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+
             st.markdown("**Top anomalies**")
-            st.dataframe(top[cols_keep].fillna(""), use_container_width=True)
+            editable = top[cols_keep].copy()
+            editable.insert(0, "Select", False)
+            edited = st.data_editor(
+                editable,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled={c: True for c in editable.columns if c != "Select"}
+            )
+            selected_original_idxs = edited.index[edited["Select"]].tolist()
+            if selected_original_idxs:
+                pos = df.index.get_indexer([selected_original_idxs[0]])
+                if len(pos) and pos[0] != -1:
+                    highlight_pos = int(pos[0])
+
+        # 5) Plot, pass highlight
+        fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+        st.plotly_chart(fig, use_container_width=True)
+
     except Exception as e:
         st.error(f"Failed to process {path.name}: {e}")
-
-# ---- Main rendering ----
-if show_all:
-    for path in csv_paths:
-        render_one(path)
-        st.divider()
-else:
-    render_one(csv_paths[selected_idx])

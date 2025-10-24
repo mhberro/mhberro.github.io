@@ -1,4 +1,62 @@
 # =========================
+# Sidebar (remove single-method selector; keep dataset controls)
+# =========================
+st.sidebar.header("Controls")
+
+dataset_names = [p.name for p in csv_paths]  # or dataset_labels if you built them
+selected_idx = st.sidebar.selectbox("Dataset",
+                                    options=list(range(len(dataset_names))),
+                                    format_func=lambda i: dataset_names[i],
+                                    index=0)
+show_all = st.sidebar.checkbox("Show all datasets", value=False)
+label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()))
+show_top = st.sidebar.number_input("Show Top-N anomalies table per dataset (0 to hide)",
+                                   min_value=0, max_value=1000, value=10, step=1)
+
+# Optional per-method knobs (global)
+if_contam = st.sidebar.slider("IF: Contamination (expected anomaly %)", 0.0, 0.2, 0.02, 0.005)
+if_trees  = st.sidebar.slider("IF: Trees (n_estimators)", 100, 1000, 300, 50)
+lof_k     = st.sidebar.slider("LOF: Neighbors (n_neighbors)", 5, 100, 20, 1)
+ae_w1     = st.sidebar.slider("AE: Hidden size 1", 4, 64, 16, 2)
+ae_w2     = st.sidebar.slider("AE: Bottleneck", 2, 32, 8, 1)
+ae_w3     = st.sidebar.slider("AE: Hidden size 3", 4, 64, 16, 2)
+ae_iter   = st.sidebar.slider("AE: Max epochs", 100, 1000, 400, 50)
+
+# =========================
+# Utility to render a single tab (table + plot with highlight)
+# =========================
+def _render_table_and_plot(df: pd.DataFrame, PCs: np.ndarray, scores01: np.ndarray, raw_scores: np.ndarray, method_label: str):
+    df = df.copy()
+    df["anomaly_score"] = scores01
+    df["raw_anomaly_score"] = raw_scores
+
+    st.markdown(f"### {method_label}")
+    highlight_pos = None
+    if show_top > 0:
+        cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score","raw_anomaly_score",
+                     "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
+        cols_keep = [c for c in cols_keep if c in df.columns]
+        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+
+        st.markdown("**Top anomalies**")
+        editable = top[cols_keep].copy()
+        editable.insert(0, "Select", False)
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled={c: True for c in editable.columns if c != "Select"}
+        )
+        selected_original_idxs = edited.index[edited["Select"]].tolist()
+        if selected_original_idxs:
+            pos = df.index.get_indexer([selected_original_idxs[0]])
+            if len(pos) and pos[0] != -1:
+                highlight_pos = int(pos[0])
+
+    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+    st.plotly_chart(fig, use_container_width=True)
+
+# =========================
 # New render_one: compute all methods + consensus; show tabs
 # =========================
 def render_one(path: Path):

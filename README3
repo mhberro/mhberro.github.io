@@ -1,170 +1,200 @@
-# ADD: helper to compute standardized effect sizes (Cohen's d on standardized features)
-def _standardized_effects(Xz: np.ndarray, feature_names: list[str], idx_a: np.ndarray, idx_b: np.ndarray) -> pd.Series:
-    """Return effect sizes for A vs B on standardized features (comparable across features)."""
-    if idx_a.sum() == 0 or idx_b.sum() == 0:
-        return pd.Series(dtype=float)
-    mean_a = Xz[idx_a].mean(axis=0)
-    mean_b = Xz[idx_b].mean(axis=0)
-    # pooled std on already standardized features ~1; still compute robustly
-    sd_a = Xz[idx_a].std(axis=0, ddof=1)
-    sd_b = Xz[idx_b].std(axis=0, ddof=1)
-    sd_p = np.sqrt(((sd_a ** 2) + (sd_b ** 2)) / 2.0)
-    sd_p[sd_p == 0] = 1.0  # avoid divide-by-zero
-    d = (mean_a - mean_b) / sd_p
-    return pd.Series(d, index=feature_names).sort_values(ascending=False)
+# NEW: utilities to compute "drivers" that explain groupings
 
-# ADD: pretty display names (collapse one-hot names like 'Simulation_Host_hostA' -> 'Simulation_Host=hostA')
-def _pretty_feat_names(names: list[str]) -> list[str]:
-    out = []
-    for n in names:
-        if "_" in n and any(n.startswith(prefix) for prefix in ["V_", "Simulation_Host_"]):
-            base, val = n.split("_", 1)
-            out.append(f"{base}={val}")
-        else:
-            out.append(n)
-    return out
+DRIVER_NUMERIC_CANDIDATES = ["FR", "Num_Tests", "total_init_time", "P", "F", "B", "U"]
 
-# ADD: simple insight bar-renderer
-def _render_insight_bars(effects: pd.Series, title: str, k: int = 5):
-    if effects.empty:
-        st.info(f"No differences available for {title}.")
-        return
-    top_pos = effects.head(k)
-    top_neg = effects.tail(k)
-    # Combine for one chart (positive at top, negative at bottom)
-    comb = pd.concat([top_pos, top_neg])
-    disp = comb.copy()
-    disp.index = _pretty_feat_names(list(disp.index))
-    fig = go.Figure(go.Bar(
-        x=disp.values,
-        y=disp.index.tolist(),
-        orientation="h",
-        hovertemplate="%{y}: %{x:.2f}σ difference<extra></extra>"
-    ))
-    fig.update_layout(
-        title=title,
-        xaxis_title="Standardized difference (σ)",
-        yaxis_title="Feature",
-        height=350,
-        margin=dict(l=10, r=10, t=40, b=10),
-        bargap=0.2,
+def _present_numeric_features(df: pd.DataFrame) -> list[str]:
+    """Keep only driver numeric columns that are present in df."""
+    return [c for c in DRIVER_NUMERIC_CANDIDATES if c in df.columns]
+
+def _zscore_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    arr = df[cols].astype(float)
+    mu = arr.mean(axis=0)
+    sd = arr.std(axis=0).replace(0, 1.0)
+    return (arr - mu) / sd
+
+def compute_continuous_drivers(df: pd.DataFrame, label: str, top_k: int = 8):
+    """
+    For continuous 'label', return:
+    - corr_df: Pearson correlations between label and each numeric feature (sorted by |r|)
+    - contrast_df: mean(z) in top quantile minus bottom quantile for each feature
+    """
+    feats = _present_numeric_features(df)
+    feats_wo_label = [f for f in feats if f != label]
+
+    if not feats_wo_label:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # correlations (numeric) with the selected label
+    corr = {}
+    x = pd.to_numeric(df[label], errors="coerce")
+    for f in feats_wo_label:
+        y = pd.to_numeric(df[f], errors="coerce")
+        valid = x.notna() & y.notna()
+        if valid.sum() < 3:
+            continue
+        r = np.corrcoef(x[valid], y[valid])[0, 1]
+        corr[f] = r
+    corr_df = (pd.Series(corr, name="r")
+               .reindex(feats_wo_label)
+               .dropna()
+               .to_frame()
+               .assign(abs_r=lambda d: d["r"].abs())
+               .sort_values("abs_r", ascending=False)
+               .drop(columns="abs_r")
+               .head(top_k))
+
+    # high vs low quantile contrast on standardized features
+    z = _zscore_cols(df, feats_wo_label)
+    qhi = df[label].quantile(0.80)
+    qlo = df[label].quantile(0.20)
+    hi = z.loc[df[label] >= qhi].mean()
+    lo = z.loc[df[label] <= qlo].mean()
+    contrast = (hi - lo).to_frame("hi_minus_lo_z").sort_values("hi_minus_lo_z", ascending=False)
+    contrast_df = contrast.head(top_k).append(contrast.tail(top_k))
+
+    return corr_df, contrast_df
+
+def compute_categorical_drivers(df: pd.DataFrame, label: str, top_groups: int = 12):
+    """
+    For categorical 'label', return a heatmap-ready DataFrame of
+    group mean z-scores minus global mean for numeric features.
+    """
+    feats = _present_numeric_features(df)
+    if not feats or label not in df.columns:
+        return pd.DataFrame()
+
+    # standardized features
+    z = _zscore_cols(df, feats)
+    z["__group__"] = df[label].astype(str)
+
+    # restrict to most frequent groups to keep the heatmap readable
+    top_labels = z["__group__"].value_counts().head(top_groups).index
+    g = z[z["__group__"].isin(top_labels)]
+
+    grp_means = g.groupby("__group__")[feats].mean()
+    # since we z-scored globally, group means already reflect deviation vs global mean
+    # reshape for heatmap (rows = groups, cols = features)
+    return grp_means
+
+def top_row_drivers(df: pd.DataFrame, idx: int, k: int = 2) -> str:
+    """Return a compact 'Top_Drivers' string for a row using largest |z| across numeric features."""
+    feats = _present_numeric_features(df)
+    if not feats:
+        return ""
+    z = _zscore_cols(df, feats)
+    if idx not in z.index:
+        return ""
+    row = z.loc[idx].abs().sort_values(ascending=False).head(k)
+    pieces = []
+    for f, val in row.items():
+        sign = "+" if z.loc[idx, f] >= 0 else "−"
+        pieces.append(f"{f}({sign}{abs(z.loc[idx, f]):.1f}σ)")
+    return ", ".join(pieces)
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+# --- AFTER plotting fig and before/after the Top anomalies table, add driver visuals ---
+
+st.markdown("### What’s driving this grouping?")
+
+selected_key = LABEL_DICT[label_choice]
+
+if selected_key in CONTINUOUS_LABELS:
+    # CONTINUOUS: show correlations and hi-vs-lo contrasts
+    corr_df, contrast_df = compute_continuous_drivers(df, selected_key, top_k=8)
+
+    if not corr_df.empty:
+        corr_fig = go.Figure(go.Bar(
+            x=corr_df["r"].values,
+            y=corr_df.index.tolist(),
+            orientation="h",
+            hovertemplate="%{y}: r=%{x:.3f}<extra></extra>"
+        ))
+        corr_fig.update_layout(
+            title=f"Feature correlations with {selected_key}",
+            xaxis_title="Pearson r",
+            yaxis_title="Feature",
+            height=400,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        st.plotly_chart(corr_fig, use_container_width=True)
+
+    if not contrast_df.empty:
+        # Sort so positives at top, negatives at bottom
+        contrast_df = contrast_df.sort_values("hi_minus_lo_z")
+        con_fig = go.Figure(go.Bar(
+            x=contrast_df["hi_minus_lo_z"].values,
+            y=contrast_df.index.tolist(),
+            orientation="h",
+            hovertemplate="%{y}: Δz (hi–low)=%{x:.2f}<extra></extra>"
+        ))
+        con_fig.update_layout(
+            title=f"High vs Low {selected_key}: feature contrast (Δz)",
+            xaxis_title="Mean z-score (High quantile − Low quantile)",
+            yaxis_title="Feature",
+            height=400,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        st.plotly_chart(con_fig, use_container_width=True)
+
+else:
+    # CATEGORICAL: show heatmap of group mean z-scores
+    hm = compute_categorical_drivers(df, selected_key, top_groups=12)
+    if not hm.empty:
+        heat = go.Figure(data=go.Heatmap(
+            z=hm.values,
+            x=hm.columns.tolist(),
+            y=hm.index.tolist(),
+            zmid=0.0,
+            colorscale="RdBu",
+            hovertemplate="Group=%{y}<br>%{x}: z=%{z:.2f}<extra></extra>"
+        ))
+        heat.update_layout(
+            title=f"Which features define each {selected_key} group? (mean z-score vs global)",
+            xaxis_title="Feature",
+            yaxis_title=selected_key,
+            height=500,
+            margin=dict(l=10, r=10, t=40, b=10)
+        )
+        st.plotly_chart(heat, use_container_width=True)
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+# (inside render_one, where you build Top anomalies)
+if show_top > 0:
+    cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score",
+                 "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
+    cols_keep = [c for c in cols_keep if c in df.columns]
+
+    top = df.sort_values("anomaly_score", ascending=False).head(show_top).copy()
+
+    # NEW: per-row short explanation of main drivers (largest |z| features)
+    top["Top_Drivers"] = [
+        top_row_drivers(df, idx, k=2) for idx in top.index
+    ]
+
+    st.markdown("**Top anomalies**")
+    editable = top[["Top_Drivers"] + cols_keep].copy()
+    editable.insert(0, "Select", False)
+
+    edited = st.data_editor(
+        editable,
+        use_container_width=True,
+        num_rows="fixed",
+        disabled={c: True for c in editable.columns if c != "Select"}
     )
-    st.plotly_chart(fig, use_container_width=True)
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-# MODIFIED: return feature names and standardized matrix from fit
-def fit_pca_scaled(X: np.ndarray, n_components: int = 3):
-    scaler = StandardScaler()
-    Xz = scaler.fit_transform(X)
-    k = max(1, min(n_components, Xz.shape[0], Xz.shape[1]))
-    pca = PCA(n_components=k)
-    PCs = pca.fit_transform(Xz)
-    return scaler, pca, Xz, PCs  # Xz reused for driver analysis
 
-_, _, Xz, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
-feature_names = list(X.columns)  # keep names aligned to Xz columns
+    selected_original_idxs = edited.index[edited["Select"]].tolist()
+    if selected_original_idxs:
+        pos = df.index.get_indexer([selected_original_idxs[0]])
+        if len(pos) and pos[0] != -1:
+            highlight_pos = int(pos[0])
 
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-# ADD: Insights panel – explains what drives HIGH vs LOW (for continuous) or a chosen category (for categorical)
-with st.expander("Why are these high/low? (Insights)", expanded=True):
-    selected_label = LABEL_DICT[label_choice]
-
-    if selected_label in CONTINUOUS_LABELS:
-        # Split by quantiles: top 20% vs bottom 20%
-        series = df[selected_label].astype(float)
-        if series.notna().sum() >= 10:  # need a few data points
-            q_low, q_high = series.quantile([0.2, 0.8])
-            idx_high = series >= q_high
-            idx_low  = series <= q_low
-
-            effects = _standardized_effects(Xz, feature_names, idx_high.values, idx_low.values)
-
-            # Visual overlays on plot: mark groups (halo markers) — optional but helpful
-            # Save for downstream if you want to overlay; here we just show bars:
-            _render_insight_bars(effects, title=f"Drivers of HIGH vs LOW {label_choice} (top 20% vs bottom 20%)")
-
-            # Friendly chips
-            if not effects.empty:
-                pos = effects.head(3)
-                neg = effects.tail(3)
-                st.markdown(
-                    "🔺 **Higher in High group:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** (+{v:.2f}σ)" for i, v in pos.items()])
-                )
-                st.markdown(
-                    "🔻 **Lower in High group:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** ({v:.2f}σ)" for i, v in neg.items()])
-                )
-        else:
-            st.info("Not enough data to compute high/low insights.")
-
-    else:
-        # Categorical: let user pick a category and compare to overall
-        cats = df[selected_label].dropna().astype(str).unique().tolist()
-        if not cats:
-            st.info("No categories available.")
-        else:
-            cat_pick = st.selectbox(f"Explain differences for {label_choice}", cats, key=f"insights_{label_choice}")
-            idx_cat = df[selected_label].astype(str).eq(cat_pick).values
-            idx_all = ~np.isnan(Xz[:,0])  # everyone
-
-            effects = _standardized_effects(Xz, feature_names, idx_cat, ~idx_cat)
-            _render_insight_bars(effects, title=f"Drivers of {label_choice} = {cat_pick} vs Others")
-
-            if not effects.empty:
-                pos = effects.head(3)
-                neg = effects.tail(3)
-                st.markdown(
-                    f"🧭 **More characteristic of `{cat_pick}`:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** (+{v:.2f}σ)" for i, v in pos.items()])
-                )
-                st.markdown(
-                    f"🧭 **Less characteristic of `{cat_pick}`:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** ({v:.2f}σ)" for i, v in neg.items()])
-                )
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-# OPTIONAL: Overlay halos for high/low (continuous case)
-if selected_label in CONTINUOUS_LABELS:
-    series = df[selected_label].astype(float)
-    if series.notna().sum() >= 10:
-        q_low, q_high = series.quantile([0.2, 0.8])
-        idx_high = series >= q_high
-        idx_low  = series <= q_low
-
-        if PCs.shape[1] >= 3:
-            fig.add_trace(go.Scatter3d(
-                x=PCs[idx_high,0], y=PCs[idx_high,1], z=PCs[idx_high,2],
-                mode="markers",
-                marker=dict(size=6, symbol="circle-open", line=dict(width=2)),
-                name=f"High {label_choice} (top 20%)",
-                hoverinfo="skip",
-                showlegend=True
-            ))
-            fig.add_trace(go.Scatter3d(
-                x=PCs[idx_low,0], y=PCs[idx_low,1], z=PCs[idx_low,2],
-                mode="markers",
-                marker=dict(size=6, symbol="diamond-open", line=dict(width=2)),
-                name=f"Low {label_choice} (bottom 20%)",
-                hoverinfo="skip",
-                showlegend=True
-            ))
-        else:
-            fig.add_trace(go.Scatter(
-                x=PCs[idx_high,0], y=PCs[idx_high,1],
-                mode="markers",
-                marker=dict(size=8, symbol="circle-open", line=dict(width=2)),
-                name=f"High {label_choice} (top 20%)",
-                hoverinfo="skip",
-                showlegend=True
-            ))
-            fig.add_trace(go.Scatter(
-                x=PCs[idx_low,0], y=PCs[idx_low,1],
-                mode="markers",
-                marker=dict(size=8, symbol="diamond-open", line=dict(width=2)),
-                name=f"Low {label_choice} (bottom 20%)",
-                hoverinfo="skip",
-                showlegend=True
-            ))
 
 
 =========================================================================================================================================================================

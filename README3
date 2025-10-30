@@ -1,124 +1,183 @@
-# =========================
-# Sidebar (remove single-method selector; keep dataset controls)
-# =========================
-st.sidebar.header("Controls")
+# ADD: helper to compute standardized effect sizes (Cohen's d on standardized features)
+def _standardized_effects(Xz: np.ndarray, feature_names: list[str], idx_a: np.ndarray, idx_b: np.ndarray) -> pd.Series:
+    """Return effect sizes for A vs B on standardized features (comparable across features)."""
+    if idx_a.sum() == 0 or idx_b.sum() == 0:
+        return pd.Series(dtype=float)
+    mean_a = Xz[idx_a].mean(axis=0)
+    mean_b = Xz[idx_b].mean(axis=0)
+    # pooled std on already standardized features ~1; still compute robustly
+    sd_a = Xz[idx_a].std(axis=0, ddof=1)
+    sd_b = Xz[idx_b].std(axis=0, ddof=1)
+    sd_p = np.sqrt(((sd_a ** 2) + (sd_b ** 2)) / 2.0)
+    sd_p[sd_p == 0] = 1.0  # avoid divide-by-zero
+    d = (mean_a - mean_b) / sd_p
+    return pd.Series(d, index=feature_names).sort_values(ascending=False)
 
-dataset_names = [p.name for p in csv_paths]  # or dataset_labels if you built them
-selected_idx = st.sidebar.selectbox("Dataset",
-                                    options=list(range(len(dataset_names))),
-                                    format_func=lambda i: dataset_names[i],
-                                    index=0)
-show_all = st.sidebar.checkbox("Show all datasets", value=False)
-label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()))
-show_top = st.sidebar.number_input("Show Top-N anomalies table per dataset (0 to hide)",
-                                   min_value=0, max_value=1000, value=10, step=1)
+# ADD: pretty display names (collapse one-hot names like 'Simulation_Host_hostA' -> 'Simulation_Host=hostA')
+def _pretty_feat_names(names: list[str]) -> list[str]:
+    out = []
+    for n in names:
+        if "_" in n and any(n.startswith(prefix) for prefix in ["V_", "Simulation_Host_"]):
+            base, val = n.split("_", 1)
+            out.append(f"{base}={val}")
+        else:
+            out.append(n)
+    return out
 
-# Optional per-method knobs (global)
-if_contam = st.sidebar.slider("IF: Contamination (expected anomaly %)", 0.0, 0.2, 0.02, 0.005)
-if_trees  = st.sidebar.slider("IF: Trees (n_estimators)", 100, 1000, 300, 50)
-lof_k     = st.sidebar.slider("LOF: Neighbors (n_neighbors)", 5, 100, 20, 1)
-ae_w1     = st.sidebar.slider("AE: Hidden size 1", 4, 64, 16, 2)
-ae_w2     = st.sidebar.slider("AE: Bottleneck", 2, 32, 8, 1)
-ae_w3     = st.sidebar.slider("AE: Hidden size 3", 4, 64, 16, 2)
-ae_iter   = st.sidebar.slider("AE: Max epochs", 100, 1000, 400, 50)
-
-# =========================
-# Utility to render a single tab (table + plot with highlight)
-# =========================
-def _render_table_and_plot(df: pd.DataFrame, PCs: np.ndarray, scores01: np.ndarray, raw_scores: np.ndarray, method_label: str):
-    df = df.copy()
-    df["anomaly_score"] = scores01
-    df["raw_anomaly_score"] = raw_scores
-
-    st.markdown(f"### {method_label}")
-    highlight_pos = None
-    if show_top > 0:
-        cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score","raw_anomaly_score",
-                     "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
-        cols_keep = [c for c in cols_keep if c in df.columns]
-        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-
-        st.markdown("**Top anomalies**")
-        editable = top[cols_keep].copy()
-        editable.insert(0, "Select", False)
-        edited = st.data_editor(
-            editable,
-            use_container_width=True,
-            num_rows="fixed",
-            disabled={c: True for c in editable.columns if c != "Select"}
-        )
-        selected_original_idxs = edited.index[edited["Select"]].tolist()
-        if selected_original_idxs:
-            pos = df.index.get_indexer([selected_original_idxs[0]])
-            if len(pos) and pos[0] != -1:
-                highlight_pos = int(pos[0])
-
-    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+# ADD: simple insight bar-renderer
+def _render_insight_bars(effects: pd.Series, title: str, k: int = 5):
+    if effects.empty:
+        st.info(f"No differences available for {title}.")
+        return
+    top_pos = effects.head(k)
+    top_neg = effects.tail(k)
+    # Combine for one chart (positive at top, negative at bottom)
+    comb = pd.concat([top_pos, top_neg])
+    disp = comb.copy()
+    disp.index = _pretty_feat_names(list(disp.index))
+    fig = go.Figure(go.Bar(
+        x=disp.values,
+        y=disp.index.tolist(),
+        orientation="h",
+        hovertemplate="%{y}: %{x:.2f}σ difference<extra></extra>"
+    ))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Standardized difference (σ)",
+        yaxis_title="Feature",
+        height=350,
+        margin=dict(l=10, r=10, t=40, b=10),
+        bargap=0.2,
+    )
     st.plotly_chart(fig, use_container_width=True)
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+# MODIFIED: return feature names and standardized matrix from fit
+def fit_pca_scaled(X: np.ndarray, n_components: int = 3):
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+    k = max(1, min(n_components, Xz.shape[0], Xz.shape[1]))
+    pca = PCA(n_components=k)
+    PCs = pca.fit_transform(Xz)
+    return scaler, pca, Xz, PCs  # Xz reused for driver analysis
 
-# =========================
-# New render_one: compute all methods + consensus; show tabs
-# =========================
-def render_one(path: Path):
-    try:
-        raw = load_csv(path)
-        df = engineer_features(raw)
+_, _, Xz, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
+feature_names = list(X.columns)  # keep names aligned to Xz columns
 
-        # Features + scaling once
-        X = build_features(df).to_numpy(dtype=float)
-        Xz, _ = scale_features(df)
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+# ADD: Insights panel – explains what drives HIGH vs LOW (for continuous) or a chosen category (for categorical)
+with st.expander("Why are these high/low? (Insights)", expanded=True):
+    selected_label = LABEL_DICT[label_choice]
 
-        # PCA only for viz
-        _, _, _, PCs = fit_pca_scaled(X, n_components=3)
+    if selected_label in CONTINUOUS_LABELS:
+        # Split by quantiles: top 20% vs bottom 20%
+        series = df[selected_label].astype(float)
+        if series.notna().sum() >= 10:  # need a few data points
+            q_low, q_high = series.quantile([0.2, 0.8])
+            idx_high = series >= q_high
+            idx_low  = series <= q_low
 
-        # Score each method
-        _, if_raw  = score_isolation_forest(Xz, contamination=if_contam, n_estimators=if_trees)
-        _, lof_raw = score_lof(Xz, n_neighbors=lof_k)
-        _, ae_raw  = score_autoencoder(Xz, hidden=(ae_w1, ae_w2, ae_w3), max_iter=ae_iter)
+            effects = _standardized_effects(Xz, feature_names, idx_high.values, idx_low.values)
 
-        if_s01  = normalize_scores(if_raw)
-        lof_s01 = normalize_scores(lof_raw)
-        ae_s01  = normalize_scores(ae_raw)
+            # Visual overlays on plot: mark groups (halo markers) — optional but helpful
+            # Save for downstream if you want to overlay; here we just show bars:
+            _render_insight_bars(effects, title=f"Drivers of HIGH vs LOW {label_choice} (top 20% vs bottom 20%)")
 
-        # Consensus: mean rank across methods (lower rank = more anomalous)
-        import numpy as np
-        def ranks(arr):
-            # rank 1 = most anomalous (highest score), so reverse sort
-            order = np.argsort(-arr)
-            inv = np.empty_like(order)
-            inv[order] = np.arange(1, len(arr)+1)
-            return inv.astype(float)
+            # Friendly chips
+            if not effects.empty:
+                pos = effects.head(3)
+                neg = effects.tail(3)
+                st.markdown(
+                    "🔺 **Higher in High group:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** (+{v:.2f}σ)" for i, v in pos.items()])
+                )
+                st.markdown(
+                    "🔻 **Lower in High group:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** ({v:.2f}σ)" for i, v in neg.items()])
+                )
+        else:
+            st.info("Not enough data to compute high/low insights.")
 
-        r_if, r_lof, r_ae = ranks(if_s01), ranks(lof_s01), ranks(ae_s01)
-        consensus_rank = (r_if + r_lof + r_ae) / 3.0
-        # Convert consensus to a 0-1 score for coloring (invert: higher = more anomalous)
-        # Use normalized inverse ranks
-        cons_score01 = normalize_scores((1.0 / consensus_rank))
+    else:
+        # Categorical: let user pick a category and compare to overall
+        cats = df[selected_label].dropna().astype(str).unique().tolist()
+        if not cats:
+            st.info("No categories available.")
+        else:
+            cat_pick = st.selectbox(f"Explain differences for {label_choice}", cats, key=f"insights_{label_choice}")
+            idx_cat = df[selected_label].astype(str).eq(cat_pick).values
+            idx_all = ~np.isnan(Xz[:,0])  # everyone
 
-        st.subheader(f"{path.name} · Multi-Method Anomaly Analysis")
+            effects = _standardized_effects(Xz, feature_names, idx_cat, ~idx_cat)
+            _render_insight_bars(effects, title=f"Drivers of {label_choice} = {cat_pick} vs Others")
 
-        tab_if, tab_lof, tab_ae, tab_cons = st.tabs([
-            "Isolation Forest", "Local Outlier Factor", "Autoencoder", "Consensus"
-        ])
+            if not effects.empty:
+                pos = effects.head(3)
+                neg = effects.tail(3)
+                st.markdown(
+                    f"🧭 **More characteristic of `{cat_pick}`:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** (+{v:.2f}σ)" for i, v in pos.items()])
+                )
+                st.markdown(
+                    f"🧭 **Less characteristic of `{cat_pick}`:** " + ", ".join([f"**{_pretty_feat_names([i])[0]}** ({v:.2f}σ)" for i, v in neg.items()])
+                )
 
-        with tab_if:
-            _render_table_and_plot(df, PCs, if_s01, if_raw, "Isolation Forest")
 
-        with tab_lof:
-            _render_table_and_plot(df, PCs, lof_s01, lof_raw, "Local Outlier Factor")
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+# OPTIONAL: Overlay halos for high/low (continuous case)
+if selected_label in CONTINUOUS_LABELS:
+    series = df[selected_label].astype(float)
+    if series.notna().sum() >= 10:
+        q_low, q_high = series.quantile([0.2, 0.8])
+        idx_high = series >= q_high
+        idx_low  = series <= q_low
 
-        with tab_ae:
-            _render_table_and_plot(df, PCs, ae_s01, ae_raw, "Autoencoder (Reconstruction)")
+        if PCs.shape[1] >= 3:
+            fig.add_trace(go.Scatter3d(
+                x=PCs[idx_high,0], y=PCs[idx_high,1], z=PCs[idx_high,2],
+                mode="markers",
+                marker=dict(size=6, symbol="circle-open", line=dict(width=2)),
+                name=f"High {label_choice} (top 20%)",
+                hoverinfo="skip",
+                showlegend=True
+            ))
+            fig.add_trace(go.Scatter3d(
+                x=PCs[idx_low,0], y=PCs[idx_low,1], z=PCs[idx_low,2],
+                mode="markers",
+                marker=dict(size=6, symbol="diamond-open", line=dict(width=2)),
+                name=f"Low {label_choice} (bottom 20%)",
+                hoverinfo="skip",
+                showlegend=True
+            ))
+        else:
+            fig.add_trace(go.Scatter(
+                x=PCs[idx_high,0], y=PCs[idx_high,1],
+                mode="markers",
+                marker=dict(size=8, symbol="circle-open", line=dict(width=2)),
+                name=f"High {label_choice} (top 20%)",
+                hoverinfo="skip",
+                showlegend=True
+            ))
+            fig.add_trace(go.Scatter(
+                x=PCs[idx_low,0], y=PCs[idx_low,1],
+                mode="markers",
+                marker=dict(size=8, symbol="diamond-open", line=dict(width=2)),
+                name=f"Low {label_choice} (bottom 20%)",
+                hoverinfo="skip",
+                showlegend=True
+            ))
 
-        with tab_cons:
-            # For consensus, "raw" is the mean rank (lower = worse); we show both.
-            _render_table_and_plot(
-                df.assign(consensus_rank=consensus_rank),
-                PCs,
-                cons_score01,
-                consensus_rank,  # raw
-                "Consensus (mean rank of IF, LOF, AE)"
-            )
 
-    except Exception as e:
-        st.error(f"Failed to process {path.name}: {e}")
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================

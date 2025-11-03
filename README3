@@ -1,181 +1,134 @@
-# NEW: utilities to compute "drivers" that explain groupings
+# MODIFIED: new imports for stats
+from sklearn.feature_selection import f_classif
+from scipy.stats import spearmanr
 
-DRIVER_NUMERIC_CANDIDATES = ["FR", "Num_Tests", "total_init_time", "P", "F", "B", "U"]
+# MODIFIED: helper – derive discrete groups from the selected label (bins for continuous; categories as-is)
+def derive_groups(df: pd.DataFrame, selected_label: str) -> pd.Series:
+    if selected_label in CONTINUOUS_LABELS:
+        s = pd.to_numeric(df[selected_label], errors="coerce")
+        q33, q66 = s.quantile([0.33, 0.66])
+        def _bin(v):
+            if pd.isna(v): return "NA"
+            if v <= q33: return "Low"
+            if v <= q66: return "Mid"
+            return "High"
+        return s.apply(_bin)
+    else:
+        return df[selected_label].astype(str).fillna("NA")
 
-def _present_numeric_features(df: pd.DataFrame) -> list[str]:
-    """Keep only driver numeric columns that are present in df."""
-    return [c for c in DRIVER_NUMERIC_CANDIDATES if c in df.columns]
-
-def _zscore_cols(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
-    arr = df[cols].astype(float)
-    mu = arr.mean(axis=0)
-    sd = arr.std(axis=0).replace(0, 1.0)
-    return (arr - mu) / sd
-
-def compute_continuous_drivers(df: pd.DataFrame, label: str, top_k: int = 8):
+# MODIFIED: helper – compute per-group "signals" (top-k features with direction) for explanation
+def compute_group_signals(df: pd.DataFrame, groups: pd.Series, top_k: int = 3) -> dict:
     """
-    For continuous 'label', return:
-    - corr_df: Pearson correlations between label and each numeric feature (sorted by |r|)
-    - contrast_df: mean(z) in top quantile minus bottom quantile for each feature
+    Returns dict[group_name] = list of strings like 'FR↑ (+2.1σ)', ranked by effect size / correlation.
+    Uses numeric, interpretable features only.
     """
-    feats = _present_numeric_features(df)
-    feats_wo_label = [f for f in feats if f != label]
+    # Choose a compact, interpretable set (avoid double-counting counts if FR & Num_Tests present)
+    candidate_feats = [c for c in ["FR","Num_Tests","total_init_time","P","F","B","U"] if c in df.columns]
+    X = df[candidate_feats].apply(pd.to_numeric, errors="coerce")
+    Z = (X - X.mean()) / X.std(ddof=0).replace(0, np.nan)  # z-scores for direction/scale
+    
+    signals = {}
+    if groups.nunique() <= 1:
+        # Degenerate case
+        for g in groups.unique():
+            signals[g] = []
+        return signals
 
-    if not feats_wo_label:
-        return pd.DataFrame(), pd.DataFrame()
+    if groups.dtype == "object" or groups.nunique() <= 12:
+        # Categorical grouping: one-vs-rest Cohen's d per feature as ranking
+        for g in groups.unique():
+            idx = (groups == g)
+            sigs = []
+            for f in candidate_feats:
+                a = Z.loc[idx, f].dropna()
+                b = Z.loc[~idx, f].dropna()
+                if len(a) < 3 or len(b) < 3:
+                    continue
+                # Cohen's d (pooled)
+                na, nb = len(a), len(b)
+                sa2, sb2 = a.var(ddof=1), b.var(ddof=1)
+                sp = np.sqrt(((na-1)*sa2 + (nb-1)*sb2) / max(na+nb-2, 1))
+                if sp == 0 or np.isnan(sp): 
+                    continue
+                d = (a.mean() - b.mean()) / sp
+                arrow = "↑" if d > 0 else "↓"
+                sigs.append((abs(d), f"{f}{arrow} ({a.mean():+.1f}σ)"))
+            sigs.sort(reverse=True, key=lambda x: x[0])
+            signals[g] = [s for _, s in sigs[:top_k]]
+    else:
+        # Fallback (shouldn't hit here often), treat as categorical
+        return compute_group_signals(df, groups.astype(str), top_k)
 
-    # correlations (numeric) with the selected label
-    corr = {}
-    x = pd.to_numeric(df[label], errors="coerce")
-    for f in feats_wo_label:
-        y = pd.to_numeric(df[f], errors="coerce")
-        valid = x.notna() & y.notna()
-        if valid.sum() < 3:
-            continue
-        r = np.corrcoef(x[valid], y[valid])[0, 1]
-        corr[f] = r
-    corr_df = (pd.Series(corr, name="r")
-               .reindex(feats_wo_label)
-               .dropna()
-               .to_frame()
-               .assign(abs_r=lambda d: d["r"].abs())
-               .sort_values("abs_r", ascending=False)
-               .drop(columns="abs_r")
-               .head(top_k))
+    # Global ranking as tiebreaker (optional): ANOVA F across groups – not shown, but improves stability
+    try:
+        y = pd.Categorical(groups).codes
+        F_vals, _ = f_classif(X.fillna(0), y)
+        F_rank = dict(zip(candidate_feats, F_vals))
+        for g, lst in signals.items():
+            lst.sort(key=lambda s: F_rank.get(s.split("↑")[0].split("↓")[0], 0), reverse=True)
+            signals[g] = lst[:top_k]
+    except Exception:
+        pass
 
-    # high vs low quantile contrast on standardized features
-    z = _zscore_cols(df, feats_wo_label)
-    qhi = df[label].quantile(0.80)
-    qlo = df[label].quantile(0.20)
-    hi = z.loc[df[label] >= qhi].mean()
-    lo = z.loc[df[label] <= qlo].mean()
-    contrast = (hi - lo).to_frame("hi_minus_lo_z").sort_values("hi_minus_lo_z", ascending=False)
-    contrast_df = contrast.head(top_k).append(contrast.tail(top_k))
-
-    return corr_df, contrast_df
-
-def compute_categorical_drivers(df: pd.DataFrame, label: str, top_groups: int = 12):
-    """
-    For categorical 'label', return a heatmap-ready DataFrame of
-    group mean z-scores minus global mean for numeric features.
-    """
-    feats = _present_numeric_features(df)
-    if not feats or label not in df.columns:
-        return pd.DataFrame()
-
-    # standardized features
-    z = _zscore_cols(df, feats)
-    z["__group__"] = df[label].astype(str)
-
-    # restrict to most frequent groups to keep the heatmap readable
-    top_labels = z["__group__"].value_counts().head(top_groups).index
-    g = z[z["__group__"].isin(top_labels)]
-
-    grp_means = g.groupby("__group__")[feats].mean()
-    # since we z-scored globally, group means already reflect deviation vs global mean
-    # reshape for heatmap (rows = groups, cols = features)
-    return grp_means
-
-def top_row_drivers(df: pd.DataFrame, idx: int, k: int = 2) -> str:
-    """Return a compact 'Top_Drivers' string for a row using largest |z| across numeric features."""
-    feats = _present_numeric_features(df)
-    if not feats:
-        return ""
-    z = _zscore_cols(df, feats)
-    if idx not in z.index:
-        return ""
-    row = z.loc[idx].abs().sort_values(ascending=False).head(k)
-    pieces = []
-    for f, val in row.items():
-        sign = "+" if z.loc[idx, f] >= 0 else "−"
-        pieces.append(f"{f}({sign}{abs(z.loc[idx, f]):.1f}σ)")
-    return ", ".join(pieces)
+    return signals
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-# --- AFTER plotting fig and before/after the Top anomalies table, add driver visuals ---
+# MODIFIED: update plot builder to accept groups & signals and inject them into hover text
+def plot_for_df(df: pd.DataFrame, PCs: np.ndarray, selected_label_name: str, highlight_pos: int | None = None,
+                groups: pd.Series | None = None, group_signals: dict | None = None) -> go.Figure:
+    selected_label = LABEL_DICT[selected_label_name]
+    scores = compute_anomaly_scores(PCs)
+    is_3d = PCs.shape[1] >= 3
 
-st.markdown("### What’s driving this grouping?")
+    if groups is None:
+        groups = derive_groups(df, selected_label)
+    if group_signals is None:
+        group_signals = compute_group_signals(df, groups)
 
-selected_key = LABEL_DICT[label_choice]
+    # base hover fields
+    base_cols = ["Test_Run_ID","FR","Num_Tests","total_init_time"]
+    for c in base_cols:
+        if c not in df.columns: df[c] = np.nan
 
-if selected_key in CONTINUOUS_LABELS:
-    # CONTINUOUS: show correlations and hi-vs-lo contrasts
-    corr_df, contrast_df = compute_continuous_drivers(df, selected_key, top_k=8)
+    # Build per-point hover with signals for its group
+    sig_for_row = groups.map(lambda g: ", ".join(group_signals.get(g, [])))
+    hovertext_common = [
+        f"Cluster: {grp}<br>Signals: {sig}<br>Test Run ID: {trid}<br>FR: {fr:.3f}<br>Total Tests: {nt}<br>Total Time: {tt}<br>Anomaly: {s:.3f}"
+        for grp, sig, trid, fr, nt, tt, s in zip(groups, sig_for_row, df["Test_Run_ID"], df["FR"], df["Num_Tests"], df["total_init_time"], scores)
+    ]
 
-    if not corr_df.empty:
-        corr_fig = go.Figure(go.Bar(
-            x=corr_df["r"].values,
-            y=corr_df.index.tolist(),
-            orientation="h",
-            hovertemplate="%{y}: r=%{x:.3f}<extra></extra>"
-        ))
-        corr_fig.update_layout(
-            title=f"Feature correlations with {selected_key}",
-            xaxis_title="Pearson r",
-            yaxis_title="Feature",
-            height=400,
-            margin=dict(l=10, r=10, t=40, b=10)
-        )
-        st.plotly_chart(corr_fig, use_container_width=True)
+    # --- existing coloring logic remains unchanged; just replace hovertext=... with hovertext_common ---
+    # For brevity, show one example branch; apply similarly in your existing branches:
+    # (Inside your continuous-label branch, when you add the main scatter trace:)
+    # fig.add_trace(go.Scatter3d(..., hovertext=hovertext_common, hoverinfo="text", ...))
 
-    if not contrast_df.empty:
-        # Sort so positives at top, negatives at bottom
-        contrast_df = contrast_df.sort_values("hi_minus_lo_z")
-        con_fig = go.Figure(go.Bar(
-            x=contrast_df["hi_minus_lo_z"].values,
-            y=contrast_df.index.tolist(),
-            orientation="h",
-            hovertemplate="%{y}: Δz (hi–low)=%{x:.2f}<extra></extra>"
-        ))
-        con_fig.update_layout(
-            title=f"High vs Low {selected_key}: feature contrast (Δz)",
-            xaxis_title="Mean z-score (High quantile − Low quantile)",
-            yaxis_title="Feature",
-            height=400,
-            margin=dict(l=10, r=10, t=40, b=10)
-        )
-        st.plotly_chart(con_fig, use_container_width=True)
+    # ADD highlight overlay (unchanged) at the end ...
+    # (keep your existing highlight code)
+    # fig.update_layout(...) and return
 
-else:
-    # CATEGORICAL: show heatmap of group mean z-scores
-    hm = compute_categorical_drivers(df, selected_key, top_groups=12)
-    if not hm.empty:
-        heat = go.Figure(data=go.Heatmap(
-            z=hm.values,
-            x=hm.columns.tolist(),
-            y=hm.index.tolist(),
-            zmid=0.0,
-            colorscale="RdBu",
-            hovertemplate="Group=%{y}<br>%{x}: z=%{z:.2f}<extra></extra>"
-        ))
-        heat.update_layout(
-            title=f"Which features define each {selected_key} group? (mean z-score vs global)",
-            xaxis_title="Feature",
-            yaxis_title=selected_key,
-            height=500,
-            margin=dict(l=10, r=10, t=40, b=10)
-        )
-        st.plotly_chart(heat, use_container_width=True)
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-# (inside render_one, where you build Top anomalies)
+
+# MODIFIED: in render_one(...), compute groups & signals once, pass to plot, and augment table with cluster/signals
+groups = derive_groups(df, LABEL_DICT[label_choice])
+group_signals = compute_group_signals(df, groups, top_k=3)
+
+# ... build Top anomalies table
 if show_top > 0:
     cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score",
                  "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
     cols_keep = [c for c in cols_keep if c in df.columns]
-
     top = df.sort_values("anomaly_score", ascending=False).head(show_top).copy()
 
-    # NEW: per-row short explanation of main drivers (largest |z| features)
-    top["Top_Drivers"] = [
-        top_row_drivers(df, idx, k=2) for idx in top.index
-    ]
+    # MODIFIED: add cluster & signals columns for interpretability
+    top["Cluster"] = groups.loc[top.index].values
+    top["Signals"] = top["Cluster"].map(lambda g: ", ".join(group_signals.get(g, [])))
 
     st.markdown("**Top anomalies**")
-    editable = top[["Top_Drivers"] + cols_keep].copy()
+    editable = top[["Cluster","Signals"] + cols_keep].copy()
     editable.insert(0, "Select", False)
 
     edited = st.data_editor(
@@ -191,11 +144,23 @@ if show_top > 0:
         if len(pos) and pos[0] != -1:
             highlight_pos = int(pos[0])
 
+# MODIFIED: pass groups & group_signals so hover shows explanations
+fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos, groups=groups, group_signals=group_signals)
+st.plotly_chart(fig, use_container_width=True)
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+# MODIFIED: inside your existing plot_for_df branches,
+# replace previous `hovertext = ...` with the unified `hovertext_common`.
+# Example (continuous + 3D branch):
+fig = go.Figure(go.Scatter3d(
+    x=PCs[:,0], y=PCs[:,1], z=PCs[:,2],
+    mode="markers",
+    hovertext=hovertext_common, hoverinfo="text",
+    marker=marker
+))
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

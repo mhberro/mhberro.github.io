@@ -1,111 +1,142 @@
-# NEW: helper to build a contribution bar chart for a selected point
-def feature_contrib_plot(xz_row: np.ndarray, feature_names: list[str], top_k: int = 8) -> go.Figure:
-    # importance = squared z-score (bigger => more responsible for anomaly)
-    z = xz_row.astype(float)
-    imp = z ** 2
-    dir_sign = np.sign(z)  # +1 / -1
+# NEW: feature contribution utilities
+FEATURE_ORDER = ["P","F","B","U","total_init_time","FR","Num_Tests"]
 
-    contrib = pd.DataFrame({
-        "feature": feature_names,
-        "importance": imp,
-        "z": z,
-        "direction": np.where(dir_sign >= 0, "↑", "↓"),
-    })
+def contribution_zscore(Xz: np.ndarray, idx: int) -> pd.Series:
+    """Model-agnostic: absolute standardized distance per feature (bigger = more 'weird')."""
+    v = np.abs(Xz[idx])  # since Xz is standardized (mean 0, std 1)
+    return pd.Series(v, index=FEATURE_ORDER)
 
-    # keep top_k most important features
-    contrib = contrib.sort_values("importance", ascending=False).head(top_k)
-    contrib = contrib.sort_values("importance", ascending=True)  # small->large for nicer horizontal bars
+def contribution_ae_per_feature(Xz: np.ndarray, ae_model: MLPRegressor, idx: int) -> pd.Series:
+    """Autoencoder per-feature reconstruction MSE."""
+    x = Xz[idx:idx+1]
+    xhat = ae_model.predict(x)
+    v = ((x - xhat) ** 2).ravel()
+    return pd.Series(v, index=FEATURE_ORDER)
 
-    # bar figure
-    fig = go.Figure(go.Bar(
-        x=contrib["importance"],
-        y=contrib["feature"],
+def contribution_lof_knn_dev(Xz: np.ndarray, idx: int, k: int = 20) -> pd.Series:
+    """LOF-style: per-feature |x - mean(neighbors)|. Fast kNN via brute force."""
+    from sklearn.neighbors import NearestNeighbors
+    k = max(5, min(k, Xz.shape[0]-1))
+    nn = NearestNeighbors(n_neighbors=k+1, algorithm="auto").fit(Xz)
+    dists, nbrs = nn.kneighbors(Xz[idx:idx+1], return_distance=True)
+    nbr_idx = nbrs[0][1:]  # drop self
+    mu = Xz[nbr_idx].mean(axis=0)
+    v = np.abs(Xz[idx] - mu)
+    return pd.Series(v, index=FEATURE_ORDER)
+
+def normalize_series_for_bar(s: pd.Series) -> pd.Series:
+    """Robust 0-1 scaling for nicer bars."""
+    s = s.fillna(0.0)
+    if s.max() == s.min():
+        return s * 0.0
+    return (s - s.min()) / (s.max() - s.min())
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+# NEW: render contribution bar chart
+def render_contribution_bar(contrib: pd.Series, title: str, key: str):
+    contrib = contrib.sort_values(ascending=True)
+    fig_bar = go.Figure(go.Bar(
+        x=contrib.values,
+        y=contrib.index.tolist(),
         orientation="h",
-        text=[f'{d}{abs(val):.2f}σ' for d, val in zip(contrib["direction"], contrib["z"])],
-        textposition="outside"
+        hoverinfo="x+y"
     ))
-    fig.update_layout(
-        title="Why this point looks odd",
-        xaxis_title="Importance (squared z-score)",
+    fig_bar.update_layout(
+        title=title,
+        xaxis_title="Relative contribution (0–1)",
         yaxis_title="Feature",
-        margin=dict(l=10, r=10, t=40, b=10),
-        height=420
+        height=320,
+        margin=dict(l=80, r=10, t=40, b=30)
     )
-    return fig
+    st.plotly_chart(fig_bar, use_container_width=True, key=key)
 
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-# MODIFIED: keep scaler outputs and standardized matrix from fit_pca_scaled
-scaler, pca, Xz, PCs = fit_pca_scaled(X.to_numpy(), n_components=3)
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-# MODIFIED: render_one() – create a two-column layout and render contributions for the selected point
-st.subheader(path.name)
+# MODIFIED: in _render_table_and_plot(), after you determine `highlight_pos`
+# and BEFORE calling plot_for_df(...), add:
 
-# ---------- Top anomalies (user selection drives highlight & contributions) ----------
-highlight_pos = None
-if show_top > 0:
-    cols_keep = ["Test_Run_ID","FR","Num_Tests","total_init_time","anomaly_score",
-                 "Simulation_Host","Simulation_Node","Capability","Script_File","V","s_number","Build"]
-    cols_keep = [c for c in cols_keep if c in df.columns]
+# default selection: top anomaly if user hasn't clicked/checked anything
+if highlight_pos is None and len(df) > 0:
+    highlight_pos = int(df["anomaly_score"].values.argmax())
 
-    top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-    st.markdown("**Top anomalies**")
+# Choose contribution mode based on the tab/method
+# We detect method by the method_label string you already pass in.
+contrib = None
+if "Isolation Forest" in method_label:
+    # model-agnostic z-scores (works for any method)
+    Xz, _ = scale_features(df)
+    contrib = normalize_series_for_bar(contribution_zscore(Xz, highlight_pos))
+elif "Local Outlier Factor" in method_label:
+    Xz, _ = scale_features(df)
+    contrib = normalize_series_for_bar(contribution_lof_knn_dev(Xz, highlight_pos, k=lof_k))
+elif "Autoencoder" in method_label:
+    # re-use Xz and the already-trained AE if you have it; else recompute quickly here
+    Xz, _ = scale_features(df)
+    # Train a tiny AE just-in-time for per-feature errors (fast on typical sizes)
+    ae_model, _ = score_autoencoder(Xz, hidden=(ae_w1, ae_w2, ae_w3), max_iter=ae_iter)
+    contrib = normalize_series_for_bar(contribution_ae_per_feature(Xz, ae_model, highlight_pos))
+elif "Consensus" in method_label:
+    # fall back to z-scores for a neutral, model-agnostic view
+    Xz, _ = scale_features(df)
+    contrib = normalize_series_for_bar(contribution_zscore(Xz, highlight_pos))
 
-    editable = top[cols_keep].copy()
-    editable.insert(0, "Select", False)
+# Render contribution bar (if we have something to show)
+if contrib is not None:
+    run_id = df.iloc[highlight_pos].get("Test_Run_ID", "(unknown)")
+    render_contribution_bar(contrib, title=f"Feature contributions · Run {run_id}", key=f"{key_prefix}-bar")
 
-    edited = st.data_editor(
-        editable,
-        use_container_width=True,
-        num_rows="fixed",
-        disabled={c: True for c in editable.columns if c != "Select"}
-    )
 
-    # Map the first selected row back to the original df row position
-    selected_original_idxs = edited.index[edited["Select"]].tolist()
-    if selected_original_idxs:
-        pos = df.index.get_indexer([selected_original_idxs[0]])
-        if len(pos) and pos[0] != -1:
-            highlight_pos = int(pos[0])
+=========================================================================================================================================================================
+=========================================================================================================================================================================
 
-# ---------- LAYOUT: plot (left) and contributions (right) ----------
-left, right = st.columns([3, 2], vertical_alignment="top")
+pip install streamlit-plotly-events
 
-with left:
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+# OPTIONAL: click-to-select a point on the scatter (if the package is installed)
+try:
+    from streamlit_plotly_events import plotly_events
+    # draw plot first (no key clash)
     fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
-    st.plotly_chart(fig, use_container_width=True)
-
-with right:
-    st.markdown("### Root-cause cues")
-    if highlight_pos is None:
-        # default to the top anomaly if nothing selected
-        default_idx = int(df["anomaly_score"].values.argmax())
-        xz_row = Xz[default_idx]
-        st.caption("Showing top-ranked anomaly (select a row in the table to update)")
+    clicked = plotly_events(fig, click_event=True, hover_event=False, select_event=False, key=f"{key_prefix}-plot-events")
+    # if user clicked, map it to nearest point by coordinates and update highlight_pos
+    if clicked:
+        # Extract clicked coordinates
+        cx = clicked[0].get("x")
+        cy = clicked[0].get("y")
+        cz = clicked[0].get("z")
+        # Find nearest point in PCs
+        pts = PCs[:, :3]
+        target = np.array([[cx, cy, cz]]) if cz is not None else np.array([[cx, cy]])
+        d = np.linalg.norm(pts[:, :target.shape[1]] - target, axis=1)
+        highlight_pos = int(np.argmin(d))
+        # re-render contributions for the clicked point
+        if "Isolation Forest" in method_label:
+            Xz, _ = scale_features(df); contrib = normalize_series_for_bar(contribution_zscore(Xz, highlight_pos))
+        elif "Local Outlier Factor" in method_label:
+            Xz, _ = scale_features(df); contrib = normalize_series_for_bar(contribution_lof_knn_dev(Xz, highlight_pos, k=lof_k))
+        elif "Autoencoder" in method_label:
+            Xz, _ = scale_features(df); ae_model, _ = score_autoencoder(Xz, hidden=(ae_w1, ae_w2, ae_w3), max_iter=ae_iter)
+            contrib = normalize_series_for_bar(contribution_ae_per_feature(Xz, ae_model, highlight_pos))
+        else:
+            Xz, _ = scale_features(df); contrib = normalize_series_for_bar(contribution_zscore(Xz, highlight_pos))
+        run_id = df.iloc[highlight_pos].get("Test_Run_ID", "(unknown)")
+        render_contribution_bar(contrib, title=f"Feature contributions · Run {run_id}", key=f"{key_prefix}-bar-clicked")
     else:
-        xz_row = Xz[highlight_pos]
-
-    contrib_fig = feature_contrib_plot(xz_row, feature_names=list(X.columns), top_k=8)
-    st.plotly_chart(contrib_fig, use_container_width=True)
-
-    # Optional quick-glance badges
-    top_feats = (np.abs(xz_row)).argsort()[::-1][:3]
-    badges = ", ".join([list(X.columns)[i] for i in top_feats])
-    st.write(f"**Most unusual features:** {badges}")
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
+        # fallback to regular chart render if no click occurred
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
+except Exception:
+    # package not installed: fall back to regular plot
+    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
 
 
 =========================================================================================================================================================================

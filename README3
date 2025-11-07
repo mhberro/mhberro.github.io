@@ -1,93 +1,117 @@
-def add_biplot_arrows_at_anchor_3d(
-    fig: go.Figure,
-    pca,
-    feature_names: list[str],
-    anchor: np.ndarray,
-    *,
-    scale: float = 1.5,
-    color: str | None = None,
-    name_prefix: str = "",
-    showlegend: bool = False,
-):
-    """
-    Draw PCA loading arrows but *anchored* at a specified 3D point (anchor),
-    using the same global PCA directions (first 2–3 PCs).
-    This visually associates feature directions with a local cluster.
+# NEW: helper to pick ONLY numeric features from FEATURES_FOR_ANALYSIS for charts/z-scores
+def get_numeric_analysis_features(df: pd.DataFrame) -> list[str]:
+    if not FEATURES_FOR_ANALYSIS:
+        return []
+    usable = []
+    for c in FEATURES_FOR_ANALYSIS:
+        if c in df.columns and pd.api.types.is_numeric_dtype(df[c]):
+            usable.append(c)
+    return usable
 
-    Parameters
-    ----------
-    fig : plotly.graph_objects.Figure
-        Target figure (3D scatter) to overlay arrows into.
-    pca : fitted sklearn.decomposition.PCA
-        The global PCA used for visualization.
-    feature_names : list[str]
-        Names of features corresponding to the PCA fit order.
-    anchor : np.ndarray
-        3D point (PC1, PC2, PC3) to anchor the arrows from (e.g., a cluster centroid).
-    scale : float
-        Arrow length multiplier in PC units.
-    color : Optional[str]
-        Line/text color for the arrows (e.g., 'green', 'red').
-    name_prefix : str
-        Prefix for trace names (e.g., 'Low FR', 'High FR').
-    showlegend : bool
-        Whether to show a legend entry for each arrow line (usually False to avoid clutter).
-    """
-    loadings = getattr(pca, "components_", None)
-    if loadings is None:
-        return fig
-    loadings = loadings.T  # shape: (n_features, n_components)
-    k = min(3, loadings.shape[1])
-    if k < 2:
+
+
+# MODIFIED: z-score frame now guards empty/invalid feature lists
+def zscore_frame(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    cols = [c for c in cols if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    if not cols:
+        return pd.DataFrame(index=df.index)
+    z = df[cols].astype(float)
+    mu = z.mean(axis=0)
+    sd = z.std(axis=0).replace(0, 1.0)
+    return (z - mu) / sd
+
+
+# MODIFIED: segment compare uses only numeric analysis features; handles empty case
+def segment_diff_bar(df: pd.DataFrame) -> go.Figure:
+    feats = get_numeric_analysis_features(df)
+    fig = go.Figure()
+    if not feats:
+        fig.update_layout(
+            title="Feature Difference (High FR − Low FR) [z-score] — No numeric features selected",
+            height=220, margin=dict(l=10, r=10, t=40, b=10)
+        )
         return fig
 
-    ax, ay, az = (anchor[0], anchor[1], anchor[2]) if len(anchor) >= 3 else (anchor[0], anchor[1], 0.0)
+    seg = make_fr_segments(df)
+    z = zscore_frame(df, feats)
+    low = z[seg == "Low FR"].mean()
+    high = z[seg == "High FR"].mean()
+    diff = (high - low).sort_values(key=lambda s: s.abs(), ascending=False)
 
-    for i, fname in enumerate(feature_names):
-        vec = loadings[i, :k] * scale
-        if k >= 3:
-            x = [ax, ax + float(vec[0])]
-            y = [ay, ay + float(vec[1])]
-            z = [az, az + float(vec[2])]
-            fig.add_trace(
-                go.Scatter3d(
-                    x=x, y=y, z=z, mode="lines",
-                    line=dict(width=4, color=color) if color else dict(width=4),
-                    name=f"{name_prefix}→ {fname}",
-                    showlegend=showlegend,
-                )
-            )
-            # Text label at arrow tip
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[x[-1]], y=[y[-1]], z=[z[-1]],
-                    mode="text",
-                    text=[fname],
-                    textposition="top center",
-                    showlegend=False
-                )
-            )
-        else:
-            # 2D fallback
-            x = [ax, ax + float(vec[0])]
-            y = [ay, ay + float(vec[1])]
-            fig.add_trace(
-                go.Scatter(
-                    x=x, y=y, mode="lines+text",
-                    text=[None, f"{name_prefix}→ {fname}"],
-                    textposition="top center",
-                    line=dict(width=4, color=color) if color else dict(width=4),
-                    showlegend=showlegend
-                )
-            )
+    fig.add_bar(x=diff.index, y=diff.values)
+    fig.update_layout(
+        title="Feature Difference (High FR − Low FR) [z-score]",
+        xaxis_title="Feature",
+        yaxis_title="Δ z-score (higher ⇒ higher in High-FR segment)",
+        height=360, margin=dict(l=10, r=10, t=40, b=60)
+    )
     return fig
 
 
+# MODIFIED: correlation heatmap restricted to numeric analysis features; handles empty case
+def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+    feats = get_numeric_analysis_features(df)
+    fig = go.Figure()
+    if not feats or "FR" not in df.columns or not pd.api.types.is_numeric_dtype(df["FR"]):
+        fig.update_layout(
+            title="Correlation with FR — No numeric features selected",
+            height=200, margin=dict(l=10, r=10, t=40, b=10)
+        )
+        return fig
+
+    corr = df[feats + ["FR"]].corr().loc(feats + ["FR"])  # build once
+    corr = df[feats + ["FR"]].corr().loc[feats, ["FR"]].round(3)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=corr.values.T, x=feats, y=["FR"], text=corr.values.T, texttemplate="%{text}",
+        zmin=-1, zmax=1, colorbar=dict(title="corr")
+    ))
+    fig.update_layout(title="Correlation with FR", height=220, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+# MODIFIED: per-point contribution uses only numeric analysis features; handles empty case
+def per_point_contribution_bar(df: pd.DataFrame, row_pos: int) -> go.Figure:
+    feats = get_numeric_analysis_features(df)
+    fig = go.Figure()
+    if not feats:
+        fig.update_layout(
+            title="Why this run? — No numeric features selected",
+            height=220, margin=dict(l=10, r=10, t=40, b=10)
+        )
+        return fig
+
+    z = zscore_frame(df, feats)
+    if row_pos < 0 or row_pos >= len(z):
+        row_pos = 0
+    if z.empty:
+        fig.update_layout(
+            title="Why this run? — No numeric features available",
+            height=220, margin=dict(l=10, r=10, t=40, b=10)
+        )
+        return fig
+
+    # top-5 absolute deviations; show signed values for direction
+    abs_dev = z.iloc[row_pos].abs().sort_values(ascending=False).head(5)
+    signed = z.iloc[row_pos][abs_dev.index]
+
+    fig.add_bar(x=signed.index, y=signed.values)
+    fig.update_layout(
+        title="Why this run? Top deviations (z-scores)",
+        xaxis_title="Feature",
+        yaxis_title="Deviation (±σ)",
+        height=300, margin=dict(l=10, r=10, t=40, b=40)
+    )
+    return fig
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+# MODIFIED: render function now resolves feature names for arrows from your list (numeric only); skips if empty
 def _render_table_and_plot(
     df: pd.DataFrame,
     PCs: np.ndarray,
@@ -95,22 +119,15 @@ def _render_table_and_plot(
     raw_scores: np.ndarray,
     method_label: str,
     key_prefix: str,
-    pca,  # global PCA (for loadings)
+    pca,
 ):
-    """
-    Renders:
-      1) Top anomalies table with row selection
-      2) PCA scatter with optional highlight + PCA loading arrows (global + segment-anchored)
-      3) Segment Comparison & FR correlation panels (optional)
-      4) Per-selection 'Why this run?' panel (optional)
-    """
     df = df.copy()
     df["anomaly_score"] = scores01
     df["raw_anomaly_score"] = raw_scores
 
     st.markdown(f"### {method_label}")
 
-    # --- Top anomalies: select a row to highlight on the plot ---
+    # --- Top anomalies selection ---
     highlight_pos = None
     if show_top > 0:
         cols_keep = [
@@ -120,7 +137,6 @@ def _render_table_and_plot(
             "Script_File", "V", "s_number", "Build"
         ]
         cols_keep = [c for c in cols_keep if c in df.columns]
-
         top = df.sort_values("anomaly_score", ascending=False).head(show_top)
 
         st.markdown("**Top anomalies**")
@@ -141,38 +157,37 @@ def _render_table_and_plot(
             if len(pos) and pos[0] != -1:
                 highlight_pos = int(pos[0])
 
-    # --- PCA plot with optional highlight ---
+    # --- PCA scatter ---
     fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
 
-    # === Driver arrows overlays ===
+    # --- Driver arrows (use your configured features; numeric-only for arrows) ---
     if show_biplot and PCs.shape[1] >= 2 and pca is not None:
-        # 1) Global arrows from origin (intentional: show global directions)
-        try:
-            add_pca_loadings_3d(fig, pca, FEATURES_FOR_ANALYSIS, scale=2.0)
-        except Exception:
-            pass
-
-        # 2) Segment-anchored arrows near each band (Low FR = green, High FR = red)
-        try:
-            seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-            # Low-FR centroid
-            low_mask = (seg == "Low FR").values
-            if np.any(low_mask):
-                low_anchor = PCs[low_mask].mean(axis=0)
-                add_biplot_arrows_at_anchor_3d(
-                    fig, pca, FEATURES_FOR_ANALYSIS, low_anchor,
-                    scale=1.2, color="green", name_prefix="Low FR ", showlegend=False
-                )
-            # High-FR centroid
-            high_mask = (seg == "High FR").values
-            if np.any(high_mask):
-                high_anchor = PCs[high_mask].mean(axis=0)
-                add_biplot_arrows_at_anchor_3d(
-                    fig, pca, FEATURES_FOR_ANALYSIS, high_anchor,
-                    scale=1.2, color="red", name_prefix="High FR ", showlegend=False
-                )
-        except Exception:
-            pass
+        feature_names = get_numeric_analysis_features(df)
+        if feature_names:
+            # global arrows at origin
+            try:
+                add_pca_loadings_3d(fig, pca, feature_names, scale=2.0)
+            except Exception:
+                pass
+            # segment-anchored arrows
+            try:
+                seg = make_fr_segments(df)
+                low_mask = (seg == "Low FR").values
+                if np.any(low_mask):
+                    low_anchor = PCs[low_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig, pca, feature_names, low_anchor,
+                        scale=1.2, color="green", name_prefix="Low FR ", showlegend=False
+                    )
+                high_mask = (seg == "High FR").values
+                if np.any(high_mask):
+                    high_anchor = PCs[high_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig, pca, feature_names, high_anchor,
+                        scale=1.2, color="red", name_prefix="High FR ", showlegend=False
+                    )
+            except Exception:
+                pass
 
     st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
 
@@ -203,10 +218,6 @@ def _render_table_and_plot(
             key=f"{key_prefix}-whybar"
         )
 
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

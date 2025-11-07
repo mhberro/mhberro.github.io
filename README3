@@ -222,6 +222,89 @@ def _render_table_and_plot(
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+def add_biplot_arrows_at_anchor_3d(
+    fig: go.Figure,
+    pca,
+    feature_names: list[str],
+    anchor: np.ndarray,
+    *,
+    scale: float = 1.5,
+    color: str | None = None,
+    name_prefix: str = "",
+    showlegend: bool = False,
+):
+    """
+    Draw PCA loading arrows but *anchored* at a specified 3D point (anchor),
+    using the same global PCA directions (first 2–3 PCs).
+    This visually associates feature directions with a local cluster.
+
+    Parameters
+    ----------
+    fig : plotly.graph_objects.Figure
+        Target figure (3D scatter) to overlay arrows into.
+    pca : fitted sklearn.decomposition.PCA
+        The global PCA used for visualization.
+    feature_names : list[str]
+        Names of features corresponding to the PCA fit order.
+    anchor : np.ndarray
+        3D point (PC1, PC2, PC3) to anchor the arrows from (e.g., a cluster centroid).
+    scale : float
+        Arrow length multiplier in PC units.
+    color : Optional[str]
+        Line/text color for the arrows (e.g., 'green', 'red').
+    name_prefix : str
+        Prefix for trace names (e.g., 'Low FR', 'High FR').
+    showlegend : bool
+        Whether to show a legend entry for each arrow line (usually False to avoid clutter).
+    """
+    loadings = getattr(pca, "components_", None)
+    if loadings is None:
+        return fig
+    loadings = loadings.T  # shape: (n_features, n_components)
+    k = min(3, loadings.shape[1])
+    if k < 2:
+        return fig
+
+    ax, ay, az = (anchor[0], anchor[1], anchor[2]) if len(anchor) >= 3 else (anchor[0], anchor[1], 0.0)
+
+    for i, fname in enumerate(feature_names):
+        vec = loadings[i, :k] * scale
+        if k >= 3:
+            x = [ax, ax + float(vec[0])]
+            y = [ay, ay + float(vec[1])]
+            z = [az, az + float(vec[2])]
+            fig.add_trace(
+                go.Scatter3d(
+                    x=x, y=y, z=z, mode="lines",
+                    line=dict(width=4, color=color) if color else dict(width=4),
+                    name=f"{name_prefix}→ {fname}",
+                    showlegend=showlegend,
+                )
+            )
+            # Text label at arrow tip
+            fig.add_trace(
+                go.Scatter3d(
+                    x=[x[-1]], y=[y[-1]], z=[z[-1]],
+                    mode="text",
+                    text=[fname],
+                    textposition="top center",
+                    showlegend=False
+                )
+            )
+        else:
+            # 2D fallback
+            x = [ax, ax + float(vec[0])]
+            y = [ay, ay + float(vec[1])]
+            fig.add_trace(
+                go.Scatter(
+                    x=x, y=y, mode="lines+text",
+                    text=[None, f"{name_prefix}→ {fname}"],
+                    textposition="top center",
+                    line=dict(width=4, color=color) if color else dict(width=4),
+                    showlegend=showlegend
+                )
+            )
+    return fig
 
 
 =========================================================================================================================================================================

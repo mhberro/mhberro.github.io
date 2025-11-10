@@ -1,398 +1,104 @@
-def cluster_profile_heatmap(df: pd.DataFrame, PCs: np.ndarray, scores01: np.ndarray) -> go.Figure:
+def segment_diff_bar(df: pd.DataFrame) -> go.Figure:
     """
-    Cluster runs in PCA space and show a cluster-vs-feature heatmap
-    using z-scores of analysis features (numeric + one-hot).
+    Segment Comparison: Low vs High FR
 
-    - Rows = clusters (sorted by average anomaly score, highest first)
-    - Columns = top-5 features/categories that vary most across clusters
-    - Colors = mean z-score in that cluster
+    For all features in FEATURES_FOR_ANALYSIS (numeric + categoricals via one-hot):
+
+      - Compute z-scores over the whole dataset (via zscore_matrix).
+      - For High-FR runs: compute mean z-score per feature.
+      - For Low-FR runs:  compute mean z-score per feature.
+      - Show *two* bar charts (High-FR and Low-FR), each with
+        the top-5 features by mean z-score for that segment.
+
+    Interpretation:
+      - High-FR chart: bars > 0 ⇒ features that tend to be higher /
+        more present in High-FR runs.
+      - Low-FR chart:  bars > 0 ⇒ features that tend to be higher /
+        more present in Low-FR runs.
+
+    This matches the intuition:
+      - e.g., capability_abc pops at the top of High-FR.
+      - capability_def pops at the top of Low-FR.
+      - init_time may appear in High-FR but below capability_abc if
+        its segment-specific effect is smaller.
     """
-    fig = go.Figure()
+    fig = make_subplots(
+        rows=1,
+        cols=2,
+        shared_y=True,
+        subplot_titles=("High FR", "Low FR"),
+    )
 
-    # Build z-score matrix (uses FEATURES_FOR_ANALYSIS, with one-hot encoding)
+    # Build FR segments
+    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
     Z, labels = zscore_matrix(df)
-    if Z.empty or not labels or PCs.shape[0] != len(df):
+
+    # If nothing to show, return an empty-ish figure with a helpful title
+    if Z.empty or not labels:
         fig.update_layout(
-            title="Cluster Profile Heatmap (configure FEATURES_FOR_ANALYSIS)",
-            height=200,
+            title="Segment Comparison (configure FEATURES_FOR_ANALYSIS)",
+            height=260,
             margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    n_samples = PCs.shape[0]
-    if n_samples < 4:
+    high_mask = (seg == "High FR").values
+    low_mask = (seg == "Low FR").values
+
+    if not np.any(high_mask) or not np.any(low_mask):
         fig.update_layout(
-            title="Cluster Profile Heatmap (not enough samples)",
-            height=200,
+            title="Segment Comparison (need both High-FR and Low-FR runs)",
+            height=260,
             margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    # Use first 2–3 PCs for clustering
-    d = min(3, PCs.shape[1])
-    Xclust = PCs[:, :d]
+    # Mean z-score per feature within each segment
+    mean_high = Z[high_mask].mean()
+    mean_low = Z[low_mask].mean()
 
-    # Choose k based on dataset size, between 2 and 4
-    k = min(4, max(2, n_samples // 20 or 2))
-    kmeans = KMeans(n_clusters=k, n_init="auto", random_state=0)
-    cluster_labels = kmeans.fit_predict(Xclust)
+    # Top-5 features for each segment (by *magnitude* of mean z-score)
+    top_high = mean_high.reindex(labels).sort_values(key=lambda s: s.abs(), ascending=False).head(5)
+    top_low = mean_low.reindex(labels).sort_values(key=lambda s: s.abs(), ascending=False).head(5)
 
-    # Cluster-level stats
-    Z_cluster = Z.groupby(cluster_labels).mean()
-    anom_cluster = pd.Series(scores01, index=df.index).groupby(cluster_labels).mean()
-
-    # Pick top-5 features by variation across clusters
-    feature_std = Z_cluster.std(axis=0).sort_values(ascending=False)
-    top_feats = feature_std.head(5).index.tolist()
-    if not top_feats:
-        fig.update_layout(
-            title="Cluster Profile Heatmap (no varying features)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    Z_cluster = Z_cluster[top_feats]
-
-    # Sort clusters by average anomaly score (most anomalous at top)
-    ordered_clusters = anom_cluster.sort_values(ascending=False).index
-    Z_cluster = Z_cluster.loc[ordered_clusters]
-    y_labels = [f"C{c} (avg anomaly {anom_cluster[c]:.2f})" for c in ordered_clusters]
-
+    # High-FR bar chart (left)
     fig.add_trace(
-        go.Heatmap(
-            z=Z_cluster.values,
-            x=Z_cluster.columns.tolist(),
-            y=y_labels,
-            zmid=0,
-            colorbar=dict(title="mean z-score"),
-        )
+        go.Bar(x=top_high.index.tolist(), y=top_high.values, name="High FR"),
+        row=1, col=1,
     )
+
+    # Low-FR bar chart (right)
+    fig.add_trace(
+        go.Bar(x=top_low.index.tolist(), y=top_low.values, name="Low FR"),
+        row=1, col=2,
+    )
+
     fig.update_layout(
-        title="Cluster Profile Heatmap (High vs Low anomaly clusters)",
+        title="Segment Comparison: Low vs High FR (top-5 features per segment)",
         xaxis_title="Feature / Category (one-hot)",
-        yaxis_title="Cluster (sorted by anomaly)",
+        yaxis_title="Mean z-score within segment",
         height=380,
-        margin=dict(l=10, r=10, t=40, b=60),
-    )
-    return fig
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-def feature_influence_network_figure(df: pd.DataFrame) -> go.Figure:
-    """
-    Build a simple 'feature influence network' among the top features that
-    co-move with anomaly_score within the given df (typically a subset of
-    the most anomalous runs).
-
-    - Nodes = features (numeric or one-hot categories)
-    - Node color = correlation with anomaly_score
-    - Edge width/color = correlation between feature pairs
-    """
-    fig = go.Figure()
-
-    if "anomaly_score" not in df.columns:
-        fig.update_layout(
-            title="Feature Influence Network (anomaly_score missing)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    X, labels = build_analysis_matrix(df)
-    if X.empty or not labels:
-        fig.update_layout(
-            title="Feature Influence Network (configure FEATURES_FOR_ANALYSIS)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    y = df["anomaly_score"].astype(float).values
-    y_mask = np.isfinite(y)
-    if y_mask.sum() < 3:
-        fig.update_layout(
-            title="Feature Influence Network (not enough valid anomaly scores)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Correlation of each feature with anomaly_score
-    corr_with_y = []
-    for col in labels:
-        xs = X[col].astype(float).values
-        mask = np.isfinite(xs) & y_mask
-        if mask.sum() < 3:
-            corr = 0.0
-        else:
-            corr = np.corrcoef(xs[mask], y[mask])[0, 1]
-        corr_with_y.append(corr)
-    corr_with_y = np.array(corr_with_y)
-
-    # Choose top features by |corr with anomaly_score|
-    top_n = min(6, len(labels))
-    if top_n < 2:
-        fig.update_layout(
-            title="Feature Influence Network (not enough informative features)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    idx = np.argsort(-np.abs(corr_with_y))[:top_n]
-    top_cols = [labels[i] for i in idx]
-    top_corr_y = corr_with_y[idx]
-
-    # Correlation matrix among top features
-    corr_mat = X[top_cols].corr().values
-
-    # Node positions on a circle
-    n = len(top_cols)
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    xs = np.cos(angles)
-    ys = np.sin(angles)
-
-    # Edges for |corr| > threshold
-    edge_traces = []
-    thresh = 0.4
-    for i in range(n):
-        for j in range(i + 1, n):
-            c = corr_mat[i, j]
-            if abs(c) < thresh:
-                continue
-            edge_traces.append(
-                go.Scatter(
-                    x=[xs[i], xs[j]],
-                    y=[ys[i], ys[j]],
-                    mode="lines",
-                    line=dict(width=2 + 3 * abs(c), color="rgba(150,150,150,0.6)"),
-                    showlegend=False,
-                    hoverinfo="skip",
-                )
-            )
-
-    # Node trace
-    # Normalize node sizes based on |corr_with_anomaly|
-    size_base = 20
-    size_scale = 30
-    max_abs = np.max(np.abs(top_corr_y)) if np.max(np.abs(top_corr_y)) > 0 else 1.0
-    sizes = size_base + size_scale * (np.abs(top_corr_y) / max_abs)
-
-    node_trace = go.Scatter(
-        x=xs,
-        y=ys,
-        mode="markers+text",
-        text=top_cols,
-        textposition="top center",
-        marker=dict(
-            size=sizes,
-            color=top_corr_y,
-            colorscale=[[0, "blue"], [0.5, "white"], [1, "red"]],
-            cmin=-1,
-            cmax=1,
-            colorbar=dict(title="corr(feature, anomaly)"),
-            line=dict(width=1, color="black"),
-        ),
-        hovertext=[
-            f"{col}<br>corr(feature, anomaly)={c:.2f}"
-            for col, c in zip(top_cols, top_corr_y)
-        ],
-        hoverinfo="text",
+        margin=dict(l=10, r=10, t=60, b=80),
         showlegend=False,
     )
 
-    for tr in edge_traces:
-        fig.add_trace(tr)
-    fig.add_trace(node_trace)
+    # Make x-axes labels readable
+    fig.update_xaxes(tickangle=45, row=1, col=1)
+    fig.update_xaxes(tickangle=45, row=1, col=2)
 
-    fig.update_layout(
-        title="Feature Influence Network (top anomaly drivers)",
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        height=420,
-        margin=dict(l=10, r=10, t=40, b=40),
-    )
     return fig
 
 
+
+
+
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-def _render_table_and_plot(
-    df: pd.DataFrame,
-    PCs: np.ndarray,
-    scores01: np.ndarray,
-    raw_scores: np.ndarray,
-    method_label: str,
-    key_prefix: str,
-    pca,  # global PCA (for loadings)
-):
-    """
-    Renders three visual perspectives for a given anomaly method:
 
-      1) Storyboard:
-         - Top anomalies table with row selection
-         - PCA scatter with optional highlight
-         - PCA loading arrows (global + segment-anchored)
-         - Segment Comparison & FR correlation
-         - Per-selection 'Why this run?' bar chart
 
-      2) Cluster Heatmap:
-         - Cluster-vs-feature heatmap in z-score space
-
-      3) Feature Network:
-         - Small network of top anomaly-driving features
-    """
-    df = df.copy()
-    df["anomaly_score"] = scores01
-    df["raw_anomaly_score"] = raw_scores
-
-    st.markdown(f"### {method_label}")
-
-    tab_story, tab_cluster, tab_network = st.tabs(
-        ["Storyboard", "Cluster Heatmap", "Feature Network"]
-    )
-
-    # === 1) STORYBOARD TAB ===
-    with tab_story:
-        # --- Top anomalies: select a row to highlight on the plot ---
-        highlight_pos = None
-        if show_top > 0:
-            cols_keep = [
-                "Test_Run_ID",
-                "FR",
-                "Num_Tests",
-                "total_init_time",
-                "anomaly_score",
-                "raw_anomaly_score",
-                "Simulation_Host",
-                "Simulation_Node",
-                "Capability",
-                "Script_File",
-                "V",
-                "s_number",
-                "Build",
-            ]
-            cols_keep = [c for c in cols_keep if c in df.columns]
-
-            top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-
-            st.markdown("**Top anomalies**")
-            editable = top[cols_keep].copy()
-            editable.insert(0, "Select", False)
-
-            edited = st.data_editor(
-                editable,
-                use_container_width=True,
-                num_rows="fixed",
-                disabled={c: True for c in editable.columns if c != "Select"},
-                key=f"{key_prefix}-table",
-            )
-
-            selected_original_idxs = edited.index[edited["Select"]].tolist()
-            if selected_original_idxs:
-                pos = df.index.get_indexer([selected_original_idxs[0]])
-                if len(pos) and pos[0] != -1:
-                    highlight_pos = int(pos[0])
-
-        # --- PCA plot with optional highlight ---
-        fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
-
-        # === Driver arrows overlays (global + low/high FR anchors) ===
-        if show_biplot and PCs.shape[1] >= 2 and pca is not None:
-            # 1) Global arrows from origin
-            try:
-                add_pca_loadings_3d(fig, pca, PCA_FEATURES, scale=2.0)
-            except Exception:
-                pass
-
-            # 2) Segment-anchored arrows near Low-FR and High-FR bands
-            try:
-                seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-                # Low-FR centroid
-                low_mask = (seg == "Low FR").values
-                if np.any(low_mask):
-                    low_anchor = PCs[low_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        PCA_FEATURES,
-                        low_anchor,
-                        scale=1.2,
-                        color="green",
-                        name_prefix="Low FR ",
-                        showlegend=False,
-                    )
-                # High-FR centroid
-                high_mask = (seg == "High FR").values
-                if np.any(high_mask):
-                    high_anchor = PCs[high_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        PCA_FEATURES,
-                        high_anchor,
-                        scale=1.2,
-                        color="red",
-                        name_prefix="High FR ",
-                        showlegend=False,
-                    )
-            except Exception:
-                pass
-
-        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
-
-        # --- Segment Comparison + FR Correlation ---
-        if show_segment_compare:
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                st.markdown("#### Segment Comparison: Low vs High FR")
-                st.plotly_chart(
-                    segment_diff_bar(df),
-                    use_container_width=True,
-                    key=f"{key_prefix}-segdiff",
-                )
-            with c2:
-                st.markdown("#### FR Correlation")
-                st.plotly_chart(
-                    fr_correlation_heatmap(df),
-                    use_container_width=True,
-                    key=f"{key_prefix}-frcorr",
-                )
-
-        # --- Per-selection “Why this run?” ---
-        if show_selection_why and highlight_pos is not None:
-            st.markdown("#### Why this run?")
-            st.plotly_chart(
-                per_point_contribution_bar(df, highlight_pos),
-                use_container_width=True,
-                key=f"{key_prefix}-whybar",
-            )
-
-    # === 2) CLUSTER HEATMAP TAB ===
-    with tab_cluster:
-        st.markdown("#### Cluster-level feature patterns")
-        st.plotly_chart(
-            cluster_profile_heatmap(df, PCs, scores01),
-            use_container_width=True,
-            key=f"{key_prefix}-clusterheat",
-        )
-
-    # === 3) FEATURE NETWORK TAB ===
-    with tab_network:
-        # Use the most anomalous subset to focus the network
-        n_sub = max(20, int(0.2 * len(df)))
-        df_anom = df.sort_values("anomaly_score", ascending=False).head(n_sub)
-        st.markdown("#### Relationships among top anomaly-driving features")
-        st.plotly_chart(
-            feature_influence_network_figure(df_anom),
-            use_container_width=True,
-            key=f"{key_prefix}-featnet",
-        )
+=========================================================================================================================================================================
+=========================================================================================================================================================================
 
 
 =========================================================================================================================================================================

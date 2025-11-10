@@ -1,63 +1,113 @@
-def segment_diff_bar(df: pd.DataFrame) -> go.Figure:
+def segment_diff_numeric_bar(df: pd.DataFrame) -> go.Figure:
     """
-    Compare Low-FR vs High-FR segments for each feature in FEATURES_FOR_ANALYSIS.
-
-    - For numeric features: show mean z-score difference (High − Low).
-    - For categorical features: show % difference (High − Low)
-      of how often each category value appears within its FR segment.
-    - Keeps the top-5 absolute differences overall.
+    Top-5 numeric features (from FEATURES_FOR_ANALYSIS) that differ between
+    High-FR and Low-FR segments, using mean z-score difference (High − Low).
     """
     fig = go.Figure()
     seg = make_fr_segments(df)
     if "FR" not in df.columns or seg is None:
-        fig.update_layout(title="Segment Comparison (FR data unavailable)")
+        fig.update_layout(title="Numeric drivers (FR data unavailable)")
         return fig
 
-    # Separate low and high FR subsets
     low_df = df[seg == "Low FR"]
     high_df = df[seg == "High FR"]
 
-    numeric_diffs = {}
-    categorical_diffs = {}
+    diffs: dict[str, float] = {}
 
     for feat in FEATURES_FOR_ANALYSIS:
         if feat not in df.columns:
             continue
         s = df[feat]
 
-        # Numeric: use standardized mean difference
-        if np.issubdtype(s.dtype, np.number):
-            z = (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) != 0 else s * 0
-            diff = z[high_df.index].mean() - z[low_df.index].mean()
-            numeric_diffs[feat] = diff
-        else:
-            # Categorical: compute percentage of each value in each FR segment
-            high_pct = high_df[feat].value_counts(normalize=True)
-            low_pct = low_df[feat].value_counts(normalize=True)
-            # Align all possible categories
-            all_values = set(high_pct.index) | set(low_pct.index)
-            for val in all_values:
-                diff = high_pct.get(val, 0) - low_pct.get(val, 0)
-                categorical_diffs[f"{feat}={val}"] = diff
+        if not np.issubdtype(s.dtype, np.number):
+            # Skip non-numeric here (handled by categorical chart)
+            continue
 
-    # Combine and select top-5 absolute differences
-    all_diffs = {**numeric_diffs, **categorical_diffs}
-    if not all_diffs:
+        # Standardize across all rows
+        std = s.std(ddof=0)
+        if std == 0 or np.isnan(std):
+            continue
+        z = (s - s.mean()) / std
+
+        high_mean = z[high_df.index].mean() if not high_df.empty else 0.0
+        low_mean = z[low_df.index].mean() if not low_df.empty else 0.0
+        diffs[feat] = high_mean - low_mean  # High − Low
+
+    if not diffs:
         fig.update_layout(
-            title="No valid features in FEATURES_FOR_ANALYSIS",
-            height=250,
+            title="Numeric drivers (no numeric features in FEATURES_FOR_ANALYSIS)",
+            height=220,
             margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    top5 = dict(sorted(all_diffs.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5])
+    # Top-5 by absolute z-score difference
+    top5 = dict(sorted(diffs.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5])
 
     fig.add_bar(x=list(top5.keys()), y=list(top5.values()))
     fig.update_layout(
-        title="Top-5 Drivers of Failure Rate (High FR − Low FR)",
-        xaxis_title="Feature / Value",
-        yaxis_title="Δ (z-score or % share)",
-        height=380,
+        title="Top-5 Numeric Drivers (High FR − Low FR, z-score)",
+        xaxis_title="Numeric Feature",
+        yaxis_title="Δ z-score (High − Low)",
+        height=360,
+        margin=dict(l=10, r=10, t=40, b=80),
+    )
+    return fig
+
+
+def segment_diff_categorical_bar(df: pd.DataFrame) -> go.Figure:
+    """
+    Top-5 categorical values (from FEATURES_FOR_ANALYSIS) that differ between
+    High-FR and Low-FR segments, using percentage share difference (High − Low).
+
+    Bars are labeled like 'Feature=Value'.
+    """
+    fig = go.Figure()
+    seg = make_fr_segments(df)
+    if "FR" not in df.columns or seg is None:
+        fig.update_layout(title="Categorical drivers (FR data unavailable)")
+        return fig
+
+    low_df = df[seg == "Low FR"]
+    high_df = df[seg == "High FR"]
+
+    diffs: dict[str, float] = {}
+
+    for feat in FEATURES_FOR_ANALYSIS:
+        if feat not in df.columns:
+            continue
+        s = df[feat]
+
+        # Only treat non-numeric as categorical here
+        if np.issubdtype(s.dtype, np.number):
+            continue
+
+        # % share in each segment
+        high_pct = high_df[feat].value_counts(normalize=True)
+        low_pct = low_df[feat].value_counts(normalize=True)
+
+        all_vals = set(high_pct.index) | set(low_pct.index)
+        for val in all_vals:
+            diff = high_pct.get(val, 0.0) - low_pct.get(val, 0.0)  # High − Low in percentage points
+            diffs[f"{feat}={val}"] = diff
+
+    if not diffs:
+        fig.update_layout(
+            title="Categorical drivers (no categorical features in FEATURES_FOR_ANALYSIS)",
+            height=220,
+            margin=dict(l=10, r=10, t=40, b=40),
+        )
+        return fig
+
+    # Top-5 by absolute percentage-point difference
+    top5 = dict(sorted(diffs.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5])
+
+    fig.add_bar(x=list(top5.keys()), y=list(top5.values()))
+    fig.update_layout(
+        title="Top-5 Categorical Drivers (High FR − Low FR, % share)",
+        xaxis_title="Feature = Value",
+        yaxis_title="Δ share (High − Low)",
+        height=360,
         margin=dict(l=10, r=10, t=40, b=80),
     )
     return fig
@@ -69,6 +119,150 @@ def segment_diff_bar(df: pd.DataFrame) -> go.Figure:
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+def _render_table_and_plot(
+    df: pd.DataFrame,
+    PCs: np.ndarray,
+    scores01: np.ndarray,
+    raw_scores: np.ndarray,
+    method_label: str,
+    key_prefix: str,
+    pca,  # global PCA (for loadings)
+):
+    """
+    Renders:
+      1) Top anomalies table with row selection
+      2) PCA scatter with optional highlight + PCA loading arrows (global + segment-anchored)
+      3) Segment Comparison panels (numeric + categorical, optional)
+      4) FR correlation heatmap (optional)
+      5) Per-selection 'Why this run?' panel (optional)
+    """
+    df = df.copy()
+    df["anomaly_score"] = scores01
+    df["raw_anomaly_score"] = raw_scores
+
+    st.markdown(f"### {method_label}")
+
+    # --- Top anomalies: select a row to highlight on the plot ---
+    highlight_pos = None
+    if show_top > 0:
+        cols_keep = [
+            "Test_Run_ID",
+            "FR",
+            "Num_Tests",
+            "total_init_time",
+            "anomaly_score",
+            "raw_anomaly_score",
+            "Simulation_Host",
+            "Simulation_Node",
+            "Capability",
+            "Script_File",
+            "V",
+            "s_number",
+            "Build",
+        ]
+        cols_keep = [c for c in cols_keep if c in df.columns]
+
+        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+
+        st.markdown("**Top anomalies**")
+        editable = top[cols_keep].copy()
+        editable.insert(0, "Select", False)
+
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled={c: True for c in editable.columns if c != "Select"},
+            key=f"{key_prefix}-table",
+        )
+
+        selected_original_idxs = edited.index[edited["Select"]].tolist()
+        if selected_original_idxs:
+            pos = df.index.get_indexer([selected_original_idxs[0]])
+            if len(pos) and pos[0] != -1:
+                highlight_pos = int(pos[0])
+
+    # --- PCA plot with optional highlight ---
+    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+
+    # === Driver arrows overlays ===
+    if show_biplot and PCs.shape[1] >= 2 and pca is not None:
+        # 1) Global arrows from origin
+        try:
+            add_pca_loadings_3d(fig, pca, PCA_FEATURES, scale=2.0)
+        except Exception:
+            pass
+
+        # 2) Segment-anchored arrows near Low-FR and High-FR bands
+        try:
+            seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+            # Low-FR centroid
+            low_mask = (seg == "Low FR").values
+            if np.any(low_mask):
+                low_anchor = PCs[low_mask].mean(axis=0)
+                add_biplot_arrows_at_anchor_3d(
+                    fig,
+                    pca,
+                    PCA_FEATURES,
+                    low_anchor,
+                    scale=1.2,
+                    color="green",
+                    name_prefix="Low FR ",
+                    showlegend=False,
+                )
+            # High-FR centroid
+            high_mask = (seg == "High FR").values
+            if np.any(high_mask):
+                high_anchor = PCs[high_mask].mean(axis=0)
+                add_biplot_arrows_at_anchor_3d(
+                    fig,
+                    pca,
+                    PCA_FEATURES,
+                    high_anchor,
+                    scale=1.2,
+                    color="red",
+                    name_prefix="High FR ",
+                    showlegend=False,
+                )
+        except Exception:
+            pass
+
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
+
+    # --- Segment Comparison: numeric + categorical + FR correlation ---
+    if show_segment_compare:
+        st.markdown("#### Segment Comparison: Low vs High FR")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Numeric drivers**")
+            st.plotly_chart(
+                segment_diff_numeric_bar(df),
+                use_container_width=True,
+                key=f"{key_prefix}-segnum",
+            )
+        with c2:
+            st.markdown("**Categorical drivers**")
+            st.plotly_chart(
+                segment_diff_categorical_bar(df),
+                use_container_width=True,
+                key=f"{key_prefix}-segcat",
+            )
+
+        st.markdown("#### FR Correlation")
+        st.plotly_chart(
+            fr_correlation_heatmap(df),
+            use_container_width=True,
+            key=f"{key_prefix}-frcorr",
+        )
+
+    # --- Per-selection “Why this run?” ---
+    if show_selection_why and highlight_pos is not None:
+        st.markdown("#### Why this run?")
+        st.plotly_chart(
+            per_point_contribution_bar(df, highlight_pos),
+            use_container_width=True,
+            key=f"{key_prefix}-whybar",
+        )
 
 
 =========================================================================================================================================================================

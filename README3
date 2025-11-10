@@ -1,364 +1,55 @@
+# Existing dataset controls (sidebar)
+show_all = st.sidebar.checkbox(
+    "Show all datasets",
+    value=False,
+    key="show_all_datasets",      # NEW
+)
+
+
+
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
 # === Visual analytics toggles ===
 st.sidebar.subheader("Root-Cause Visuals")
 
-show_biplot = st.sidebar.checkbox("Show PCA driver arrows", value=True)
-
-# NEW: let user choose which PCA features to draw as arrows
-pca_arrow_features = st.sidebar.multiselect(
-    "PCA driver arrows (numeric features)",
-    PCA_FEATURES,           # e.g. ["P", "F", "B", "U", "total_init_time", "FR", "Num_Tests"]
-    default=PCA_FEATURES,   # all on by default
+show_biplot = st.sidebar.checkbox(
+    "Show PCA driver arrows",
+    value=True,
+    key="show_biplot",            # NEW
 )
 
-show_segment_compare = st.sidebar.checkbox("Show segment comparison (z-scores / % share)", value=True)
-show_selection_why = st.sidebar.checkbox("Show 'Why this run?' panel", value=True)
+pca_arrow_features = st.sidebar.multiselect(
+    "PCA driver arrows (numeric features)",
+    PCA_FEATURES,
+    default=PCA_FEATURES,
+    key="pca_arrow_features",     # (optional but nice to be explicit)
+)
 
+show_segment_compare = st.sidebar.checkbox(
+    "Show segment comparison (z-scores / % share)",
+    value=True,
+    key="show_segment_compare",   # NEW
+)
 
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
-    """
-    Show correlation of each analysis feature (numeric + encoded categoricals)
-    with High-FR and Low-FR indicators.
-
-    - Builds binary columns:
-        High_FR = 1 if run is in the 'High FR' segment
-        Low_FR  = 1 if run is in the 'Low FR' segment
-    - Computes correlation of each feature (from build_analysis_matrix)
-      with these two indicators.
-    """
-    fig = go.Figure()
-
-    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-    if seg is None or seg.isna().all():
-        fig.update_layout(
-            title="FR correlation (segments unavailable)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Build numeric / one-hot matrix for all analysis features
-    X, labels = build_analysis_matrix(df)
-    if X.empty or not labels:
-        fig.update_layout(
-            title="FR correlation (configure FEATURES_FOR_ANALYSIS)",
-            height=200,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Binary indicators for High-FR and Low-FR segments
-    high_ind = (seg == "High FR").astype(int).rename("High_FR")
-    low_ind = (seg == "Low FR").astype(int).rename("Low_FR")
-
-    corr_df = pd.concat([X, high_ind, low_ind], axis=1).corr()
-    # Extract correlations of features with the two indicators
-    corr_high = corr_df.loc[labels, "High_FR"].round(3)
-    corr_low = corr_df.loc[labels, "Low_FR"].round(3)
-
-    corr_mat = pd.DataFrame(
-        {"High_FR": corr_high, "Low_FR": corr_low},
-        index=labels,
-    ).T  # shape: (2, n_features)
-
-    # Keep top-5 features by max |corr| across High/Low
-    max_abs = corr_mat.abs().max(axis=0)
-    top_idx = max_abs.sort_values(ascending=False).head(5).index
-    corr_mat = corr_mat[top_idx]
-
-    fig.add_trace(
-        go.Heatmap(
-            z=corr_mat.values,
-            x=corr_mat.columns.tolist(),          # features
-            y=corr_mat.index.tolist(),           # ["High_FR", "Low_FR"]
-            text=corr_mat.values,
-            texttemplate="%{text}",
-            zmin=-1,
-            zmax=1,
-            colorbar=dict(title="corr"),
-        )
-    )
-    fig.update_layout(
-        title="Correlation with High-FR / Low-FR",
-        height=260,
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-    return fig
+show_selection_why = st.sidebar.checkbox(
+    "Show 'Why this run?' panel",
+    value=True,
+    key="show_selection_why",     # NEW
+)
 
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-def _render_table_and_plot(
-    df: pd.DataFrame,
-    PCs: np.ndarray,
-    scores01: np.ndarray,
-    raw_scores: np.ndarray,
-    method_label: str,
-    key_prefix: str,
-    pca,                  # global PCA (for loadings)
-    pca_arrow_features: list[str],  # NEW: user-selected PCA features for arrows
-):
-    """
-    Renders:
-      1) Top anomalies table with row selection
-      2) PCA scatter with optional highlight + PCA loading arrows
-         (global + segment-anchored; subset controlled by pca_arrow_features)
-      3) PCA plot and segment driver charts side-by-side:
-           - Left: PCA plot
-           - Right: Numeric drivers, categorical drivers, FR correlation
-      4) Per-selection 'Why this run?' panel (optional)
-    """
-    df = df.copy()
-    df["anomaly_score"] = scores01
-    df["raw_anomaly_score"] = raw_scores
 
-    st.markdown(f"### {method_label}")
-
-    # --- Top anomalies: select a row to highlight on the plot ---
-    highlight_pos = None
-    if show_top > 0:
-        cols_keep = [
-            "Test_Run_ID",
-            "FR",
-            "Num_Tests",
-            "total_init_time",
-            "anomaly_score",
-            "raw_anomaly_score",
-            "Simulation_Host",
-            "Simulation_Node",
-            "Capability",
-            "Script_File",
-            "V",
-            "s_number",
-            "Build",
-        ]
-        cols_keep = [c for c in cols_keep if c in df.columns]
-
-        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-
-        st.markdown("**Top anomalies**")
-        editable = top[cols_keep].copy()
-        editable.insert(0, "Select", False)
-
-        edited = st.data_editor(
-            editable,
-            use_container_width=True,
-            num_rows="fixed",
-            disabled={c: True for c in editable.columns if c != "Select"},
-            key=f"{key_prefix}-table",
-        )
-
-        selected_original_idxs = edited.index[edited["Select"]].tolist()
-        if selected_original_idxs:
-            pos = df.index.get_indexer([selected_original_idxs[0]])
-            if len(pos) and pos[0] != -1:
-                highlight_pos = int(pos[0])
-
-    # === PCA + segment drivers side-by-side ===
-    if show_segment_compare:
-        col_plot, col_seg = st.columns([2, 2])
-    else:
-        col_plot, col_seg = st.columns([4, 0.01])  # effectively only plot
-
-    # --- Left column: PCA plot (with optional arrows) ---
-    with col_plot:
-        fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
-
-        if show_biplot and PCs.shape[1] >= 2 and pca is not None:
-            # Use user-selected PCA arrow features; fall back to PCA_FEATURES if none selected
-            arrow_feats = pca_arrow_features or PCA_FEATURES
-
-            # 1) Global arrows from origin
-            try:
-                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
-            except Exception:
-                pass
-
-            # 2) Segment-anchored arrows near Low-FR and High-FR bands
-            try:
-                seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-                # Low-FR centroid
-                low_mask = (seg == "Low FR").values
-                if np.any(low_mask):
-                    low_anchor = PCs[low_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        arrow_feats,
-                        low_anchor,
-                        scale=1.2,
-                        color="green",
-                        name_prefix="Low FR ",
-                        showlegend=False,
-                    )
-                # High-FR centroid
-                high_mask = (seg == "High FR").values
-                if np.any(high_mask):
-                    high_anchor = PCs[high_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        arrow_feats,
-                        high_anchor,
-                        scale=1.2,
-                        color="red",
-                        name_prefix="High FR ",
-                        showlegend=False,
-                    )
-            except Exception:
-                pass
-
-        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
-
-    # --- Right column: segment drivers & FR correlation ---
-    if show_segment_compare:
-        with col_seg:
-            st.markdown("#### Segment Comparison: Low vs High FR")
-
-            st.markdown("**Numeric drivers**")
-            st.plotly_chart(
-                segment_diff_numeric_bar(df),
-                use_container_width=True,
-                key=f"{key_prefix}-segnum",
-            )
-
-            st.markdown("**Categorical drivers**")
-            st.plotly_chart(
-                segment_diff_categorical_bar(df),
-                use_container_width=True,
-                key=f"{key_prefix}-segcat",
-            )
-
-            st.markdown("**FR Correlation (High / Low)**")
-            st.plotly_chart(
-                fr_correlation_heatmap(df),
-                use_container_width=True,
-                key=f"{key_prefix}-frcorr",
-            )
-
-    # --- Per-selection “Why this run?” (full-width, below) ---
-    if show_selection_why and highlight_pos is not None:
-        st.markdown("#### Why this run?")
-        st.plotly_chart(
-            per_point_contribution_bar(df, highlight_pos),
-            use_container_width=True,
-            key=f"{key_prefix}-whybar",
-        )
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-
-def render_one(path: Path):
-    """
-    Loads a dataset, computes features, runs all anomaly methods (IF/LOF/AE),
-    builds PCA for visualization, and renders four tabs:
-      - Isolation Forest
-      - Local Outlier Factor
-      - Autoencoder (reconstruction)
-      - Consensus (mean rank across methods)
-    Each tab shows:
-      - Top anomalies table with selection-driven highlight
-      - PCA plot (with selectable driver arrows)
-      - Segment driver charts + FR correlation (side-by-side with PCA)
-      - 'Why this run?' panel
-    """
-    try:
-        raw = load_csv(path)
-        df = engineer_features(raw)
-
-        # Features + scaling once
-        X = build_features(df).to_numpy(dtype=float)
-        Xz, _ = scale_features(df)
-
-        # PCA ONLY for visualization (capture pca object for biplot arrows)
-        scaler_viz, pca_viz, _, PCs = fit_pca_scaled(X, n_components=3)
-
-        # Score each method
-        _, if_raw  = score_isolation_forest(Xz, contamination=if_contam, n_estimators=if_trees)
-        _, lof_raw = score_lof(Xz, n_neighbors=lof_k)
-        _, ae_raw  = score_autoencoder(Xz, hidden=(ae_w1, ae_w2, ae_w3), max_iter=ae_iter)
-
-        if_s01  = normalize_scores(if_raw)
-        lof_s01 = normalize_scores(lof_raw)
-        ae_s01  = normalize_scores(ae_raw)
-
-        # Consensus: mean rank across methods (lower rank = more anomalous)
-        import numpy as np
-
-        def ranks(arr):
-            order = np.argsort(-arr)       # higher score = more anomalous
-            inv = np.empty_like(order)
-            inv[order] = np.arange(1, len(arr) + 1)
-            return inv.astype(float)
-
-        r_if, r_lof, r_ae = ranks(if_s01), ranks(lof_s01), ranks(ae_s01)
-        consensus_rank = (r_if + r_lof + r_ae) / 3.0
-        cons_score01 = normalize_scores((1.0 / consensus_rank))  # invert rank for [0,1] score
-
-        st.subheader(f"{path.name} · Multi-Method Anomaly Analysis")
-
-        tab_if, tab_lof, tab_ae, tab_cons = st.tabs(
-            ["Isolation Forest", "Local Outlier Factor", "Autoencoder", "Consensus"]
-        )
-
-        with tab_if:
-            _render_table_and_plot(
-                df,
-                PCs,
-                if_s01,
-                if_raw,
-                "Isolation Forest",
-                key_prefix=f"{path.name}-IF",
-                pca=pca_viz,
-                pca_arrow_features=pca_arrow_features,
-            )
-
-        with tab_lof:
-            _render_table_and_plot(
-                df,
-                PCs,
-                lof_s01,
-                lof_raw,
-                "Local Outlier Factor",
-                key_prefix=f"{path.name}-LOF",
-                pca=pca_viz,
-                pca_arrow_features=pca_arrow_features,
-            )
-
-        with tab_ae:
-            _render_table_and_plot(
-                df,
-                PCs,
-                ae_s01,
-                ae_raw,
-                "Autoencoder (Reconstruction)",
-                key_prefix=f"{path.name}-AE",
-                pca=pca_viz,
-                pca_arrow_features=pca_arrow_features,
-            )
-
-        with tab_cons:
-            _render_table_and_plot(
-                df.assign(consensus_rank=consensus_rank),
-                PCs,
-                cons_score01,
-                consensus_rank,  # raw = mean rank
-                "Consensus (mean rank of IF, LOF, AE)",
-                key_prefix=f"{path.name}-CONS",
-                pca=pca_viz,
-                pca_arrow_features=pca_arrow_features,
-            )
-
-    except Exception as e:
-        st.error(f"Failed to process {path.name}: {e}")
 
 
 =========================================================================================================================================================================

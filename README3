@@ -1,3 +1,58 @@
+
+# === Visual analytics toggles ===
+st.sidebar.subheader("Root-Cause Visuals")
+
+show_biplot = st.sidebar.checkbox(
+    "Show PCA driver arrows",
+    value=True,
+    key="show_biplot",
+)
+
+# User selects which PCA *features* to show as arrows
+pca_arrow_features = st.sidebar.multiselect(
+    "PCA driver arrows (numeric features)",
+    PCA_FEATURES,           # e.g. ["P", "F", "B", "U", "total_init_time", "FR", "Num_Tests"]
+    default=PCA_FEATURES,
+    key="pca_arrow_features",
+)
+
+# NEW: user selects which arrow *clusters* to show
+show_global_pca_arrows = st.sidebar.checkbox(
+    "Show global arrows (from origin)",
+    value=True,
+    key="show_global_pca_arrows",
+)
+
+show_low_fr_arrows = st.sidebar.checkbox(
+    "Show Low-FR cluster arrows",
+    value=True,
+    key="show_low_fr_arrows",
+)
+
+show_high_fr_arrows = st.sidebar.checkbox(
+    "Show High-FR cluster arrows",
+    value=True,
+    key="show_high_fr_arrows",
+)
+
+show_segment_compare = st.sidebar.checkbox(
+    "Show segment comparison (z-scores / % share)",
+    value=True,
+    key="show_segment_compare",
+)
+
+show_selection_why = st.sidebar.checkbox(
+    "Show 'Why this run?' panel",
+    value=True,
+    key="show_selection_why",
+)
+
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
 def _render_table_and_plot(
     df: pd.DataFrame,
     PCs: np.ndarray,
@@ -12,7 +67,8 @@ def _render_table_and_plot(
     Renders:
       1) Top anomalies table with row selection
       2) PCA scatter with optional highlight + PCA loading arrows
-         (global + segment-anchored; subset controlled by pca_arrow_features)
+         (global + segment-anchored; subset controlled by pca_arrow_features
+          and by which clusters the user chooses to display)
       3) Segment Comparison + FR correlation below the PCA plot
       4) Per-selection 'Why this run?' panel at the bottom
     """
@@ -69,43 +125,48 @@ def _render_table_and_plot(
         # Use user-selected PCA arrow features; fall back to PCA_FEATURES if none selected
         arrow_feats = pca_arrow_features or PCA_FEATURES
 
-        # 1) Global arrows from origin
-        try:
-            add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
-        except Exception:
-            pass
+        # 1) Global arrows from origin (if enabled)
+        if show_global_pca_arrows:
+            try:
+                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
+            except Exception:
+                pass
 
         # 2) Segment-anchored arrows near Low-FR and High-FR bands
         try:
             seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-            # Low-FR centroid
-            low_mask = (seg == "Low FR").values
-            if np.any(low_mask):
-                low_anchor = PCs[low_mask].mean(axis=0)
-                add_biplot_arrows_at_anchor_3d(
-                    fig,
-                    pca,
-                    arrow_feats,
-                    low_anchor,
-                    scale=1.2,
-                    color="green",
-                    name_prefix="Low FR ",
-                    showlegend=False,
-                )
-            # High-FR centroid
-            high_mask = (seg == "High FR").values
-            if np.any(high_mask):
-                high_anchor = PCs[high_mask].mean(axis=0)
-                add_biplot_arrows_at_anchor_3d(
-                    fig,
-                    pca,
-                    arrow_feats,
-                    high_anchor,
-                    scale=1.2,
-                    color="red",
-                    name_prefix="High FR ",
-                    showlegend=False,
-                )
+
+            # Low-FR centroid arrows (if enabled)
+            if show_low_fr_arrows:
+                low_mask = (seg == "Low FR").values
+                if np.any(low_mask):
+                    low_anchor = PCs[low_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig,
+                        pca,
+                        arrow_feats,
+                        low_anchor,
+                        scale=1.2,
+                        color="green",
+                        name_prefix="Low FR ",
+                        showlegend=False,
+                    )
+
+            # High-FR centroid arrows (if enabled)
+            if show_high_fr_arrows:
+                high_mask = (seg == "High FR").values
+                if np.any(high_mask):
+                    high_anchor = PCs[high_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig,
+                        pca,
+                        arrow_feats,
+                        high_anchor,
+                        scale=1.2,
+                        color="red",
+                        name_prefix="High FR ",
+                        showlegend=False,
+                    )
         except Exception:
             pass
 
@@ -145,41 +206,6 @@ def _render_table_and_plot(
             use_container_width=True,
             key=f"{key_prefix}-whybar",
         )
-
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-# === Visual analytics toggles ===
-st.sidebar.subheader("Root-Cause Visuals")
-
-show_biplot = st.sidebar.checkbox(
-    "Show PCA driver arrows",
-    value=True,
-    key="show_biplot",            # NEW
-)
-
-pca_arrow_features = st.sidebar.multiselect(
-    "PCA driver arrows (numeric features)",
-    PCA_FEATURES,
-    default=PCA_FEATURES,
-    key="pca_arrow_features",     # (optional but nice to be explicit)
-)
-
-show_segment_compare = st.sidebar.checkbox(
-    "Show segment comparison (z-scores / % share)",
-    value=True,
-    key="show_segment_compare",   # NEW
-)
-
-show_selection_why = st.sidebar.checkbox(
-    "Show 'Why this run?' panel",
-    value=True,
-    key="show_selection_why",     # NEW
-)
 
 
 

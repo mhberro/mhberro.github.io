@@ -1,91 +1,65 @@
 def segment_diff_bar(df: pd.DataFrame) -> go.Figure:
     """
-    Segment Comparison: Low vs High FR
+    Compare Low-FR vs High-FR segments for each feature in FEATURES_FOR_ANALYSIS.
 
-    For all features in FEATURES_FOR_ANALYSIS (numeric + categoricals via one-hot):
-
-      - Compute z-scores over the whole dataset (via zscore_matrix).
-      - For High-FR runs: compute mean z-score per feature.
-      - For Low-FR runs:  compute mean z-score per feature.
-      - Show *two* bar charts (High-FR and Low-FR), each with
-        the top-5 features by mean z-score for that segment.
-
-    Interpretation:
-      - High-FR chart: bars > 0 ⇒ features that tend to be higher /
-        more present in High-FR runs.
-      - Low-FR chart:  bars > 0 ⇒ features that tend to be higher /
-        more present in Low-FR runs.
-
-    This matches the intuition:
-      - e.g., capability_abc pops at the top of High-FR.
-      - capability_def pops at the top of Low-FR.
-      - init_time may appear in High-FR but below capability_abc if
-        its segment-specific effect is smaller.
+    - For numeric features: show mean z-score difference (High − Low).
+    - For categorical features: show % difference (High − Low)
+      of how often each category value appears within its FR segment.
+    - Keeps the top-5 absolute differences overall.
     """
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        shared_y=True,
-        subplot_titles=("High FR", "Low FR"),
-    )
+    fig = go.Figure()
+    seg = make_fr_segments(df)
+    if "FR" not in df.columns or seg is None:
+        fig.update_layout(title="Segment Comparison (FR data unavailable)")
+        return fig
 
-    # Build FR segments
-    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-    Z, labels = zscore_matrix(df)
+    # Separate low and high FR subsets
+    low_df = df[seg == "Low FR"]
+    high_df = df[seg == "High FR"]
 
-    # If nothing to show, return an empty-ish figure with a helpful title
-    if Z.empty or not labels:
+    numeric_diffs = {}
+    categorical_diffs = {}
+
+    for feat in FEATURES_FOR_ANALYSIS:
+        if feat not in df.columns:
+            continue
+        s = df[feat]
+
+        # Numeric: use standardized mean difference
+        if np.issubdtype(s.dtype, np.number):
+            z = (s - s.mean()) / s.std(ddof=0) if s.std(ddof=0) != 0 else s * 0
+            diff = z[high_df.index].mean() - z[low_df.index].mean()
+            numeric_diffs[feat] = diff
+        else:
+            # Categorical: compute percentage of each value in each FR segment
+            high_pct = high_df[feat].value_counts(normalize=True)
+            low_pct = low_df[feat].value_counts(normalize=True)
+            # Align all possible categories
+            all_values = set(high_pct.index) | set(low_pct.index)
+            for val in all_values:
+                diff = high_pct.get(val, 0) - low_pct.get(val, 0)
+                categorical_diffs[f"{feat}={val}"] = diff
+
+    # Combine and select top-5 absolute differences
+    all_diffs = {**numeric_diffs, **categorical_diffs}
+    if not all_diffs:
         fig.update_layout(
-            title="Segment Comparison (configure FEATURES_FOR_ANALYSIS)",
-            height=260,
+            title="No valid features in FEATURES_FOR_ANALYSIS",
+            height=250,
             margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    high_mask = (seg == "High FR").values
-    low_mask = (seg == "Low FR").values
+    top5 = dict(sorted(all_diffs.items(), key=lambda kv: abs(kv[1]), reverse=True)[:5])
 
-    if not np.any(high_mask) or not np.any(low_mask):
-        fig.update_layout(
-            title="Segment Comparison (need both High-FR and Low-FR runs)",
-            height=260,
-            margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Mean z-score per feature within each segment
-    mean_high = Z[high_mask].mean()
-    mean_low = Z[low_mask].mean()
-
-    # Top-5 features for each segment (by *magnitude* of mean z-score)
-    top_high = mean_high.reindex(labels).sort_values(key=lambda s: s.abs(), ascending=False).head(5)
-    top_low = mean_low.reindex(labels).sort_values(key=lambda s: s.abs(), ascending=False).head(5)
-
-    # High-FR bar chart (left)
-    fig.add_trace(
-        go.Bar(x=top_high.index.tolist(), y=top_high.values, name="High FR"),
-        row=1, col=1,
-    )
-
-    # Low-FR bar chart (right)
-    fig.add_trace(
-        go.Bar(x=top_low.index.tolist(), y=top_low.values, name="Low FR"),
-        row=1, col=2,
-    )
-
+    fig.add_bar(x=list(top5.keys()), y=list(top5.values()))
     fig.update_layout(
-        title="Segment Comparison: Low vs High FR (top-5 features per segment)",
-        xaxis_title="Feature / Category (one-hot)",
-        yaxis_title="Mean z-score within segment",
+        title="Top-5 Drivers of Failure Rate (High FR − Low FR)",
+        xaxis_title="Feature / Value",
+        yaxis_title="Δ (z-score or % share)",
         height=380,
-        margin=dict(l=10, r=10, t=60, b=80),
-        showlegend=False,
+        margin=dict(l=10, r=10, t=40, b=80),
     )
-
-    # Make x-axes labels readable
-    fig.update_xaxes(tickangle=45, row=1, col=1)
-    fig.update_xaxes(tickangle=45, row=1, col=2)
-
     return fig
 
 

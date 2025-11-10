@@ -1,10 +1,150 @@
-# Existing dataset controls (sidebar)
-show_all = st.sidebar.checkbox(
-    "Show all datasets",
-    value=False,
-    key="show_all_datasets",      # NEW
-)
+def _render_table_and_plot(
+    df: pd.DataFrame,
+    PCs: np.ndarray,
+    scores01: np.ndarray,
+    raw_scores: np.ndarray,
+    method_label: str,
+    key_prefix: str,
+    pca,                  # global PCA (for loadings)
+    pca_arrow_features: list[str],  # user-selected PCA features for arrows
+):
+    """
+    Renders:
+      1) Top anomalies table with row selection
+      2) PCA scatter with optional highlight + PCA loading arrows
+         (global + segment-anchored; subset controlled by pca_arrow_features)
+      3) Segment Comparison + FR correlation below the PCA plot
+      4) Per-selection 'Why this run?' panel at the bottom
+    """
+    df = df.copy()
+    df["anomaly_score"] = scores01
+    df["raw_anomaly_score"] = raw_scores
 
+    st.markdown(f"### {method_label}")
+
+    # --- Top anomalies: select a row to highlight on the plot ---
+    highlight_pos = None
+    if show_top > 0:
+        cols_keep = [
+            "Test_Run_ID",
+            "FR",
+            "Num_Tests",
+            "total_init_time",
+            "anomaly_score",
+            "raw_anomaly_score",
+            "Simulation_Host",
+            "Simulation_Node",
+            "Capability",
+            "Script_File",
+            "V",
+            "s_number",
+            "Build",
+        ]
+        cols_keep = [c for c in cols_keep if c in df.columns]
+
+        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+
+        st.markdown("**Top anomalies**")
+        editable = top[cols_keep].copy()
+        editable.insert(0, "Select", False)
+
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled={c: True for c in editable.columns if c != "Select"},
+            key=f"{key_prefix}-table",
+        )
+
+        selected_original_idxs = edited.index[edited["Select"]].tolist()
+        if selected_original_idxs:
+            pos = df.index.get_indexer([selected_original_idxs[0]])
+            if len(pos) and pos[0] != -1:
+                highlight_pos = int(pos[0])
+
+    # --- PCA plot (full width), with optional driver arrows ---
+    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+
+    if show_biplot and PCs.shape[1] >= 2 and pca is not None:
+        # Use user-selected PCA arrow features; fall back to PCA_FEATURES if none selected
+        arrow_feats = pca_arrow_features or PCA_FEATURES
+
+        # 1) Global arrows from origin
+        try:
+            add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
+        except Exception:
+            pass
+
+        # 2) Segment-anchored arrows near Low-FR and High-FR bands
+        try:
+            seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+            # Low-FR centroid
+            low_mask = (seg == "Low FR").values
+            if np.any(low_mask):
+                low_anchor = PCs[low_mask].mean(axis=0)
+                add_biplot_arrows_at_anchor_3d(
+                    fig,
+                    pca,
+                    arrow_feats,
+                    low_anchor,
+                    scale=1.2,
+                    color="green",
+                    name_prefix="Low FR ",
+                    showlegend=False,
+                )
+            # High-FR centroid
+            high_mask = (seg == "High FR").values
+            if np.any(high_mask):
+                high_anchor = PCs[high_mask].mean(axis=0)
+                add_biplot_arrows_at_anchor_3d(
+                    fig,
+                    pca,
+                    arrow_feats,
+                    high_anchor,
+                    scale=1.2,
+                    color="red",
+                    name_prefix="High FR ",
+                    showlegend=False,
+                )
+        except Exception:
+            pass
+
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
+
+    # --- Segment Comparison + FR correlation (below PCA plot) ---
+    if show_segment_compare:
+        st.markdown("#### Segment Comparison: Low vs High FR")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Numeric drivers**")
+            st.plotly_chart(
+                segment_diff_numeric_bar(df),
+                use_container_width=True,
+                key=f"{key_prefix}-segnum",
+            )
+        with c2:
+            st.markdown("**Categorical drivers**")
+            st.plotly_chart(
+                segment_diff_categorical_bar(df),
+                use_container_width=True,
+                key=f"{key_prefix}-segcat",
+            )
+
+        st.markdown("#### FR Correlation (High / Low)")
+        st.plotly_chart(
+            fr_correlation_heatmap(df),
+            use_container_width=True,
+            key=f"{key_prefix}-frcorr",
+        )
+
+    # --- Per-selection “Why this run?” (bottom) ---
+    if show_selection_why and highlight_pos is not None:
+        st.markdown("#### Why this run?")
+        st.plotly_chart(
+            per_point_contribution_bar(df, highlight_pos),
+            use_container_width=True,
+            key=f"{key_prefix}-whybar",
+        )
 
 
 

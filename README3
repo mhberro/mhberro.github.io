@@ -1,171 +1,98 @@
-# === Influence Network (Anomaly co-movement) ===
-st.sidebar.subheader("Anomaly Influence Network")
+def render_sidebar_controls():
+    """Dynamic sidebar that shows only the controls relevant to the visible graphics."""
+    st.sidebar.header("Controls")
 
-show_influence_network = st.sidebar.checkbox(
-    "Show Anomaly Influence Network",
-    value=True,
-    key="show_influence_network",
-)
+    # Dataset & global bits (always visible)
+    dataset_label_list = dataset_labels if "dataset_labels" in globals() else [p.name for p in csv_paths]
+    selected_idx = st.sidebar.selectbox("Dataset",
+                                        options=list(range(len(dataset_label_list))),
+                                        format_func=lambda i: dataset_label_list[i],
+                                        index=0,
+                                        key="selected_dataset_idx")
+    show_all = st.sidebar.checkbox("Show all datasets", value=False, key="show_all_datasets")
+    label_choice = st.sidebar.selectbox("Color/Group by", list(LABEL_DICT.keys()),
+                                        index=0, key="label_choice")
+    show_top = st.sidebar.number_input("Top-N anomalies table (0 to hide)", min_value=0, max_value=1000,
+                                       value=10, step=1, key="show_top")
 
-influence_subset = st.sidebar.selectbox(
-    "Subset",
-    ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
-    index=0,
-    key="influence_subset",
-)
+    st.sidebar.divider()
+    st.sidebar.subheader("Method-Specific")
 
-influence_topk = st.sidebar.slider(
-    "Top-K features",
-    min_value=4, max_value=15, value=10, step=1,
-    key="influence_topk",
-)
+    primary = st.session_state.get("active_primary", "PCA")
+    secondary = st.session_state.get("active_secondary", "Storyboard")
 
-influence_edge_thresh = st.sidebar.slider(
-    "Edge threshold (|corr|)",
-    min_value=0.10, max_value=0.90, value=0.40, step=0.05,
-    key="influence_edge_thresh",
-)
+    # PCA-specific controls
+    if primary == "PCA":
+        # Biplot/group visuals
+        st.sidebar.checkbox("Show PCA driver arrows", value=True, key="show_biplot")
+        st.sidebar.multiselect("PCA driver arrows (numeric features)",
+                               PCA_FEATURES,
+                               default=PCA_FEATURES,
+                               key="pca_arrow_features")
+        st.sidebar.checkbox("Show global arrows (from origin)", value=True, key="show_global_pca_arrows")
+        st.sidebar.checkbox("Show Low-FR cluster arrows", value=True, key="show_low_fr_arrows")
+        st.sidebar.checkbox("Show High-FR cluster arrows", value=True, key="show_high_fr_arrows")
 
-influence_corr_method = st.sidebar.selectbox(
-    "Correlation method",
-    ["pearson", "spearman"],
-    index=0,
-    key="influence_corr_method",
-)
+        # Storyboard toggles (only if Storyboard subtab is visible)
+        if secondary == "Storyboard":
+            st.sidebar.checkbox("Show segment comparison (z-scores / % share)", value=True,
+                                key="show_segment_compare")
+            st.sidebar.checkbox("Show 'Why this run?' panel", value=True, key="show_selection_why")
 
+        # Influence network controls (only if Influence subtab visible)
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.selectbox("Subset", ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                                 index=0, key="influence_subset")
+            st.sidebar.slider("Top-K features", 4, 15, 10, 1, key="influence_topk")
+            st.sidebar.slider("Edge threshold (|corr|)", 0.10, 0.90, 0.40, 0.05, key="influence_edge_thresh")
+            st.sidebar.selectbox("Correlation method", ["pearson", "spearman"], index=0,
+                                 key="influence_corr_method")
+            st.sidebar.checkbox("Show Anomaly Influence Network", value=True, key="show_influence_network")
 
+    # IF-specific controls
+    if primary == "Isolation Forest":
+        st.sidebar.slider("IF: Contamination (expected anomaly %)", 0.0, 0.2, 0.02, 0.005, key="if_contam")
+        st.sidebar.slider("IF: Trees (n_estimators)", 100, 1000, 300, 50, key="if_trees")
+        # Storyboard toggles
+        if secondary == "Storyboard":
+            st.sidebar.checkbox("Show segment comparison (z-scores / % share)", value=True,
+                                key="show_segment_compare")
+            st.sidebar.checkbox("Show 'Why this run?' panel", value=True, key="show_selection_why")
+        # Influence network toggles
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.selectbox("Subset", ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                                 index=0, key="influence_subset")
+            st.sidebar.slider("Top-K features", 4, 15, 10, 1, key="influence_topk")
+            st.sidebar.slider("Edge threshold (|corr|)", 0.10, 0.90, 0.40, 0.05, key="influence_edge_thresh")
+            st.sidebar.selectbox("Correlation method", ["pearson", "spearman"], index=0,
+                                 key="influence_corr_method")
+            st.sidebar.checkbox("Show Anomaly Influence Network", value=True, key="show_influence_network")
 
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-def anomaly_influence_network_figure(
-    df: pd.DataFrame,
-    scores01: np.ndarray,
-    *,
-    subset: str = "Anomalous (top 5%)",
-    q: float = 0.95,
-    top_k: int = 10,
-    edge_thresh: float = 0.40,
-    corr_method: str = "pearson",
-) -> go.Figure:
-    """
-    Build a feature co-movement network among the top-K features most responsible
-    for anomalies. Nodes = features; edges = |correlation| among selected subset.
-    Node color = mean z-score (subset); node size = variance (subset).
-    """
-    fig = go.Figure()
+    # LOF-specific controls
+    if primary == "Local Outlier Factor":
+        st.sidebar.slider("LOF: Neighbors (n_neighbors)", 5, 100, 20, 1, key="lof_k")
+        # Storyboard toggles
+        if secondary == "Storyboard":
+            st.sidebar.checkbox("Show segment comparison (z-scores / % share)", value=True,
+                                key="show_segment_compare")
+            st.sidebar.checkbox("Show 'Why this run?' panel", value=True, key="show_selection_why")
+        # Influence network toggles
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.selectbox("Subset", ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                                 index=0, key="influence_subset")
+            st.sidebar.slider("Top-K features", 4, 15, 10, 1, key="influence_topk")
+            st.sidebar.slider("Edge threshold (|corr|)", 0.10, 0.90, 0.40, 0.05, key="influence_edge_thresh")
+            st.sidebar.selectbox("Correlation method", ["pearson", "spearman"], index=0,
+                                 key="influence_corr_method")
+            st.sidebar.checkbox("Show Anomaly Influence Network", value=True, key="show_influence_network")
 
-    # Build numeric/one-hot analysis matrix from FEATURES_FOR_ANALYSIS
-    Z, labels = zscore_matrix(df)  # Z is standardized (z-scores)
-    if Z.empty or not labels:
-        fig.update_layout(
-            title="Influence Network (configure FEATURES_FOR_ANALYSIS)",
-            height=220, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Choose subset mask
-    if subset.startswith("Anomalous"):
-        thr = np.nanpercentile(scores01, 100 * q)
-        mask = scores01 >= thr
-        subset_name = "Anomalous"
-    elif subset.startswith("Normal"):
-        thr = np.nanpercentile(scores01, 100 * (1 - q))
-        mask = scores01 <= thr
-        subset_name = "Normal"
-    else:
-        mask = np.ones(len(Z), dtype=bool)
-        subset_name = "All runs"
-
-    Zs = Z.loc[mask]
-    if Zs.shape[0] < 3:
-        fig.update_layout(
-            title=f"Influence Network ({subset_name}: not enough rows)",
-            height=220, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Feature importance = variance within the subset (how much the feature varies among selected runs)
-    imp = Zs.var(axis=0)  # already standardized, so variance is an effect size
-    imp = imp.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
-    # Pick top-K features by importance
-    top_feats = imp.sort_values(ascending=False).head(top_k).index.tolist()
-    Zk = Zs[top_feats]
-
-    # Node color = mean z-score in subset (how high/low feature is on average)
-    node_color = Zk.mean(axis=0)  # signed
-    # Node size = scaled importance
-    imp_vals = imp[top_feats].values
-    if np.nanmax(imp_vals) <= 0:
-        sizes = np.full_like(imp_vals, 20.0, dtype=float)
-    else:
-        sizes = 20 + 40 * (imp_vals / np.nanmax(imp_vals))  # 20..60
-
-    # Correlation among top-K features within subset
-    corr = Zk.corr(method=corr_method).fillna(0.0)
-
-    # Layout: place nodes on a circle (stable & simple)
-    n = len(top_feats)
-    angles = np.linspace(0, 2 * np.pi, n, endpoint=False)
-    radius = 1.0
-    xs = radius * np.cos(angles)
-    ys = radius * np.sin(angles)
-    pos = {feat: (float(x), float(y)) for feat, x, y in zip(top_feats, xs, ys)}
-
-    # Edges: add lines where |corr| >= edge_thresh; color by sign
-    for i in range(n):
-        for j in range(i + 1, n):
-            f1, f2 = top_feats[i], top_feats[j]
-            c = corr.loc[f1, f2]
-            if np.isnan(c) or abs(c) < edge_thresh:
-                continue
-            x0, y0 = pos[f1]
-            x1, y1 = pos[f2]
-            fig.add_trace(
-                go.Scatter(
-                    x=[x0, x1], y=[y0, y1],
-                    mode="lines",
-                    line=dict(
-                        width=2 + 4 * abs(c),  # thicker = stronger
-                        color="red" if c > 0 else "blue",
-                    ),
-                    hoverinfo="text",
-                    text=[f"{f1} ↔ {f2}: corr={c:.2f}"] * 2,
-                    showlegend=False,
-                )
-            )
-
-    # Nodes
-    fig.add_trace(
-        go.Scatter(
-            x=[pos[f][0] for f in top_feats],
-            y=[pos[f][1] for f in top_feats],
-            mode="markers+text",
-            text=top_feats,
-            textposition="top center",
-            hoverinfo="text",
-            marker=dict(
-                size=sizes.tolist(),
-                color=node_color.values.tolist(),
-                colorscale="RdBu",
-                cmin=-np.nanmax(np.abs(node_color.values)) if np.nanmax(np.abs(node_color.values)) > 0 else -1,
-                cmax= np.nanmax(np.abs(node_color.values)) if np.nanmax(np.abs(node_color.values)) > 0 else 1,
-                colorbar=dict(title="mean z (subset)"),
-                line=dict(width=1, color="#444"),
-            ),
-            showlegend=False,
-        )
-    )
-
-    fig.update_layout(
-        title=f"Anomaly Influence Network — {subset_name} subset "
-              f"(Top-{top_k}, edges |corr|≥{edge_thresh:.2f})",
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        height=520,
-        margin=dict(l=10, r=10, t=60, b=10),
-    )
-    return fig
+    # Return a small dict used by main rendering
+    return {
+        "selected_idx": st.session_state["selected_dataset_idx"],
+        "show_all": show_all,
+        "label_choice": st.session_state["label_choice"],
+        "show_top": st.session_state["show_top"],
+    }
 
 
 
@@ -183,14 +110,9 @@ def _render_table_and_plot(
     pca_arrow_features: list[str],  # user-selected PCA features for arrows
 ):
     """
-    Renders:
-      1) Top anomalies table with row selection
-      2) PCA scatter with optional highlight + PCA loading arrows
-         (global + segment-anchored; subset controlled by pca_arrow_features
-          and by which clusters the user chooses to display)
-      3) Segment Comparison + FR correlation below the PCA plot
-      4) Anomaly Influence Network (optional)
-      5) Per-selection 'Why this run?' panel at the bottom
+    Renders the Top anomalies + PCA plot. Beneath that, renders a sub-tabset:
+      - Storyboard (segment comparison, FR correlation, 'Why this run?')
+      - Anomaly Influence Network
     """
     df = df.copy()
     df["anomaly_score"] = scores01
@@ -198,32 +120,21 @@ def _render_table_and_plot(
 
     st.markdown(f"### {method_label}")
 
-    # --- Top anomalies: select a row to highlight on the plot ---
+    # --- Top anomalies table & selection ---
     highlight_pos = None
-    if show_top > 0:
+    if st.session_state.get("show_top", 10) > 0:
         cols_keep = [
-            "Test_Run_ID",
-            "FR",
-            "Num_Tests",
-            "total_init_time",
-            "anomaly_score",
-            "raw_anomaly_score",
-            "Simulation_Host",
-            "Simulation_Node",
-            "Capability",
-            "Script_File",
-            "V",
-            "s_number",
-            "Build",
+            "Test_Run_ID", "FR", "Num_Tests", "total_init_time",
+            "anomaly_score", "raw_anomaly_score",
+            "Simulation_Host", "Simulation_Node", "Capability",
+            "Script_File", "V", "s_number", "Build",
         ]
         cols_keep = [c for c in cols_keep if c in df.columns]
-
-        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+        top = df.sort_values("anomaly_score", ascending=False).head(st.session_state["show_top"])
 
         st.markdown("**Top anomalies**")
         editable = top[cols_keep].copy()
         editable.insert(0, "Select", False)
-
         edited = st.data_editor(
             editable,
             use_container_width=True,
@@ -231,7 +142,6 @@ def _render_table_and_plot(
             disabled={c: True for c in editable.columns if c != "Select"},
             key=f"{key_prefix}-table",
         )
-
         selected_original_idxs = edited.index[edited["Select"]].tolist()
         if selected_original_idxs:
             pos = df.index.get_indexer([selected_original_idxs[0]])
@@ -239,114 +149,167 @@ def _render_table_and_plot(
                 highlight_pos = int(pos[0])
 
     # --- PCA plot (full width), with optional driver arrows ---
-    fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+    fig = plot_for_df(df, PCs, st.session_state["label_choice"], highlight_pos=highlight_pos)
 
-    if show_biplot and PCs.shape[1] >= 2 and pca is not None:
-        # Use user-selected PCA arrow features; fall back to PCA_FEATURES if none selected
-        arrow_feats = pca_arrow_features or PCA_FEATURES
-
-        # 1) Global arrows from origin (if enabled)
-        if show_global_pca_arrows:
-            try:
-                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
-            except Exception:
-                pass
-
-        # 2) Segment-anchored arrows near Low-FR and High-FR bands (if enabled)
+    if st.session_state.get("show_biplot", True) and PCs.shape[1] >= 2 and pca is not None:
+        arrow_feats = st.session_state.get("pca_arrow_features", PCA_FEATURES) or PCA_FEATURES
+        # Global arrows
+        if st.session_state.get("show_global_pca_arrows", True):
+            try: add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
+            except Exception: pass
+        # Segment-anchored arrows
         try:
-            seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-
-            if show_low_fr_arrows:
+            seg = make_fr_segments(df)
+            if st.session_state.get("show_low_fr_arrows", True):
                 low_mask = (seg == "Low FR").values
                 if np.any(low_mask):
                     low_anchor = PCs[low_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        arrow_feats,
-                        low_anchor,
-                        scale=1.2,
-                        color="green",
-                        name_prefix="Low FR ",
-                        showlegend=False,
-                    )
-
-            if show_high_fr_arrows:
+                    add_biplot_arrows_at_anchor_3d(fig, pca, arrow_feats, low_anchor,
+                                                   scale=1.2, color="green", name_prefix="Low FR ")
+            if st.session_state.get("show_high_fr_arrows", True):
                 high_mask = (seg == "High FR").values
                 if np.any(high_mask):
                     high_anchor = PCs[high_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(
-                        fig,
-                        pca,
-                        arrow_feats,
-                        high_anchor,
-                        scale=1.2,
-                        color="red",
-                        name_prefix="High FR ",
-                        showlegend=False,
-                    )
+                    add_biplot_arrows_at_anchor_3d(fig, pca, arrow_feats, high_anchor,
+                                                   scale=1.2, color="red", name_prefix="High FR ")
         except Exception:
             pass
 
     st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
 
-    # --- Segment Comparison + FR correlation (below PCA plot) ---
-    if show_segment_compare:
-        st.markdown("#### Segment Comparison: Low vs High FR")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Numeric drivers**")
-            st.plotly_chart(
-                segment_diff_numeric_bar(df),
-                use_container_width=True,
-                key=f"{key_prefix}-segnum",
+    # --- Secondary tabs: Storyboard | Anomaly Influence Network ---
+    sub_story, sub_net = st.tabs(["Storyboard", "Anomaly Influence Network"])
+    # Track active secondary for dynamic sidebar
+    with sub_story:
+        st.session_state["active_secondary"] = "Storyboard"
+        if st.session_state.get("show_segment_compare", True):
+            st.markdown("#### Segment Comparison: Low vs High FR")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Numeric drivers**")
+                st.plotly_chart(segment_diff_numeric_bar(df), use_container_width=True,
+                                key=f"{key_prefix}-segnum")
+            with c2:
+                st.markdown("**Categorical drivers**")
+                st.plotly_chart(segment_diff_categorical_bar(df), use_container_width=True,
+                                key=f"{key_prefix}-segcat")
+            st.markdown("#### FR Correlation (High / Low)")
+            st.plotly_chart(fr_correlation_heatmap(df), use_container_width=True,
+                            key=f"{key_prefix}-frcorr")
+        if st.session_state.get("show_selection_why", True) and highlight_pos is not None:
+            st.markdown("#### Why this run?")
+            st.plotly_chart(per_point_contribution_bar(df, highlight_pos),
+                            use_container_width=True, key=f"{key_prefix}-whybar")
+
+    with sub_net:
+        st.session_state["active_secondary"] = "Anomaly Influence Network"
+        if st.session_state.get("show_influence_network", True):
+            net_fig = anomaly_influence_network_figure(
+                df,
+                scores01,
+                subset=st.session_state.get("influence_subset", "Anomalous (top 5%)"),
+                q=0.95,
+                top_k=st.session_state.get("influence_topk", 10),
+                edge_thresh=st.session_state.get("influence_edge_thresh", 0.40),
+                corr_method=st.session_state.get("influence_corr_method", "pearson"),
             )
-        with c2:
-            st.markdown("**Categorical drivers**")
-            st.plotly_chart(
-                segment_diff_categorical_bar(df),
-                use_container_width=True,
-                key=f"{key_prefix}-segcat",
+            st.plotly_chart(net_fig, use_container_width=True, key=f"{key_prefix}-influence")
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+def render_one(path: Path):
+    """
+    Renders three primary tabs: PCA | Isolation Forest | Local Outlier Factor
+    Each primary tab includes a secondary tabset: Storyboard | Anomaly Influence Network
+    Sidebar controls are dynamic based on the active primary/secondary tabs.
+    """
+    try:
+        raw = load_csv(path)
+        df = engineer_features(raw)
+
+        # Feature matrices
+        X = build_features(df).to_numpy(dtype=float)
+        Xz, _ = scale_features(df)
+
+        # PCA for viz + PCA-distance anomaly score for the PCA tab
+        scaler_viz, pca_viz, _, PCs = fit_pca_scaled(X, n_components=3)
+        pca_dist_raw = compute_anomaly_scores(PCs)
+        pca_s01 = normalize_scores(pca_dist_raw)
+
+        # IF scores
+        _, if_raw = score_isolation_forest(
+            Xz,
+            contamination=st.session_state.get("if_contam", 0.02),
+            n_estimators=st.session_state.get("if_trees", 300),
+        )
+        if_s01 = normalize_scores(if_raw)
+
+        # LOF scores
+        _, lof_raw = score_lof(
+            Xz,
+            n_neighbors=st.session_state.get("lof_k", 20),
+        )
+        lof_s01 = normalize_scores(lof_raw)
+
+        st.subheader(f"{path.name} · Anomaly Analysis")
+
+        tab_pca, tab_if, tab_lof = st.tabs(["Principal Component Analysis", "Isolation Forest", "Local Outlier Factor"])
+
+        with tab_pca:
+            st.session_state["active_primary"] = "PCA"
+            _render_table_and_plot(
+                df, PCs, pca_s01, pca_dist_raw,
+                "Principal Component Analysis",
+                key_prefix=f"{path.name}-PCA",
+                pca=pca_viz,
+                pca_arrow_features=st.session_state.get("pca_arrow_features", PCA_FEATURES),
             )
 
-        st.markdown("#### FR Correlation (High / Low)")
-        st.plotly_chart(
-            fr_correlation_heatmap(df),
-            use_container_width=True,
-            key=f"{key_prefix}-frcorr",
-        )
+        with tab_if:
+            st.session_state["active_primary"] = "Isolation Forest"
+            _render_table_and_plot(
+                df, PCs, if_s01, if_raw,
+                "Isolation Forest",
+                key_prefix=f"{path.name}-IF",
+                pca=pca_viz,
+                pca_arrow_features=st.session_state.get("pca_arrow_features", PCA_FEATURES),
+            )
 
-    # --- NEW: Anomaly Influence Network ---
-    if show_influence_network:
-        st.markdown("#### Anomaly Influence Network")
-        net_fig = anomaly_influence_network_figure(
-            df,
-            scores01,
-            subset=influence_subset,
-            q=0.95,
-            top_k=influence_topk,
-            edge_thresh=influence_edge_thresh,
-            corr_method=influence_corr_method,
-        )
-        st.plotly_chart(net_fig, use_container_width=True, key=f"{key_prefix}-influence")
+        with tab_lof:
+            st.session_state["active_primary"] = "Local Outlier Factor"
+            _render_table_and_plot(
+                df, PCs, lof_s01, lof_raw,
+                "Local Outlier Factor",
+                key_prefix=f"{path.name}-LOF",
+                pca=pca_viz,
+                pca_arrow_features=st.session_state.get("pca_arrow_features", PCA_FEATURES),
+            )
 
-    # --- Per-selection “Why this run?” (bottom) ---
-    if show_selection_why and highlight_pos is not None:
-        st.markdown("#### Why this run?")
-        st.plotly_chart(
-            per_point_contribution_bar(df, highlight_pos),
-            use_container_width=True,
-            key=f"{key_prefix}-whybar",
-        )
+    except Exception as e:
+        st.error(f"Failed to process {path.name}: {e}")
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+# ---- Dynamic Sidebar (renders based on active tabs) ----
+sidebar_state = render_sidebar_controls()
+selected_idx = sidebar_state["selected_idx"]
+show_all = sidebar_state["show_all"]
+label_choice = sidebar_state["label_choice"]  # consumed inside _render_table_and_plot via session_state
+show_top = sidebar_state["show_top"]          # consumed inside _render_table_and_plot via session_state
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-
+if show_all:
+    for path in csv_paths:
+        render_one(path)
+        st.divider()
+else:
+    render_one(csv_paths[selected_idx])
 
 
 =========================================================================================================================================================================

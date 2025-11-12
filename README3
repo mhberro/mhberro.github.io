@@ -362,5 +362,176 @@ def _render_table_and_plot(
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+def _render_table_and_plot(
+    df: pd.DataFrame,
+    PCs: np.ndarray,
+    scores01: np.ndarray,
+    raw_scores: np.ndarray,
+    method_label: str,
+    key_prefix: str,
+    pca,  # global PCA (for loadings)
+):
+    """
+    Renders three visual perspectives for a given anomaly method:
+
+      1) Storyboard:
+         - Top anomalies table with row selection
+         - PCA scatter with optional highlight
+         - PCA loading arrows (global + segment-anchored)
+         - Segment Comparison & FR correlation
+         - Per-selection 'Why this run?' bar chart
+
+      2) Cluster Heatmap:
+         - Cluster-vs-feature heatmap in z-score space
+
+      3) Feature Network:
+         - Small network of top anomaly-driving features
+    """
+    df = df.copy()
+    df["anomaly_score"] = scores01
+    df["raw_anomaly_score"] = raw_scores
+
+    st.markdown(f"### {method_label}")
+
+    tab_story, tab_cluster, tab_network = st.tabs(
+        ["Storyboard", "Cluster Heatmap", "Feature Network"]
+    )
+
+    # === 1) STORYBOARD TAB ===
+    with tab_story:
+        # --- Top anomalies: select a row to highlight on the plot ---
+        highlight_pos = None
+        if show_top > 0:
+            cols_keep = [
+                "Test_Run_ID",
+                "FR",
+                "Num_Tests",
+                "total_init_time",
+                "anomaly_score",
+                "raw_anomaly_score",
+                "Simulation_Host",
+                "Simulation_Node",
+                "Capability",
+                "Script_File",
+                "V",
+                "s_number",
+                "Build",
+            ]
+            cols_keep = [c for c in cols_keep if c in df.columns]
+
+            top = df.sort_values("anomaly_score", ascending=False).head(show_top)
+
+            st.markdown("**Top anomalies**")
+            editable = top[cols_keep].copy()
+            editable.insert(0, "Select", False)
+
+            edited = st.data_editor(
+                editable,
+                use_container_width=True,
+                num_rows="fixed",
+                disabled={c: True for c in editable.columns if c != "Select"},
+                key=f"{key_prefix}-table",
+            )
+
+            selected_original_idxs = edited.index[edited["Select"]].tolist()
+            if selected_original_idxs:
+                pos = df.index.get_indexer([selected_original_idxs[0]])
+                if len(pos) and pos[0] != -1:
+                    highlight_pos = int(pos[0])
+
+        # --- PCA plot with optional highlight ---
+        fig = plot_for_df(df, PCs, label_choice, highlight_pos=highlight_pos)
+
+        # === Driver arrows overlays (global + low/high FR anchors) ===
+        if show_biplot and PCs.shape[1] >= 2 and pca is not None:
+            # 1) Global arrows from origin
+            try:
+                add_pca_loadings_3d(fig, pca, PCA_FEATURES, scale=2.0)
+            except Exception:
+                pass
+
+            # 2) Segment-anchored arrows near Low-FR and High-FR bands
+            try:
+                seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+                # Low-FR centroid
+                low_mask = (seg == "Low FR").values
+                if np.any(low_mask):
+                    low_anchor = PCs[low_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig,
+                        pca,
+                        PCA_FEATURES,
+                        low_anchor,
+                        scale=1.2,
+                        color="green",
+                        name_prefix="Low FR ",
+                        showlegend=False,
+                    )
+                # High-FR centroid
+                high_mask = (seg == "High FR").values
+                if np.any(high_mask):
+                    high_anchor = PCs[high_mask].mean(axis=0)
+                    add_biplot_arrows_at_anchor_3d(
+                        fig,
+                        pca,
+                        PCA_FEATURES,
+                        high_anchor,
+                        scale=1.2,
+                        color="red",
+                        name_prefix="High FR ",
+                        showlegend=False,
+                    )
+            except Exception:
+                pass
+
+        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
+
+        # --- Segment Comparison + FR Correlation ---
+        if show_segment_compare:
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.markdown("#### Segment Comparison: Low vs High FR")
+                st.plotly_chart(
+                    segment_diff_bar(df),
+                    use_container_width=True,
+                    key=f"{key_prefix}-segdiff",
+                )
+            with c2:
+                st.markdown("#### FR Correlation")
+                st.plotly_chart(
+                    fr_correlation_heatmap(df),
+                    use_container_width=True,
+                    key=f"{key_prefix}-frcorr",
+                )
+
+        # --- Per-selection “Why this run?” ---
+        if show_selection_why and highlight_pos is not None:
+            st.markdown("#### Why this run?")
+            st.plotly_chart(
+                per_point_contribution_bar(df, highlight_pos),
+                use_container_width=True,
+                key=f"{key_prefix}-whybar",
+            )
+
+    # === 2) CLUSTER HEATMAP TAB ===
+    with tab_cluster:
+        st.markdown("#### Cluster-level feature patterns")
+        st.plotly_chart(
+            cluster_profile_heatmap(df, PCs, scores01),
+            use_container_width=True,
+            key=f"{key_prefix}-clusterheat",
+        )
+
+    # === 3) FEATURE NETWORK TAB ===
+    with tab_network:
+        # Use the most anomalous subset to focus the network
+        n_sub = max(20, int(0.2 * len(df)))
+        df_anom = df.sort_values("anomaly_score", ascending=False).head(n_sub)
+        st.markdown("#### Relationships among top anomaly-driving features")
+        st.plotly_chart(
+            feature_influence_network_figure(df_anom),
+            use_container_width=True,
+            key=f"{key_prefix}-featnet",
+        )
 
 

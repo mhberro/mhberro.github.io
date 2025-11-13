@@ -1,80 +1,93 @@
 def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
     """
-    Show effect sizes (Cohen's d) of each analysis feature for:
-      - High-FR vs Rest
-      - Low-FR  vs Rest
+    Show representation (%) of each feature/value among High-FR and Low-FR runs.
 
-    Uses the analysis matrix (numeric + one-hot from FEATURES_FOR_ANALYSIS).
-    Keeps the top-5 features by max(|d_high|, |d_low|).
+    For categorical features:
+        each 'Feature=Value' combination is treated separately (one-hot style),
+        and we compute the % of High-FR vs Low-FR runs that contain that value.
+
+    For numeric features:
+        we use quartiles — bin into Q1..Q4 — and compute how much each quartile
+        appears in High-FR vs Low-FR runs (showing which ranges dominate).
+
+    The result is a 2-row heatmap:
+        - Row 1: % of High-FR runs containing each feature/value
+        - Row 2: % of Low-FR runs containing each feature/value
     """
     fig = go.Figure()
-
-    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+    seg = make_fr_segments(df)
     if seg is None or seg.isna().all():
+        fig.update_layout(title="FR representation (segments unavailable)",
+                          height=200, margin=dict(l=10, r=10, t=40, b=40))
+        return fig
+
+    # --- Prepare masks ---
+    high_mask = seg == "High FR"
+    low_mask = seg == "Low FR"
+    high_df = df.loc[high_mask]
+    low_df = df.loc[low_mask]
+
+    rep_dict_high = {}
+    rep_dict_low = {}
+
+    for feat in FEATURES_FOR_ANALYSIS:
+        if feat not in df.columns:
+            continue
+
+        s = df[feat]
+        # ---- Categorical feature: measure % of each value ----
+        if not np.issubdtype(s.dtype, np.number):
+            high_counts = high_df[feat].value_counts(normalize=True)
+            low_counts = low_df[feat].value_counts(normalize=True)
+            all_vals = set(high_counts.index) | set(low_counts.index)
+            for val in all_vals:
+                label = f"{feat}={val}"
+                rep_dict_high[label] = 100 * high_counts.get(val, 0.0)
+                rep_dict_low[label] = 100 * low_counts.get(val, 0.0)
+        else:
+            # ---- Numeric feature: bin into quartiles ----
+            q = pd.qcut(s.rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
+            df_bin = df.assign(_bin=q)
+            high_counts = df_bin.loc[high_mask, "_bin"].value_counts(normalize=True)
+            low_counts = df_bin.loc[low_mask, "_bin"].value_counts(normalize=True)
+            for val in ["Q1","Q2","Q3","Q4"]:
+                label = f"{feat}:{val}"
+                rep_dict_high[label] = 100 * high_counts.get(val, 0.0)
+                rep_dict_low[label] = 100 * low_counts.get(val, 0.0)
+
+    if not rep_dict_high:
         fig.update_layout(
-            title="FR effect sizes (segments unavailable)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
+            title="FR representation (no valid features)",
+            height=220, margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    X, labels = build_analysis_matrix(df)
-    if X.empty or not labels:
-        fig.update_layout(
-            title="FR effect sizes (configure FEATURES_FOR_ANALYSIS)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
+    # --- Construct DataFrame and limit to top features by High-FR representation ---
+    df_rep = pd.DataFrame({
+        "High_FR": pd.Series(rep_dict_high),
+        "Low_FR": pd.Series(rep_dict_low)
+    }).fillna(0.0)
 
-    high_mask = (seg == "High FR").values
-    low_mask  = (seg == "Low FR").values
+    # Rank by which features dominate High-FR
+    top_idx = df_rep["High_FR"].sort_values(ascending=False).head(10).index
+    df_top = df_rep.loc[top_idx]
 
-    def cohens_d(group_mask: np.ndarray) -> pd.Series:
-        """Cohen's d for each feature: group vs rest (pooled SD)."""
-        if X.shape[0] < 3 or group_mask.sum() < 2 or (~group_mask).sum() < 2:
-            return pd.Series(0.0, index=labels)
+    mat = df_top.T  # rows: High_FR, Low_FR
 
-        X1 = X.loc[group_mask]
-        X2 = X.loc[~group_mask]
+    fig.add_trace(go.Heatmap(
+        z=mat.values,
+        x=mat.columns.tolist(),
+        y=mat.index.tolist(),
+        text=mat.round(1).astype(str) + "%",
+        texttemplate="%{text}",
+        zmin=0, zmax=100,
+        colorscale="YlOrRd",
+        colorbar=dict(title="% representation"),
+    ))
 
-        m1 = X1.mean(axis=0)
-        m2 = X2.mean(axis=0)
-        v1 = X1.var(axis=0, ddof=1)
-        v2 = X2.var(axis=0, ddof=1)
-        n1 = float(len(X1))
-        n2 = float(len(X2))
-
-        sp2 = ((n1 - 1.0) * v1 + (n2 - 1.0) * v2) / max(n1 + n2 - 2.0, 1.0)
-        sp = sp2.clip(lower=1e-12).pow(0.5)  # avoid divide-by-zero
-
-        d = (m1 - m2) / sp
-        d = d.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        return d
-
-    d_high = cohens_d(high_mask)
-    d_low  = cohens_d(low_mask)
-
-    # Keep top-5 features by largest effect across High/Low
-    max_abs = pd.concat([d_high.abs(), d_low.abs()], axis=1).max(axis=1)
-    top_idx = max_abs.sort_values(ascending=False).head(5).index
-
-    mat = pd.DataFrame(
-        {"High_FR": d_high.loc[top_idx], "Low_FR": d_low.loc[top_idx]},
-    ).T  # shape: (2, k)
-
-    fig.add_trace(
-        go.Heatmap(
-            z=mat.values,
-            x=mat.columns.tolist(),     # features
-            y=mat.index.tolist(),       # ["High_FR","Low_FR"]
-            text=mat.round(3).values,
-            texttemplate="%{text}",
-            zmin=-3, zmax=3,            # typical effect size range; adjust if needed
-            colorbar=dict(title="Cohen's d"),
-        )
-    )
     fig.update_layout(
-        title="Effect Size with High/Low FR (Cohen's d: group vs rest)",
-        height=260,
+        title="Feature Representation (% share) among High-FR and Low-FR runs",
+        height=300,
         margin=dict(l=10, r=10, t=40, b=10),
     )
     return fig

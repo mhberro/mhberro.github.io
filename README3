@@ -1,66 +1,101 @@
 def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
     """
-    Representation heatmap:
-      - For CATEGORICAL features, for each value `feat=val`, compute:
-          High_FR % = 100 * (# rows with feat=val AND High_FR) / (# rows with feat=val AND (High_FR or Low_FR))
-          Low_FR  % = 100 * (# rows with feat=val AND Low_FR)  / (# rows with feat=val AND (High_FR or Low_FR))
-        => High + Low = 100% for each value (Mid FR rows are excluded from the denominator).
-      - For NUMERIC features, bin into quartiles (Q1..Q4) and do the same per-bin split.
-
-    Keeps the top-10 columns by High_FR representation (most indicative of High_FR).
+    Representation heatmap (robust, groupby-based):
+      - For CATEGORICAL features:
+          For each value `feat=val`, compute within High/Low FR rows:
+            High_FR% = 100 * count(feat=val & High_FR) / [count(feat=val & High_FR) + count(feat=val & Low_FR)]
+            Low_FR%  = 100 * count(feat=val & Low_FR)  / [same denominator]
+          (Mid FR rows are excluded from both numerator and denominator.)
+      - For NUMERIC features:
+          Bin each feature into quartiles (qcut with duplicates='drop') and compute the same split per bin.
+      - Keeps the top-10 columns by High_FR% (most indicative of High_FR).
     """
     fig = go.Figure()
-    seg = make_fr_segments(df)
+
+    seg = make_fr_segments(df)  # expected values: "Low FR", "Mid FR", "High FR"
     if seg is None or seg.isna().all():
         fig.update_layout(title="FR representation (segments unavailable)",
                           height=200, margin=dict(l=10, r=10, t=40, b=40))
         return fig
 
-    high_mask = (seg == "High FR")
-    low_mask  = (seg == "Low FR")
+    # Work only with High/Low rows; exclude Mid FR entirely from denominators
+    mask_hl = seg.isin(["High FR", "Low FR"])
+    if not mask_hl.any():
+        fig.update_layout(title="FR representation (no High/Low rows)",
+                          height=200, margin=dict(l=10, r=10, t=40, b=40))
+        return fig
+
+    df_hl = df.loc[mask_hl].copy()
+    df_hl["_FR_GROUP"] = np.where(seg.loc[mask_hl].eq("High FR"), "High_FR", "Low_FR")
 
     rep_high = {}
-    rep_low  = {}
+    rep_low = {}
 
     for feat in FEATURES_FOR_ANALYSIS:
-        if feat not in df.columns:
+        if feat not in df_hl.columns:
             continue
-        s = df[feat]
 
-        # Categorical: per value split
+        s = df_hl[feat]
+
+        # CATEGORICAL branch: treat as strings and compute per-value representation
         if not np.issubdtype(s.dtype, np.number):
-            vals = df[feat].astype(str)
-            for val, _ in vals.value_counts().items():
-                val_mask = (vals == val)
-                # Only count High/Low rows for the denominator (exclude Mid FR)
-                denom = (val_mask & (high_mask | low_mask)).sum()
-                if denom == 0:
-                    continue
-                n_high = (val_mask & high_mask).sum()
-                n_low  = (val_mask & low_mask).sum()
+            sub = df_hl[[feat, "_FR_GROUP"]].dropna()
+            if sub.empty:
+                continue
+            sub = sub.assign(**{feat: sub[feat].astype(str)})
+            counts = sub.groupby([feat, "_FR_GROUP"]).size().unstack("_FR_GROUP", fill_value=0)
+
+            # Ensure both columns exist
+            for col in ("High_FR", "Low_FR"):
+                if col not in counts.columns:
+                    counts[col] = 0
+
+            denom = counts["High_FR"] + counts["Low_FR"]
+            valid = denom > 0
+            if not valid.any():
+                continue
+
+            high_pct = 100.0 * (counts.loc[valid, "High_FR"] / denom.loc[valid])
+            low_pct  = 100.0 * (counts.loc[valid, "Low_FR"]  / denom.loc[valid])
+
+            for val in counts.index[valid]:
                 label = f"{feat}={val}"
-                rep_high[label] = 100.0 * n_high / denom
-                rep_low[label]  = 100.0 * n_low  / denom
+                rep_high[label] = float(high_pct.loc[val])
+                rep_low[label]  = float(low_pct.loc[val])
 
         else:
-            # Numeric: bin into quartiles and split
+            # NUMERIC branch: bin into quartiles over High+Low rows only
             s_num = pd.to_numeric(s, errors="coerce")
-            if s_num.notna().sum() < 4:
+            sub = pd.DataFrame({feat: s_num, "_FR_GROUP": df_hl["_FR_GROUP"]}).dropna()
+            if sub[feat].nunique() < 2 or sub.empty:
                 continue
+
             try:
-                bins = pd.qcut(s_num.rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
+                bins = pd.qcut(sub[feat], 4, labels=["Q1", "Q2", "Q3", "Q4"], duplicates="drop")
             except Exception:
                 continue
-            for qlabel in ["Q1","Q2","Q3","Q4"]:
-                bin_mask = (bins == qlabel)
-                denom = (bin_mask & (high_mask | low_mask)).sum()
-                if denom == 0:
-                    continue
-                n_high = (bin_mask & high_mask).sum()
-                n_low  = (bin_mask & low_mask).sum()
-                label = f"{feat}:{qlabel}"
-                rep_high[label] = 100.0 * n_high / denom
-                rep_low[label]  = 100.0 * n_low  / denom
+
+            sub = sub.assign(_BIN=bins).dropna(subset=["_BIN"])
+            if sub.empty:
+                continue
+
+            counts = sub.groupby(["_BIN", "_FR_GROUP"]).size().unstack("_FR_GROUP", fill_value=0)
+            for col in ("High_FR", "Low_FR"):
+                if col not in counts.columns:
+                    counts[col] = 0
+
+            denom = counts["High_FR"] + counts["Low_FR"]
+            valid = denom > 0
+            if not valid.any():
+                continue
+
+            high_pct = 100.0 * (counts.loc[valid, "High_FR"] / denom.loc[valid])
+            low_pct  = 100.0 * (counts.loc[valid, "Low_FR"]  / denom.loc[valid])
+
+            for qlab in counts.index[valid]:
+                label = f"{feat}:{qlab}"
+                rep_high[label] = float(high_pct.loc[qlab])
+                rep_low[label]  = float(low_pct.loc[qlab])
 
     if not rep_high:
         fig.update_layout(
@@ -69,9 +104,15 @@ def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
         )
         return fig
 
+    # Assemble matrix and choose top-10 by High_FR representation
     mat = pd.DataFrame({"High_FR": pd.Series(rep_high), "Low_FR": pd.Series(rep_low)}).fillna(0.0)
 
-    # Keep top-10 columns by High_FR percentage
+    # Guard against stray rounding mismatches (normalize each column to sum to 100 exactly)
+    col_sums = mat["High_FR"] + mat["Low_FR"]
+    nz = col_sums > 0
+    mat.loc[nz, "High_FR"] = 100.0 * mat.loc[nz, "High_FR"] / col_sums.loc[nz]
+    mat.loc[nz, "Low_FR"]  = 100.0 * mat.loc[nz, "Low_FR"]  / col_sums.loc[nz]
+
     top_idx = mat["High_FR"].sort_values(ascending=False).head(10).index
     mat = mat.loc[top_idx].T  # rows: High_FR, Low_FR
 
@@ -87,7 +128,7 @@ def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
     ))
     fig.update_layout(
         title="Feature/Value Representation within High-FR vs Low-FR (sums to 100% per value/bin)",
-        height=300,
+        height=320,
         margin=dict(l=10, r=10, t=40, b=10),
     )
     return fig
@@ -95,125 +136,9 @@ def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
 
 
 
+
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-
-def _render_table_and_plot(
-    df: pd.DataFrame,
-    PCs: np.ndarray,
-    scores01: np.ndarray,
-    raw_scores: np.ndarray,
-    method_label: str,
-    key_prefix: str,
-    pca,                  # global PCA (for loadings)
-    pca_arrow_features: list[str],  # user-selected PCA features for arrows
-):
-    """
-    Original layout:
-      - Top anomalies table
-      - PCA plot (with optional driver arrows)
-      - Segment Comparison (categorical only) + FR representation heatmap below
-      - Optional 'Why this run?' panel
-    """
-    df = df.copy()
-    df["anomaly_score"] = scores01
-    df["raw_anomaly_score"] = raw_scores
-
-    st.markdown(f"### {method_label}")
-
-    # --- Top anomalies: select a row to highlight on the plot ---
-    highlight_pos = None
-    if st.session_state.get("show_top", 10) > 0:
-        cols_keep = [
-            "Test_Run_ID",
-            "FR",
-            "Num_Tests",
-            "total_init_time",
-            "anomaly_score",
-            "raw_anomaly_score",
-            "Simulation_Host",
-            "Simulation_Node",
-            "Capability",
-            "Script_File",
-            "V",
-            "s_number",
-            "Build",
-        ]
-        cols_keep = [c for c in cols_keep if c in df.columns]
-
-        top = df.sort_values("anomaly_score", ascending=False).head(st.session_state["show_top"])
-
-        st.markdown("**Top anomalies**")
-        editable = top[cols_keep].copy()
-        editable.insert(0, "Select", False)
-        edited = st.data_editor(
-            editable,
-            use_container_width=True,
-            num_rows="fixed",
-            disabled={c: True for c in editable.columns if c != "Select"},
-            key=f"{key_prefix}-table",
-        )
-        selected_original_idxs = edited.index[edited["Select"]].tolist()
-        if selected_original_idxs:
-            pos = df.index.get_indexer([selected_original_idxs[0]])
-            if len(pos) and pos[0] != -1:
-                highlight_pos = int(pos[0])
-
-    # --- PCA plot (full width), with optional driver arrows ---
-    fig = plot_for_df(df, PCs, st.session_state["label_choice"], highlight_pos=highlight_pos)
-
-    if st.session_state.get("show_biplot", True) and PCs.shape[1] >= 2 and pca is not None:
-        arrow_feats = st.session_state.get("pca_arrow_features", PCA_FEATURES) or PCA_FEATURES
-        if st.session_state.get("show_global_pca_arrows", True):
-            try:
-                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
-            except Exception:
-                pass
-        try:
-            seg = make_fr_segments(df)
-            if st.session_state.get("show_low_fr_arrows", True):
-                low_mask = (seg == "Low FR").values
-                if np.any(low_mask):
-                    low_anchor = PCs[low_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(fig, pca, arrow_feats, low_anchor,
-                                                   scale=1.2, color="green", name_prefix="Low FR ")
-            if st.session_state.get("show_high_fr_arrows", True):
-                high_mask = (seg == "High FR").values
-                if np.any(high_mask):
-                    high_anchor = PCs[high_mask].mean(axis=0)
-                    add_biplot_arrows_at_anchor_3d(fig, pca, arrow_feats, high_anchor,
-                                                   scale=1.2, color="red", name_prefix="High FR ")
-        except Exception:
-            pass
-
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
-
-    # --- Segment Comparison (categorical-only) + FR representation heatmap ---
-    if st.session_state.get("show_segment_compare", True):
-        st.markdown("#### Segment Comparison: Low vs High FR")
-        # REMOVED numeric drivers section; keep categorical only
-        st.markdown("**Categorical drivers**")
-        st.plotly_chart(
-            segment_diff_categorical_bar(df),
-            use_container_width=True,
-            key=f"{key_prefix}-segcat",
-        )
-
-        st.markdown("#### FR Representation (High vs Low)")
-        st.plotly_chart(
-            fr_correlation_heatmap(df),
-            use_container_width=True,
-            key=f"{key_prefix}-frcorr",
-        )
-
-    # --- Per-selection “Why this run?” ---
-    if st.session_state.get("show_selection_why", True) and highlight_pos is not None:
-        st.markdown("#### Why this run?")
-        st.plotly_chart(
-            per_point_contribution_bar(df, highlight_pos),
-            use_container_width=True,
-            key=f"{key_prefix}-whybar",
-        )
 
 
 

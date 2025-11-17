@@ -1,144 +1,119 @@
-def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+def build_representation_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """
-    Representation heatmap (robust, groupby-based):
-      - For CATEGORICAL features:
-          For each value `feat=val`, compute within High/Low FR rows:
-            High_FR% = 100 * count(feat=val & High_FR) / [count(feat=val & High_FR) + count(feat=val & Low_FR)]
-            Low_FR%  = 100 * count(feat=val & Low_FR)  / [same denominator]
-          (Mid FR rows are excluded from both numerator and denominator.)
-      - For NUMERIC features:
-          Bin each feature into quartiles (qcut with duplicates='drop') and compute the same split per bin.
-      - Keeps the top-10 columns by High_FR% (most indicative of High_FR).
+    Build a 0/1 representation matrix for FEATURES_FOR_ANALYSIS.
+
+    - For categorical features:
+        One-hot encode values => columns like 'Capability=A'.
+    - For numeric features:
+        Bin into quartiles over *all* rows => columns like 'total_init_time:Q1'...'Q4'.
+
+    Returns:
+        R      : DataFrame (same index as df), all columns are 0/1.
+        labels : list of column names in R.
     """
-    fig = go.Figure()
-
-    seg = make_fr_segments(df)  # expected values: "Low FR", "Mid FR", "High FR"
-    if seg is None or seg.isna().all():
-        fig.update_layout(title="FR representation (segments unavailable)",
-                          height=200, margin=dict(l=10, r=10, t=40, b=40))
-        return fig
-
-    # Work only with High/Low rows; exclude Mid FR entirely from denominators
-    mask_hl = seg.isin(["High FR", "Low FR"])
-    if not mask_hl.any():
-        fig.update_layout(title="FR representation (no High/Low rows)",
-                          height=200, margin=dict(l=10, r=10, t=40, b=40))
-        return fig
-
-    df_hl = df.loc[mask_hl].copy()
-    df_hl["_FR_GROUP"] = np.where(seg.loc[mask_hl].eq("High FR"), "High_FR", "Low_FR")
-
-    rep_high = {}
-    rep_low = {}
+    parts = []
+    labels: list[str] = []
 
     for feat in FEATURES_FOR_ANALYSIS:
-        if feat not in df_hl.columns:
+        if feat not in df.columns:
             continue
+        s = df[feat]
 
-        s = df_hl[feat]
-
-        # CATEGORICAL branch: treat as strings and compute per-value representation
+        # CATEGORICAL: treat as strings and one-hot encode
         if not np.issubdtype(s.dtype, np.number):
-            sub = df_hl[[feat, "_FR_GROUP"]].dropna()
-            if sub.empty:
+            vals = s.astype(str)
+            dummies = pd.get_dummies(vals, prefix=f"{feat}=")
+            if dummies.empty:
                 continue
-            sub = sub.assign(**{feat: sub[feat].astype(str)})
-            counts = sub.groupby([feat, "_FR_GROUP"]).size().unstack("_FR_GROUP", fill_value=0)
-
-            # Ensure both columns exist
-            for col in ("High_FR", "Low_FR"):
-                if col not in counts.columns:
-                    counts[col] = 0
-
-            denom = counts["High_FR"] + counts["Low_FR"]
-            valid = denom > 0
-            if not valid.any():
-                continue
-
-            high_pct = 100.0 * (counts.loc[valid, "High_FR"] / denom.loc[valid])
-            low_pct  = 100.0 * (counts.loc[valid, "Low_FR"]  / denom.loc[valid])
-
-            for val in counts.index[valid]:
-                label = f"{feat}={val}"
-                rep_high[label] = float(high_pct.loc[val])
-                rep_low[label]  = float(low_pct.loc[val])
+            # Clean up labels to 'feat=value'
+            dummies.columns = [col.replace("==", "=") for col in dummies.columns]
+            parts.append(dummies.astype(int))
+            labels.extend(dummies.columns.tolist())
 
         else:
-            # NUMERIC branch: bin into quartiles over High+Low rows only
+            # NUMERIC: bin into quartiles and one-hot encode bins
             s_num = pd.to_numeric(s, errors="coerce")
-            sub = pd.DataFrame({feat: s_num, "_FR_GROUP": df_hl["_FR_GROUP"]}).dropna()
-            if sub[feat].nunique() < 2 or sub.empty:
+            if s_num.notna().sum() < 4:
                 continue
-
             try:
-                bins = pd.qcut(sub[feat], 4, labels=["Q1", "Q2", "Q3", "Q4"], duplicates="drop")
+                bins = pd.qcut(s_num, 4, labels=["Q1", "Q2", "Q3", "Q4"], duplicates="drop")
             except Exception:
                 continue
-
-            sub = sub.assign(_BIN=bins).dropna(subset=["_BIN"])
-            if sub.empty:
+            dummies = pd.get_dummies(bins, prefix=f"{feat}:")
+            if dummies.empty:
                 continue
+            # Clean labels like 'feat::Q1' -> 'feat:Q1'
+            dummies.columns = [col.replace("::", ":") for col in dummies.columns]
+            parts.append(dummies.astype(int))
+            labels.extend(dummies.columns.tolist())
 
-            counts = sub.groupby(["_BIN", "_FR_GROUP"]).size().unstack("_FR_GROUP", fill_value=0)
-            for col in ("High_FR", "Low_FR"):
-                if col not in counts.columns:
-                    counts[col] = 0
+    if not parts:
+        return pd.DataFrame(index=df.index), []
 
-            denom = counts["High_FR"] + counts["Low_FR"]
-            valid = denom > 0
-            if not valid.any():
-                continue
+    R = pd.concat(parts, axis=1).reindex(index=df.index, fill_value=0)
+    return R, labels
 
-            high_pct = 100.0 * (counts.loc[valid, "High_FR"] / denom.loc[valid])
-            low_pct  = 100.0 * (counts.loc[valid, "Low_FR"]  / denom.loc[valid])
 
-            for qlab in counts.index[valid]:
-                label = f"{feat}:{qlab}"
-                rep_high[label] = float(high_pct.loc[qlab])
-                rep_low[label]  = float(low_pct.loc[qlab])
 
-    if not rep_high:
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
+    """
+    Representation heatmap based on a 0/1 matrix:
+
+    For each feature/value/bin column:
+      - Consider only rows where that column == 1 AND FR segment is High or Low.
+      - High_FR% = 100 * (# High_FR rows with col=1) / (# High_FR + Low_FR rows with col=1)
+      - Low_FR%  = 100 * (# Low_FR  rows with col=1) / (same denom)
+      => High_FR% + Low_FR% = 100% for each column.
+
+    Shows top-10 columns by High_FR%.
+    """
+    fig = go.Figure()
+    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+    if seg is None or seg.isna().all():
         fig.update_layout(
-            title="FR representation (no valid features)",
-            height=220, margin=dict(l=10, r=10, t=40, b=40),
+            title="FR representation (segments unavailable)",
+            height=200, margin=dict(l=10, r=10, t=40, b=40),
         )
         return fig
 
-    # Assemble matrix and choose top-10 by High_FR representation
-    mat = pd.DataFrame({"High_FR": pd.Series(rep_high), "Low_FR": pd.Series(rep_low)}).fillna(0.0)
+    # Build 0/1 representation matrix
+    R, rep_labels = build_representation_matrix(df)
+    if R.empty:
+        fig.update_layout(
+            title="FR representation (no valid features in FEATURES_FOR_ANALYSIS)",
+            height=200, margin=dict(l=10, r=10, t=40, b=40),
+        )
+        return fig
 
-    # Guard against stray rounding mismatches (normalize each column to sum to 100 exactly)
-    col_sums = mat["High_FR"] + mat["Low_FR"]
-    nz = col_sums > 0
-    mat.loc[nz, "High_FR"] = 100.0 * mat.loc[nz, "High_FR"] / col_sums.loc[nz]
-    mat.loc[nz, "Low_FR"]  = 100.0 * mat.loc[nz, "Low_FR"]  / col_sums.loc[nz]
+    # Restrict to High/Low rows only (exclude Mid FR from denominators)
+    mask_hl = seg.isin(["High FR", "Low FR"])
+    if not mask_hl.any():
+        fig.update_layout(
+            title="FR representation (no High/Low FR rows)",
+            height=200, margin=dict(l=10, r=10, t=40, b=40),
+        )
+        return fig
 
-    top_idx = mat["High_FR"].sort_values(ascending=False).head(10).index
-    mat = mat.loc[top_idx].T  # rows: High_FR, Low_FR
+    seg_hl = seg[mask_hl]
+    R_hl = R.loc[mask_hl]
 
-    fig.add_trace(go.Heatmap(
-        z=mat.values,
-        x=mat.columns.tolist(),
-        y=mat.index.tolist(),
-        text=np.round(mat.values, 1).astype(str) + "%",
-        texttemplate="%{text}",
-        zmin=0, zmax=100,
-        colorscale="YlOrRd",
-        colorbar=dict(title="% within value/bin"),
-    ))
-    fig.update_layout(
-        title="Feature/Value Representation within High-FR vs Low-FR (sums to 100% per value/bin)",
-        height=320,
-        margin=dict(l=10, r=10, t=40, b=10),
-    )
-    return fig
+    high_mask = seg_hl == "High FR"
+    low_mask = seg_hl == "Low FR"
 
+    # Counts per column (vectorized)
+    high_counts = R_hl[high_mask].sum(axis=0).astype(float)
+    low_counts  = R_hl[low_mask].sum(axis=0).astype(float)
+    denom = high_counts + low_counts
 
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
+    # Only keep columns that occur at least once in High or Low
+    valid = denom > 0
+    if not valid.any():
+        fig.update_layout(
+            title="FR representation (
 
 
 

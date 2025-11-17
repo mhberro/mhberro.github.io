@@ -113,7 +113,45 @@ def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
     valid = denom > 0
     if not valid.any():
         fig.update_layout(
-            title="FR representation (
+            title="FR representation (no values present in High/Low FR)",
+            height=200, margin=dict(l=10, r=10, t=40, b=40),
+        )
+        return fig
+
+    high_pct = pd.Series(0.0, index=denom.index)
+    low_pct  = pd.Series(0.0, index=denom.index)
+    high_pct[valid] = 100.0 * high_counts[valid] / denom[valid]
+    low_pct[valid]  = 100.0 * low_counts[valid]  / denom[valid]
+
+    # Normalize each column to guard against tiny numerical drift
+    col_sums = high_pct + low_pct
+    nz = col_sums > 0
+    high_pct[nz] = 100.0 * high_pct[nz] / col_sums[nz]
+    low_pct[nz]  = 100.0 * low_pct[nz]  / col_sums[nz]
+
+    mat = pd.DataFrame({"High_FR": high_pct, "Low_FR": low_pct})
+
+    # Pick top-10 columns by High_FR percentage
+    top_idx = mat["High_FR"].sort_values(ascending=False).head(10).index
+    mat_top = mat.loc[top_idx].T  # rows: High_FR, Low_FR
+
+    fig.add_trace(go.Heatmap(
+        z=mat_top.values,
+        x=mat_top.columns.tolist(),
+        y=mat_top.index.tolist(),
+        text=np.round(mat_top.values, 1).astype(str) + "%",
+        texttemplate="%{text}",
+        zmin=0, zmax=100,
+        colorscale="YlOrRd",
+        colorbar=dict(title="% of rows with this value/bin\nthat are High vs Low"),
+    ))
+    fig.update_layout(
+        title="Feature/Value Representation within High-FR vs Low-FR (per value/bin)",
+        height=320,
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig
+
 
 
 

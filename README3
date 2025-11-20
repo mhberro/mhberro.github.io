@@ -175,6 +175,55 @@ def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+import matplotlib.pyplot as plt
+from matplotlib.colors import ListedColormap
+
+# Background colors: 0 = UNTAGGED (green), 1 = TAGGED (red)
+cmap_bg = ListedColormap(["#81c784", "#e57373"])  # light green, light red
+
+# Point colors (slightly darker)
+point_colors = {
+    "UNTAGGED": "#388e3c",  # darker green
+    "TAGGED":   "#c62828",  # darker red
+}
+
+# Build a grid over the feature space
+x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
+
+xx, yy = np.meshgrid(
+    np.linspace(x_min, x_max, 300),
+    np.linspace(y_min, y_max, 300),
+)
+
+grid = np.c_[xx.ravel(), yy.ravel()]
+Z = clf_2d.predict(grid).reshape(xx.shape)  # 0 or 1 for each grid point
+
+plt.figure(figsize=(8, 6))
+
+# Decision regions
+plt.contourf(xx, yy, Z, alpha=0.3, cmap=cmap_bg)
+
+# Actual samples on top
+for label, color in point_colors.items():
+    mask = df["outcome"] == label
+    plt.scatter(
+        df.loc[mask, "target_distance"],
+        df.loc[mask, "closing_speed"],
+        s=20,
+        c=color,
+        label=label,
+        edgecolor="k",
+        linewidth=0.3,
+        alpha=0.8,
+    )
+
+plt.xlabel("target_distance (ECEF Euclidean, e.g. meters)")
+plt.ylabel("closing_speed (it_speed - runner_speed)")
+plt.title("Decision tree boundary for TAGGED vs UNTAGGED")
+plt.legend()
+plt.tight_layout()
+plt.show()
 
 
 =========================================================================================================================================================================

@@ -1,109 +1,334 @@
-def make_fr_segments(df: pd.DataFrame) -> pd.Series:
-    """
-    Segment runs into FR-based groups.
 
-    Primary strategy (for discrete FR like {0, ..., 1}):
-        - Low FR  : FR == min(FR) and close to 0
-        - High FR : FR == max(FR) and close to 1
-        - Mid FR  : all remaining values (0 < FR < 1)
+# ---- Session State Defaults for Controls ----
+if "active_primary" not in st.session_state:
+    st.session_state["active_primary"] = "PCA"
 
-    Fallback strategy (for more continuous FR):
-        - Low FR  : FR <= 25th percentile
-        - Mid FR  : 25th < FR < 75th percentile
-        - High FR : FR >= 75th percentile
+if "active_secondary" not in st.session_state:
+    st.session_state["active_secondary"] = "Storyboard"
 
-    Stores percentage breakdown and thresholds in st.session_state["FR_quartile_stats"].
-    """
-    if "FR" not in df.columns:
-        return None
+# Global-ish controls
+if "label_choice" not in st.session_state:
+    st.session_state["label_choice"] = "Failure Rate"  # or whatever default label name you use
 
-    fr = df["FR"].astype(float)
-    fr_clean = fr.dropna()
-    if fr_clean.empty:
-        return None
+if "show_top" not in st.session_state:
+    st.session_state["show_top"] = 10
 
-    unique_vals = np.sort(fr_clean.unique())
-    min_fr = float(unique_vals[0])
-    max_fr = float(unique_vals[-1])
+# PCA / visualization toggles
+for key, default in {
+    "show_biplot": True,
+    "pca_arrow_features": [],
+    "show_global_pca_arrows": True,
+    "show_low_fr_arrows": True,
+    "show_high_fr_arrows": True,
+    "show_segment_compare": True,
+    "show_selection_why": True,
+    "show_influence_network": True,
+    "influence_subset": "Anomalous (top 5%)",
+    "influence_topk": 10,
+    "influence_edge_thresh": 0.40,
+    "influence_corr_method": "pearson",
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-    seg = pd.Series(index=df.index, dtype=object)
+# Method hyperparameters
+if "if_contam" not in st.session_state:
+    st.session_state["if_contam"] = 0.02
+if "if_trees" not in st.session_state:
+    st.session_state["if_trees"] = 300
+if "lof_k" not in st.session_state:
+    st.session_state["lof_k"] = 20
 
-    # ---- Strategy 1: Discrete FR with clear 0 / 1 extremes ----
-    # Detect case like: {0, small decimals..., 1} where quantiles are useless.
-    # Heuristics:
-    #   - There is a value close to 0
-    #   - There is a value close to 1
-    #   - Number of unique FR values is small (e.g., <= 10)
-    is_discrete_01 = (
-        len(unique_vals) <= 10
-        and np.isclose(min_fr, 0.0, atol=1e-6)
-        and np.isclose(max_fr, 1.0, atol=1e-6)
+# Dataset selection
+if "selected_dataset_idx" not in st.session_state:
+    st.session_state["selected_dataset_idx"] = 0
+
+
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+def render_sidebar_controls(
+    csv_paths: list[Path],
+    dataset_labels: list[str],
+    LABEL_DICT: dict,
+    PCA_FEATURES: list[str],
+):
+    """Dynamic sidebar that shows controls relevant to the visible graphics."""
+    st.sidebar.header("Controls")
+
+    # ---- Dataset selection & global labeling ----
+    dataset_label_list = dataset_labels or [p.name for p in csv_paths]
+
+    selected_idx = st.sidebar.selectbox(
+        "Dataset",
+        options=list(range(len(dataset_label_list))),
+        format_func=lambda i: dataset_label_list[i],
+        index=st.session_state.get("selected_dataset_idx", 0),
+        key="selected_dataset_idx",
     )
 
-    if is_discrete_01:
-        # Low FR = exactly the minimum (≈ 0), High FR = exactly the maximum (≈ 1)
-        low_mask = np.isclose(fr, min_fr, atol=1e-6)
-        high_mask = np.isclose(fr, max_fr, atol=1e-6)
-        mid_mask = ~(low_mask | high_mask)
+    show_all = st.sidebar.checkbox(
+        "Show all datasets",
+        value=False,
+        key="sidebar_show_all_datasets",   # IMPORTANT: unique key
+    )
 
-        seg[low_mask] = "Low FR"
-        seg[high_mask] = "High FR"
-        seg[mid_mask] = "Mid FR"
+    st.sidebar.subheader("Color / Group by")
+    label_choice = st.sidebar.selectbox(
+        "Label",
+        options=list(LABEL_DICT.keys()),
+        index=list(LABEL_DICT.keys()).index(st.session_state.get("label_choice", list(LABEL_DICT.keys())[0])),
+        key="label_choice",
+    )
 
-        strategy = "discrete_0_1"
-        low_thr = min_fr
-        high_thr = max_fr
+    show_top = st.sidebar.number_input(
+        "Top-N anomalies table (0 to hide)",
+        min_value=0,
+        max_value=1000,
+        value=st.session_state.get("show_top", 10),
+        step=1,
+        key="show_top",
+    )
 
-    else:
-        # ---- Strategy 2: Fallback to quartiles (more continuous FR) ----
-        q1 = fr_clean.quantile(0.25)
-        q3 = fr_clean.quantile(0.75)
+    st.sidebar.divider()
+    st.sidebar.subheader("Method-Specific")
 
-        seg[fr <= q1] = "Low FR"
-        seg[fr >= q3] = "High FR"
-        seg[(fr > q1) & (fr < q3)] = "Mid FR"
+    primary = st.session_state.get("active_primary", "PCA")
+    secondary = st.session_state.get("active_secondary", "Storyboard")
 
-        strategy = "quartiles"
-        low_thr = float(q1)
-        high_thr = float(q3)
+    # ---- PCA-specific controls ----
+    if primary == "PCA":
+        st.sidebar.markdown("**PCA Visualization**")
+        st.sidebar.checkbox(
+            "Show PCA driver arrows",
+            value=st.session_state.get("show_biplot", True),
+            key="show_biplot",
+        )
 
-    # --- Compute percentages in each segment ---
-    total = len(seg)
-    pct_low  = 100.0 * (seg == "Low FR").sum() / total
-    pct_mid  = 100.0 * (seg == "Mid FR").sum() / total
-    pct_high = 100.0 * (seg == "High FR").sum() / total
+        st.sidebar.multiselect(
+            "PCA driver arrows (numeric features)",
+            PCA_FEATURES,
+            default=st.session_state.get("pca_arrow_features", PCA_FEATURES),
+            key="pca_arrow_features",
+        )
 
-    # Store stats in session_state for optional display / debugging
-    st.session_state["FR_quartile_stats"] = {
-        "strategy": strategy,
-        "Low FR %": round(pct_low, 2),
-        "Mid FR %": round(pct_mid, 2),
-        "High FR %": round(pct_high, 2),
-        "Low threshold": round(low_thr, 6),
-        "High threshold": round(high_thr, 6),
-        "unique_FR_values": unique_vals.tolist(),
+        st.sidebar.checkbox(
+            "Show global arrows (from origin)",
+            value=st.session_state.get("show_global_pca_arrows", True),
+            key="show_global_pca_arrows",
+        )
+
+        st.sidebar.checkbox(
+            "Show Low-FR cluster arrows",
+            value=st.session_state.get("show_low_fr_arrows", True),
+            key="show_low_fr_arrows",
+        )
+
+        st.sidebar.checkbox(
+            "Show High-FR cluster arrows",
+            value=st.session_state.get("show_high_fr_arrows", True),
+            key="show_high_fr_arrows",
+        )
+
+        # Storyboard-specific controls
+        if secondary == "Storyboard":
+            st.sidebar.markdown("**Storyboard Options**")
+            st.sidebar.checkbox(
+                "Show segment comparison (z-scores / % share)",
+                value=st.session_state.get("show_segment_compare", True),
+                key="show_segment_compare",
+            )
+            st.sidebar.checkbox(
+                "Show 'Why this run?' panel",
+                value=st.session_state.get("show_selection_why", True),
+                key="show_selection_why",
+            )
+
+        # Influence network-specific controls
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.markdown("**Anomaly Influence Network**")
+            st.sidebar.selectbox(
+                "Subset",
+                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
+                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
+                ),
+                key="influence_subset",
+            )
+            st.sidebar.slider(
+                "Top-K features",
+                min_value=4,
+                max_value=15,
+                value=st.session_state.get("influence_topk", 10),
+                step=1,
+                key="influence_topk",
+            )
+            st.sidebar.slider(
+                "Edge threshold (|corr|)",
+                min_value=0.10,
+                max_value=0.90,
+                value=st.session_state.get("influence_edge_thresh", 0.40),
+                step=0.05,
+                key="influence_edge_thresh",
+            )
+            st.sidebar.selectbox(
+                "Correlation method",
+                ["pearson", "spearman"],
+                index=["pearson", "spearman"].index(
+                    st.session_state.get("influence_corr_method", "pearson")
+                ),
+                key="influence_corr_method",
+            )
+            st.sidebar.checkbox(
+                "Show Anomaly Influence Network",
+                value=st.session_state.get("show_influence_network", True),
+                key="show_influence_network",
+            )
+
+    # ---- Isolation Forest controls ----
+    if primary == "Isolation Forest":
+        st.sidebar.markdown("**Isolation Forest**")
+        st.sidebar.slider(
+            "IF: Contamination (expected anomaly %)",
+            min_value=0.0,
+            max_value=0.2,
+            value=st.session_state.get("if_contam", 0.02),
+            step=0.005,
+            key="if_contam",
+        )
+        st.sidebar.slider(
+            "IF: Trees (n_estimators)",
+            min_value=100,
+            max_value=1000,
+            value=st.session_state.get("if_trees", 300),
+            step=50,
+            key="if_trees",
+        )
+
+        if secondary == "Storyboard":
+            st.sidebar.markdown("**Storyboard Options**")
+            st.sidebar.checkbox(
+                "Show segment comparison (z-scores / % share)",
+                value=st.session_state.get("show_segment_compare", True),
+                key="show_segment_compare",
+            )
+            st.sidebar.checkbox(
+                "Show 'Why this run?' panel",
+                value=st.session_state.get("show_selection_why", True),
+                key="show_selection_why",
+            )
+
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.markdown("**Anomaly Influence Network**")
+            st.sidebar.selectbox(
+                "Subset",
+                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
+                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
+                ),
+                key="influence_subset",
+            )
+            st.sidebar.slider(
+                "Top-K features",
+                min_value=4,
+                max_value=15,
+                value=st.session_state.get("influence_topk", 10),
+                step=1,
+                key="influence_topk",
+            )
+            st.sidebar.slider(
+                "Edge threshold (|corr|)",
+                min_value=0.10,
+                max_value=0.90,
+                value=st.session_state.get("influence_edge_thresh", 0.40),
+                step=0.05,
+                key="influence_edge_thresh",
+            )
+            st.sidebar.selectbox(
+                "Correlation method",
+                ["pearson", "spearman"],
+                index=["pearson", "spearman"].index(
+                    st.session_state.get("influence_corr_method", "pearson")
+                ),
+                key="influence_corr_method",
+            )
+            st.sidebar.checkbox(
+                "Show Anomaly Influence Network",
+                value=st.session_state.get("show_influence_network", True),
+                key="show_influence_network",
+            )
+
+    # ---- LOF controls ----
+    if primary == "Local Outlier Factor":
+        st.sidebar.markdown("**Local Outlier Factor**")
+        st.sidebar.slider(
+            "LOF: Neighbors (n_neighbors)",
+            min_value=5,
+            max_value=100,
+            value=st.session_state.get("lof_k", 20),
+            step=1,
+            key="lof_k",
+        )
+
+        if secondary == "Storyboard":
+            st.sidebar.markdown("**Storyboard Options**")
+            st.sidebar.checkbox(
+                "Show segment comparison (z-scores / % share)",
+                value=st.session_state.get("show_segment_compare", True),
+                key="show_segment_compare",
+            )
+            st.sidebar.checkbox(
+                "Show 'Why this run?' panel",
+                value=st.session_state.get("show_selection_why", True),
+                key="show_selection_why",
+            )
+
+        if secondary == "Anomaly Influence Network":
+            st.sidebar.markdown("**Anomaly Influence Network**")
+            st.sidebar.selectbox(
+                "Subset",
+                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
+                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
+                ),
+                key="influence_subset",
+            )
+            st.sidebar.slider(
+                "Top-K features",
+                min_value=4,
+                max_value=15,
+                value=st.session_state.get("influence_topk", 10),
+                step=1,
+                key="influence_topk",
+            )
+            st.sidebar.slider(
+                "Edge threshold (|corr|)",
+                min_value=0.10,
+                max_value=0.90,
+                value=st.session_state.get("influence_edge_thresh", 0.40),
+                step=0.05,
+                key="influence_edge_thresh",
+            )
+            st.sidebar.selectbox(
+                "Correlation method",
+                ["pearson", "spearman"],
+                index=["pearson", "spearman"].index(
+                    st.session_state.get("influence_corr_method", "pearson")
+                ),
+                key="influence_corr_method",
+            )
+            st.sidebar.checkbox(
+                "Show Anomaly Influence Network",
+                value=st.session_state.get("show_influence_network", True),
+                key="show_influence_network",
+            )
+
+    return {
+        "selected_idx": selected_idx,
+        "show_all": show_all,
     }
-
-    return seg
-
-
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-with st.sidebar:
-    if "FR_quartile_stats" in st.session_state:
-        st.subheader("FR Segmentation")
-        stats = st.session_state["FR_quartile_stats"]
-        st.write(f"Strategy: `{stats['strategy']}`")
-        st.write(f"Low FR %:  {stats['Low FR %']}%  (FR ≤ {stats['Low threshold']})")
-        st.write(f"High FR %: {stats['High FR %']}% (FR ≥ {stats['High threshold']})")
-        st.write(f"Mid FR %:  {stats['Mid FR %']}%")
-
-
-
 
 
 =========================================================================================================================================================================

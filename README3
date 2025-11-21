@@ -334,6 +334,27 @@ def render_sidebar_controls(
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+# Assume:
+#   csv_paths: List[Path]
+#   dataset_labels: List[str] (same length as csv_paths)
+#   LABEL_DICT, PCA_FEATURES already defined
+
+sidebar_state = render_sidebar_controls(
+    csv_paths=csv_paths,
+    dataset_labels=dataset_labels,
+    LABEL_DICT=LABEL_DICT,
+    PCA_FEATURES=PCA_FEATURES,
+)
+
+selected_idx = sidebar_state["selected_idx"]
+show_all = sidebar_state["show_all"]
+
+if show_all:
+    for path in csv_paths:
+        render_one(path)
+        st.divider()
+else:
+    render_one(csv_paths[selected_idx])
 
 
 =========================================================================================================================================================================

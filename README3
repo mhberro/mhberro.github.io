@@ -1,156 +1,107 @@
-def build_representation_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+def make_fr_segments(df: pd.DataFrame) -> pd.Series:
     """
-    Build a 0/1 representation matrix for FEATURES_FOR_ANALYSIS.
+    Segment runs into FR-based groups.
 
-    - For categorical features:
-        One-hot encode values => columns like 'Capability=A'.
-    - For numeric features:
-        Bin into quartiles over *all* rows => columns like 'total_init_time:Q1'...'Q4'.
+    Primary strategy (for discrete FR like {0, ..., 1}):
+        - Low FR  : FR == min(FR) and close to 0
+        - High FR : FR == max(FR) and close to 1
+        - Mid FR  : all remaining values (0 < FR < 1)
 
-    Returns:
-        R      : DataFrame (same index as df), all columns are 0/1.
-        labels : list of column names in R.
+    Fallback strategy (for more continuous FR):
+        - Low FR  : FR <= 25th percentile
+        - Mid FR  : 25th < FR < 75th percentile
+        - High FR : FR >= 75th percentile
+
+    Stores percentage breakdown and thresholds in st.session_state["FR_quartile_stats"].
     """
-    parts = []
-    labels: list[str] = []
+    if "FR" not in df.columns:
+        return None
 
-    for feat in FEATURES_FOR_ANALYSIS:
-        if feat not in df.columns:
-            continue
-        s = df[feat]
+    fr = df["FR"].astype(float)
+    fr_clean = fr.dropna()
+    if fr_clean.empty:
+        return None
 
-        # CATEGORICAL: treat as strings and one-hot encode
-        if not np.issubdtype(s.dtype, np.number):
-            vals = s.astype(str)
-            dummies = pd.get_dummies(vals, prefix=f"{feat}=")
-            if dummies.empty:
-                continue
-            # Clean up labels to 'feat=value'
-            dummies.columns = [col.replace("==", "=") for col in dummies.columns]
-            parts.append(dummies.astype(int))
-            labels.extend(dummies.columns.tolist())
+    unique_vals = np.sort(fr_clean.unique())
+    min_fr = float(unique_vals[0])
+    max_fr = float(unique_vals[-1])
 
-        else:
-            # NUMERIC: bin into quartiles and one-hot encode bins
-            s_num = pd.to_numeric(s, errors="coerce")
-            if s_num.notna().sum() < 4:
-                continue
-            try:
-                bins = pd.qcut(s_num, 4, labels=["Q1", "Q2", "Q3", "Q4"], duplicates="drop")
-            except Exception:
-                continue
-            dummies = pd.get_dummies(bins, prefix=f"{feat}:")
-            if dummies.empty:
-                continue
-            # Clean labels like 'feat::Q1' -> 'feat:Q1'
-            dummies.columns = [col.replace("::", ":") for col in dummies.columns]
-            parts.append(dummies.astype(int))
-            labels.extend(dummies.columns.tolist())
+    seg = pd.Series(index=df.index, dtype=object)
 
-    if not parts:
-        return pd.DataFrame(index=df.index), []
-
-    R = pd.concat(parts, axis=1).reindex(index=df.index, fill_value=0)
-    return R, labels
-
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-def fr_correlation_heatmap(df: pd.DataFrame) -> go.Figure:
-    """
-    Representation heatmap based on a 0/1 matrix:
-
-    For each feature/value/bin column:
-      - Consider only rows where that column == 1 AND FR segment is High or Low.
-      - High_FR% = 100 * (# High_FR rows with col=1) / (# High_FR + Low_FR rows with col=1)
-      - Low_FR%  = 100 * (# Low_FR  rows with col=1) / (same denom)
-      => High_FR% + Low_FR% = 100% for each column.
-
-    Shows top-10 columns by High_FR%.
-    """
-    fig = go.Figure()
-    seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
-    if seg is None or seg.isna().all():
-        fig.update_layout(
-            title="FR representation (segments unavailable)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Build 0/1 representation matrix
-    R, rep_labels = build_representation_matrix(df)
-    if R.empty:
-        fig.update_layout(
-            title="FR representation (no valid features in FEATURES_FOR_ANALYSIS)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    # Restrict to High/Low rows only (exclude Mid FR from denominators)
-    mask_hl = seg.isin(["High FR", "Low FR"])
-    if not mask_hl.any():
-        fig.update_layout(
-            title="FR representation (no High/Low FR rows)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    seg_hl = seg[mask_hl]
-    R_hl = R.loc[mask_hl]
-
-    high_mask = seg_hl == "High FR"
-    low_mask = seg_hl == "Low FR"
-
-    # Counts per column (vectorized)
-    high_counts = R_hl[high_mask].sum(axis=0).astype(float)
-    low_counts  = R_hl[low_mask].sum(axis=0).astype(float)
-    denom = high_counts + low_counts
-
-    # Only keep columns that occur at least once in High or Low
-    valid = denom > 0
-    if not valid.any():
-        fig.update_layout(
-            title="FR representation (no values present in High/Low FR)",
-            height=200, margin=dict(l=10, r=10, t=40, b=40),
-        )
-        return fig
-
-    high_pct = pd.Series(0.0, index=denom.index)
-    low_pct  = pd.Series(0.0, index=denom.index)
-    high_pct[valid] = 100.0 * high_counts[valid] / denom[valid]
-    low_pct[valid]  = 100.0 * low_counts[valid]  / denom[valid]
-
-    # Normalize each column to guard against tiny numerical drift
-    col_sums = high_pct + low_pct
-    nz = col_sums > 0
-    high_pct[nz] = 100.0 * high_pct[nz] / col_sums[nz]
-    low_pct[nz]  = 100.0 * low_pct[nz]  / col_sums[nz]
-
-    mat = pd.DataFrame({"High_FR": high_pct, "Low_FR": low_pct})
-
-    # Pick top-10 columns by High_FR percentage
-    top_idx = mat["High_FR"].sort_values(ascending=False).head(10).index
-    mat_top = mat.loc[top_idx].T  # rows: High_FR, Low_FR
-
-    fig.add_trace(go.Heatmap(
-        z=mat_top.values,
-        x=mat_top.columns.tolist(),
-        y=mat_top.index.tolist(),
-        text=np.round(mat_top.values, 1).astype(str) + "%",
-        texttemplate="%{text}",
-        zmin=0, zmax=100,
-        colorscale="YlOrRd",
-        colorbar=dict(title="% of rows with this value/bin\nthat are High vs Low"),
-    ))
-    fig.update_layout(
-        title="Feature/Value Representation within High-FR vs Low-FR (per value/bin)",
-        height=320,
-        margin=dict(l=10, r=10, t=40, b=10),
+    # ---- Strategy 1: Discrete FR with clear 0 / 1 extremes ----
+    # Detect case like: {0, small decimals..., 1} where quantiles are useless.
+    # Heuristics:
+    #   - There is a value close to 0
+    #   - There is a value close to 1
+    #   - Number of unique FR values is small (e.g., <= 10)
+    is_discrete_01 = (
+        len(unique_vals) <= 10
+        and np.isclose(min_fr, 0.0, atol=1e-6)
+        and np.isclose(max_fr, 1.0, atol=1e-6)
     )
-    return fig
+
+    if is_discrete_01:
+        # Low FR = exactly the minimum (≈ 0), High FR = exactly the maximum (≈ 1)
+        low_mask = np.isclose(fr, min_fr, atol=1e-6)
+        high_mask = np.isclose(fr, max_fr, atol=1e-6)
+        mid_mask = ~(low_mask | high_mask)
+
+        seg[low_mask] = "Low FR"
+        seg[high_mask] = "High FR"
+        seg[mid_mask] = "Mid FR"
+
+        strategy = "discrete_0_1"
+        low_thr = min_fr
+        high_thr = max_fr
+
+    else:
+        # ---- Strategy 2: Fallback to quartiles (more continuous FR) ----
+        q1 = fr_clean.quantile(0.25)
+        q3 = fr_clean.quantile(0.75)
+
+        seg[fr <= q1] = "Low FR"
+        seg[fr >= q3] = "High FR"
+        seg[(fr > q1) & (fr < q3)] = "Mid FR"
+
+        strategy = "quartiles"
+        low_thr = float(q1)
+        high_thr = float(q3)
+
+    # --- Compute percentages in each segment ---
+    total = len(seg)
+    pct_low  = 100.0 * (seg == "Low FR").sum() / total
+    pct_mid  = 100.0 * (seg == "Mid FR").sum() / total
+    pct_high = 100.0 * (seg == "High FR").sum() / total
+
+    # Store stats in session_state for optional display / debugging
+    st.session_state["FR_quartile_stats"] = {
+        "strategy": strategy,
+        "Low FR %": round(pct_low, 2),
+        "Mid FR %": round(pct_mid, 2),
+        "High FR %": round(pct_high, 2),
+        "Low threshold": round(low_thr, 6),
+        "High threshold": round(high_thr, 6),
+        "unique_FR_values": unique_vals.tolist(),
+    }
+
+    return seg
+
+
+
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+with st.sidebar:
+    if "FR_quartile_stats" in st.session_state:
+        st.subheader("FR Segmentation")
+        stats = st.session_state["FR_quartile_stats"]
+        st.write(f"Strategy: `{stats['strategy']}`")
+        st.write(f"Low FR %:  {stats['Low FR %']}%  (FR ≤ {stats['Low threshold']})")
+        st.write(f"High FR %: {stats['High FR %']}% (FR ≥ {stats['High threshold']})")
+        st.write(f"Mid FR %:  {stats['Mid FR %']}%")
+
 
 
 

@@ -362,6 +362,37 @@ else:
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+kinematic-classifier
+
+# conftest.py (alternative)
+import pytest, shutil
+from pathlib import Path
+
+@pytest.fixture()
+def repo_data_files_with_fakes(tmp_path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    fake_src = root / "data" / "fake_data_files"
+    real_dst = root / "my_pkg" / "data" / "data_files"
+
+    backups = []
+    real_dst.mkdir(parents=True, exist_ok=True)
+
+    # backup any existing files, then copy fakes
+    for f in real_dst.glob("*"):
+        b = tmp_path / f.name
+        shutil.copy2(f, b)
+        backups.append((f, b))
+    for f in fake_src.iterdir():
+        if f.is_file():
+            shutil.copy2(f, real_dst / f.name)
+
+    yield real_dst  # tests run with fakes in place
+
+    # restore previous contents
+    for f in real_dst.glob("*"):
+        f.unlink()
+    for dst, backup in backups:
+        shutil.copy2(backup, dst)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

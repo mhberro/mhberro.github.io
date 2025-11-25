@@ -402,60 +402,142 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+PG-35: Susceptibility Modeling
 
+
+import seaborn as sns
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 
-# Background colors: 0 = UNTAGGED (green), 1 = TAGGED (red)
-cmap_bg = ListedColormap(["#81c784", "#e57373"])  # light green, light red
+plt.figure(figsize=(9, 7))
 
-# Point colors (slightly darker)
-point_colors = {
-    "UNTAGGED": "#388e3c",  # darker green
-    "TAGGED":   "#c62828",  # darker red
-}
-
-# Build a grid over the feature space
-x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
-y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
-
-xx, yy = np.meshgrid(
-    np.linspace(x_min, x_max, 300),
-    np.linspace(y_min, y_max, 300),
+sns.kdeplot(
+    data=df,
+    x="target_distance",
+    y="closing_speed",
+    fill=True,
+    thresh=0.1,
+    levels=20,
+    cmap="Greys",
+    alpha=0.3
 )
 
-grid = np.c_[xx.ravel(), yy.ravel()]
-Z = clf_2d.predict(grid).reshape(xx.shape)  # 0 or 1 for each grid point
+palette = {
+    "TAGGED": "#e57373",     # medium-light red
+    "UNTAGGED": "#81c784",   # medium-light green
+}
 
-plt.figure(figsize=(8, 6))
+sns.scatterplot(
+    data=df,
+    x="target_distance",
+    y="closing_speed",
+    hue="outcome",
+    palette=palette,
+    edgecolor="k",
+    s=40,
+    alpha=0.8
+)
 
-# Decision regions
-plt.contourf(xx, yy, Z, alpha=0.3, cmap=cmap_bg)
-
-# Actual samples on top
-for label, color in point_colors.items():
-    mask = df["outcome"] == label
-    plt.scatter(
-        df.loc[mask, "target_distance"],
-        df.loc[mask, "closing_speed"],
-        s=20,
-        c=color,
-        label=label,
-        edgecolor="k",
-        linewidth=0.3,
-        alpha=0.8,
-    )
-
-plt.xlabel("target_distance (ECEF Euclidean, e.g. meters)")
-plt.ylabel("closing_speed (it_speed - runner_speed)")
-plt.title("Decision tree boundary for TAGGED vs UNTAGGED")
-plt.legend()
+plt.title("Joint Distribution of Distance and Closing Speed")
+plt.xlabel("Target Distance (ECEF meters)")
+plt.ylabel("Closing Speed (it_speed - runner_speed)")
+plt.legend(title="Outcome")
 plt.tight_layout()
 plt.show()
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+
+plt.figure(figsize=(8, 6))
+
+sns.histplot(
+    data=df,
+    x="heading_diff",
+    hue="outcome",
+    bins=40,
+    kde=True,
+    palette={"TAGGED": "#e57373", "UNTAGGED": "#81c784"},
+    alpha=0.6
+)
+
+plt.title("Distribution of Heading Difference by Outcome")
+plt.xlabel("Heading Difference (degrees)")
+plt.ylabel("Count")
+plt.tight_layout()
+plt.show()
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+from sklearn.tree import DecisionTreeClassifier
+import numpy as np
+
+# Train a 2D decision tree
+features = ["target_distance", "closing_speed"]
+X = df[features].values
+y = (df["outcome"] == "TAGGED").astype(int)
+
+clf_2d = DecisionTreeClassifier(max_depth=3)
+clf_2d.fit(X, y)
+
+# Build grid
+x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
+y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
+
+xx, yy = np.meshgrid(
+    np.linspace(x_min, x_max, 400),
+    np.linspace(y_min, y_max, 400)
+)
+
+Z = clf_2d.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
+
+plt.figure(figsize=(9, 7))
+
+# Background regions
+plt.contourf(
+    xx, yy, Z,
+    alpha=0.3,
+    cmap=ListedColormap(["#81c784", "#e57373"])
+)
+
+# Actual points
+palette = {"TAGGED": "#c62828", "UNTAGGED": "#2e7d32"}
+sns.scatterplot(
+    data=df,
+    x="target_distance",
+    y="closing_speed",
+    hue="outcome",
+    palette=palette,
+    edgecolor="k",
+    s=30,
+    alpha=0.8
+)
+
+plt.title("Decision Boundary for Tag Likelihood")
+plt.xlabel("Target Distance (meters)")
+plt.ylabel("Closing Speed (m/s)")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+Extras
+
+- Anomaly Detection
 def _render_table_and_plot(
     df: pd.DataFrame,
     PCs: np.ndarray,

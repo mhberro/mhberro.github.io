@@ -404,121 +404,79 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
+df_copy = df.copy()
+independent_variables = sorted(df_copy.drop('GRAD_DEBT_MDN', axis=1).columns)
+dependent_variable = 'GRAD_DEBT_MDN'
 
-import seaborn as sns
-import matplotlib.pyplot as plt
+# Determine grid size for subplots
+num_independent_vars = len(independent_variables)
+rows = int(num_independent_vars**0.5)
+cols = (num_independent_vars + rows - 1) // rows # Calculate columns to ensure all plots fit
 
-plt.figure(figsize=(9, 7))
+# Fill nan values with 0 to create trendlines
+df_copy.fillna(0, inplace=True)
 
-sns.kdeplot(
-    data=df,
-    x="target_distance",
-    y="closing_speed",
-    fill=True,
-    thresh=0.1,
-    levels=20,
-    cmap="Greys",
-    alpha=0.3
-)
+# Drop variables due to categorical
+drop_cats = independent_variables.remove('STABBR')
 
-palette = {
-    "TAGGED": "#e57373",     # medium-light red
-    "UNTAGGED": "#81c784",   # medium-light green
-}
 
-sns.scatterplot(
-    data=df,
-    x="target_distance",
-    y="closing_speed",
-    hue="outcome",
-    palette=palette,
-    edgecolor="k",
-    s=40,
-    alpha=0.8
-)
+fig, axs = plt.subplots(rows, cols, figsize=(7 * cols, 6 * rows))
+axs = axs.flatten()
 
-plt.title("Joint Distribution of Distance and Closing Speed")
-plt.xlabel("Target Distance (ECEF meters)")
-plt.ylabel("Closing Speed (it_speed - runner_speed)")
-plt.legend(title="Outcome")
+for i, ind_var in tqdm(enumerate(independent_variables)):
+    x = df_copy[ind_var]
+    y = df_copy[dependent_variable]
+    
+    axs[i].scatter(x, y)
+
+    if x.dtype and y.dtype != 'object':
+        # Trendlines
+        z = np.polyfit(x, y, 1)
+        p = np.poly1d(z)
+        axs[i].plot(x, p(x), "r--", label="Trendline")
+    
+    axs[i].set_xlabel(ind_var)
+    axs[i].set_ylabel(dependent_variable)
+    axs[i].set_title(f'{ind_var} vs {dependent_variable}')
+
 plt.tight_layout()
+plt.savefig("Variables with Trendlines.png")
 plt.show()
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-plt.figure(figsize=(8, 6))
+# Get numerical columns
+numerical_cols = sorted(df.select_dtypes(include=['number']).columns)
 
-sns.histplot(
-    data=df,
-    x="heading_diff",
-    hue="outcome",
-    bins=40,
-    kde=True,
-    palette={"TAGGED": "#e57373", "UNTAGGED": "#81c784"},
-    alpha=0.6
-)
+num_cols = len(numerical_cols)
+n_rows = int(num_cols**0.5)
+n_cols = (num_cols + n_rows - 1) // n_rows # Calculate columns to ensure all plots fit
 
-plt.title("Distribution of Heading Difference by Outcome")
-plt.xlabel("Heading Difference (degrees)")
-plt.ylabel("Count")
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3 , n_rows * 6))
+axes = axes.flatten() # Flatten the array of axes for easy iteration
+
+for i, col in enumerate(numerical_cols):
+    sns.boxplot(y=df[col], ax=axes[i])
+    axes[i].set_title(f'Boxplot of {col}')
+    axes[i].set_ylabel('Value')
+
 plt.tight_layout()
+plt.savefig("BoxplotsVariables.png")
 plt.show()
 
-
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-from sklearn.tree import DecisionTreeClassifier
-import numpy as np
+dependent_variable_correlations = correlation_matrix[[dependent_variable]]
+dependent_variable_correlations.sort_values(by=dependent_variable, ascending=False)
 
-# Train a 2D decision tree
-features = ["target_distance", "closing_speed"]
-X = df[features].values
-y = (df["outcome"] == "TAGGED").astype(int)
-
-clf_2d = DecisionTreeClassifier(max_depth=3)
-clf_2d.fit(X, y)
-
-# Build grid
-x_min, x_max = X[:, 0].min() - 1, X[:, 0].max() + 1
-y_min, y_max = X[:, 1].min() - 1, X[:, 1].max() + 1
-
-xx, yy = np.meshgrid(
-    np.linspace(x_min, x_max, 400),
-    np.linspace(y_min, y_max, 400)
-)
-
-Z = clf_2d.predict(np.c_[xx.ravel(), yy.ravel()]).reshape(xx.shape)
-
-plt.figure(figsize=(9, 7))
-
-# Background regions
-plt.contourf(
-    xx, yy, Z,
-    alpha=0.3,
-    cmap=ListedColormap(["#81c784", "#e57373"])
-)
-
-# Actual points
-palette = {"TAGGED": "#c62828", "UNTAGGED": "#2e7d32"}
-sns.scatterplot(
-    data=df,
-    x="target_distance",
-    y="closing_speed",
-    hue="outcome",
-    palette=palette,
-    edgecolor="k",
-    s=30,
-    alpha=0.8
-)
-
-plt.title("Decision Boundary for Tag Likelihood")
-plt.xlabel("Target Distance (meters)")
-plt.ylabel("Closing Speed (m/s)")
-plt.legend()
-plt.tight_layout()
+plt.figure(figsize=(10, 30)) # Adjust figure size as needed
+sns.heatmap(dependent_variable_correlations.sort_values(by=dependent_variable, ascending=False),
+            annot=True, cmap='coolwarm', fmt=".2f", linewidths=.5)
+plt.title('Correlation of Independent Variables with Dependent Variable')
+plt.savefig("Dependent Variable Correlation Heatmap.png")
 plt.show()
 
 =========================================================================================================================================================================

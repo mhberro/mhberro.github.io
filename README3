@@ -405,245 +405,130 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 PG-35: Susceptibility Modeling
 
 
-import numpy as np
 import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
-
-sns.set(style="whitegrid")
-
-# Make sure outcome is a clean categorical
-df["outcome"] = df["outcome"].astype(str)
-
-# Palette for negative/positive outcome
-palette_light = {
-    "TAGGED":   "#e57373",  # light red
-    "UNTAGGED": "#81c784",  # light green
-    "tag":      "#e57373",
-    "untag":    "#81c784",
-}
-
-# 1.1 Basic summary
-print("=== BASIC INFO ===")
-print(df[["target_distance", "closing_speed", "heading_diff",
-          "remaining_timesteps", "outcome"]].describe(include="all"))
-print("\nOutcome value counts:")
-print(df["outcome"].value_counts(dropna=False))
-
-# 1.2 Joint distribution: distance vs closing_speed
-plt.figure(figsize=(9, 7))
-
-sns.kdeplot(
-    data=df,
-    x="target_distance",
-    y="closing_speed",
-    fill=True,
-    thresh=0.1,
-    levels=20,
-    cmap="Greys",
-    alpha=0.3,
-)
-
-sns.scatterplot(
-    data=df,
-    x="target_distance",
-    y="closing_speed",
-    hue="outcome",
-    palette=palette_light,
-    edgecolor="k",
-    s=40,
-    alpha=0.8,
-)
-
-plt.title("Joint Distribution: Target Distance vs Closing Speed")
-plt.xlabel("Target Distance (ECEF meters)")
-plt.ylabel("Closing Speed (it_speed - target_speed)")
-plt.legend(title="Outcome")
-plt.tight_layout()
-plt.show()
-
-# 1.3 Distribution comparison: key features by outcome
-key_features = ["target_distance", "closing_speed", "heading_diff", "remaining_timesteps"]
-
-for feat in key_features:
-    plt.figure(figsize=(8, 6))
-    sns.histplot(
-        data=df,
-        x=feat,
-        hue="outcome",
-        bins=40,
-        kde=True,
-        palette=palette_light,
-        alpha=0.6,
-    )
-    plt.title(f"Distribution of {feat} by Outcome")
-    plt.xlabel(feat)
-    plt.ylabel("Count")
-    plt.tight_layout()
-    plt.show()
-
-# 1.4 Correlation heatmap for numeric features
-numeric_cols = ["target_distance", "closing_speed", "heading_diff", "remaining_timesteps"]
-numeric_df = df[numeric_cols].copy()
-
-corr = numeric_df.corr()
-
-plt.figure(figsize=(7, 6))
-sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm", square=True)
-plt.title("Correlation Heatmap of Core Runner–IT Features")
-plt.tight_layout()
-plt.show()
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-from sklearn.ensemble import RandomForestClassifier
-
-# 2.1 Build feature matrix X and target y
-
-base_features = [
-    "target_distance",
-    "closing_speed",
-    "heading_diff",
-    "remaining_timesteps",
-]
-
-# Optional features if they exist
-optional_features = []
-for col in ["it_speed", "target_speed"]:
-    if col in df.columns:
-        optional_features.append(col)
-
-# Pattern dummies (columns starting with 'target_pattern_')
-pattern_features = [c for c in df.columns if c.startswith("target_pattern_")]
-
-feature_cols = base_features + optional_features + pattern_features
-
-X = df[feature_cols].copy()
-
-# Encode outcome as 0/1
-y = (df["outcome"].str.upper() == "TAGGED").astype(int)
-
-# 2.2 Train a RandomForest for feature importance
-rf = RandomForestClassifier(
-    n_estimators=200,
-    max_depth=None,
-    random_state=42,
-    n_jobs=-1,
-)
-
-rf.fit(X, y)
-
-importances = rf.feature_importances_
-
-feat_importance = pd.DataFrame({
-    "feature": feature_cols,
-    "importance": importances
-}).sort_values("importance", ascending=False)
-
-print("=== Top-5 Features by RandomForest Importance ===")
-print(feat_importance.head(5))
-
-# 2.3 Plot top-10 for a nicer view
-top_n = 10
-plt.figure(figsize=(8, 6))
-sns.barplot(
-    data=feat_importance.head(top_n),
-    x="importance",
-    y="feature",
-    orient="h",
-    palette="viridis",
-)
-plt.title("Top Feature Importances for Tag Prediction")
-plt.xlabel("Importance")
-plt.ylabel("Feature")
-plt.tight_layout()
-plt.show()
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
-import matplotlib.pyplot as plt
 import numpy as np
+import matplotlib.pyplot as plt
+import ast
 
-def plot_match_3d(df, match_id, runner_idx="target"):
-    """
-    3D ECEF trajectory visualization for one match.
-    
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Full dataset.
-    match_id : hashable
-        Identifier for one episode / simulation run.
-    runner_idx : int or "target"
-        If int, uses that runner index for the whole episode.
-        If "target", uses the runner indicated by it_runner_index at each timestep.
-    """
-    # Filter to single match & sort by time
-    match_df = df[df["match_id"] == match_id].sort_values("timestep").reset_index(drop=True)
-    
-    it_x, it_y, it_z = [], [], []
-    r_x, r_y, r_z = [], [], []
-    
-    for _, row in match_df.iterrows():
-        it_loc = np.array(row["it_location"])  # [x, y, z]
-        it_x.append(it_loc[0])
-        it_y.append(it_loc[1])
-        it_z.append(it_loc[2])
-        
-        if runner_idx == "target":
-            r_idx = int(row["it_runner_index"])
-        else:
-            r_idx = int(runner_idx)
-        
-        runner_loc = np.array(row["runners_location"][r_idx])
-        r_x.append(runner_loc[0])
-        r_y.append(runner_loc[1])
-        r_z.append(runner_loc[2])
-    
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    
-    # Plot IT drone path
-    ax.plot(it_x, it_y, it_z, label="IT Drone", color="red", linewidth=2)
-    ax.scatter(it_x[0], it_y[0], it_z[0], color="darkred", marker="o", s=50, label="IT Start")
-    ax.scatter(it_x[-1], it_y[-1], it_z[-1], color="pink", marker="x", s=50, label="IT End")
-    
-    # Plot Runner path
-    ax.plot(r_x, r_y, r_z, label="Runner", color="green", linewidth=2)
-    ax.scatter(r_x[0], r_y[0], r_z[0], color="darkgreen", marker="o", s=50, label="Runner Start")
-    ax.scatter(r_x[-1], r_y[-1], r_z[-1], color="lightgreen", marker="x", s=50, label="Runner End")
-    
-    ax.set_xlabel("X (ECEF)")
-    ax.set_ylabel("Y (ECEF)")
-    ax.set_zlabel("Z (ECEF)")
-    ax.set_title(f"3D ECEF Trajectory - Match {match_id}")
-    ax.legend()
-    
-    # Make aspect ratio a bit nicer
-    max_range = np.array([
-        max(it_x + r_x) - min(it_x + r_x),
-        max(it_y + r_y) - min(it_y + r_y),
-        max(it_z + r_z) - min(it_z + r_z),
-    ]).max() / 2.0
-    
-    mid_x = (max(it_x + r_x) + min(it_x + r_x)) * 0.5
-    mid_y = (max(it_y + r_y) + min(it_y + r_y)) * 0.5
-    mid_z = (max(it_z + r_z) + min(it_z + r_z)) * 0.5
-    
-    ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    ax.set_zlim(mid_z - max_range, mid_z + max_range)
-    
-    plt.tight_layout()
-    plt.show()
+# ---------------------------------------------------------
+# 1. LOAD DATA (Replace this block with pd.read_csv for your real data)
+# ---------------------------------------------------------
+# Generating synthetic data to demonstrate the structure
+np.random.seed(42)
+num_rows = 200
+data = []
+pattern_types = ['ZigZag', 'Circle', 'Straight']
 
-# Example usage (update match_id to something valid in your df):
-# plot_match_3d(df, match_id=0, runner_idx="target")
+for i in range(num_rows):
+    # Simulating 3 runners
+    runners_loc = [[np.random.uniform(32, 33), np.random.uniform(-97, -96), 150] for _ in range(3)]
+    runners_speed = [np.random.randint(10, 50) for _ in range(3)]
+    it_loc = [np.random.uniform(32, 33), np.random.uniform(-97, -96), 150]
+    target_idx = np.random.randint(0, 3)
+    
+    row = {
+        'timestep': i,
+        'runners_location': str(runners_loc), # Simulated CSV string format
+        'runner_speed': str(runners_speed),
+        'it_location': str(it_loc),
+        'it_runner_index': target_idx,
+        'pattern_type': str(pattern_types),
+        'runner_pattern_index': str([0, 1, 2]), # Fixed patterns for demo
+        'outcome': 'tag' if np.random.random() > 0.8 else 'untag',
+        'it_speed': np.random.randint(20, 60)
+    }
+    data.append(row)
+
+df = pd.DataFrame(data)
+
+# ---------------------------------------------------------
+# 2. PREPROCESSING
+# ---------------------------------------------------------
+# Columns that contain lists often get loaded as strings from CSVs.
+# We apply ast.literal_eval to convert "[1, 2]" string back to [1, 2] list.
+list_cols = ['runners_location', 'runner_speed', 'it_location', 
+             'runner_pattern_index', 'pattern_type']
+
+for col in list_cols:
+    # distinct check to ensure we don't eval lists if they are already lists
+    if isinstance(df[col].iloc[0], str):
+        df[col] = df[col].apply(ast.literal_eval)
+
+# ---------------------------------------------------------
+# 3. FEATURE ENGINEERING
+# ---------------------------------------------------------
+def calculate_distance(row):
+    """
+    Calculates Euclidean distance between IT drone and TARGET runner.
+    NOTE: If coordinates are Lat/Lon/Alt, convert to ECEF (X,Y,Z) 
+    first for accurate meter distance. This uses raw values.
+    """
+    it_loc = np.array(row['it_location'])
+    target_idx = row['it_runner_index']
+    target_loc = np.array(row['runners_location'][target_idx])
+    
+    # Euclidean distance
+    return np.linalg.norm(it_loc - target_loc)
+
+def get_target_pattern(row):
+    """Extracts the specific flight pattern of the target runner"""
+    try:
+        pidx = row['runner_pattern_index'][row['it_runner_index']]
+        return row['pattern_type'][pidx]
+    except:
+        return 'Unknown'
+
+df['distance_to_target'] = df.apply(calculate_distance, axis=1)
+df['target_pattern'] = df.apply(get_target_pattern, axis=1)
+
+# ---------------------------------------------------------
+# 4. VISUALIZATION
+# ---------------------------------------------------------
+plt.figure(figsize=(15, 10))
+
+# Plot 1: Outcome Counts
+plt.subplot(2, 2, 1)
+df['outcome'].value_counts().plot(kind='bar', color=['skyblue', 'salmon'])
+plt.title('Distribution of Outcomes (Tag vs Untag)')
+plt.ylabel('Count')
+
+# Plot 2: Distance vs Outcome
+plt.subplot(2, 2, 2)
+# We expect tags to happen at close distances (or 0 distance)
+# Aggregating distance by outcome
+distances = [df[df['outcome'] == u]['distance_to_target'] for u in df['outcome'].unique()]
+plt.boxplot(distances, labels=df['outcome'].unique())
+plt.title('Distance to Target by Outcome')
+plt.ylabel('Distance')
+
+# Plot 3: Success Rate by Pattern
+plt.subplot(2, 2, 3)
+ct = pd.crosstab(df['target_pattern'], df['outcome'])
+ct.plot(kind='bar', stacked=True, ax=plt.gca())
+plt.title('Outcome by Target Runner Pattern')
+plt.ylabel('Count')
+
+# Plot 4: Speed Distribution
+plt.subplot(2, 2, 4)
+# Flatten list of lists for runner speeds
+all_runner_speeds = [s for sublist in df['runner_speed'] for s in sublist]
+plt.hist(all_runner_speeds, alpha=0.5, label='Runners', bins=20)
+plt.hist(df['it_speed'], alpha=0.5, label='It Drone', bins=20)
+plt.title('Speed Distribution: Runner vs It')
+plt.legend()
+
+plt.tight_layout()
+plt.show() # Use plt.savefig('eda.png') in non-interactive environments
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

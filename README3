@@ -1,47 +1,122 @@
+F-35 anomaly detection
 
-# ---- Session State Defaults for Controls ----
-if "active_primary" not in st.session_state:
-    st.session_state["active_primary"] = "PCA"
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import streamlit as st
 
-if "active_secondary" not in st.session_state:
-    st.session_state["active_secondary"] = "Storyboard"
+def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.Figure:
+    """
+    Shows correlation of features to High/Low FR.
+    Calculates: Given Feature=X, what % were High FR vs Low FR?
+    (The High% and Low% for a specific feature value will sum to 100%)
+    """
+    fig = go.Figure()
+    
+    # 1. Segment the data
+    seg = make_fr_segments(df)
+    if seg is None or seg.isna().all():
+        fig.update_layout(title="FR representation (segments unavailable)",
+                          height=200, margin=dict(l=10, r=10, t=40, b=40))
+        return fig
 
-# Global-ish controls
-if "label_choice" not in st.session_state:
-    st.session_state["label_choice"] = "Failure Rate"  # or whatever default label name you use
+    # 2. Filter down to only High and Low for binary comparison
+    # We ignore "Mid FR" to ensure High + Low = 100% for the specific feature context
+    mask_binary = seg.isin(["High FR", "Low FR"])
+    df_binary = df.loc[mask_binary].copy()
+    seg_binary = seg.loc[mask_binary]
 
-if "show_top" not in st.session_state:
-    st.session_state["show_top"] = 10
+    rep_dict_high = {}
+    rep_dict_low = {}
 
-# PCA / visualization toggles
-for key, default in {
-    "show_biplot": True,
-    "pca_arrow_features": [],
-    "show_global_pca_arrows": True,
-    "show_low_fr_arrows": True,
-    "show_high_fr_arrows": True,
-    "show_segment_compare": True,
-    "show_selection_why": True,
-    "show_influence_network": True,
-    "influence_subset": "Anomalous (top 5%)",
-    "influence_topk": 10,
-    "influence_edge_thresh": 0.40,
-    "influence_corr_method": "pearson",
-}.items():
-    if key not in st.session_state:
-        st.session_state[key] = default
+    for feat in features_for_analysis:
+        if feat not in df_binary.columns:
+            continue
 
-# Method hyperparameters
-if "if_contam" not in st.session_state:
-    st.session_state["if_contam"] = 0.02
-if "if_trees" not in st.session_state:
-    st.session_state["if_trees"] = 300
-if "lof_k" not in st.session_state:
-    st.session_state["lof_k"] = 20
+        s = df_binary[feat]
+        
+        # --- Handle Numeric Features (Binning) ---
+        if np.issubdtype(s.dtype, np.number):
+            # We must calculate quartiles based on the FULL dataset (including Mid),
+            # otherwise the bins might be skewed if we only look at High/Low.
+            full_s = df[feat]
+            # Use qcut with duplicate dropping in case data is sparse
+            try:
+                # Rank method='first' handles ties efficiently
+                q = pd.qcut(full_s.rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
+                # Apply these bins to our binary subset
+                s = q.loc[mask_binary]
+            except ValueError:
+                # Fallback if qcut fails (e.g. not enough unique values)
+                continue
 
-# Dataset selection
-if "selected_dataset_idx" not in st.session_state:
-    st.session_state["selected_dataset_idx"] = 0
+        # --- Calculate Counts ---
+        # Create a cross-tabulation: Rows=FeatureValues, Cols=Segment(High/Low)
+        ct = pd.crosstab(s, seg_binary)
+        
+        # Ensure columns exist even if count is 0
+        if "High FR" not in ct.columns: ct["High FR"] = 0
+        if "Low FR" not in ct.columns:  ct["Low FR"] = 0
+
+        # Iterate through the unique values (e.g., "Chrome", "Firefox", "Q1", "Q2")
+        for val in ct.index:
+            count_high = ct.loc[val, "High FR"]
+            count_low = ct.loc[val, "Low FR"]
+            total = count_high + count_low
+
+            if total == 0:
+                continue
+
+            # --- THE FIX: Normalize based on the specific feature's total ---
+            pct_high = (count_high / total) * 100.0
+            pct_low = (count_low / total) * 100.0
+
+            # Construct Label
+            if np.issubdtype(df[feat].dtype, np.number):
+                label = f"{feat}:{val}" # e.g. Memory:Q1
+            else:
+                label = f"{feat}={val}" # e.g. Browser=Chrome
+
+            rep_dict_high[label] = pct_high
+            rep_dict_low[label] = pct_low
+
+    if not rep_dict_high:
+        fig.update_layout(title="FR representation (no valid features)", height=220)
+        return fig
+
+    # --- Construct DataFrame ---
+    df_rep = pd.DataFrame({
+        "High_FR": pd.Series(rep_dict_high),
+        "Low_FR": pd.Series(rep_dict_low)
+    }).fillna(0.0)
+
+    # Filter: Show top features most strongly correlated with High FR
+    # We sort by High_FR descending to see the "Problem Areas" first
+    top_idx = df_rep["High_FR"].sort_values(ascending=False).head(15).index
+    df_top = df_rep.loc[top_idx]
+
+    mat = df_top.T  # rows: High_FR, Low_FR
+
+    # --- Plot ---
+    fig.add_trace(go.Heatmap(
+        z=mat.values,
+        x=mat.columns.tolist(),
+        y=mat.index.tolist(),
+        text=mat.round(1).astype(str) + "%",
+        texttemplate="%{text}",
+        zmin=0, zmax=100,
+        colorscale="RdYlGn_r", # Red for High FR, Green for Low FR (Reversed)
+        colorbar=dict(title="% Correlation"),
+    ))
+
+    fig.update_layout(
+        title="Feature Correlation: Probability of High vs Low FR given Feature",
+        height=350,
+        margin=dict(l=10, r=10, t=50, b=10),
+    )
+    return fig
+
+# Note: The make_fr_segments function remains unchanged.
 
 
 
@@ -49,312 +124,12 @@ if "selected_dataset_idx" not in st.session_state:
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
-def render_sidebar_controls(
-    csv_paths: list[Path],
-    dataset_labels: list[str],
-    LABEL_DICT: dict,
-    PCA_FEATURES: list[str],
-):
-    """Dynamic sidebar that shows controls relevant to the visible graphics."""
-    st.sidebar.header("Controls")
 
-    # ---- Dataset selection & global labeling ----
-    dataset_label_list = dataset_labels or [p.name for p in csv_paths]
-
-    selected_idx = st.sidebar.selectbox(
-        "Dataset",
-        options=list(range(len(dataset_label_list))),
-        format_func=lambda i: dataset_label_list[i],
-        index=st.session_state.get("selected_dataset_idx", 0),
-        key="selected_dataset_idx",
-    )
-
-    show_all = st.sidebar.checkbox(
-        "Show all datasets",
-        value=False,
-        key="sidebar_show_all_datasets",   # IMPORTANT: unique key
-    )
-
-    st.sidebar.subheader("Color / Group by")
-    label_choice = st.sidebar.selectbox(
-        "Label",
-        options=list(LABEL_DICT.keys()),
-        index=list(LABEL_DICT.keys()).index(st.session_state.get("label_choice", list(LABEL_DICT.keys())[0])),
-        key="label_choice",
-    )
-
-    show_top = st.sidebar.number_input(
-        "Top-N anomalies table (0 to hide)",
-        min_value=0,
-        max_value=1000,
-        value=st.session_state.get("show_top", 10),
-        step=1,
-        key="show_top",
-    )
-
-    st.sidebar.divider()
-    st.sidebar.subheader("Method-Specific")
-
-    primary = st.session_state.get("active_primary", "PCA")
-    secondary = st.session_state.get("active_secondary", "Storyboard")
-
-    # ---- PCA-specific controls ----
-    if primary == "PCA":
-        st.sidebar.markdown("**PCA Visualization**")
-        st.sidebar.checkbox(
-            "Show PCA driver arrows",
-            value=st.session_state.get("show_biplot", True),
-            key="show_biplot",
-        )
-
-        st.sidebar.multiselect(
-            "PCA driver arrows (numeric features)",
-            PCA_FEATURES,
-            default=st.session_state.get("pca_arrow_features", PCA_FEATURES),
-            key="pca_arrow_features",
-        )
-
-        st.sidebar.checkbox(
-            "Show global arrows (from origin)",
-            value=st.session_state.get("show_global_pca_arrows", True),
-            key="show_global_pca_arrows",
-        )
-
-        st.sidebar.checkbox(
-            "Show Low-FR cluster arrows",
-            value=st.session_state.get("show_low_fr_arrows", True),
-            key="show_low_fr_arrows",
-        )
-
-        st.sidebar.checkbox(
-            "Show High-FR cluster arrows",
-            value=st.session_state.get("show_high_fr_arrows", True),
-            key="show_high_fr_arrows",
-        )
-
-        # Storyboard-specific controls
-        if secondary == "Storyboard":
-            st.sidebar.markdown("**Storyboard Options**")
-            st.sidebar.checkbox(
-                "Show segment comparison (z-scores / % share)",
-                value=st.session_state.get("show_segment_compare", True),
-                key="show_segment_compare",
-            )
-            st.sidebar.checkbox(
-                "Show 'Why this run?' panel",
-                value=st.session_state.get("show_selection_why", True),
-                key="show_selection_why",
-            )
-
-        # Influence network-specific controls
-        if secondary == "Anomaly Influence Network":
-            st.sidebar.markdown("**Anomaly Influence Network**")
-            st.sidebar.selectbox(
-                "Subset",
-                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
-                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
-                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
-                ),
-                key="influence_subset",
-            )
-            st.sidebar.slider(
-                "Top-K features",
-                min_value=4,
-                max_value=15,
-                value=st.session_state.get("influence_topk", 10),
-                step=1,
-                key="influence_topk",
-            )
-            st.sidebar.slider(
-                "Edge threshold (|corr|)",
-                min_value=0.10,
-                max_value=0.90,
-                value=st.session_state.get("influence_edge_thresh", 0.40),
-                step=0.05,
-                key="influence_edge_thresh",
-            )
-            st.sidebar.selectbox(
-                "Correlation method",
-                ["pearson", "spearman"],
-                index=["pearson", "spearman"].index(
-                    st.session_state.get("influence_corr_method", "pearson")
-                ),
-                key="influence_corr_method",
-            )
-            st.sidebar.checkbox(
-                "Show Anomaly Influence Network",
-                value=st.session_state.get("show_influence_network", True),
-                key="show_influence_network",
-            )
-
-    # ---- Isolation Forest controls ----
-    if primary == "Isolation Forest":
-        st.sidebar.markdown("**Isolation Forest**")
-        st.sidebar.slider(
-            "IF: Contamination (expected anomaly %)",
-            min_value=0.0,
-            max_value=0.2,
-            value=st.session_state.get("if_contam", 0.02),
-            step=0.005,
-            key="if_contam",
-        )
-        st.sidebar.slider(
-            "IF: Trees (n_estimators)",
-            min_value=100,
-            max_value=1000,
-            value=st.session_state.get("if_trees", 300),
-            step=50,
-            key="if_trees",
-        )
-
-        if secondary == "Storyboard":
-            st.sidebar.markdown("**Storyboard Options**")
-            st.sidebar.checkbox(
-                "Show segment comparison (z-scores / % share)",
-                value=st.session_state.get("show_segment_compare", True),
-                key="show_segment_compare",
-            )
-            st.sidebar.checkbox(
-                "Show 'Why this run?' panel",
-                value=st.session_state.get("show_selection_why", True),
-                key="show_selection_why",
-            )
-
-        if secondary == "Anomaly Influence Network":
-            st.sidebar.markdown("**Anomaly Influence Network**")
-            st.sidebar.selectbox(
-                "Subset",
-                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
-                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
-                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
-                ),
-                key="influence_subset",
-            )
-            st.sidebar.slider(
-                "Top-K features",
-                min_value=4,
-                max_value=15,
-                value=st.session_state.get("influence_topk", 10),
-                step=1,
-                key="influence_topk",
-            )
-            st.sidebar.slider(
-                "Edge threshold (|corr|)",
-                min_value=0.10,
-                max_value=0.90,
-                value=st.session_state.get("influence_edge_thresh", 0.40),
-                step=0.05,
-                key="influence_edge_thresh",
-            )
-            st.sidebar.selectbox(
-                "Correlation method",
-                ["pearson", "spearman"],
-                index=["pearson", "spearman"].index(
-                    st.session_state.get("influence_corr_method", "pearson")
-                ),
-                key="influence_corr_method",
-            )
-            st.sidebar.checkbox(
-                "Show Anomaly Influence Network",
-                value=st.session_state.get("show_influence_network", True),
-                key="show_influence_network",
-            )
-
-    # ---- LOF controls ----
-    if primary == "Local Outlier Factor":
-        st.sidebar.markdown("**Local Outlier Factor**")
-        st.sidebar.slider(
-            "LOF: Neighbors (n_neighbors)",
-            min_value=5,
-            max_value=100,
-            value=st.session_state.get("lof_k", 20),
-            step=1,
-            key="lof_k",
-        )
-
-        if secondary == "Storyboard":
-            st.sidebar.markdown("**Storyboard Options**")
-            st.sidebar.checkbox(
-                "Show segment comparison (z-scores / % share)",
-                value=st.session_state.get("show_segment_compare", True),
-                key="show_segment_compare",
-            )
-            st.sidebar.checkbox(
-                "Show 'Why this run?' panel",
-                value=st.session_state.get("show_selection_why", True),
-                key="show_selection_why",
-            )
-
-        if secondary == "Anomaly Influence Network":
-            st.sidebar.markdown("**Anomaly Influence Network**")
-            st.sidebar.selectbox(
-                "Subset",
-                ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
-                index=["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"].index(
-                    st.session_state.get("influence_subset", "Anomalous (top 5%)")
-                ),
-                key="influence_subset",
-            )
-            st.sidebar.slider(
-                "Top-K features",
-                min_value=4,
-                max_value=15,
-                value=st.session_state.get("influence_topk", 10),
-                step=1,
-                key="influence_topk",
-            )
-            st.sidebar.slider(
-                "Edge threshold (|corr|)",
-                min_value=0.10,
-                max_value=0.90,
-                value=st.session_state.get("influence_edge_thresh", 0.40),
-                step=0.05,
-                key="influence_edge_thresh",
-            )
-            st.sidebar.selectbox(
-                "Correlation method",
-                ["pearson", "spearman"],
-                index=["pearson", "spearman"].index(
-                    st.session_state.get("influence_corr_method", "pearson")
-                ),
-                key="influence_corr_method",
-            )
-            st.sidebar.checkbox(
-                "Show Anomaly Influence Network",
-                value=st.session_state.get("show_influence_network", True),
-                key="show_influence_network",
-            )
-
-    return {
-        "selected_idx": selected_idx,
-        "show_all": show_all,
-    }
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-# Assume:
-#   csv_paths: List[Path]
-#   dataset_labels: List[str] (same length as csv_paths)
-#   LABEL_DICT, PCA_FEATURES already defined
-
-sidebar_state = render_sidebar_controls(
-    csv_paths=csv_paths,
-    dataset_labels=dataset_labels,
-    LABEL_DICT=LABEL_DICT,
-    PCA_FEATURES=PCA_FEATURES,
-)
-
-selected_idx = sidebar_state["selected_idx"]
-show_all = sidebar_state["show_all"]
-
-if show_all:
-    for path in csv_paths:
-        render_one(path)
-        st.divider()
-else:
-    render_one(csv_paths[selected_idx])
 
 
 =========================================================================================================================================================================

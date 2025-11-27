@@ -9,7 +9,6 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
     """
     Shows correlation of features to High/Low FR.
     Calculates: Given Feature=X, what % were High FR vs Low FR?
-    (The High% and Low% for a specific feature value will sum to 100%)
     """
     fig = go.Figure()
     
@@ -20,11 +19,18 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
                           height=200, margin=dict(l=10, r=10, t=40, b=40))
         return fig
 
-    # 2. Filter down to only High and Low for binary comparison
-    # We ignore "Mid FR" to ensure High + Low = 100% for the specific feature context
-    mask_binary = seg.isin(["High FR", "Low FR"])
-    df_binary = df.loc[mask_binary].copy()
-    seg_binary = seg.loc[mask_binary]
+    # 2. Attach Segment to a copy of the DF to guarantee alignment
+    #    (This fixes the index misalignment issue)
+    df_analysis = df.copy()
+    df_analysis["_FR_Segment"] = seg
+
+    # 3. Filter down to only High and Low for binary comparison
+    mask_binary = df_analysis["_FR_Segment"].isin(["High FR", "Low FR"])
+    df_binary = df_analysis.loc[mask_binary].copy()
+    
+    if df_binary.empty:
+        fig.update_layout(title="No High/Low FR data found", height=200)
+        return fig
 
     rep_dict_high = {}
     rep_dict_low = {}
@@ -33,49 +39,47 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
         if feat not in df_binary.columns:
             continue
 
-        s = df_binary[feat]
-        
         # --- Handle Numeric Features (Binning) ---
-        if np.issubdtype(s.dtype, np.number):
-            # We must calculate quartiles based on the FULL dataset (including Mid),
-            # otherwise the bins might be skewed if we only look at High/Low.
-            full_s = df[feat]
-            # Use qcut with duplicate dropping in case data is sparse
+        if np.issubdtype(df[feat].dtype, np.number):
+            # Calculate quartiles on the FULL dataset to ensure stable bins
+            # Use distinct labels so we can track them easily
             try:
-                # Rank method='first' handles ties efficiently
-                q = pd.qcut(full_s.rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
-                # Apply these bins to our binary subset
-                s = q.loc[mask_binary]
+                # We assign this back to df_binary based on index alignment
+                q = pd.qcut(df[feat].rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
+                df_binary[f"_bin_{feat}"] = q
+                target_col = f"_bin_{feat}"
+                is_numeric = True
             except ValueError:
-                # Fallback if qcut fails (e.g. not enough unique values)
                 continue
+        else:
+            target_col = feat
+            is_numeric = False
 
-        # --- Calculate Counts ---
-        # Create a cross-tabulation: Rows=FeatureValues, Cols=Segment(High/Low)
-        ct = pd.crosstab(s, seg_binary)
-        
-        # Ensure columns exist even if count is 0
-        if "High FR" not in ct.columns: ct["High FR"] = 0
-        if "Low FR" not in ct.columns:  ct["Low FR"] = 0
+        # --- Calculate Counts using GroupBy (Safer than Crosstab) ---
+        # Group by [Feature Value, Segment]
+        counts = df_binary.groupby([target_col, "_FR_Segment"]).size().unstack(fill_value=0)
 
-        # Iterate through the unique values (e.g., "Chrome", "Firefox", "Q1", "Q2")
-        for val in ct.index:
-            count_high = ct.loc[val, "High FR"]
-            count_low = ct.loc[val, "Low FR"]
+        # Ensure columns exist
+        if "High FR" not in counts.columns: counts["High FR"] = 0
+        if "Low FR" not in counts.columns:  counts["Low FR"] = 0
+
+        # Calculate Percentages
+        for val in counts.index:
+            count_high = counts.loc[val, "High FR"]
+            count_low = counts.loc[val, "Low FR"]
             total = count_high + count_low
 
             if total == 0:
                 continue
 
-            # --- THE FIX: Normalize based on the specific feature's total ---
             pct_high = (count_high / total) * 100.0
             pct_low = (count_low / total) * 100.0
 
             # Construct Label
-            if np.issubdtype(df[feat].dtype, np.number):
-                label = f"{feat}:{val}" # e.g. Memory:Q1
+            if is_numeric:
+                label = f"{feat}:{val}" 
             else:
-                label = f"{feat}={val}" # e.g. Browser=Chrome
+                label = f"{feat}={val}" 
 
             rep_dict_high[label] = pct_high
             rep_dict_low[label] = pct_low
@@ -91,7 +95,6 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
     }).fillna(0.0)
 
     # Filter: Show top features most strongly correlated with High FR
-    # We sort by High_FR descending to see the "Problem Areas" first
     top_idx = df_rep["High_FR"].sort_values(ascending=False).head(15).index
     df_top = df_rep.loc[top_idx]
 
@@ -105,7 +108,7 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
         text=mat.round(1).astype(str) + "%",
         texttemplate="%{text}",
         zmin=0, zmax=100,
-        colorscale="RdYlGn_r", # Red for High FR, Green for Low FR (Reversed)
+        colorscale="RdYlGn_r", 
         colorbar=dict(title="% Correlation"),
     ))
 
@@ -115,8 +118,6 @@ def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.
         margin=dict(l=10, r=10, t=50, b=10),
     )
     return fig
-
-# Note: The make_fr_segments function remains unchanged.
 
 
 

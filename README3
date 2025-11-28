@@ -1,131 +1,358 @@
 F-35 anomaly detection
-
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import streamlit as st
-
-def fr_correlation_heatmap(df: pd.DataFrame, features_for_analysis: list) -> go.Figure:
+def _render_table_and_plot(
+    df: pd.DataFrame,
+    PCs: np.ndarray,
+    scores01: np.ndarray,
+    raw_scores: np.ndarray,
+    method_label: str,
+    key_prefix: str,
+    pca,                  # fitted PCA object (for loadings/arrows)
+    pca_arrow_features: list[str],  # user-selected PCA features for arrows
+):
     """
-    Shows correlation of features to High/Low FR.
-    Calculates: Given Feature=X, what % were High FR vs Low FR?
+    Renders, for a given anomaly scoring method:
+
+      1) Top anomalies table with row selection
+      2) PCA scatter plot (3D) with optional highlight and PCA driver arrows
+      3) Secondary tab set:
+           - Storyboard:
+               * Segment comparison (numeric + categorical)
+               * FR representation heatmap (High/Low)
+               * 'Why this run?' bar chart for selected run
+           - Anomaly Influence Network:
+               * Feature co-movement network among top-K features
     """
-    fig = go.Figure()
-    
-    # 1. Segment the data
-    seg = make_fr_segments(df)
-    if seg is None or seg.isna().all():
-        fig.update_layout(title="FR representation (segments unavailable)",
-                          height=200, margin=dict(l=10, r=10, t=40, b=40))
-        return fig
+    df = df.copy()
+    df["anomaly_score"] = scores01
+    df["raw_anomaly_score"] = raw_scores
 
-    # 2. Attach Segment to a copy of the DF to guarantee alignment
-    #    (This fixes the index misalignment issue)
-    df_analysis = df.copy()
-    df_analysis["_FR_Segment"] = seg
+    st.markdown(f"### {method_label}")
 
-    # 3. Filter down to only High and Low for binary comparison
-    mask_binary = df_analysis["_FR_Segment"].isin(["High FR", "Low FR"])
-    df_binary = df_analysis.loc[mask_binary].copy()
-    
-    if df_binary.empty:
-        fig.update_layout(title="No High/Low FR data found", height=200)
-        return fig
+    # -------------------------------------------------------------------------
+    # Top anomalies table & selection
+    # -------------------------------------------------------------------------
+    highlight_pos: int | None = None
+    show_top = st.session_state.get("show_top", 10)
 
-    rep_dict_high = {}
-    rep_dict_low = {}
+    if show_top > 0:
+        cols_keep = [
+            "Test_Run_ID",
+            "FR",
+            "Num_Tests",
+            "total_init_time",
+            "anomaly_score",
+            "raw_anomaly_score",
+            "Simulation_Host",
+            "Simulation_Node",
+            "Capability",
+            "Script_File",
+            "V",
+            "s_number",
+            "Build",
+        ]
+        cols_keep = [c for c in cols_keep if c in df.columns]
 
-    for feat in features_for_analysis:
-        if feat not in df_binary.columns:
-            continue
+        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
 
-        # --- Handle Numeric Features (Binning) ---
-        if np.issubdtype(df[feat].dtype, np.number):
-            # Calculate quartiles on the FULL dataset to ensure stable bins
-            # Use distinct labels so we can track them easily
-            try:
-                # We assign this back to df_binary based on index alignment
-                q = pd.qcut(df[feat].rank(method="first"), 4, labels=["Q1","Q2","Q3","Q4"])
-                df_binary[f"_bin_{feat}"] = q
-                target_col = f"_bin_{feat}"
-                is_numeric = True
-            except ValueError:
-                continue
-        else:
-            target_col = feat
-            is_numeric = False
+        st.markdown("**Top anomalies**")
+        editable = top[cols_keep].copy()
+        editable.insert(0, "Select", False)
 
-        # --- Calculate Counts using GroupBy (Safer than Crosstab) ---
-        # Group by [Feature Value, Segment]
-        counts = df_binary.groupby([target_col, "_FR_Segment"]).size().unstack(fill_value=0)
+        edited = st.data_editor(
+            editable,
+            use_container_width=True,
+            num_rows="fixed",
+            disabled={c: True for c in editable.columns if c != "Select"},
+            key=f"{key_prefix}-table",
+        )
 
-        # Ensure columns exist
-        if "High FR" not in counts.columns: counts["High FR"] = 0
-        if "Low FR" not in counts.columns:  counts["Low FR"] = 0
+        # Map selected row back to original df index
+        selected_original_idxs = edited.index[edited["Select"]].tolist()
+        if selected_original_idxs:
+            pos = df.index.get_indexer([selected_original_idxs[0]])
+            if len(pos) and pos[0] != -1:
+                highlight_pos = int(pos[0])
 
-        # Calculate Percentages
-        for val in counts.index:
-            count_high = counts.loc[val, "High FR"]
-            count_low = counts.loc[val, "Low FR"]
-            total = count_high + count_low
+    # -------------------------------------------------------------------------
+    # PCA plot (full width) with optional driver arrows
+    # -------------------------------------------------------------------------
+    label_choice = st.session_state.get("label_choice", "Failure Rate")
 
-            if total == 0:
-                continue
-
-            pct_high = (count_high / total) * 100.0
-            pct_low = (count_low / total) * 100.0
-
-            # Construct Label
-            if is_numeric:
-                label = f"{feat}:{val}" 
-            else:
-                label = f"{feat}={val}" 
-
-            rep_dict_high[label] = pct_high
-            rep_dict_low[label] = pct_low
-
-    if not rep_dict_high:
-        fig.update_layout(title="FR representation (no valid features)", height=220)
-        return fig
-
-    # --- Construct DataFrame ---
-    df_rep = pd.DataFrame({
-        "High_FR": pd.Series(rep_dict_high),
-        "Low_FR": pd.Series(rep_dict_low)
-    }).fillna(0.0)
-
-    # Filter: Show top features most strongly correlated with High FR
-    top_idx = df_rep["High_FR"].sort_values(ascending=False).head(15).index
-    df_top = df_rep.loc[top_idx]
-
-    mat = df_top.T  # rows: High_FR, Low_FR
-
-    # --- Plot ---
-    fig.add_trace(go.Heatmap(
-        z=mat.values,
-        x=mat.columns.tolist(),
-        y=mat.index.tolist(),
-        text=mat.round(1).astype(str) + "%",
-        texttemplate="%{text}",
-        zmin=0, zmax=100,
-        colorscale="RdYlGn_r", 
-        colorbar=dict(title="% Correlation"),
-    ))
-
-    fig.update_layout(
-        title="Feature Correlation: Probability of High vs Low FR given Feature",
-        height=350,
-        margin=dict(l=10, r=10, t=50, b=10),
+    fig = plot_for_df(
+        df,
+        PCs,
+        label_choice=label_choice,
+        highlight_pos=highlight_pos,
     )
-    return fig
 
+    show_biplot = st.session_state.get("show_biplot", True)
+    if show_biplot and PCs.shape[1] >= 2 and pca is not None:
+        # Use user-selected PCA arrow features, falling back to PCA_FEATURES
+        from typing import cast
+        default_arrow_feats = cast(list[str], globals().get("PCA_FEATURES", []))
+        arrow_feats = st.session_state.get("pca_arrow_features", pca_arrow_features) or default_arrow_feats
 
+        show_global_pca_arrows = st.session_state.get("show_global_pca_arrows", True)
+        show_low_fr_arrows = st.session_state.get("show_low_fr_arrows", True)
+        show_high_fr_arrows = st.session_state.get("show_high_fr_arrows", True)
 
+        # 1) Global arrows from origin
+        if show_global_pca_arrows:
+            try:
+                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
+            except Exception:
+                pass
+
+        # 2) Segment-anchored arrows near Low-FR and High-FR bands
+        try:
+            seg = make_fr_segments(df)  # "Low FR" / "Mid FR" / "High FR"
+
+            if seg is not None:
+                # Low-FR centroid arrows
+                if show_low_fr_arrows:
+                    low_mask = (seg == "Low FR").values
+                    if np.any(low_mask):
+                        low_anchor = PCs[low_mask].mean(axis=0)
+                        add_biplot_arrows_at_anchor_3d(
+                            fig,
+                            pca,
+                            arrow_feats,
+                            low_anchor,
+                            scale=1.2,
+                            color="green",
+                            name_prefix="Low FR ",
+                            showlegend=False,
+                        )
+
+                # High-FR centroid arrows
+                if show_high_fr_arrows:
+                    high_mask = (seg == "High FR").values
+                    if np.any(high_mask):
+                        high_anchor = PCs[high_mask].mean(axis=0)
+                        add_biplot_arrows_at_anchor_3d(
+                            fig,
+                            pca,
+                            arrow_feats,
+                            high_anchor,
+                            scale=1.2,
+                            color="red",
+                            name_prefix="High FR ",
+                            showlegend=False,
+                        )
+        except Exception:
+            pass
+
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
+
+    # -------------------------------------------------------------------------
+    # Secondary tabs: Storyboard | Anomaly Influence Network
+    # -------------------------------------------------------------------------
+    sub_story, sub_net = st.tabs(["Storyboard", "Anomaly Influence Network"])
+
+    # --- Storyboard tab ------------------------------------------------------
+    with sub_story:
+        st.session_state["active_secondary"] = "Storyboard"
+
+        show_segment_compare = st.session_state.get("show_segment_compare", True)
+        show_selection_why = st.session_state.get("show_selection_why", True)
+
+        # Segment comparison + FR representation
+        if show_segment_compare:
+            st.markdown("#### Segment Comparison: Low vs High FR")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Numeric drivers**")
+                st.plotly_chart(
+                    segment_diff_numeric_bar(df),
+                    use_container_width=True,
+                    key=f"{key_prefix}-segnum",
+                )
+            with c2:
+                st.markdown("**Categorical drivers**")
+                st.plotly_chart(
+                    segment_diff_categorical_bar(df),
+                    use_container_width=True,
+                    key=f"{key_prefix}-segcat",
+                )
+
+            st.markdown("#### FR Representation (High / Low)")
+            st.plotly_chart(
+                fr_correlation_heatmap(df),
+                use_container_width=True,
+                key=f"{key_prefix}-frcorr",
+            )
+
+        # Per-selection “Why this run?”
+        if show_selection_why and highlight_pos is not None:
+            st.markdown("#### Why this run?")
+            st.plotly_chart(
+                per_point_contribution_bar(df, highlight_pos),
+                use_container_width=True,
+                key=f"{key_prefix}-whybar",
+            )
+
+    # --- Anomaly Influence Network tab --------------------------------------
+    with sub_net:
+        st.session_state["active_secondary"] = "Anomaly Influence Network"
+
+        show_influence_network = st.session_state.get("show_influence_network", True)
+        if show_influence_network:
+            subset = st.session_state.get("influence_subset", "Anomalous (top 5%)")
+            top_k = st.session_state.get("influence_topk", 10)
+            edge_thresh = st.session_state.get("influence_edge_thresh", 0.40)
+            corr_method = st.session_state.get("influence_corr_method", "pearson")
+
+            net_fig = anomaly_influence_network_figure(
+                df,
+                scores01,
+                subset=subset,
+                q=0.95,
+                top_k=top_k,
+                edge_thresh=edge_thresh,
+                corr_method=corr_method,
+            )
+            st.plotly_chart(
+                net_fig,
+                use_container_width=True,
+                key=f"{key_prefix}-influence",
+            )
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+def render_one(path: Path):
+    """
+    Load one dataset, engineer features, run PCA + IF + LOF,
+    and render three primary tabs:
+
+        - Principal Component Analysis
+        - Isolation Forest
+        - Local Outlier Factor
+
+    Each primary tab reuses `_render_table_and_plot`, which adds:
+        - Top anomalies table
+        - PCA visualization (with driver arrows)
+        - Storyboard subtab (segment comparison, FR representation, Why-this-run)
+        - Anomaly Influence Network subtab
+    """
+    try:
+        # ---------------------------------------------------------------------
+        # Load & feature engineering
+        # ---------------------------------------------------------------------
+        raw = load_csv(path)
+        df = engineer_features(raw)
+
+        # Build feature matrices
+        X = build_features(df).to_numpy(dtype=float)      # raw numeric feature matrix
+        Xz, _ = scale_features(df)                        # scaled version for anomaly models
+
+        # ---------------------------------------------------------------------
+        # PCA for visualization + PCA-based anomaly score (distance in PC space)
+        # ---------------------------------------------------------------------
+        scaler_viz, pca_viz, _, PCs = fit_pca_scaled(X, n_components=3)
+
+        # Any function that turns PCs into an anomaly score (e.g., distance from mean)
+        pca_dist_raw = compute_anomaly_scores(PCs)
+        pca_s01 = normalize_scores(pca_dist_raw)
+
+        # ---------------------------------------------------------------------
+        # Isolation Forest
+        # ---------------------------------------------------------------------
+        if_contam = st.session_state.get("if_contam", 0.02)
+        if_trees = st.session_state.get("if_trees", 300)
+
+        _, if_raw = score_isolation_forest(
+            Xz,
+            contamination=if_contam,
+            n_estimators=if_trees,
+        )
+        if_s01 = normalize_scores(if_raw)
+
+        # ---------------------------------------------------------------------
+        # Local Outlier Factor
+        # ---------------------------------------------------------------------
+        lof_k = st.session_state.get("lof_k", 20)
+
+        _, lof_raw = score_lof(
+            Xz,
+            n_neighbors=lof_k,
+        )
+        lof_s01 = normalize_scores(lof_raw)
+
+        # ---------------------------------------------------------------------
+        # Page heading and primary method tabs
+        # ---------------------------------------------------------------------
+        st.subheader(f"{path.name} · Anomaly Analysis")
+
+        tab_pca, tab_if, tab_lof = st.tabs(
+            ["Principal Component Analysis", "Isolation Forest", "Local Outlier Factor"]
+        )
+
+        # --- PCA tab ---------------------------------------------------------
+        with tab_pca:
+            st.session_state["active_primary"] = "PCA"
+
+            # Use whatever PCA features were previously selected in the sidebar
+            pca_arrow_features = st.session_state.get(
+                "pca_arrow_features",
+                globals().get("PCA_FEATURES", []),
+            )
+
+            _render_table_and_plot(
+                df=df,
+                PCs=PCs,
+                scores01=pca_s01,
+                raw_scores=pca_dist_raw,
+                method_label="Principal Component Analysis",
+                key_prefix=f"{path.name}-PCA",
+                pca=pca_viz,
+                pca_arrow_features=pca_arrow_features,
+            )
+
+        # --- Isolation Forest tab -------------------------------------------
+        with tab_if:
+            st.session_state["active_primary"] = "Isolation Forest"
+
+            pca_arrow_features = st.session_state.get(
+                "pca_arrow_features",
+                globals().get("PCA_FEATURES", []),
+            )
+
+            _render_table_and_plot(
+                df=df,
+                PCs=PCs,
+                scores01=if_s01,
+                raw_scores=if_raw,
+                method_label="Isolation Forest",
+                key_prefix=f"{path.name}-IF",
+                pca=pca_viz,
+                pca_arrow_features=pca_arrow_features,
+            )
+
+        # --- Local Outlier Factor tab ---------------------------------------
+        with tab_lof:
+            st.session_state["active_primary"] = "Local Outlier Factor"
+
+            pca_arrow_features = st.session_state.get(
+                "pca_arrow_features",
+                globals().get("PCA_FEATURES", []),
+            )
+
+            _render_table_and_plot(
+                df=df,
+                PCs=PCs,
+                scores01=lof_s01,
+                raw_scores=lof_raw,
+                method_label="Local Outlier Factor",
+                key_prefix=f"{path.name}-LOF",
+                pca=pca_viz,
+                pca_arrow_features=pca_arrow_features,
+            )
+
+    except Exception as e:
+        st.error(f"Failed to process {path.name}: {e}")
 
 
 =========================================================================================================================================================================

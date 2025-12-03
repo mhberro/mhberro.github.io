@@ -486,106 +486,136 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
+def classify_engagement_geometry(df):
+    """
+    Classifies the tactical geometry based on Aspect Angle.
+    """
+    conditions = [
+        (df['fd_aspect_angle'] <= 45),
+        (df['fd_aspect_angle'] > 45) & (df['fd_aspect_angle'] < 135),
+        (df['fd_aspect_angle'] >= 135)
+    ]
+    choices = ['Tail Chase', 'Beam/Flank', 'Head-On']
+    
+    df['geometry_type'] = np.select(conditions, choices, default='Unknown')
+    return df
+
+# Apply the classification
+df = classify_engagement_geometry(df)
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
 
-# Set the "Data Science Expert" aesthetic
+# Style setup
 sns.set_theme(style="whitegrid", context="talk")
-palette = {"tag": "#e74c3c", "untag": "#3498db"} # Red for Tag (Action), Blue for Untag
+palette = {"tag": "#e74c3c", "untag": "#3498db"}
+geometry_palette = {"Tail Chase": "#2ecc71", "Beam/Flank": "#f1c40f", "Head-On": "#9b59b6"}
 
-def visualize_drone_dynamics(df):
+def plot_individual_visuals(df):
     
-    # Create a figure with a custom grid layout
-    fig = plt.figure(figsize=(20, 16))
-    gs = fig.add_gridspec(2, 2)
+    # ==========================================
+    # 1. The Intercept Geometry (Polar Scatter)
+    # ==========================================
+    plt.figure(figsize=(10, 10))
+    ax1 = plt.subplot(111, projection='polar')
     
-    # -------------------------------------------------------
-    # 1. The Intercept Geometry (Polar Plot)
-    # -------------------------------------------------------
-    ax1 = fig.add_subplot(gs[0, 0], projection='polar')
-    
-    # Convert degrees to radians for polar plotting
     theta = np.radians(df['fd_pursuit_err'])
     r = df['fd_range']
     
-    # Scatter plot
-    # We create two masks to plot Tags on TOP of Untags
-    mask_tag = df['outcome'] == 'tag'
+    # Plot Untags first (background)
     mask_untag = df['outcome'] == 'untag'
-    
     ax1.scatter(theta[mask_untag], r[mask_untag], c=palette['untag'], 
-                alpha=0.3, s=20, label='Untag', edgecolors='none')
+                alpha=0.3, s=30, label='Untag', edgecolors='none')
+    
+    # Plot Tags on top (foreground)
+    mask_tag = df['outcome'] == 'tag'
     ax1.scatter(theta[mask_tag], r[mask_tag], c=palette['tag'], 
-                alpha=0.9, s=50, label='Tag', edgecolors='k')
+                alpha=0.9, s=60, label='Tag', edgecolors='k')
     
-    ax1.set_theta_zero_location("N") # 0 degrees is UP (Nose of the drone)
-    ax1.set_theta_direction(-1)      # Clockwise
+    ax1.set_theta_zero_location("N")
+    ax1.set_theta_direction(-1)
     ax1.set_rlabel_position(90)
-    ax1.set_title("Intercept Geometry:\nPursuit Error (Angle) vs Range (Radius)", pad=20)
-    ax1.legend(loc='lower right', bbox_to_anchor=(1.3, 0.1))
-    
-    # -------------------------------------------------------
-    # 2. The Feasibility Cliff (TTI Margin)
-    # -------------------------------------------------------
-    ax2 = fig.add_subplot(gs[0, 1])
-    
-    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
-                fill=True, common_norm=False, palette=palette, 
-                alpha=0.5, linewidth=2, ax=ax2)
-    
-    # Add a vertical line at 0 (The theoretical physics wall)
-    ax2.axvline(0, color='black', linestyle='--', linewidth=2, label='Physics Threshold (0)')
-    
-    ax2.set_title("The Feasibility Cliff: Time-To-Intercept Margin")
-    ax2.set_xlabel("Steps Remaining - Steps Needed (Negative = Impossible)")
-    ax2.set_ylabel("Density")
-    ax2.legend()
-    
-    # -------------------------------------------------------
-    # 3. Kinematic Phase Space (Range vs Closing Vel)
-    # -------------------------------------------------------
-    ax3 = fig.add_subplot(gs[1, 0])
-    
-    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
-                    palette=palette, alpha=0.6, s=60, ax=ax3)
-    
-    ax3.axhline(0, color='gray', linestyle='--') # Zero closing velocity line
-    ax3.set_title("Kinematic Phase Space")
-    ax3.set_xlabel("Range (meters)")
-    ax3.set_ylabel("Closing Velocity (m/s)")
-    
-    # Annotate the "Kill Zone"
-    ax3.text(x=df['fd_range'].min(), y=df['fd_closing_vel'].max(), 
-             s="  KILL ZONE", color='darkred', weight='bold', verticalalignment='top')
-    
-    # -------------------------------------------------------
-    # 4. Feature Correlation Matrix
-    # -------------------------------------------------------
-    ax4 = fig.add_subplot(gs[1, 1])
-    
-    # Select only our new engineering features
-    cols = ['fd_range', 'fd_closing_vel', 'fd_los_rate', 
-            'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio', 'fd_tti_margin']
-    
-    corr = df[cols].corr()
-    
-    mask = np.triu(np.ones_like(corr, dtype=bool)) # Hide upper triangle
-    sns.heatmap(corr, mask=mask, cmap='RdBu_r', vmax=1, vmin=-1, center=0,
-                square=True, linewidths=.5, cbar_kws={"shrink": .5}, annot=True, fmt=".2f", ax=ax4)
-    
-    ax4.set_title("Feature Correlation Matrix (Multicollinearity Check)")
-    
-    plt.tight_layout()
+    plt.title("Visual 1: Intercept Geometry\n(Pursuit Angle vs Range)")
+    plt.legend(loc='lower right', bbox_to_anchor=(1.2, 0))
     plt.show()
 
-# Run the visualization
-visualize_drone_dynamics(df)
+    # ==========================================
+    # 2. The Feasibility Cliff (KDE)
+    # ==========================================
+    plt.figure(figsize=(12, 6))
+    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
+                fill=True, common_norm=False, palette=palette, 
+                alpha=0.5, linewidth=2)
+    plt.axvline(0, color='black', linestyle='--', linewidth=2)
+    plt.title("Visual 2: The Feasibility Cliff (TTI Margin)")
+    plt.xlabel("Steps Remaining - Steps Needed (Negative = Impossible)")
+    plt.show()
 
-=========================================================================================================================================================================
-=========================================================================================================================================================================
+    # ==========================================
+    # 3. Kinematic Phase Space
+    # ==========================================
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
+                    palette=palette, alpha=0.6, s=60)
+    plt.axhline(0, color='gray', linestyle='--')
+    plt.title("Visual 3: Kinematic Phase Space")
+    plt.xlabel("Range (meters)")
+    plt.ylabel("Closing Velocity (m/s)")
+    plt.show()
 
+    # ==========================================
+    # 4. BEST VISUAL FOR HEAD VS TAIL: The Rose Histogram
+    # ==========================================
+    # This shows the distribution of Aspect Angles for TAGS only
+    
+    # Filter for Tags only to see what works
+    tags_only = df[df['outcome'] == 'tag']
+    
+    plt.figure(figsize=(10, 10))
+    ax4 = plt.subplot(111, projection='polar')
+    
+    # Histogram of Aspect Angles
+    # We use 18 bins (20 degrees each)
+    n_bins = 18
+    bins = np.linspace(0, 2*np.pi, n_bins + 1)
+    
+    # Convert aspect (0-180) to radians. 
+    # Note: Aspect is usually symmetrical (0-180 Left/Right). 
+    # For visualization, we mirror it to 360 to look like a full compass.
+    angles = np.radians(tags_only['fd_aspect_angle'])
+    angles_mirrored = np.concatenate([angles, -angles]) # Mirror for visual symmetry
+    
+    plt.hist(angles_mirrored, bins=n_bins, color=palette['tag'], alpha=0.7, edgecolor='k')
+    
+    ax4.set_theta_zero_location("S") # 0 (Tail) is usually bottom/South in aspect plots
+    ax4.set_title("Visual 4: Engagement Aspect Rose Plot\n(Where do successful tags come from?)", pad=20)
+    
+    # Label the sectors
+    plt.figtext(0.5, 0.85, "HEAD ON", ha='center', fontsize=12, weight='bold')
+    plt.figtext(0.5, 0.15, "TAIL CHASE", ha='center', fontsize=12, weight='bold')
+    plt.show()
 
+    # ==========================================
+    # 5. Physics Validation: Closing Speed by Geometry
+    # ==========================================
+    plt.figure(figsize=(12, 6))
+    sns.violinplot(data=df, x='geometry_type', y='fd_closing_vel', hue='outcome',
+                   split=True, inner='quart', palette=palette, 
+                   order=['Head-On', 'Beam/Flank', 'Tail Chase'])
+    
+    plt.axhline(0, color='black', linestyle='--', alpha=0.5)
+    plt.title("Visual 5: Closing Velocity Dynamics by Geometry")
+    plt.ylabel("Closing Velocity (m/s)")
+    plt.show()
+
+# Run
+plot_individual_visuals(df)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

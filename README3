@@ -486,126 +486,101 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 
-def engineer_flight_dynamics_features(df):
-    """
-    Engineers aerospace features using Coordinate Truth for geometry
-    and Speed/Heading for kinematics.
-    """
+# Set the "Data Science Expert" aesthetic
+sns.set_theme(style="whitegrid", context="talk")
+palette = {"tag": "#e74c3c", "untag": "#3498db"} # Red for Tag (Action), Blue for Untag
+
+def visualize_drone_dynamics(df):
     
-    # 1. Helper: Vector Construction (Level Flight Assumption)
-    def get_velocity_vector_level(speed, heading_deg):
-        """
-        Constructs a 3D velocity vector assuming 0 pitch (level flight).
-        Heading: 0 = North (Y+), 90 = East (X+)
-        """
-        heading_rad = np.radians(heading_deg)
-        
-        # Standard Navigation Math:
-        # Vx = Speed * Sin(Heading)
-        # Vy = Speed * Cos(Heading)
-        # Vz = 0 (Assumption due to missing pitch data)
-        vx = speed * np.sin(heading_rad)
-        vy = speed * np.cos(heading_rad)
-        vz = 0.0 
-        
-        return np.array([vx, vy, vz])
-
-    # Feature Lists
-    feat_range = []
-    feat_closing_vel = []
-    feat_los_rate = []
-    feat_pursuit_err = []
-    feat_aspect_angle = []
-    feat_speed_ratio = []
-    feat_tti_margin = []
-
-    for index, row in df.iterrows():
-        # --- A. Extract Truth Data ---
-        t_idx = row['it_runner_index']
-        
-        # Positions (The most reliable data)
-        p_it = np.array(row['it_location'])
-        p_target = np.array(row['runners_location'][t_idx])
-        
-        # Velocities (derived from Speed + Heading, assuming level flight)
-        v_it = get_velocity_vector_level(row['it_speed'], row['it_heading'])
-        v_target = get_velocity_vector_level(row['runner_speed'][t_idx], row['runner_heading'][t_idx])
-
-        # --- B. Geometric Calculations ---
-        
-        # 1. Range Vector (The true 3D Line of Sight)
-        r_vec = p_target - p_it
-        dist = np.linalg.norm(r_vec) + 1e-9 # Epsilon to prevent div/0
-        
-        # 2. Unit LOS Vector (The perfect pointing direction)
-        u_los = r_vec / dist
-        
-        # 3. Relative Velocity (V_it - V_target)
-        v_rel = v_it - v_target
-        
-        # --- C. Feature Computation ---
-        
-        # F1: Slant Range
-        feat_range.append(dist)
-        
-        # F2: Closing Velocity
-        # How much of our relative speed is projected onto the LOS?
-        closing_vel = np.dot(v_rel, u_los)
-        feat_closing_vel.append(closing_vel)
-        
-        # F3: LOS Rate (Proportional Navigation Metric)
-        # Rate of change of the angle to target. 
-        # Low LOS Rate + High Closing Vel = Collision Course (Good Tag)
-        cross_prod_mag = np.linalg.norm(np.cross(r_vec, v_rel))
-        los_rate = cross_prod_mag / (dist**2)
-        feat_los_rate.append(los_rate)
-        
-        # F4: Pure Pursuit Error
-        # Angle between It_Drone's Nose (Velocity) and the Target (LOS)
-        v_it_mag = np.linalg.norm(v_it) + 1e-9
-        # Dot product / magnitudes = Cos(angle)
-        dot_pursuit = np.dot(v_it, u_los)
-        # Clip to -1.0 to 1.0 to handle floating point errors before arccos
-        pursuit_rad = np.arccos(np.clip(dot_pursuit / v_it_mag, -1.0, 1.0))
-        feat_pursuit_err.append(np.degrees(pursuit_rad))
-        
-        # F5: Aspect Angle
-        # Angle between Target's Tail and It_Drone
-        # 0 deg = Tail Chase (Run away), 180 deg = Head-on
-        v_t_mag = np.linalg.norm(v_target) + 1e-9
-        dot_aspect = np.dot(v_target, u_los)
-        aspect_rad = np.arccos(np.clip(dot_aspect / v_t_mag, -1.0, 1.0))
-        feat_aspect_angle.append(np.degrees(aspect_rad))
-        
-        # F6: Speed Ratio
-        # >1.0 means It drone is faster
-        s_ratio = row['it_speed'] / (row['runner_speed'][t_idx] + 1e-9)
-        feat_speed_ratio.append(s_ratio)
-        
-        # F7: TTI Feasibility (The Margin)
-        if closing_vel > 0.1: # If we are actually closing the gap
-            steps_needed = dist / closing_vel
-            # Margin = "Time we have" - "Time we need"
-            margin = row['remaining_timesteps'] - steps_needed
-        else:
-            # If closing vel is negative (opening gap), capture is impossible.
-            # Assign a large negative penalty
-            margin = -100.0 
-        feat_tti_margin.append(margin)
-
-    # Append to DataFrame
-    df['fd_range'] = feat_range
-    df['fd_closing_vel'] = feat_closing_vel
-    df['fd_los_rate'] = feat_los_rate
-    df['fd_pursuit_err'] = feat_pursuit_err
-    df['fd_aspect_angle'] = feat_aspect_angle
-    df['fd_speed_ratio'] = feat_speed_ratio
-    df['fd_tti_margin'] = feat_tti_margin
+    # Create a figure with a custom grid layout
+    fig = plt.figure(figsize=(20, 16))
+    gs = fig.add_gridspec(2, 2)
     
-    return df
+    # -------------------------------------------------------
+    # 1. The Intercept Geometry (Polar Plot)
+    # -------------------------------------------------------
+    ax1 = fig.add_subplot(gs[0, 0], projection='polar')
+    
+    # Convert degrees to radians for polar plotting
+    theta = np.radians(df['fd_pursuit_err'])
+    r = df['fd_range']
+    
+    # Scatter plot
+    # We create two masks to plot Tags on TOP of Untags
+    mask_tag = df['outcome'] == 'tag'
+    mask_untag = df['outcome'] == 'untag'
+    
+    ax1.scatter(theta[mask_untag], r[mask_untag], c=palette['untag'], 
+                alpha=0.3, s=20, label='Untag', edgecolors='none')
+    ax1.scatter(theta[mask_tag], r[mask_tag], c=palette['tag'], 
+                alpha=0.9, s=50, label='Tag', edgecolors='k')
+    
+    ax1.set_theta_zero_location("N") # 0 degrees is UP (Nose of the drone)
+    ax1.set_theta_direction(-1)      # Clockwise
+    ax1.set_rlabel_position(90)
+    ax1.set_title("Intercept Geometry:\nPursuit Error (Angle) vs Range (Radius)", pad=20)
+    ax1.legend(loc='lower right', bbox_to_anchor=(1.3, 0.1))
+    
+    # -------------------------------------------------------
+    # 2. The Feasibility Cliff (TTI Margin)
+    # -------------------------------------------------------
+    ax2 = fig.add_subplot(gs[0, 1])
+    
+    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
+                fill=True, common_norm=False, palette=palette, 
+                alpha=0.5, linewidth=2, ax=ax2)
+    
+    # Add a vertical line at 0 (The theoretical physics wall)
+    ax2.axvline(0, color='black', linestyle='--', linewidth=2, label='Physics Threshold (0)')
+    
+    ax2.set_title("The Feasibility Cliff: Time-To-Intercept Margin")
+    ax2.set_xlabel("Steps Remaining - Steps Needed (Negative = Impossible)")
+    ax2.set_ylabel("Density")
+    ax2.legend()
+    
+    # -------------------------------------------------------
+    # 3. Kinematic Phase Space (Range vs Closing Vel)
+    # -------------------------------------------------------
+    ax3 = fig.add_subplot(gs[1, 0])
+    
+    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
+                    palette=palette, alpha=0.6, s=60, ax=ax3)
+    
+    ax3.axhline(0, color='gray', linestyle='--') # Zero closing velocity line
+    ax3.set_title("Kinematic Phase Space")
+    ax3.set_xlabel("Range (meters)")
+    ax3.set_ylabel("Closing Velocity (m/s)")
+    
+    # Annotate the "Kill Zone"
+    ax3.text(x=df['fd_range'].min(), y=df['fd_closing_vel'].max(), 
+             s="  KILL ZONE", color='darkred', weight='bold', verticalalignment='top')
+    
+    # -------------------------------------------------------
+    # 4. Feature Correlation Matrix
+    # -------------------------------------------------------
+    ax4 = fig.add_subplot(gs[1, 1])
+    
+    # Select only our new engineering features
+    cols = ['fd_range', 'fd_closing_vel', 'fd_los_rate', 
+            'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio', 'fd_tti_margin']
+    
+    corr = df[cols].corr()
+    
+    mask = np.triu(np.ones_like(corr, dtype=bool)) # Hide upper triangle
+    sns.heatmap(corr, mask=mask, cmap='RdBu_r', vmax=1, vmin=-1, center=0,
+                square=True, linewidths=.5, cbar_kws={"shrink": .5}, annot=True, fmt=".2f", ax=ax4)
+    
+    ax4.set_title("Feature Correlation Matrix (Multicollinearity Check)")
+    
+    plt.tight_layout()
+    plt.show()
+
+# Run the visualization
+visualize_drone_dynamics(df)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

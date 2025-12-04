@@ -486,147 +486,71 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 
-# Mock Data Generation including the new features
-def generate_mock_data_v2(n_rows=500):
-    np.random.seed(42)
-    data = []
+def plot_dogfight_polar_full(df_analyzed):
+    plt.figure(figsize=(12, 12))
+    ax = plt.subplot(111, projection='polar')
     
-    for _ in range(n_rows):
-        n_runners = 5
-        target_idx = np.random.randint(0, n_runners)
-        
-        # Simulate Headings (0-360)
-        runner_headings = np.random.randint(0, 360, n_runners).tolist()
-        
-        # Simulate Bearings (Bearing of Runner FROM It Drone)
-        # If It is chasing (Tail), It is behind. 
-        # Runner Heading = 0 (North). It is South. Vector It->Runner is North (0).
-        # So Chasing implies Bearing ~= Heading.
-        # Head-on implies Bearing ~= Heading + 180.
-        
-        runner_bearings = np.random.randint(0, 360, n_runners).tolist()
-        
-        # Let's bias the mock data: "Tags" happen more often in Tail chases (Rear)
-        # Tail chase: Runner Heading approx equals Bearing (It -> Runner)
-        # e.g. Runner going North (0). It is South. It->Runner vector is North (0).
-        
-        heading = runner_headings[target_idx]
-        bearing = runner_bearings[target_idx]
-        
-        # Calculate angle difference
-        diff = abs(heading - bearing)
-        if diff > 180: diff = 360 - diff
-        
-        # Bias outcome: 
-        # If diff < 45 (Tail chase/Behind), higher chance of tag
-        is_tail = diff < 60
-        
-        outcome = "tag" if (is_tail and np.random.random() > 0.3) else "untag"
-        if np.random.random() > 0.9: outcome = "tag" # Random noise tags
-        
-        row = {
-            'timestep': np.random.randint(0, 1000),
-            'runner_heading': runner_headings,
-            'runner_bearing': runner_bearings, # Bearing OF runner WRT it
-            'it_runner_index': target_idx,
-            'outcome': outcome
-        }
-        data.append(row)
-    return pd.DataFrame(data)
-
-df = generate_mock_data_v2()
-
-# Feature Engineering Function
-def calculate_approach_dynamics(row):
-    idx = row['it_runner_index']
+    # Set 0 degrees (Up) to represent the Runner's Head/Nose
+    ax.set_theta_zero_location("N") 
+    ax.set_theta_direction(-1) # Clockwise for intuitive Left/Right
     
-    # Get Target Heading (Where the runner is going)
-    target_heading = row['runner_heading'][idx]
+    # Define settings for each outcome type
+    # We plot 'untag' first so they are in the background
+    groups = {
+        'untag': {'color': 'blue', 'alpha': 0.1, 'label': 'Escaped (Untag)', 'marker': 'o', 'zorder': 1},
+        'tag':   {'color': 'red',  'alpha': 0.8, 'label': 'Captured (Tag)',   'marker': 'x', 'zorder': 2}
+    }
     
-    # Get Bearing (Direction from It -> Runner)
-    bearing_it_to_runner = row['runner_bearing'][idx]
-    
-    # We want to know where the 'It' drone is RELATIVE to the Runner.
-    # Vector: Runner -> It is (Bearing + 180)
-    bearing_runner_to_it = (bearing_it_to_runner + 180) % 360
-    
-    # Calculate Relative Angle (0 = It is in front, 180 = It is behind)
-    # We subtract Runner's heading to make it relative to the runner's nose.
-    # Format: [-180, 180]
-    relative_angle = bearing_runner_to_it - target_heading
-    
-    # Normalize to -180 to 180
-    relative_angle = (relative_angle + 180) % 360 - 180
-    
-    # Categorize
-    # Front: -45 to 45
-    # Rear: -135 to -180 OR 135 to 180
-    # Flank: 45 to 135 OR -45 to -135
-    
-    abs_angle = abs(relative_angle)
-    if abs_angle <= 45:
-        position = 'Head (Front)'
-    elif abs_angle >= 135:
-        position = 'Tail (Back)'
-    else:
-        position = 'Flank (Side)'
+    # Loop through groups to plot them
+    for outcome, props in groups.items():
+        subset = df_analyzed[df_analyzed['outcome'] == outcome]
         
-    return pd.Series([relative_angle, position], index=['relative_approach_angle', 'approach_sector'])
-
-# Apply
-df_eng = df.apply(calculate_approach_dynamics, axis=1)
-df_final = pd.concat([df, df_eng], axis=1)
-
-# Visualization Check
-plt.figure(figsize=(10, 10))
-ax = plt.subplot(111, projection='polar')
-
-# Convert to radians for polar plot
-# The angle on the plot should represent the position of 'It' relative to Runner
-# 0 degrees on polar plot = Runner's Nose.
-# Theta = relative_approach_angle (converted to radians)
-
-theta = np.deg2rad(df_final['relative_approach_angle'])
-r = np.random.uniform(10, 20, len(df_final)) # Mock distance/jitter
-
-# Color by outcome
-colors = df_final['outcome'].map({'tag': 'red', 'untag': 'blue'})
-
-ax.scatter(theta, r, c=colors, alpha=0.6)
-ax.set_theta_zero_location("N") # 0 is North (Head)
-ax.set_theta_direction(-1) # Clockwise
-ax.set_title("Relative Position of 'It' Drone (Center = Runner)")
-plt.savefig('polar_test.png')
-print("Code generated and verified.")
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-def plot_sector_success(df_analyzed):
-    plt.figure(figsize=(10, 6))
-    
-    # Calculate % of Tags per sector
-    sector_stats = df_analyzed.groupby('approach_sector')['outcome'].value_counts(normalize=True).unstack()
-    
-    if 'tag' in sector_stats.columns:
-        success_rates = sector_stats['tag'].sort_values()
+        if subset.empty:
+            continue
+            
+        # Convert degrees to radians for the plot
+        theta = np.deg2rad(subset['relative_approach_angle'])
         
-        sns.barplot(x=success_rates.index, y=success_rates.values, palette='Reds')
-        plt.ylabel('Tag Probability')
-        plt.title('Which Approach Angle is Deadliest?', fontsize=14)
-        plt.ylim(0, 1.0)
-    else:
-        print("No tags found in data.")
-        
+        # Use distance for radius (r) if available, otherwise use random jitter
+        if 'distance_to_target' in subset.columns:
+            r = subset['distance_to_target']
+        else:
+            # Mock radius if distance feature is missing
+            r = np.random.uniform(0.5, 1.0, len(subset))
+            
+        ax.scatter(theta, r, 
+                   c=props['color'], 
+                   alpha=props['alpha'], 
+                   label=props['label'], 
+                   marker=props['marker'],
+                   zorder=props['zorder'],
+                   s=40) # s is size of marker
+
+    # Add Sector Labels for context
+    # Adjust 'r_max' to place labels just outside the furthest point
+    r_max = ax.get_ylim()[1]
+    
+    plt.text(0, r_max * 1.05, "HEAD\n(Front)", ha='center', fontweight='bold')
+    plt.text(np.pi, r_max * 1.05, "TAIL\n(Back)", ha='center', fontweight='bold')
+    plt.text(np.pi/2, r_max * 1.05, "RIGHT FLANK", ha='center', fontsize=9)
+    plt.text(-np.pi/2, r_max * 1.05, "LEFT FLANK", ha='center', fontsize=9)
+
+    plt.title("Relative Position of 'It' Drone: Tags vs. Untags\n(Center = Runner)", fontsize=16, y=1.08)
+    plt.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+    
     plt.show()
 
-# plot_sector_success(df_analyzed)
+# Run the updated visual
+# plot_dogfight_polar_full(df_analyzed)
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

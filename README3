@@ -488,65 +488,63 @@ PG-35: Susceptibility Modeling
 
 import matplotlib.pyplot as plt
 import numpy as np
-import seaborn as sns
 
-def plot_dogfight_polar_full(df_analyzed):
-    plt.figure(figsize=(12, 12))
+def plot_danger_zone_gradient(df_analyzed):
+    # 1. Filter for only 'Tag' outcomes to visualize the "Danger Zones"
+    tags_only = df_analyzed[df_analyzed['outcome'] == 'tag'].copy()
+    
+    # 2. Prepare Data
+    # Convert angles to radians [-pi, pi]
+    theta = np.deg2rad(tags_only['relative_approach_angle'])
+    
+    # Use distance if available, otherwise mock it for demonstration
+    if 'distance_to_target' in tags_only.columns:
+        r = tags_only['distance_to_target']
+    else:
+        # If you don't have distance, we simulate it to show the visual
+        # In reality, tags usually happen close (0 to 50 meters, for example)
+        r = np.random.uniform(0, 50, len(tags_only))
+
+    # 3. Setup Bins for the 2D Histogram
+    # Angle bins: 36 slices (10 degrees each)
+    theta_bins = np.linspace(-np.pi, np.pi, 37)
+    # Radius bins: 20 rings moving outward
+    r_bins = np.linspace(0, r.max(), 21)
+
+    # 4. Compute 2D Histogram (Density)
+    # H is the count of tags in each bin
+    H, _, _ = np.histogram2d(theta, r, bins=[theta_bins, r_bins])
+    
+    # 5. Plotting
+    plt.figure(figsize=(10, 8))
     ax = plt.subplot(111, projection='polar')
-    
-    # Set 0 degrees (Up) to represent the Runner's Head/Nose
-    ax.set_theta_zero_location("N") 
-    ax.set_theta_direction(-1) # Clockwise for intuitive Left/Right
-    
-    # Define settings for each outcome type
-    # We plot 'untag' first so they are in the background
-    groups = {
-        'untag': {'color': 'blue', 'alpha': 0.1, 'label': 'Escaped (Untag)', 'marker': 'o', 'zorder': 1},
-        'tag':   {'color': 'red',  'alpha': 0.8, 'label': 'Captured (Tag)',   'marker': 'x', 'zorder': 2}
-    }
-    
-    # Loop through groups to plot them
-    for outcome, props in groups.items():
-        subset = df_analyzed[df_analyzed['outcome'] == outcome]
-        
-        if subset.empty:
-            continue
-            
-        # Convert degrees to radians for the plot
-        theta = np.deg2rad(subset['relative_approach_angle'])
-        
-        # Use distance for radius (r) if available, otherwise use random jitter
-        if 'distance_to_target' in subset.columns:
-            r = subset['distance_to_target']
-        else:
-            # Mock radius if distance feature is missing
-            r = np.random.uniform(0.5, 1.0, len(subset))
-            
-        ax.scatter(theta, r, 
-                   c=props['color'], 
-                   alpha=props['alpha'], 
-                   label=props['label'], 
-                   marker=props['marker'],
-                   zorder=props['zorder'],
-                   s=40) # s is size of marker
 
-    # Add Sector Labels for context
-    # Adjust 'r_max' to place labels just outside the furthest point
-    r_max = ax.get_ylim()[1]
-    
-    plt.text(0, r_max * 1.05, "HEAD\n(Front)", ha='center', fontweight='bold')
-    plt.text(np.pi, r_max * 1.05, "TAIL\n(Back)", ha='center', fontweight='bold')
-    plt.text(np.pi/2, r_max * 1.05, "RIGHT FLANK", ha='center', fontsize=9)
-    plt.text(-np.pi/2, r_max * 1.05, "LEFT FLANK", ha='center', fontsize=9)
+    # Configure orientation (0 is North/Up, Clockwise)
+    ax.set_theta_zero_location("N")
+    ax.set_theta_direction(-1)
 
-    plt.title("Relative Position of 'It' Drone: Tags vs. Untags\n(Center = Runner)", fontsize=16, y=1.08)
-    plt.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+    # Create the gradient mesh
+    # We use T.T (transpose) because histogram2d returns (x,y) but pcolormesh expects (y,x) grid logic often
+    # 'Reds' colormap: White = Safe, Dark Red = High Danger
+    mesh = ax.pcolormesh(theta_bins, r_bins, H.T, cmap='Reds', shading='auto', alpha=0.9)
+
+    # Add Colorbar to explain the gradient
+    cbar = plt.colorbar(mesh, ax=ax, pad=0.1)
+    cbar.set_label('Number of Successful Tags')
+
+    # Labels
+    # Use coordinates just outside the max radius for text
+    max_r = r.max()
+    plt.text(0, max_r * 1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
+    plt.text(np.pi, max_r * 1.1, "TAIL\n(Back)", ha='center', fontweight='bold')
+
+    plt.title("Heatmap of 'It' Drone Attack Positions\n(Darker Red = More Frequent Tags)", fontsize=15, y=1.1)
+    plt.grid(alpha=0.3)
     
     plt.show()
 
-# Run the updated visual
-# plot_dogfight_polar_full(df_analyzed)
-
+# Run the heatmap
+# plot_danger_zone_gradient(df_analyzed)
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 

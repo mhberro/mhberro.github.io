@@ -486,22 +486,15 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-def classify_engagement_geometry(df):
-    """
-    Classifies the tactical geometry based on Aspect Angle.
-    """
-    conditions = [
-        (df['fd_aspect_angle'] <= 45),
-        (df['fd_aspect_angle'] > 45) & (df['fd_aspect_angle'] < 135),
-        (df['fd_aspect_angle'] >= 135)
-    ]
-    choices = ['Tail Chase', 'Beam/Flank', 'Head-On']
-    
-    df['geometry_type'] = np.select(conditions, choices, default='Unknown')
-    return df
+# Convert outcome to binary for correlation analysis
+# Tag = 1, Untag = 0
+df['outcome_binary'] = df['outcome'].map({'tag': 1, 'untag': 0})
 
-# Apply the classification
-df = classify_engagement_geometry(df)
+# Define the list of numerical engineered features
+numerical_features = [
+    'fd_range', 'fd_closing_vel', 'fd_los_rate', 
+    'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio', 'fd_tti_margin'
+]
 
 
 
@@ -511,111 +504,103 @@ df = classify_engagement_geometry(df)
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
+import pandas as pd
 
-# Style setup
+# Set aesthetic style
 sns.set_theme(style="whitegrid", context="talk")
-palette = {"tag": "#e74c3c", "untag": "#3498db"}
-geometry_palette = {"Tail Chase": "#2ecc71", "Beam/Flank": "#f1c40f", "Head-On": "#9b59b6"}
+# Define consistent colors: Red for the "positive" class (tag), Blue for negative
+palette = {"tag": "#e74c3c", "untag": "#3498db"} 
 
-def plot_individual_visuals(df):
+def plot_predictive_power_eda(df, numerical_features):
     
-    # ==========================================
-    # 1. The Intercept Geometry (Polar Scatter)
-    # ==========================================
-    plt.figure(figsize=(10, 10))
-    ax1 = plt.subplot(111, projection='polar')
+    fig = plt.figure(figsize=(24, 18))
+    gs = fig.add_gridspec(3, 3)
+    fig.suptitle('Exploratory Analysis of Feature Predictive Power', fontsize=24, y=0.95)
+
+    # ===================================================
+    # 1. The Feature "Leaderboard" (Correlation Bar Chart)
+    # ===================================================
+    # Goal: Instant ranking of linear predictive relationship.
+    ax1 = fig.add_subplot(gs[0, :]) # Span top row
+
+    # Calculate point-biserial correlation with the binary outcome
+    correlations = df[numerical_features].corrwith(df['outcome_binary']).sort_values(ascending=False)
     
-    theta = np.radians(df['fd_pursuit_err'])
-    r = df['fd_range']
+    # Plot
+    sns.barplot(x=correlations.values, y=correlations.index, palette="vlag", ax=ax1)
     
-    # Plot Untags first (background)
-    mask_untag = df['outcome'] == 'untag'
-    ax1.scatter(theta[mask_untag], r[mask_untag], c=palette['untag'], 
-                alpha=0.3, s=30, label='Untag', edgecolors='none')
+    ax1.set_title("Feature 'Leaderboard': Correlation with 'Tag' Outcome", weight='bold')
+    ax1.set_xlabel("Point-Biserial Correlation Coefficient (Positive = More Tags)")
+    ax1.axvline(0, color='k', linewidth=1)
+    # Add annotations
+    for i, v in enumerate(correlations.values):
+        ax1.text(v + (0.01 if v>0 else -0.01), i, f"{v:.2f}", 
+                 va='center', ha=('left' if v>0 else 'right'), fontsize=12)
+
+    # ===================================================
+    # 2. The Separation Check (Multi-Violin Plots)
+    # ===================================================
+    # Goal: Visualize distribution overlap. Less overlap = better feature.
+    # We use individual subplots because scales vary wildly.
     
-    # Plot Tags on top (foreground)
-    mask_tag = df['outcome'] == 'tag'
-    ax1.scatter(theta[mask_tag], r[mask_tag], c=palette['tag'], 
-                alpha=0.9, s=60, label='Tag', edgecolors='k')
-    
-    ax1.set_theta_zero_location("N")
-    ax1.set_theta_direction(-1)
-    ax1.set_rlabel_position(90)
-    plt.title("Visual 1: Intercept Geometry\n(Pursuit Angle vs Range)")
-    plt.legend(loc='lower right', bbox_to_anchor=(1.2, 0))
+    # Subplot positions for the 6 main continuous features (excluding margin for now)
+    positions = [gs[1, 0], gs[1, 1], gs[1, 2], gs[2, 0], gs[2, 1], gs[2, 2]]
+    plot_feats = ['fd_range', 'fd_closing_vel', 'fd_los_rate', 
+                  'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio']
+    titles = ['Range (Distance)', 'Closing Velocity', 'Line-of-Sight Rate', 
+              'Pursuit Error (Angle)', 'Aspect Angle', 'Speed Ratio']
+
+    for i, (feat, pos, title) in enumerate(zip(plot_feats, positions, titles)):
+        ax = fig.add_subplot(pos)
+        
+        # Violin plot shows the KDE (shape) and the boxplot (stats)
+        sns.violinplot(data=df, x='outcome', y=feat, palette=palette, 
+                       split=False, inner="quartile", linewidth=1.5, ax=ax)
+        
+        ax.set_title(f"{title} Separation")
+        ax.set_ylabel("") # Remove redundant y-labels
+        ax.set_xlabel("")
+
+    plt.tight_layout()
+    # Adjust layout to make room for the big title
+    plt.subplots_adjust(top=0.90, hspace=0.3, wspace=0.2)
     plt.show()
 
-    # ==========================================
-    # 2. The Feasibility Cliff (KDE)
-    # ==========================================
-    plt.figure(figsize=(12, 6))
-    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
-                fill=True, common_norm=False, palette=palette, 
-                alpha=0.5, linewidth=2)
-    plt.axvline(0, color='black', linestyle='--', linewidth=2)
-    plt.title("Visual 2: The Feasibility Cliff (TTI Margin)")
-    plt.xlabel("Steps Remaining - Steps Needed (Negative = Impossible)")
+    # ===================================================
+    # 3. Categorical Power: Geometry Success Rates
+    # ===================================================
+    # Goal: Show if specific tactical geometries guarantee a win or loss.
+    plt.figure(figsize=(10, 6))
+    
+    # Create normalized crosstab (percentages summing to 100% across rows)
+    ct = pd.crosstab(df['geometry_type'], df['outcome'], normalize='index') * 100
+    # Reorder indices logically if they exist
+    desired_order = ['Tail Chase', 'Beam/Flank', 'Head-On']
+    existing_order = [o for o in desired_order if o in ct.index]
+    ct = ct.loc[existing_order]
+    
+    ax_cat = ct.plot(kind='barh', stacked=True, color=[palette['untag'], palette['tag']], 
+                     edgecolor='white', width=0.8)
+    
+    plt.title("Tag Success Rate by Engagement Geometry", weight='bold')
+    plt.xlabel("Percentage of Encounters (%)")
+    plt.ylabel("")
+    plt.legend(title='Outcome', bbox_to_anchor=(1.05, 1), loc='upper left')
+    
+    # Add percentage labels onto the bars
+    for n, x in enumerate([*ct.index.values]):
+        for (img, label, color) in zip(ax_cat.containers, ct.columns, ['white', 'black']):
+            # Adjust label color for contrast against red/blue bars
+            text_color = 'white' if label == 'tag' or label == 'untag' else 'black'
+            plt.text(img[n].get_width() / 2 + img[n].get_x(), n, 
+                     f"{img[n].get_width():.0f}%",
+                     va='center', ha='center', color=text_color, weight='bold')
+                     
+    plt.tight_layout()
     plt.show()
 
-    # ==========================================
-    # 3. Kinematic Phase Space
-    # ==========================================
-    plt.figure(figsize=(10, 8))
-    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
-                    palette=palette, alpha=0.6, s=60)
-    plt.axhline(0, color='gray', linestyle='--')
-    plt.title("Visual 3: Kinematic Phase Space")
-    plt.xlabel("Range (meters)")
-    plt.ylabel("Closing Velocity (m/s)")
-    plt.show()
-
-    # ==========================================
-    # 4. BEST VISUAL FOR HEAD VS TAIL: The Rose Histogram
-    # ==========================================
-    # This shows the distribution of Aspect Angles for TAGS only
-    
-    # Filter for Tags only to see what works
-    tags_only = df[df['outcome'] == 'tag']
-    
-    plt.figure(figsize=(10, 10))
-    ax4 = plt.subplot(111, projection='polar')
-    
-    # Histogram of Aspect Angles
-    # We use 18 bins (20 degrees each)
-    n_bins = 18
-    bins = np.linspace(0, 2*np.pi, n_bins + 1)
-    
-    # Convert aspect (0-180) to radians. 
-    # Note: Aspect is usually symmetrical (0-180 Left/Right). 
-    # For visualization, we mirror it to 360 to look like a full compass.
-    angles = np.radians(tags_only['fd_aspect_angle'])
-    angles_mirrored = np.concatenate([angles, -angles]) # Mirror for visual symmetry
-    
-    plt.hist(angles_mirrored, bins=n_bins, color=palette['tag'], alpha=0.7, edgecolor='k')
-    
-    ax4.set_theta_zero_location("S") # 0 (Tail) is usually bottom/South in aspect plots
-    ax4.set_title("Visual 4: Engagement Aspect Rose Plot\n(Where do successful tags come from?)", pad=20)
-    
-    # Label the sectors
-    plt.figtext(0.5, 0.85, "HEAD ON", ha='center', fontsize=12, weight='bold')
-    plt.figtext(0.5, 0.15, "TAIL CHASE", ha='center', fontsize=12, weight='bold')
-    plt.show()
-
-    # ==========================================
-    # 5. Physics Validation: Closing Speed by Geometry
-    # ==========================================
-    plt.figure(figsize=(12, 6))
-    sns.violinplot(data=df, x='geometry_type', y='fd_closing_vel', hue='outcome',
-                   split=True, inner='quart', palette=palette, 
-                   order=['Head-On', 'Beam/Flank', 'Tail Chase'])
-    
-    plt.axhline(0, color='black', linestyle='--', alpha=0.5)
-    plt.title("Visual 5: Closing Velocity Dynamics by Geometry")
-    plt.ylabel("Closing Velocity (m/s)")
-    plt.show()
-
-# Run
-plot_individual_visuals(df)
+# Run the EDA
+plot_predictive_power_eda(df, numerical_features)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

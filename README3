@@ -490,92 +490,203 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
 
-def analyze_approach_dynamics(df):
-    """
-    Engineers 'relative_angle' and 'sector' features to determine if 
-    the It drone is attacking from the Head or Tail.
-    """
+# Set plot style for professional analytics
+sns.set_theme(style="whitegrid")
+plt.rcParams['figure.figsize'] = (10, 6)
+
+# ==========================================
+# 1. SYNTHETIC DATA GENERATION
+# ==========================================
+def generate_dummy_data(n_samples=1000):
+    np.random.seed(42)
     
-    def calculate_relative_geometry(row):
-        # 1. Get the data for the specific TARGET runner using the index
-        idx = row['it_runner_index']
-        runner_heading = row['runner_heading'][idx]
+    data = []
+    patterns = ["Straight", "ZigZag", "Spiral", "Hover", "Random"]
+    
+    for _ in range(n_samples):
+        # Simulation Parameters
+        n_runners = 3
+        it_runner_idx = np.random.randint(0, n_runners)
         
-        # 'runner_bearing' is the angle FROM It TO Runner.
-        # We need the angle FROM Runner TO It (the reverse).
-        bearing_from_it = row['runner_bearing'][idx]
-        bearing_to_it = (bearing_from_it + 180) % 360
+        # IT Drone Data (ECEF approx)
+        it_loc = np.array([1000, 2000, 500]) + np.random.normal(0, 50, 3)
+        it_spd = np.random.randint(5, 20)
         
-        # 2. Calculate Relative Angle (0 deg = Front/Head, 180 deg = Back/Tail)
-        # We normalize this to be between -180 and 180.
-        # 0 is directly in front. Positive is Right, Negative is Left.
-        rel_angle = bearing_to_it - runner_heading
+        # Runners Data structures
+        runners_locs = []
+        runners_bearings = [] # Relative to IT
+        runners_speeds = []
+        runner_patterns = []
         
-        # Normalize to range [-180, 180]
-        rel_angle = (rel_angle + 180) % 360 - 180
+        # Target Runner Logic (to create realistic correlations)
+        # If distance is close, probability of tag is high
+        dist_offset = np.random.exponential(scale=20) # Skewed towards close encounters
+        target_loc = it_loc + np.random.normal(0, dist_offset, 3)
         
-        # 3. Define Sectors
-        # Head: +/- 45 degrees
-        # Tail: > 135 or < -135 degrees
-        # Flank: Everything else
-        abs_angle = abs(rel_angle)
-        if abs_angle <= 45:
-            sector = 'Head (Front)'
-        elif abs_angle >= 135:
-            sector = 'Tail (Back)'
-        else:
-            sector = 'Flank (Side)'
-            
-        return pd.Series([rel_angle, sector], index=['relative_approach_angle', 'approach_sector'])
+        # Decide Outcome based on distance and speed
+        distance = np.linalg.norm(it_loc - target_loc)
+        speed_diff = abs(it_spd - np.random.randint(5, 20))
+        
+        # Logic: Closer distance + lower speed diff = Higher Tag Chance
+        prob_tag = 1 / (1 + 0.1 * distance + 0.05 * speed_diff)
+        outcome = "tag" if np.random.random() < prob_tag else "untag"
+        
+        for i in range(n_runners):
+            if i == it_runner_idx:
+                runners_locs.append(list(target_loc))
+                runners_bearings.append(np.random.randint(0, 360))
+                runners_speeds.append(it_spd + np.random.randint(-5, 5)) # Similar speed to IT
+                runner_patterns.append(np.random.randint(0, len(patterns)))
+            else:
+                # Other runners (noise)
+                runners_locs.append(list(it_loc + np.random.normal(0, 100, 3)))
+                runners_bearings.append(np.random.randint(0, 360))
+                runners_speeds.append(np.random.randint(5, 20))
+                runner_patterns.append(np.random.randint(0, len(patterns)))
 
-    # Apply the logic
-    print("Calculating relative geometry...")
-    new_features = df.apply(calculate_relative_geometry, axis=1)
-    return pd.concat([df, new_features], axis=1)
+        row = {
+            "timestep": np.random.randint(0, 100),
+            "remaining_timesteps": np.random.randint(0, 50),
+            "it_location": list(it_loc),
+            "it_speed": it_spd,
+            "it_runner_index": it_runner_idx,
+            "runners_location": runners_locs,
+            "runner_bearing": runners_bearings,
+            "runner_speed": runners_speeds,
+            "pattern_type": patterns,
+            "runner_pattern_index": runner_patterns,
+            "outcome": outcome
+        }
+        data.append(row)
+        
+    return pd.DataFrame(data)
 
-# Assuming 'df' is your loaded dataframe
-# df_analyzed = analyze_approach_dynamics(df)
+df_raw = generate_dummy_data()
+
+# ==========================================
+# 2. FEATURE ENGINEERING
+# ==========================================
+# We must extract the Target Runner's specific data from the lists
+# and calculate physical metrics (Distance) from ECEF coords.
+
+processed_data = []
+
+for idx, row in df_raw.iterrows():
+    target_idx = row['it_runner_index']
+    
+    # Extract Target Runner specific features
+    target_loc = np.array(row['runners_location'][target_idx])
+    it_loc = np.array(row['it_location'])
+    
+    # Calculate Euclidean Distance (3D)
+    distance_3d = np.linalg.norm(target_loc - it_loc)
+    
+    # Extract other target features
+    target_speed = row['runner_speed'][target_idx]
+    target_bearing = row['runner_bearing'][target_idx]
+    
+    # Map pattern index to string
+    pattern_idx = row['runner_pattern_index'][target_idx]
+    target_pattern = row['pattern_type'][pattern_idx]
+    
+    processed_data.append({
+        "outcome": row['outcome'],
+        "distance_to_target": distance_3d,
+        "relative_speed": abs(row['it_speed'] - target_speed),
+        "target_bearing": target_bearing,
+        "target_pattern": target_pattern,
+        "remaining_timesteps": row['remaining_timesteps'],
+        "it_speed": row['it_speed']
+    })
+
+df = pd.DataFrame(processed_data)
+
+# ==========================================
+# 3. GENERATING THE PLOTS
+# ==========================================
+
+# --- PLOT 1: Feature Importance (Using Random Forest) ---
+# Prepare data for model
+le = LabelEncoder()
+X = df.drop(columns=['outcome', 'target_pattern']) # Numeric only for simplicity
+y = le.fit_transform(df['outcome'])
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X, y)
+
+importances = pd.DataFrame({
+    'Feature': X.columns,
+    'Importance': model.feature_importances_
+}).sort_values(by='Importance', ascending=False)
+
+plt.figure()
+sns.barplot(x='Importance', y='Feature', data=importances, palette="viridis")
+plt.title('Plot 1: Feature Importance (Model Weights)', fontsize=15)
+plt.xlabel('Importance Score')
+plt.tight_layout()
+plt.savefig('plot1_feature_importance.png')
+plt.show()
+
+# --- PLOT 2: Distance Distribution by Outcome ---
+plt.figure()
+sns.boxplot(x='outcome', y='distance_to_target', data=df, palette="Set2")
+plt.title('Plot 2: Impact of Distance on Tagging Outcome', fontsize=15)
+plt.ylabel('Distance to Target (meters)')
+plt.tight_layout()
+plt.savefig('plot2_distance_box.png')
+plt.show()
+
+# --- PLOT 3: Tag Rate by Flight Pattern ---
+# Calculate Tag Rate per pattern
+pattern_stats = df.groupby('target_pattern')['outcome'].value_counts(normalize=True).unstack().fillna(0)
+pattern_stats['tag_rate'] = pattern_stats.get('tag', 0)
+pattern_stats = pattern_stats.sort_values('tag_rate', ascending=False).reset_index()
+
+plt.figure()
+sns.barplot(x='target_pattern', y='tag_rate', data=pattern_stats, palette="rocket")
+plt.axhline(y=df['outcome'].value_counts(normalize=True)['tag'], color='k', linestyle='--', label='Avg Tag Rate')
+plt.title('Plot 3: Vulnerability by Flight Pattern', fontsize=15)
+plt.ylabel('Probability of Being Tagged')
+plt.legend()
+plt.tight_layout()
+plt.savefig('plot3_pattern_efficacy.png')
+plt.show()
+
+# --- PLOT 4: Bivariate Density (Distance vs Speed) for Tags ---
+# Filter only for 'Tag' events to see where they happen
+tag_events = df[df['outcome'] == 'tag']
+
+plt.figure()
+# Use KDE (Kernel Density Estimate) to show the "Heatmap"
+sns.kdeplot(
+    data=tag_events, x='distance_to_target', y='relative_speed', 
+    fill=True, cmap="Reds", thresh=0.05
+)
+plt.title('Plot 4: The "Danger Zone" (Tag Density)', fontsize=15)
+plt.xlabel('Distance to Target')
+plt.ylabel('Relative Speed Difference')
+plt.tight_layout()
+plt.savefig('plot4_danger_zone.png')
+plt.show()
+
+# --- PLOT 5: Violin Plot of Remaining Time ---
+plt.figure()
+sns.violinplot(x='outcome', y='remaining_timesteps', data=df, palette="muted", split=True)
+plt.title('Plot 5: Temporal Urgency (When do tags happen?)', fontsize=15)
+plt.ylabel('Remaining Timesteps')
+plt.tight_layout()
+plt.savefig('plot5_time_urgency.png')
+plt.show()
+
+print("All plots generated successfully.")
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-def plot_dogfight_polar(df_analyzed):
-    # Filter for 'Tag' outcomes to see where successful attacks come from
-    tags_only = df_analyzed[df_analyzed['outcome'] == 'tag'].copy()
-    
-    # Convert degrees to radians for matplotlib polar plot
-    theta = np.deg2rad(tags_only['relative_approach_angle'])
-    
-    # We can use 'distance_to_target' for the radius (r) if you calculated it previously.
-    # If not, we can just use a constant radius to visualize direction only.
-    # Let's assume you have a 'distance_to_target' column; if not, set r = 1
-    if 'distance_to_target' in tags_only.columns:
-        r = tags_only['distance_to_target']
-    else:
-        r = np.random.uniform(0.8, 1.2, len(tags_only)) # Jitter for visibility
 
-    plt.figure(figsize=(10, 10))
-    ax = plt.subplot(111, projection='polar')
-    
-    # Plot formatting
-    # 0 degrees (Up) represents the Runner's Head/Nose
-    ax.set_theta_zero_location("N") 
-    ax.set_theta_direction(-1) # Clockwise
-    
-    # Scatter plot
-    sc = ax.scatter(theta, r, c='red', alpha=0.6, edgecolors='black', s=50, label='Successful Tags')
-    
-    # Add sector labels
-    plt.text(0, r.max()*1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
-    plt.text(np.pi, r.max()*1.1, "TAIL\n(Back)", ha='center', fontweight='bold')
-    
-    plt.title("Relative Position of 'It' Drone During Tags\n(Center = Runner)", fontsize=15)
-    plt.legend(loc='lower right')
-    plt.show()
-
-# plot_dogfight_polar(df_analyzed)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

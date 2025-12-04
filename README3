@@ -490,193 +490,143 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
 
-# Set plot style
-sns.set_theme(style="whitegrid")
-plt.rcParams['figure.figsize'] = (10, 6)
-
-# ==========================================
-# 1. SYNTHETIC DATA GENERATION
-# ==========================================
-def generate_dummy_data(n_samples=1000):
+# Mock Data Generation including the new features
+def generate_mock_data_v2(n_rows=500):
     np.random.seed(42)
-    
     data = []
-    patterns = ["Straight", "ZigZag", "Spiral", "Hover", "Random"]
     
-    for _ in range(n_samples):
-        n_runners = 3
-        it_runner_idx = np.random.randint(0, n_runners)
+    for _ in range(n_rows):
+        n_runners = 5
+        target_idx = np.random.randint(0, n_runners)
         
-        # IT Drone Data (ECEF approx)
-        it_loc = np.array([1000.0, 2000.0, 500.0]) + np.random.normal(0, 50, 3)
-        it_spd = np.random.randint(5, 20)
+        # Simulate Headings (0-360)
+        runner_headings = np.random.randint(0, 360, n_runners).tolist()
         
-        # Runners Data structures
-        runners_locs = []
-        runners_bearings = [] 
-        runners_speeds = []
-        runner_patterns = []
+        # Simulate Bearings (Bearing of Runner FROM It Drone)
+        # If It is chasing (Tail), It is behind. 
+        # Runner Heading = 0 (North). It is South. Vector It->Runner is North (0).
+        # So Chasing implies Bearing ~= Heading.
+        # Head-on implies Bearing ~= Heading + 180.
         
-        # Target Runner Logic
-        dist_offset = np.random.exponential(scale=20) 
-        target_loc = it_loc + np.random.normal(0, dist_offset, 3)
+        runner_bearings = np.random.randint(0, 360, n_runners).tolist()
         
-        distance = np.linalg.norm(it_loc - target_loc)
-        speed_diff = abs(it_spd - np.random.randint(5, 20))
+        # Let's bias the mock data: "Tags" happen more often in Tail chases (Rear)
+        # Tail chase: Runner Heading approx equals Bearing (It -> Runner)
+        # e.g. Runner going North (0). It is South. It->Runner vector is North (0).
         
-        # Outcome Logic
-        prob_tag = 1 / (1 + 0.1 * distance + 0.05 * speed_diff)
-        outcome = "tag" if np.random.random() < prob_tag else "untag"
+        heading = runner_headings[target_idx]
+        bearing = runner_bearings[target_idx]
         
-        for i in range(n_runners):
-            if i == it_runner_idx:
-                runners_locs.append(list(target_loc))
-                runners_bearings.append(np.random.randint(0, 360))
-                runners_speeds.append(it_spd + np.random.randint(-5, 5)) 
-                runner_patterns.append(np.random.randint(0, len(patterns)))
-            else:
-                runners_locs.append(list(it_loc + np.random.normal(0, 100, 3)))
-                runners_bearings.append(np.random.randint(0, 360))
-                runners_speeds.append(np.random.randint(5, 20))
-                runner_patterns.append(np.random.randint(0, len(patterns)))
-
+        # Calculate angle difference
+        diff = abs(heading - bearing)
+        if diff > 180: diff = 360 - diff
+        
+        # Bias outcome: 
+        # If diff < 45 (Tail chase/Behind), higher chance of tag
+        is_tail = diff < 60
+        
+        outcome = "tag" if (is_tail and np.random.random() > 0.3) else "untag"
+        if np.random.random() > 0.9: outcome = "tag" # Random noise tags
+        
         row = {
-            "timestep": np.random.randint(0, 100),
-            "remaining_timesteps": np.random.randint(0, 50),
-            "it_location": list(it_loc),
-            "it_speed": it_spd,
-            "it_runner_index": it_runner_idx,
-            "runners_location": runners_locs,
-            "runner_bearing": runners_bearings,
-            "runner_speed": runners_speeds,
-            "pattern_type": patterns,
-            "runner_pattern_index": runner_patterns,
-            "outcome": outcome
+            'timestep': np.random.randint(0, 1000),
+            'runner_heading': runner_headings,
+            'runner_bearing': runner_bearings, # Bearing OF runner WRT it
+            'it_runner_index': target_idx,
+            'outcome': outcome
         }
         data.append(row)
-        
     return pd.DataFrame(data)
 
-df = generate_dummy_data()
+df = generate_mock_data_v2()
 
-# ==========================================
-# 2. FEATURE ENGINEERING (Appending to Original)
-# ==========================================
+# Feature Engineering Function
+def calculate_approach_dynamics(row):
+    idx = row['it_runner_index']
+    
+    # Get Target Heading (Where the runner is going)
+    target_heading = row['runner_heading'][idx]
+    
+    # Get Bearing (Direction from It -> Runner)
+    bearing_it_to_runner = row['runner_bearing'][idx]
+    
+    # We want to know where the 'It' drone is RELATIVE to the Runner.
+    # Vector: Runner -> It is (Bearing + 180)
+    bearing_runner_to_it = (bearing_it_to_runner + 180) % 360
+    
+    # Calculate Relative Angle (0 = It is in front, 180 = It is behind)
+    # We subtract Runner's heading to make it relative to the runner's nose.
+    # Format: [-180, 180]
+    relative_angle = bearing_runner_to_it - target_heading
+    
+    # Normalize to -180 to 180
+    relative_angle = (relative_angle + 180) % 360 - 180
+    
+    # Categorize
+    # Front: -45 to 45
+    # Rear: -135 to -180 OR 135 to 180
+    # Flank: 45 to 135 OR -45 to -135
+    
+    abs_angle = abs(relative_angle)
+    if abs_angle <= 45:
+        position = 'Head (Front)'
+    elif abs_angle >= 135:
+        position = 'Tail (Back)'
+    else:
+        position = 'Flank (Side)'
+        
+    return pd.Series([relative_angle, position], index=['relative_approach_angle', 'approach_sector'])
 
-# We calculate features for the specific target runner and add them as new columns
-# Vectorized approach is hard with list-of-lists in cells, so we use apply/list comprehension
+# Apply
+df_eng = df.apply(calculate_approach_dynamics, axis=1)
+df_final = pd.concat([df, df_eng], axis=1)
 
-# Helper to extract target location
-def get_target_loc(row):
-    return np.array(row['runners_location'][row['it_runner_index']])
+# Visualization Check
+plt.figure(figsize=(10, 10))
+ax = plt.subplot(111, projection='polar')
 
-# Helper to extract target speed
-def get_target_speed(row):
-    return row['runner_speed'][row['it_runner_index']]
+# Convert to radians for polar plot
+# The angle on the plot should represent the position of 'It' relative to Runner
+# 0 degrees on polar plot = Runner's Nose.
+# Theta = relative_approach_angle (converted to radians)
 
-# Helper to extract target bearing
-def get_target_bearing(row):
-    return row['runner_bearing'][row['it_runner_index']]
+theta = np.deg2rad(df_final['relative_approach_angle'])
+r = np.random.uniform(10, 20, len(df_final)) # Mock distance/jitter
 
-# Helper to extract target pattern string
-def get_target_pattern(row):
-    p_idx = row['runner_pattern_index'][row['it_runner_index']]
-    return row['pattern_type'][p_idx]
+# Color by outcome
+colors = df_final['outcome'].map({'tag': 'red', 'untag': 'blue'})
 
-# Apply extractions
-# Note: In a real large dataset, we might optimize this, but for <100k rows apply is fine
-target_locs = df.apply(get_target_loc, axis=1)
-it_locs = df['it_location'].apply(np.array)
-
-# Calculate Distance (3D Euclidean)
-# Stack arrays to use numpy vectorization for norm
-t_loc_stack = np.stack(target_locs.values)
-it_loc_stack = np.stack(it_locs.values)
-df['distance_to_target'] = np.linalg.norm(t_loc_stack - it_loc_stack, axis=1)
-
-# Other features
-df['target_speed'] = df.apply(get_target_speed, axis=1)
-df['relative_speed'] = (df['it_speed'] - df['target_speed']).abs()
-df['target_bearing'] = df.apply(get_target_bearing, axis=1)
-df['target_pattern'] = df.apply(get_target_pattern, axis=1)
-
-# Check the dataframe structure (head)
-print(df[['outcome', 'distance_to_target', 'relative_speed', 'target_pattern']].head())
-
-# ==========================================
-# 3. GENERATING PLOTS
-# ==========================================
-
-# Plot 1: Feature Importance
-le = LabelEncoder()
-# Select features for model (exclude original list columns and string columns)
-X_cols = ['remaining_timesteps', 'it_speed', 'distance_to_target', 'relative_speed', 'target_bearing', 'target_speed']
-X = df[X_cols]
-y = le.fit_transform(df['outcome'])
-
-model = RandomForestClassifier(n_estimators=100, random_state=42)
-model.fit(X, y)
-
-importances = pd.DataFrame({
-    'Feature': X_cols,
-    'Importance': model.feature_importances_
-}).sort_values(by='Importance', ascending=False)
-
-plt.figure()
-sns.barplot(x='Importance', y='Feature', data=importances, palette="viridis")
-plt.title('Feature Importance (RF Model)', fontsize=15)
-plt.tight_layout()
-plt.savefig('plot1_feature_importance.png')
-
-# Plot 2: Box Plot Distance vs Outcome
-plt.figure()
-sns.boxplot(x='outcome', y='distance_to_target', data=df, palette="Set2")
-plt.title('Distance Distribution by Outcome', fontsize=15)
-plt.ylabel('Distance to Target (m)')
-plt.tight_layout()
-plt.savefig('plot2_distance_box.png')
-
-# Plot 3: Tag Rate by Pattern
-pattern_stats = df.groupby('target_pattern')['outcome'].value_counts(normalize=True).unstack().fillna(0)
-if 'tag' in pattern_stats.columns:
-    pattern_stats['tag_rate'] = pattern_stats['tag']
-else:
-    pattern_stats['tag_rate'] = 0
-pattern_stats = pattern_stats.sort_values('tag_rate', ascending=False).reset_index()
-
-plt.figure()
-sns.barplot(x='target_pattern', y='tag_rate', data=pattern_stats, palette="rocket")
-plt.title('Tag Rate by Flight Pattern', fontsize=15)
-plt.ylabel('Tag Probability')
-plt.tight_layout()
-plt.savefig('plot3_pattern_efficacy.png')
-
-# Plot 4: Bivariate KDE (Danger Zone)
-tag_subset = df[df['outcome'] == 'tag']
-plt.figure()
-if len(tag_subset) > 5: # Safety check
-    sns.kdeplot(data=tag_subset, x='distance_to_target', y='relative_speed', fill=True, cmap="Reds")
-    plt.title('Tag Density: Distance vs Relative Speed', fontsize=15)
-else:
-    plt.text(0.5, 0.5, "Not enough tag data for density plot", ha='center')
-plt.tight_layout()
-plt.savefig('plot4_danger_zone.png')
-
-# Plot 5: Violin Plot Remaining Timesteps
-plt.figure()
-sns.violinplot(x='outcome', y='remaining_timesteps', data=df, palette="muted")
-plt.title('Distribution of Remaining Time by Outcome', fontsize=15)
-plt.tight_layout()
-plt.savefig('plot5_time_urgency.png')
+ax.scatter(theta, r, c=colors, alpha=0.6)
+ax.set_theta_zero_location("N") # 0 is North (Head)
+ax.set_theta_direction(-1) # Clockwise
+ax.set_title("Relative Position of 'It' Drone (Center = Runner)")
+plt.savefig('polar_test.png')
+print("Code generated and verified.")
 
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+def plot_sector_success(df_analyzed):
+    plt.figure(figsize=(10, 6))
+    
+    # Calculate % of Tags per sector
+    sector_stats = df_analyzed.groupby('approach_sector')['outcome'].value_counts(normalize=True).unstack()
+    
+    if 'tag' in sector_stats.columns:
+        success_rates = sector_stats['tag'].sort_values()
+        
+        sns.barplot(x=success_rates.index, y=success_rates.values, palette='Reds')
+        plt.ylabel('Tag Probability')
+        plt.title('Which Approach Angle is Deadliest?', fontsize=14)
+        plt.ylim(0, 1.0)
+    else:
+        print("No tags found in data.")
+        
+    plt.show()
 
+# plot_sector_success(df_analyzed)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

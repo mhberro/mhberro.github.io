@@ -493,7 +493,7 @@ import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 
-# Set plot style for professional analytics
+# Set plot style
 sns.set_theme(style="whitegrid")
 plt.rcParams['figure.figsize'] = (10, 6)
 
@@ -507,30 +507,27 @@ def generate_dummy_data(n_samples=1000):
     patterns = ["Straight", "ZigZag", "Spiral", "Hover", "Random"]
     
     for _ in range(n_samples):
-        # Simulation Parameters
         n_runners = 3
         it_runner_idx = np.random.randint(0, n_runners)
         
         # IT Drone Data (ECEF approx)
-        it_loc = np.array([1000, 2000, 500]) + np.random.normal(0, 50, 3)
+        it_loc = np.array([1000.0, 2000.0, 500.0]) + np.random.normal(0, 50, 3)
         it_spd = np.random.randint(5, 20)
         
         # Runners Data structures
         runners_locs = []
-        runners_bearings = [] # Relative to IT
+        runners_bearings = [] 
         runners_speeds = []
         runner_patterns = []
         
-        # Target Runner Logic (to create realistic correlations)
-        # If distance is close, probability of tag is high
-        dist_offset = np.random.exponential(scale=20) # Skewed towards close encounters
+        # Target Runner Logic
+        dist_offset = np.random.exponential(scale=20) 
         target_loc = it_loc + np.random.normal(0, dist_offset, 3)
         
-        # Decide Outcome based on distance and speed
         distance = np.linalg.norm(it_loc - target_loc)
         speed_diff = abs(it_spd - np.random.randint(5, 20))
         
-        # Logic: Closer distance + lower speed diff = Higher Tag Chance
+        # Outcome Logic
         prob_tag = 1 / (1 + 0.1 * distance + 0.05 * speed_diff)
         outcome = "tag" if np.random.random() < prob_tag else "untag"
         
@@ -538,10 +535,9 @@ def generate_dummy_data(n_samples=1000):
             if i == it_runner_idx:
                 runners_locs.append(list(target_loc))
                 runners_bearings.append(np.random.randint(0, 360))
-                runners_speeds.append(it_spd + np.random.randint(-5, 5)) # Similar speed to IT
+                runners_speeds.append(it_spd + np.random.randint(-5, 5)) 
                 runner_patterns.append(np.random.randint(0, len(patterns)))
             else:
-                # Other runners (noise)
                 runners_locs.append(list(it_loc + np.random.normal(0, 100, 3)))
                 runners_bearings.append(np.random.randint(0, 360))
                 runners_speeds.append(np.random.randint(5, 20))
@@ -564,123 +560,117 @@ def generate_dummy_data(n_samples=1000):
         
     return pd.DataFrame(data)
 
-df_raw = generate_dummy_data()
+df = generate_dummy_data()
 
 # ==========================================
-# 2. FEATURE ENGINEERING
-# ==========================================
-# We must extract the Target Runner's specific data from the lists
-# and calculate physical metrics (Distance) from ECEF coords.
-
-processed_data = []
-
-for idx, row in df_raw.iterrows():
-    target_idx = row['it_runner_index']
-    
-    # Extract Target Runner specific features
-    target_loc = np.array(row['runners_location'][target_idx])
-    it_loc = np.array(row['it_location'])
-    
-    # Calculate Euclidean Distance (3D)
-    distance_3d = np.linalg.norm(target_loc - it_loc)
-    
-    # Extract other target features
-    target_speed = row['runner_speed'][target_idx]
-    target_bearing = row['runner_bearing'][target_idx]
-    
-    # Map pattern index to string
-    pattern_idx = row['runner_pattern_index'][target_idx]
-    target_pattern = row['pattern_type'][pattern_idx]
-    
-    processed_data.append({
-        "outcome": row['outcome'],
-        "distance_to_target": distance_3d,
-        "relative_speed": abs(row['it_speed'] - target_speed),
-        "target_bearing": target_bearing,
-        "target_pattern": target_pattern,
-        "remaining_timesteps": row['remaining_timesteps'],
-        "it_speed": row['it_speed']
-    })
-
-df = pd.DataFrame(processed_data)
-
-# ==========================================
-# 3. GENERATING THE PLOTS
+# 2. FEATURE ENGINEERING (Appending to Original)
 # ==========================================
 
-# --- PLOT 1: Feature Importance (Using Random Forest) ---
-# Prepare data for model
+# We calculate features for the specific target runner and add them as new columns
+# Vectorized approach is hard with list-of-lists in cells, so we use apply/list comprehension
+
+# Helper to extract target location
+def get_target_loc(row):
+    return np.array(row['runners_location'][row['it_runner_index']])
+
+# Helper to extract target speed
+def get_target_speed(row):
+    return row['runner_speed'][row['it_runner_index']]
+
+# Helper to extract target bearing
+def get_target_bearing(row):
+    return row['runner_bearing'][row['it_runner_index']]
+
+# Helper to extract target pattern string
+def get_target_pattern(row):
+    p_idx = row['runner_pattern_index'][row['it_runner_index']]
+    return row['pattern_type'][p_idx]
+
+# Apply extractions
+# Note: In a real large dataset, we might optimize this, but for <100k rows apply is fine
+target_locs = df.apply(get_target_loc, axis=1)
+it_locs = df['it_location'].apply(np.array)
+
+# Calculate Distance (3D Euclidean)
+# Stack arrays to use numpy vectorization for norm
+t_loc_stack = np.stack(target_locs.values)
+it_loc_stack = np.stack(it_locs.values)
+df['distance_to_target'] = np.linalg.norm(t_loc_stack - it_loc_stack, axis=1)
+
+# Other features
+df['target_speed'] = df.apply(get_target_speed, axis=1)
+df['relative_speed'] = (df['it_speed'] - df['target_speed']).abs()
+df['target_bearing'] = df.apply(get_target_bearing, axis=1)
+df['target_pattern'] = df.apply(get_target_pattern, axis=1)
+
+# Check the dataframe structure (head)
+print(df[['outcome', 'distance_to_target', 'relative_speed', 'target_pattern']].head())
+
+# ==========================================
+# 3. GENERATING PLOTS
+# ==========================================
+
+# Plot 1: Feature Importance
 le = LabelEncoder()
-X = df.drop(columns=['outcome', 'target_pattern']) # Numeric only for simplicity
+# Select features for model (exclude original list columns and string columns)
+X_cols = ['remaining_timesteps', 'it_speed', 'distance_to_target', 'relative_speed', 'target_bearing', 'target_speed']
+X = df[X_cols]
 y = le.fit_transform(df['outcome'])
+
 model = RandomForestClassifier(n_estimators=100, random_state=42)
 model.fit(X, y)
 
 importances = pd.DataFrame({
-    'Feature': X.columns,
+    'Feature': X_cols,
     'Importance': model.feature_importances_
 }).sort_values(by='Importance', ascending=False)
 
 plt.figure()
 sns.barplot(x='Importance', y='Feature', data=importances, palette="viridis")
-plt.title('Plot 1: Feature Importance (Model Weights)', fontsize=15)
-plt.xlabel('Importance Score')
+plt.title('Feature Importance (RF Model)', fontsize=15)
 plt.tight_layout()
 plt.savefig('plot1_feature_importance.png')
-plt.show()
 
-# --- PLOT 2: Distance Distribution by Outcome ---
+# Plot 2: Box Plot Distance vs Outcome
 plt.figure()
 sns.boxplot(x='outcome', y='distance_to_target', data=df, palette="Set2")
-plt.title('Plot 2: Impact of Distance on Tagging Outcome', fontsize=15)
-plt.ylabel('Distance to Target (meters)')
+plt.title('Distance Distribution by Outcome', fontsize=15)
+plt.ylabel('Distance to Target (m)')
 plt.tight_layout()
 plt.savefig('plot2_distance_box.png')
-plt.show()
 
-# --- PLOT 3: Tag Rate by Flight Pattern ---
-# Calculate Tag Rate per pattern
+# Plot 3: Tag Rate by Pattern
 pattern_stats = df.groupby('target_pattern')['outcome'].value_counts(normalize=True).unstack().fillna(0)
-pattern_stats['tag_rate'] = pattern_stats.get('tag', 0)
+if 'tag' in pattern_stats.columns:
+    pattern_stats['tag_rate'] = pattern_stats['tag']
+else:
+    pattern_stats['tag_rate'] = 0
 pattern_stats = pattern_stats.sort_values('tag_rate', ascending=False).reset_index()
 
 plt.figure()
 sns.barplot(x='target_pattern', y='tag_rate', data=pattern_stats, palette="rocket")
-plt.axhline(y=df['outcome'].value_counts(normalize=True)['tag'], color='k', linestyle='--', label='Avg Tag Rate')
-plt.title('Plot 3: Vulnerability by Flight Pattern', fontsize=15)
-plt.ylabel('Probability of Being Tagged')
-plt.legend()
+plt.title('Tag Rate by Flight Pattern', fontsize=15)
+plt.ylabel('Tag Probability')
 plt.tight_layout()
 plt.savefig('plot3_pattern_efficacy.png')
-plt.show()
 
-# --- PLOT 4: Bivariate Density (Distance vs Speed) for Tags ---
-# Filter only for 'Tag' events to see where they happen
-tag_events = df[df['outcome'] == 'tag']
-
+# Plot 4: Bivariate KDE (Danger Zone)
+tag_subset = df[df['outcome'] == 'tag']
 plt.figure()
-# Use KDE (Kernel Density Estimate) to show the "Heatmap"
-sns.kdeplot(
-    data=tag_events, x='distance_to_target', y='relative_speed', 
-    fill=True, cmap="Reds", thresh=0.05
-)
-plt.title('Plot 4: The "Danger Zone" (Tag Density)', fontsize=15)
-plt.xlabel('Distance to Target')
-plt.ylabel('Relative Speed Difference')
+if len(tag_subset) > 5: # Safety check
+    sns.kdeplot(data=tag_subset, x='distance_to_target', y='relative_speed', fill=True, cmap="Reds")
+    plt.title('Tag Density: Distance vs Relative Speed', fontsize=15)
+else:
+    plt.text(0.5, 0.5, "Not enough tag data for density plot", ha='center')
 plt.tight_layout()
 plt.savefig('plot4_danger_zone.png')
-plt.show()
 
-# --- PLOT 5: Violin Plot of Remaining Time ---
+# Plot 5: Violin Plot Remaining Timesteps
 plt.figure()
-sns.violinplot(x='outcome', y='remaining_timesteps', data=df, palette="muted", split=True)
-plt.title('Plot 5: Temporal Urgency (When do tags happen?)', fontsize=15)
-plt.ylabel('Remaining Timesteps')
+sns.violinplot(x='outcome', y='remaining_timesteps', data=df, palette="muted")
+plt.title('Distribution of Remaining Time by Outcome', fontsize=15)
 plt.tight_layout()
 plt.savefig('plot5_time_urgency.png')
-plt.show()
-
-print("All plots generated successfully.")
 
 
 =========================================================================================================================================================================

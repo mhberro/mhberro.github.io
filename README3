@@ -486,93 +486,137 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
+import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-import numpy as np
+from ast import literal_eval
 
-# Set a professional aesthetic
-sns.set_theme(style="whitegrid", context="talk", font_scale=1.1)
-# Define distinct colors: Blue for 'Untag' (safe), Red/Orange for 'Tag' (danger)
-palette = {"untag": "#3498db", "tag": "#e74c3c"}
+# --------------------------------------------------------------------------------
+# PART 1: MOCK DATA GENERATION
+# (Replace this block with your actual data loading: df = pd.read_csv('your_file.csv'))
+# --------------------------------------------------------------------------------
+def generate_mock_data(n_rows=500):
+    np.random.seed(42)
+    data = []
+    patterns = ["ZigZag", "Spiral", "Straight", "Hover", "Random"]
+    
+    for _ in range(n_rows):
+        n_runners = 5
+        # Simulate locations (ECEF-ish coordinates)
+        runners_loc = [np.random.uniform(-1000, 1000, 3).tolist() for _ in range(n_runners)]
+        it_loc = np.random.uniform(-1000, 1000, 3).tolist()
+        
+        # Simulate index of the target being chased
+        target_idx = np.random.randint(0, n_runners)
+        
+        # Determine outcome based on a fake logic (closer distance = higher chance of tag)
+        dist = np.linalg.norm(np.array(it_loc) - np.array(runners_loc[target_idx]))
+        outcome = "tag" if dist < 200 or np.random.random() > 0.8 else "untag"
+        
+        row = {
+            'timestep': np.random.randint(0, 1000),
+            'runners_location': runners_loc,
+            'it_location': it_loc,
+            'runner_speed': np.random.randint(5, 20, n_runners).tolist(),
+            'it_speed': np.random.randint(10, 25),
+            'it_runner_index': target_idx,
+            'pattern_type': patterns,
+            'runner_pattern_index': np.random.randint(0, len(patterns), n_runners).tolist(),
+            'remaining_timesteps': np.random.randint(1, 100),
+            'outcome': outcome
+        }
+        data.append(row)
+    return pd.DataFrame(data)
 
-def plot_top_3_eda(df):
-    # Create a figure with 3 subplots arranged horizontally
-    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
-    
-    # =============================================
-    # Plot 1: The "Chase Phase Space" (Range vs Closing Vel)
-    # =============================================
-    ax1 = axes[0]
-    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
-                    palette=palette, alpha=0.6, s=50, ax=ax1, edgecolor=None)
-    
-    # Add reference lines for intuition
-    ax1.axhline(0, color='black', linestyle='--', linewidth=1.5) # Zero closing speed
-    ax1.axvline(0, color='black', linestyle='-', linewidth=2)    # Zero range (impact)
-    
-    # Annotate zones
-    ax1.text(x=df['fd_range'].quantile(0.05), y=df['fd_closing_vel'].max()*0.9, 
-             s="KILL ZONE\n(Close & Fast)", color=palette['tag'], weight='bold', ha='left')
-    ax1.text(x=df['fd_range'].mean(), y=df['fd_closing_vel'].min()*0.8, 
-             s="ESCAPE ZONE\n(Gap Opening)", color=palette['untag'], weight='bold', ha='center')
-    
-    ax1.set_title("1. The Chase Phase Space\n(Where are we & What are we doing?)", weight='bold')
-    ax1.set_xlabel("Slant Range (meters)\n[Closer ←]")
-    ax1.set_ylabel("Closing Velocity (m/s)\n[Opening Gap ↓  |  Closing Gap ↑]")
-    ax1.legend(title='Outcome', loc='upper right')
+df = generate_mock_data()
 
-    # =============================================
-    # Plot 2: The "Feasibility Cliff" (TTI Margin KDE)
-    # =============================================
-    ax2 = axes[1]
-    # Use KDE (Kernel Density Estimate) for a smooth distribution curve
-    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
-                fill=True, common_norm=False, palette=palette, 
-                alpha=0.4, linewidth=3, ax=ax2)
-    
-    # Add the crucial physics boundary line
-    ax2.axvline(0, color='black', linestyle='-', linewidth=3)
-    
-    # Annotate sides
-    ax2.annotate('IMPOSSIBLE\n(Time run out)', xy=(0, 0), xytext=(-20, 0.02),
-                 arrowprops=dict(facecolor='black', shrink=0.05), ha='right', weight='bold')
-    ax2.annotate('POSSIBLE\n(Time spare)', xy=(0, 0), xytext=(20, 0.02),
-                 arrowprops=dict(facecolor='black', shrink=0.05), ha='left', weight='bold')
+# --------------------------------------------------------------------------------
+# PART 2: FEATURE ENGINEERING
+# We must extract the specific data of the "Target" runner from the lists.
+# --------------------------------------------------------------------------------
 
-    ax2.set_title("2. The Feasibility Cliff\n(Do we have enough time?)", weight='bold')
-    ax2.set_xlabel("TTI Margin (Steps Remaining - Steps Needed)\n[← Impossible | Possible →]")
-    ax2.set_ylabel("Probability Density")
-    ax2.set_xlim(left=-50, right=50) # Focus on the relevant area near 0
-
-    # =============================================
-    # Plot 3: "Capability vs Strategy" (Speed Ratio vs Pursuit Error)
-    # =============================================
-    ax3 = axes[2]
-    sns.scatterplot(data=df, x='fd_speed_ratio', y='fd_pursuit_err', hue='outcome',
-                    palette=palette, alpha=0.6, s=50, ax=ax3, edgecolor=None)
+def extract_game_dynamics(row):
+    # Identify the target runner
+    idx = row['it_runner_index']
     
-    # Reference lines
-    ax3.axvline(1.0, color='gray', linestyle='--', linewidth=1.5) # Equal Speed
-    ax3.axhline(0, color='black', linestyle='-', linewidth=1.5)    # Perfect pointing
+    # Extract Target Location & Speed
+    target_loc = np.array(row['runners_location'][idx])
+    it_loc = np.array(row['it_location'])
     
-    # Annotate zones
-    ax3.text(x=1.05, y=5, s="SWEET SPOT\n(Faster & Aiming Well)", 
-             color=palette['tag'], weight='bold', vcenter='bottom')
-    ax3.text(x=0.5, y=5, s="Too Slow\n(Even if aiming well)", 
-             color='gray', ha='center')
+    # 1. Calculate Euclidean Distance (Critical Feature)
+    distance = np.linalg.norm(it_loc - target_loc)
     
-    ax3.set_title("3. Capability vs. Strategy\n(Speed vs. Pointing)", weight='bold')
-    ax3.set_xlabel("Speed Ratio (It Speed / Runner Speed)\n[Slower ← | Faster →]")
-    ax3.set_ylabel("Pursuit Angle Error (Degrees)\n[← Perfect Aim | Bad Aim →]")
-    # Invert Y axis because 0 error is "good" and should be at the bottom
-    ax3.invert_yaxis() 
-    ax3.legend([],[], frameon=False) # Hide legend on this one to save space
+    # 2. Extract Target Speed
+    target_speed = row['runner_speed'][idx]
+    
+    # 3. Calculate Speed Difference (Positive means It is faster)
+    speed_diff = row['it_speed'] - target_speed
+    
+    # 4. Extract Target Pattern
+    pattern_idx = row['runner_pattern_index'][idx]
+    target_pattern = row['pattern_type'][pattern_idx]
+    
+    return pd.Series([distance, target_speed, speed_diff, target_pattern], 
+                     index=['distance_to_target', 'target_speed', 'speed_difference', 'target_pattern'])
 
-    plt.tight_layout()
-    plt.show()
+# Apply the engineering
+print("Engineering relative features...")
+engineered_feats = df.apply(extract_game_dynamics, axis=1)
+df_clean = pd.concat([df[['outcome', 'remaining_timesteps', 'it_speed']], engineered_feats], axis=1)
 
-# Run the function
-plot_top_3_eda(df)
+# Encode outcome as binary for correlation analysis
+df_clean['outcome_binary'] = df_clean['outcome'].apply(lambda x: 1 if x == 'tag' else 0)
+
+# --------------------------------------------------------------------------------
+# PART 3: VISUAL ANALYTICS
+# --------------------------------------------------------------------------------
+sns.set_style("whitegrid")
+plt.rcParams['figure.figsize'] = (14, 10)
+
+# 1. CORRELATION HEATMAP
+# Purpose: Identify which numerical features correlate most strongly with the outcome.
+plt.figure(figsize=(10, 8))
+corr = df_clean.select_dtypes(include=[np.number]).corr()
+mask = np.triu(np.ones_like(corr, dtype=bool))
+sns.heatmap(corr, mask=mask, annot=True, cmap='coolwarm', vmin=-1, vmax=1, fmt=".2f")
+plt.title('Feature Correlation Matrix\n(Focus on "outcome_binary")', fontsize=16)
+plt.show()
+
+# 2. PAIRPLOT WITH HUE
+# Purpose: Visualize the separation of classes based on top interaction features.
+# We expect "Tag" to cluster around low distance and high remaining time.
+vars_to_plot = ['distance_to_target', 'remaining_timesteps', 'speed_difference']
+sns.pairplot(df_clean, vars=vars_to_plot, hue='outcome', palette={'tag': 'green', 'untag': 'red'}, diag_kind='kde')
+plt.suptitle('Feature Space Separation: Tag vs Untag', y=1.02, fontsize=16)
+plt.show()
+
+# 3. CATEGORICAL IMPORTANCE (Pattern Type)
+# Purpose: See if specific flight patterns make a runner harder to tag.
+plt.figure(figsize=(12, 6))
+sns.countplot(data=df_clean, x='target_pattern', hue='outcome', palette='viridis')
+plt.title('Outcome Distribution by Target Flight Pattern', fontsize=16)
+plt.xlabel('Flight Pattern of Target Runner')
+plt.ylabel('Count')
+plt.legend(title='Outcome')
+plt.show()
+
+# 4. DISTRIBUTION OF KEY FEATURES (Box Plots)
+# Purpose: Detect statistical significance and outliers.
+fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+sns.boxplot(x='outcome', y='distance_to_target', data=df_clean, ax=axes[0], palette="Set2")
+axes[0].set_title('Distance to Target Distribution')
+
+sns.boxplot(x='outcome', y='remaining_timesteps', data=df_clean, ax=axes[1], palette="Set2")
+axes[1].set_title('Remaining Timesteps Distribution')
+
+sns.boxplot(x='outcome', y='speed_difference', data=df_clean, ax=axes[2], palette="Set2")
+axes[2].set_title('Speed Difference (It - Runner)')
+
+plt.suptitle('Statistical Distributions of Top Predictors', fontsize=16)
+plt.tight_layout()
+plt.show()
 
 
 =========================================================================================================================================================================

@@ -486,121 +486,99 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-# Convert outcome to binary for correlation analysis
-# Tag = 1, Untag = 0
-df['outcome_binary'] = df['outcome'].map({'tag': 1, 'untag': 0})
-
-# Define the list of numerical engineered features
-numerical_features = [
-    'fd_range', 'fd_closing_vel', 'fd_los_rate', 
-    'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio', 'fd_tti_margin'
-]
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
 import matplotlib.pyplot as plt
 import seaborn as sns
 import numpy as np
-import pandas as pd
 
-# Set aesthetic style
-sns.set_theme(style="whitegrid", context="talk")
-# Define consistent colors: Red for the "positive" class (tag), Blue for negative
-palette = {"tag": "#e74c3c", "untag": "#3498db"} 
+# Set a professional aesthetic
+sns.set_theme(style="whitegrid", context="talk", font_scale=1.1)
+# Define distinct colors: Blue for 'Untag' (safe), Red/Orange for 'Tag' (danger)
+palette = {"untag": "#3498db", "tag": "#e74c3c"}
 
-def plot_predictive_power_eda(df, numerical_features):
+def plot_top_3_eda(df):
+    # Create a figure with 3 subplots arranged horizontally
+    fig, axes = plt.subplots(1, 3, figsize=(24, 8))
     
-    fig = plt.figure(figsize=(24, 18))
-    gs = fig.add_gridspec(3, 3)
-    fig.suptitle('Exploratory Analysis of Feature Predictive Power', fontsize=24, y=0.95)
+    # =============================================
+    # Plot 1: The "Chase Phase Space" (Range vs Closing Vel)
+    # =============================================
+    ax1 = axes[0]
+    sns.scatterplot(data=df, x='fd_range', y='fd_closing_vel', hue='outcome',
+                    palette=palette, alpha=0.6, s=50, ax=ax1, edgecolor=None)
+    
+    # Add reference lines for intuition
+    ax1.axhline(0, color='black', linestyle='--', linewidth=1.5) # Zero closing speed
+    ax1.axvline(0, color='black', linestyle='-', linewidth=2)    # Zero range (impact)
+    
+    # Annotate zones
+    ax1.text(x=df['fd_range'].quantile(0.05), y=df['fd_closing_vel'].max()*0.9, 
+             s="KILL ZONE\n(Close & Fast)", color=palette['tag'], weight='bold', ha='left')
+    ax1.text(x=df['fd_range'].mean(), y=df['fd_closing_vel'].min()*0.8, 
+             s="ESCAPE ZONE\n(Gap Opening)", color=palette['untag'], weight='bold', ha='center')
+    
+    ax1.set_title("1. The Chase Phase Space\n(Where are we & What are we doing?)", weight='bold')
+    ax1.set_xlabel("Slant Range (meters)\n[Closer ←]")
+    ax1.set_ylabel("Closing Velocity (m/s)\n[Opening Gap ↓  |  Closing Gap ↑]")
+    ax1.legend(title='Outcome', loc='upper right')
 
-    # ===================================================
-    # 1. The Feature "Leaderboard" (Correlation Bar Chart)
-    # ===================================================
-    # Goal: Instant ranking of linear predictive relationship.
-    ax1 = fig.add_subplot(gs[0, :]) # Span top row
+    # =============================================
+    # Plot 2: The "Feasibility Cliff" (TTI Margin KDE)
+    # =============================================
+    ax2 = axes[1]
+    # Use KDE (Kernel Density Estimate) for a smooth distribution curve
+    sns.kdeplot(data=df, x='fd_tti_margin', hue='outcome', 
+                fill=True, common_norm=False, palette=palette, 
+                alpha=0.4, linewidth=3, ax=ax2)
+    
+    # Add the crucial physics boundary line
+    ax2.axvline(0, color='black', linestyle='-', linewidth=3)
+    
+    # Annotate sides
+    ax2.annotate('IMPOSSIBLE\n(Time run out)', xy=(0, 0), xytext=(-20, 0.02),
+                 arrowprops=dict(facecolor='black', shrink=0.05), ha='right', weight='bold')
+    ax2.annotate('POSSIBLE\n(Time spare)', xy=(0, 0), xytext=(20, 0.02),
+                 arrowprops=dict(facecolor='black', shrink=0.05), ha='left', weight='bold')
 
-    # Calculate point-biserial correlation with the binary outcome
-    correlations = df[numerical_features].corrwith(df['outcome_binary']).sort_values(ascending=False)
-    
-    # Plot
-    sns.barplot(x=correlations.values, y=correlations.index, palette="vlag", ax=ax1)
-    
-    ax1.set_title("Feature 'Leaderboard': Correlation with 'Tag' Outcome", weight='bold')
-    ax1.set_xlabel("Point-Biserial Correlation Coefficient (Positive = More Tags)")
-    ax1.axvline(0, color='k', linewidth=1)
-    # Add annotations
-    for i, v in enumerate(correlations.values):
-        ax1.text(v + (0.01 if v>0 else -0.01), i, f"{v:.2f}", 
-                 va='center', ha=('left' if v>0 else 'right'), fontsize=12)
+    ax2.set_title("2. The Feasibility Cliff\n(Do we have enough time?)", weight='bold')
+    ax2.set_xlabel("TTI Margin (Steps Remaining - Steps Needed)\n[← Impossible | Possible →]")
+    ax2.set_ylabel("Probability Density")
+    ax2.set_xlim(left=-50, right=50) # Focus on the relevant area near 0
 
-    # ===================================================
-    # 2. The Separation Check (Multi-Violin Plots)
-    # ===================================================
-    # Goal: Visualize distribution overlap. Less overlap = better feature.
-    # We use individual subplots because scales vary wildly.
+    # =============================================
+    # Plot 3: "Capability vs Strategy" (Speed Ratio vs Pursuit Error)
+    # =============================================
+    ax3 = axes[2]
+    sns.scatterplot(data=df, x='fd_speed_ratio', y='fd_pursuit_err', hue='outcome',
+                    palette=palette, alpha=0.6, s=50, ax=ax3, edgecolor=None)
     
-    # Subplot positions for the 6 main continuous features (excluding margin for now)
-    positions = [gs[1, 0], gs[1, 1], gs[1, 2], gs[2, 0], gs[2, 1], gs[2, 2]]
-    plot_feats = ['fd_range', 'fd_closing_vel', 'fd_los_rate', 
-                  'fd_pursuit_err', 'fd_aspect_angle', 'fd_speed_ratio']
-    titles = ['Range (Distance)', 'Closing Velocity', 'Line-of-Sight Rate', 
-              'Pursuit Error (Angle)', 'Aspect Angle', 'Speed Ratio']
+    # Reference lines
+    ax3.axvline(1.0, color='gray', linestyle='--', linewidth=1.5) # Equal Speed
+    ax3.axhline(0, color='black', linestyle='-', linewidth=1.5)    # Perfect pointing
+    
+    # Annotate zones
+    ax3.text(x=1.05, y=5, s="SWEET SPOT\n(Faster & Aiming Well)", 
+             color=palette['tag'], weight='bold', vcenter='bottom')
+    ax3.text(x=0.5, y=5, s="Too Slow\n(Even if aiming well)", 
+             color='gray', ha='center')
+    
+    ax3.set_title("3. Capability vs. Strategy\n(Speed vs. Pointing)", weight='bold')
+    ax3.set_xlabel("Speed Ratio (It Speed / Runner Speed)\n[Slower ← | Faster →]")
+    ax3.set_ylabel("Pursuit Angle Error (Degrees)\n[← Perfect Aim | Bad Aim →]")
+    # Invert Y axis because 0 error is "good" and should be at the bottom
+    ax3.invert_yaxis() 
+    ax3.legend([],[], frameon=False) # Hide legend on this one to save space
 
-    for i, (feat, pos, title) in enumerate(zip(plot_feats, positions, titles)):
-        ax = fig.add_subplot(pos)
-        
-        # Violin plot shows the KDE (shape) and the boxplot (stats)
-        sns.violinplot(data=df, x='outcome', y=feat, palette=palette, 
-                       split=False, inner="quartile", linewidth=1.5, ax=ax)
-        
-        ax.set_title(f"{title} Separation")
-        ax.set_ylabel("") # Remove redundant y-labels
-        ax.set_xlabel("")
-
-    plt.tight_layout()
-    # Adjust layout to make room for the big title
-    plt.subplots_adjust(top=0.90, hspace=0.3, wspace=0.2)
-    plt.show()
-
-    # ===================================================
-    # 3. Categorical Power: Geometry Success Rates
-    # ===================================================
-    # Goal: Show if specific tactical geometries guarantee a win or loss.
-    plt.figure(figsize=(10, 6))
-    
-    # Create normalized crosstab (percentages summing to 100% across rows)
-    ct = pd.crosstab(df['geometry_type'], df['outcome'], normalize='index') * 100
-    # Reorder indices logically if they exist
-    desired_order = ['Tail Chase', 'Beam/Flank', 'Head-On']
-    existing_order = [o for o in desired_order if o in ct.index]
-    ct = ct.loc[existing_order]
-    
-    ax_cat = ct.plot(kind='barh', stacked=True, color=[palette['untag'], palette['tag']], 
-                     edgecolor='white', width=0.8)
-    
-    plt.title("Tag Success Rate by Engagement Geometry", weight='bold')
-    plt.xlabel("Percentage of Encounters (%)")
-    plt.ylabel("")
-    plt.legend(title='Outcome', bbox_to_anchor=(1.05, 1), loc='upper left')
-    
-    # Add percentage labels onto the bars
-    for n, x in enumerate([*ct.index.values]):
-        for (img, label, color) in zip(ax_cat.containers, ct.columns, ['white', 'black']):
-            # Adjust label color for contrast against red/blue bars
-            text_color = 'white' if label == 'tag' or label == 'untag' else 'black'
-            plt.text(img[n].get_width() / 2 + img[n].get_x(), n, 
-                     f"{img[n].get_width():.0f}%",
-                     va='center', ha='center', color=text_color, weight='bold')
-                     
     plt.tight_layout()
     plt.show()
 
-# Run the EDA
-plot_predictive_power_eda(df, numerical_features)
+# Run the function
+plot_top_3_eda(df)
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

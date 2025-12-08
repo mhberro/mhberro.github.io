@@ -486,54 +486,68 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np
+def plot_dogfight_arrows(df_analyzed):
+    plt.figure(figsize=(12, 12))
+    ax = plt.subplot(111, projection='polar')
+    
+    # Orientation: 0 is North (Up), Clockwise
+    ax.set_theta_zero_location("N") 
+    ax.set_theta_direction(-1)
+    
+    # Filter for Tags (Successful captures)
+    tags = df_analyzed[df_analyzed['outcome'] == 'tag']
+    
+    if tags.empty:
+        print("No tags to plot.")
+        return
 
-def analyze_alignment_simple(df_corrected):
-    """
-    Assumes df_corrected already has 'calculated_heading' from the previous step.
-    Uses the logic: Bearing (It->Runner) == Heading (Runner) implies Tail Chase.
-    """
+    # 1. Prepare Coordinates
+    # Theta: Where the drone is relative to the runner
+    angles = np.deg2rad(tags['relative_approach_angle'])
     
-    # 1. Get the relevant bearing for the target
-    # Note: No +180 needed anymore based on your clarification!
-    def get_bearing(row):
-        return row['runner_bearing'][row['it_runner_index']]
-        
-    df_corrected['target_bearing'] = df_corrected.apply(get_bearing, axis=1)
+    # Radius: Distance (Mocking it if not available, or use 'distance_to_target')
+    if 'distance_to_target' in tags.columns:
+        radii = tags['distance_to_target']
+    else:
+        # Create 'rings' of attackers for better visibility
+        radii = np.random.uniform(0.5, 1.5, len(tags))
     
-    # 2. Calculate Alignment Angle (Delta)
-    # We want the shortest difference between the two angles (0 to 180)
-    # Example: Bearing 350, Heading 10 -> Diff is 20, not 340.
+    # 2. Define Direction Vectors (U, V) for Quiver
+    # On a polar axis, U is the Radial component, V is the Angular component.
+    # We want arrows pointing INWARD (towards the runner at center).
+    # So Radial component (U) = -1, Angular component (V) = 0.
+    u = -1 * np.ones_like(angles)
+    v = np.zeros_like(angles)
     
-    diff = abs(df_corrected['target_bearing'] - df_corrected['calculated_heading'])
-    df_corrected['alignment_delta'] = np.minimum(diff, 360 - diff)
+    # 3. Plot the Arrows
+    # Pivot='tip' means the arrow tip touches the exact location
+    # Pivot='tail' means the arrow starts at the location and points in
+    ax.quiver(angles, radii, u, v, 
+              color='red', 
+              alpha=0.6, 
+              scale=20,          # Adjust scale to change arrow length
+              headwidth=4, 
+              headlength=4,
+              pivot='tail',      # Arrow tail is at drone location, pointing at runner
+              label='It Drone Attack Vector')
+
+    # 4. Context Labels
+    r_max = ax.get_ylim()[1]
     
-    # 3. Visualization
-    plt.figure(figsize=(10, 6))
+    # Runner Marker in Center
+    ax.plot(0, 0, marker='^', markersize=15, color='blue', label='Runner (Target)')
     
-    # Plot Tags vs Untags
-    sns.kdeplot(data=df_corrected[df_corrected['outcome']=='tag'], x='alignment_delta', 
-                fill=True, color='red', label='Tag (Capture)', alpha=0.3)
+    plt.text(0, r_max*1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
+    plt.text(np.pi, r_max*1.1, "TAIL\n(Rear)", ha='center', fontweight='bold')
+    plt.text(np.pi/2, r_max*1.1, "RIGHT FLANK", ha='center', fontsize=9)
+    plt.text(-np.pi/2, r_max*1.1, "LEFT FLANK", ha='center', fontsize=9)
     
-    sns.kdeplot(data=df_corrected[df_corrected['outcome']=='untag'], x='alignment_delta', 
-                fill=True, color='blue', label='Untag (Escape)', alpha=0.3)
-    
-    # Annotate the Meaning
-    plt.axvline(0, color='black', linestyle='--', alpha=0.5)
-    plt.text(5, plt.ylim()[1]*0.9, "TAIL CHASE\n(Running Away)", color='black', fontweight='bold')
-    
-    plt.axvline(180, color='black', linestyle='--', alpha=0.5)
-    plt.text(175, plt.ylim()[1]*0.9, "HEAD ON\n(Collision Course)", color='black', ha='right', fontweight='bold')
-    
-    plt.title("Chaser-Runner Alignment Analysis", fontsize=14)
-    plt.xlabel("Angle Difference (Degrees)\n0° = Perfectly Aligned (Chase) | 180° = Opposite (Joust)")
-    plt.xlim(0, 180)
-    plt.legend()
+    plt.title("Direction of 'It' Drones Relative to Runner\n(Arrows point to the target)", fontsize=15, y=1.08)
+    plt.legend(loc='lower right')
     plt.show()
 
-# analyze_alignment_simple(df_corrected)
+# Run the visual
+# plot_dogfight_arrows(df_analyzed)
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 

@@ -486,68 +486,93 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
 
-def plot_dogfight_arrows(df_analyzed):
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_dogfight_actual_headings(df_analyzed):
     plt.figure(figsize=(12, 12))
     ax = plt.subplot(111, projection='polar')
     
-    # Orientation: 0 is North (Up), Clockwise
+    # 1. Orientation Setup (North Up, Clockwise)
     ax.set_theta_zero_location("N") 
     ax.set_theta_direction(-1)
     
-    # Filter for Tags (Successful captures)
-    tags = df_analyzed[df_analyzed['outcome'] == 'tag']
+    # Filter for Tags
+    tags = df_analyzed[df_analyzed['outcome'] == 'tag'].copy()
     
     if tags.empty:
-        print("No tags to plot.")
+        print("No tags found to plot.")
         return
 
-    # 1. Prepare Coordinates
-    # Theta: Where the drone is relative to the runner
-    angles = np.deg2rad(tags['relative_approach_angle'])
+    # 2. Extract Key Angles (in Radians)
+    # Theta: Where the drone IS (Relative to Runner's Nose)
+    theta = np.deg2rad(tags['relative_approach_angle'])
     
-    # Radius: Distance (Mocking it if not available, or use 'distance_to_target')
-    if 'distance_to_target' in tags.columns:
-        radii = tags['distance_to_target']
-    else:
-        # Create 'rings' of attackers for better visibility
-        radii = np.random.uniform(0.5, 1.5, len(tags))
+    # Phi: Where the drone is FACING (It Heading)
+    # We must rotate this by the Runner's Heading to match the plot orientation
+    # Formula: (It_Heading - Runner_Heading)
     
-    # 2. Define Direction Vectors (U, V) for Quiver
-    # On a polar axis, U is the Radial component, V is the Angular component.
-    # We want arrows pointing INWARD (towards the runner at center).
-    # So Radial component (U) = -1, Angular component (V) = 0.
-    u = -1 * np.ones_like(angles)
-    v = np.zeros_like(angles)
+    # Note: We access 'it_heading' assuming it follows the logic "same features for it drone"
+    # If it_heading is a single int, we use it directly. If it's a list (rare for 'It'), handle appropriately.
+    # Here we assume standard row-by-row extraction.
     
-    # 3. Plot the Arrows
-    # Pivot='tip' means the arrow tip touches the exact location
-    # Pivot='tail' means the arrow starts at the location and points in
-    ax.quiver(angles, radii, u, v, 
-              color='red', 
-              alpha=0.6, 
-              scale=20,          # Adjust scale to change arrow length
-              headwidth=4, 
-              headlength=4,
-              pivot='tail',      # Arrow tail is at drone location, pointing at runner
-              label='It Drone Attack Vector')
+    def get_relative_heading_rad(row):
+        idx = row['it_runner_index']
+        # Extract features
+        r_head = row['runner_heading'][idx]
+        # Assuming 'it_heading' is a column. If it's inside a list, adjust index access.
+        # Based on typical structure:
+        i_head = row['it_heading'] if 'it_heading' in row else 0 # Fallback 0 if missing
+        
+        # Calculate Relative Heading (Plot Frame)
+        # We also convert to Radians immediately
+        return np.deg2rad(i_head - r_head)
 
-    # 4. Context Labels
-    r_max = ax.get_ylim()[1]
+    it_heading_rel = tags.apply(get_relative_heading_rad, axis=1)
+
+    # 3. Calculate Vector Components (U, V)
+    # U is Radial (In/Out), V is Angular (Left/Right spin)
+    # We project the Heading Vector onto the Position Vector
     
-    # Runner Marker in Center
+    # Angle difference between "Where I am facing" and "Where I am located"
+    angle_diff = it_heading_rel - theta
+    
+    # Decomposition
+    u = np.cos(angle_diff) # Radial component
+    v = np.sin(angle_diff) # Tangential component
+
+    # 4. Radius (Distance)
+    if 'distance_to_target' in tags.columns:
+        r = tags['distance_to_target']
+    else:
+        r = np.random.uniform(0.5, 1.5, len(tags))
+
+    # 5. Plot the Quivers
+    ax.quiver(theta, r, u, v,
+              color='red',
+              alpha=0.6,
+              scale=30,           # Adjust scale: Higher = Shorter arrows
+              pivot='mid',        # Pivot at center of arrow to show flow
+              headwidth=3,
+              headlength=4,
+              label='It Drone Heading')
+
+    # 6. Context Markers
+    # Runner in Center
     ax.plot(0, 0, marker='^', markersize=15, color='blue', label='Runner (Target)')
     
+    # Labels
+    r_max = ax.get_ylim()[1]
     plt.text(0, r_max*1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
     plt.text(np.pi, r_max*1.1, "TAIL\n(Rear)", ha='center', fontweight='bold')
-    plt.text(np.pi/2, r_max*1.1, "RIGHT FLANK", ha='center', fontsize=9)
-    plt.text(-np.pi/2, r_max*1.1, "LEFT FLANK", ha='center', fontsize=9)
+    plt.text(np.pi/2, r_max*1.1, "Right Flank", ha='center', fontsize=9)
+    plt.text(-np.pi/2, r_max*1.1, "Left Flank", ha='center', fontsize=9)
     
-    plt.title("Direction of 'It' Drones Relative to Runner\n(Arrows point to the target)", fontsize=15, y=1.08)
+    plt.title("Actual Flight Direction of 'It' Drones\n(Relative to Runner)", fontsize=15, y=1.08)
     plt.legend(loc='lower right')
     plt.show()
 
-# Run the visual
-# plot_dogfight_arrows(df_analyzed)
+# plot_dogfight_actual_headings(df_analyzed)
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 

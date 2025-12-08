@@ -485,112 +485,58 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
-import numpy as np
-import pandas as pd
+
 import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
 
-def recalculate_heading_and_analyze(df):
-    # 1. SETUP: Sort by timestep to ensure sequential order
-    # If you have a 'match_id' or 'simulation_id', add it to the sort:
-    # df = df.sort_values(by=['match_id', 'timestep'])
-    df = df.sort_values(by=['timestep'])
+def analyze_alignment_simple(df_corrected):
+    """
+    Assumes df_corrected already has 'calculated_heading' from the previous step.
+    Uses the logic: Bearing (It->Runner) == Heading (Runner) implies Tail Chase.
+    """
     
-    # 2. EXTRACT COORDINATES FOR TARGET RUNNER
-    # We need to pull the specific Lat/Lon for the target runner out of the list
-    def get_target_loc(row):
-        idx = row['it_runner_index']
-        # Assuming format is [Lat, Lon, Alt] based on your description
-        return row['runners_location'][idx][0], row['runners_location'][idx][1]
-
-    # Create temporary columns for Lat/Lon
-    # Zip is faster than apply for simple extractions
-    coords = df.apply(get_target_loc, axis=1)
-    df['temp_lat'] = [x[0] for x in coords]
-    df['temp_lon'] = [x[1] for x in coords]
-    
-    # 3. CALCULATE DELTAS (Change in position)
-    # We group by match_id if you have it. If not, we assume one continuous stream
-    # or handle the jumps where 'remaining_timesteps' resets.
-    
-    # Simple differencing (Current - Previous)
-    df['d_lat'] = df['temp_lat'].diff()
-    df['d_lon'] = df['temp_lon'].diff()
-    
-    # 4. CALCULATE TRUE HEADING (The "Course Over Ground")
-    # np.arctan2(y, x) gives angle in radians. 
-    # For Navigation (0=North, Clockwise):
-    # Standard Math is 0=East, Counter-Clockwise.
-    # We use arctan2(d_lon, d_lat) to align with North-Up.
-    
-    df['calculated_heading_rad'] = np.arctan2(df['d_lon'], df['d_lat'])
-    df['calculated_heading'] = np.degrees(df['calculated_heading_rad'])
-    
-    # Normalize to 0-360 range
-    df['calculated_heading'] = (df['calculated_heading'] + 360) % 360
-    
-    # Fill NaN values (first row has no previous step) with the next known heading (backfill)
-    df['calculated_heading'] = df['calculated_heading'].bfill()
-    
-    # ---------------------------------------------------------
-    # 5. RE-RUN "HEAD VS TAIL" LOGIC WITH NEW HEADING
-    # ---------------------------------------------------------
-    
-    # A. Get Angle FROM Runner TO It
-    # runner_bearing is It->Runner. We want Runner->It.
-    # Flip it 180 degrees.
+    # 1. Get the relevant bearing for the target
+    # Note: No +180 needed anymore based on your clarification!
     def get_bearing(row):
-        idx = row['it_runner_index']
-        return row['runner_bearing'][idx]
+        return row['runner_bearing'][row['it_runner_index']]
+        
+    df_corrected['target_bearing'] = df_corrected.apply(get_bearing, axis=1)
     
-    df['bearing_raw'] = df.apply(get_bearing, axis=1)
-    df['bearing_to_it'] = (df['bearing_raw'] + 180) % 360
+    # 2. Calculate Alignment Angle (Delta)
+    # We want the shortest difference between the two angles (0 to 180)
+    # Example: Bearing 350, Heading 10 -> Diff is 20, not 340.
     
-    # B. Calculate Relative Angle (Attack Angle)
-    # Attack Angle = Direction to Threat - Direction I am Facing
-    df['attack_angle'] = df['bearing_to_it'] - df['calculated_heading']
+    diff = abs(df_corrected['target_bearing'] - df_corrected['calculated_heading'])
+    df_corrected['alignment_delta'] = np.minimum(diff, 360 - diff)
     
-    # C. Normalize to -180 (Left/Rear) to +180 (Right/Rear)
-    df['attack_angle'] = (df['attack_angle'] + 180) % 360 - 180
+    # 3. Visualization
+    plt.figure(figsize=(10, 6))
     
-    return df
-
-# Apply the fix
-# df_corrected = recalculate_heading_and_analyze(df)
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-def plot_corrected_dogfight(df_corrected):
-    plt.figure(figsize=(10, 10))
-    ax = plt.subplot(111, projection='polar')
+    # Plot Tags vs Untags
+    sns.kdeplot(data=df_corrected[df_corrected['outcome']=='tag'], x='alignment_delta', 
+                fill=True, color='red', label='Tag (Capture)', alpha=0.3)
     
-    ax.set_theta_zero_location("N") # North = Runner's Nose
-    ax.set_theta_direction(-1)      # Clockwise
+    sns.kdeplot(data=df_corrected[df_corrected['outcome']=='untag'], x='alignment_delta', 
+                fill=True, color='blue', label='Untag (Escape)', alpha=0.3)
     
-    # Filter for Tags and Untags
-    tags = df_corrected[df_corrected['outcome'] == 'tag']
-    untags = df_corrected[df_corrected['outcome'] == 'untag']
+    # Annotate the Meaning
+    plt.axvline(0, color='black', linestyle='--', alpha=0.5)
+    plt.text(5, plt.ylim()[1]*0.9, "TAIL CHASE\n(Running Away)", color='black', fontweight='bold')
     
-    # Plot Untags (Background, Blue)
-    if not untags.empty:
-        ax.scatter(np.deg2rad(untags['attack_angle']), 
-                   np.random.uniform(0.5, 0.9, len(untags)), # Jitter radius
-                   c='blue', alpha=0.1, s=10, label='Untag', zorder=1)
+    plt.axvline(180, color='black', linestyle='--', alpha=0.5)
+    plt.text(175, plt.ylim()[1]*0.9, "HEAD ON\n(Collision Course)", color='black', ha='right', fontweight='bold')
     
-    # Plot Tags (Foreground, Red)
-    if not tags.empty:
-        ax.scatter(np.deg2rad(tags['attack_angle']), 
-                   np.random.uniform(0.6, 0.8, len(tags)), # Jitter radius
-                   c='red', alpha=0.8, s=50, marker='x', label='Tag', zorder=2)
-    
-    # Labels
-    r_max = ax.get_ylim()[1]
-    plt.text(0, r_max*1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
-    plt.text(np.pi, r_max*1.1, "TAIL\n(Rear)", ha='center', fontweight='bold')
-    
-    plt.title("Corrected Attack Angles\n(Derived from Lat/Lon Trajectory)", y=1.08, fontsize=15)
-    plt.legend(loc='lower right')
+    plt.title("Chaser-Runner Alignment Analysis", fontsize=14)
+    plt.xlabel("Angle Difference (Degrees)\n0° = Perfectly Aligned (Chase) | 180° = Opposite (Joust)")
+    plt.xlim(0, 180)
+    plt.legend()
     plt.show()
 
-# plot_corrected_dogfight(df_corrected)
+# analyze_alignment_simple(df_corrected)
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
 
 
 =========================================================================================================================================================================

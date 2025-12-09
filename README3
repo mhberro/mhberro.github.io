@@ -490,8 +490,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-def plot_dogfight_final_clean(df_analyzed):
-    # Increase figure size to give labels room to breathe
+def plot_dogfight_final_units(df_analyzed):
+    # Set figure size
     plt.figure(figsize=(12, 12))
     ax = plt.subplot(111, projection='polar')
     
@@ -526,16 +526,16 @@ def plot_dogfight_final_clean(df_analyzed):
             
         theta = np.deg2rad(subset['relative_approach_angle'])
         
+        # Use Distance if available, otherwise mock it for visualization
         if 'distance_to_target' in subset.columns:
             r = subset['distance_to_target']
         else:
-            r = np.random.uniform(0.5, 1.5, len(subset))
+            r = np.random.uniform(10, 100, len(subset)) # Mocking meters
             
-        # Track max radius to place labels correctly later
         if r.max() > max_radius_found:
             max_radius_found = r.max()
 
-        # Vector Math
+        # Vector Math for Headings
         target_headings = np.array([row['runner_heading'][row['it_runner_index']] 
                                     for _, row in subset.iterrows()])
         it_headings = subset['it_heading'].values
@@ -555,42 +555,47 @@ def plot_dogfight_final_clean(df_analyzed):
                   label=group['label'])
 
     # ---------------------------------------------------------
-    # CLEANER LABELS
+    # LABELS, UNITS & FORMATTING
     # ---------------------------------------------------------
     
-    # Force the plot limit to be slightly larger than data to fit arrows
-    ax.set_ylim(0, max_radius_found * 1.1)
-    r_label_pos = max_radius_found * 1.25 # Place text 25% outside the data ring
+    # Set limit slightly larger than max data
+    ax.set_ylim(0, max_radius_found * 1.15)
     
-    # 1. Sector Labels (Moved further out)
+    # A. UNIT LABELS (New Addition)
+    # Move the radial numbers (10, 20, 30...) to the 45-degree angle
+    ax.set_rlabel_position(45) 
+    
+    # Add the text "Distance (m)" next to the outermost grid line
+    plt.text(np.deg2rad(45), max_radius_found * 1.05, "  Distance (m)", 
+             color='gray', ha='left', va='center', fontsize=10, fontweight='bold')
+
+    # B. SECTOR LABELS
+    r_label_pos = max_radius_found * 1.25
+    
     plt.text(0, r_label_pos, "HEAD\n(Front)", ha='center', va='bottom', fontweight='bold', fontsize=11)
     plt.text(np.pi, r_label_pos, "TAIL\n(Rear)", ha='center', va='top', fontweight='bold', fontsize=11)
     plt.text(np.pi/2, r_label_pos, "Right Flank", ha='left', va='center', fontsize=10)
     plt.text(-np.pi/2, r_label_pos, "Left Flank", ha='right', va='center', fontsize=10)
     
-    # 2. Runner Marker
+    # C. RUNNER MARKER
     ax.plot(0, 0, marker='^', markersize=15, color='black', label='Target Runner')
 
-    # 3. Dynamic Title (Moved Up)
+    # D. TITLE & STATS
     plt.title("Drone Dogfight Analysis: Approach Vectors", fontsize=16, y=1.15, fontweight='bold')
     
-    # 4. Speed Stats (Moved to top-left corner box to avoid center overlap)
     speed_text = (f"STATS:\n"
                   f"Avg It Speed: {avg_it_speed:.1f} m/s\n"
                   f"Avg Target Speed: {avg_runner_speed:.1f} m/s\n"
                   f"Delta: {'+' if avg_it_speed > avg_runner_speed else ''}{avg_it_speed - avg_runner_speed:.1f} m/s")
     
-    # Place text box in figure coordinates (0,0 is bottom-left, 1,1 is top-right)
     plt.figtext(0.02, 0.95, speed_text, ha='left', va='top', fontsize=10, 
                 bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray', boxstyle='round,pad=0.5'))
 
-    # 5. Legend (Moved outside)
     plt.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1))
-    
     plt.tight_layout()
     plt.show()
 
-# plot_dogfight_final_clean(df_analyzed)
+# plot_dogfight_final_units(df_analyzed)
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 

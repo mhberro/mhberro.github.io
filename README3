@@ -485,94 +485,120 @@ def repo_data_files_with_fakes(tmp_path, monkeypatch):
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 PG-35: Susceptibility Modeling
-
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 
-def plot_dogfight_actual_headings(df_analyzed):
-    plt.figure(figsize=(12, 12))
+def plot_dogfight_final(df_analyzed):
+    # Set up the figure
+    plt.figure(figsize=(14, 14))
     ax = plt.subplot(111, projection='polar')
     
     # 1. Orientation Setup (North Up, Clockwise)
     ax.set_theta_zero_location("N") 
     ax.set_theta_direction(-1)
     
-    # Filter for Tags
-    tags = df_analyzed[df_analyzed['outcome'] == 'tag'].copy()
+    # ---------------------------------------------------------
+    # DATA PREPARATION
+    # ---------------------------------------------------------
     
-    if tags.empty:
-        print("No tags found to plot.")
-        return
+    # Helper to extract speed for the specific target runner
+    def get_target_speed(row):
+        return row['runner_speed'][row['it_runner_index']]
 
-    # 2. Extract Key Angles (in Radians)
-    # Theta: Where the drone IS (Relative to Runner's Nose)
-    theta = np.deg2rad(tags['relative_approach_angle'])
+    df_analyzed['target_speed_val'] = df_analyzed.apply(get_target_speed, axis=1)
     
-    # Phi: Where the drone is FACING (It Heading)
-    # We must rotate this by the Runner's Heading to match the plot orientation
-    # Formula: (It_Heading - Runner_Heading)
+    # Calculate global averages for the subtitle
+    avg_it_speed = df_analyzed['it_speed'].mean()
+    avg_runner_speed = df_analyzed['target_speed_val'].mean()
     
-    # Note: We access 'it_heading' assuming it follows the logic "same features for it drone"
-    # If it_heading is a single int, we use it directly. If it's a list (rare for 'It'), handle appropriately.
-    # Here we assume standard row-by-row extraction.
+    # Define groups to plot
+    # Untags first (Background), Tags second (Foreground)
+    groups = [
+        {'label': 'Untag (Escaped)', 'color': 'blue', 'alpha': 0.3, 'data': df_analyzed[df_analyzed['outcome'] == 'untag']},
+        {'label': 'Tag (Captured)',  'color': 'red',  'alpha': 0.8, 'data': df_analyzed[df_analyzed['outcome'] == 'tag']}
+    ]
     
-    def get_relative_heading_rad(row):
-        idx = row['it_runner_index']
-        # Extract features
-        r_head = row['runner_heading'][idx]
-        # Assuming 'it_heading' is a column. If it's inside a list, adjust index access.
-        # Based on typical structure:
-        i_head = row['it_heading'] if 'it_heading' in row else 0 # Fallback 0 if missing
+    # ---------------------------------------------------------
+    # PLOTTING LOOP
+    # ---------------------------------------------------------
+    for group in groups:
+        subset = group['data']
+        if subset.empty: continue
+            
+        # A. Position Angle (Theta): Where is the drone?
+        # Convert relative angle to radians for plotting
+        theta = np.deg2rad(subset['relative_approach_angle'])
         
-        # Calculate Relative Heading (Plot Frame)
-        # We also convert to Radians immediately
-        return np.deg2rad(i_head - r_head)
+        # B. Radius (r): Distance
+        if 'distance_to_target' in subset.columns:
+            r = subset['distance_to_target']
+        else:
+            r = np.random.uniform(0.5, 1.5, len(subset))
+            
+        # C. Vector Direction (Heading): Where is the drone facing?
+        # We assume 'it_heading' is available. 
+        # Logic: Relative Heading = It_Heading - Runner_Heading
+        
+        # Note: Vectorizing this operation for speed
+        # Create an array of Target Headings
+        # We need to grab the specific heading for each row's target
+        # (This is a bit complex in pandas without a loop, so we use a list comp for safety)
+        target_headings = np.array([row['runner_heading'][row['it_runner_index']] 
+                                    for _, row in subset.iterrows()])
+        
+        it_headings = subset['it_heading'].values
+        
+        # Calculate Relative Heading (in Radians)
+        rel_heading_rad = np.deg2rad(it_headings - target_headings)
+        
+        # Decompose into Polar Vectors (U, V)
+        # Angle difference between "Facing Direction" and "Location Angle"
+        angle_diff = rel_heading_rad - theta
+        
+        u = np.cos(angle_diff) # Radial (In/Out)
+        v = np.sin(angle_diff) # Tangential (Left/Right)
+        
+        # Plot Quivers (Arrows)
+        ax.quiver(theta, r, u, v,
+                  color=group['color'],
+                  alpha=group['alpha'],
+                  scale=30,           # Adjust scale: Higher number = Shorter arrows
+                  pivot='mid',        # Arrow rotates around its center
+                  headwidth=3,
+                  headlength=4,
+                  label=group['label'])
 
-    it_heading_rel = tags.apply(get_relative_heading_rad, axis=1)
-
-    # 3. Calculate Vector Components (U, V)
-    # U is Radial (In/Out), V is Angular (Left/Right spin)
-    # We project the Heading Vector onto the Position Vector
+    # ---------------------------------------------------------
+    # LABELS & CONTEXT
+    # ---------------------------------------------------------
     
-    # Angle difference between "Where I am facing" and "Where I am located"
-    angle_diff = it_heading_rel - theta
+    # Runner Marker in Center
+    ax.plot(0, 0, marker='^', markersize=20, color='black', label='Target Runner')
     
-    # Decomposition
-    u = np.cos(angle_diff) # Radial component
-    v = np.sin(angle_diff) # Tangential component
-
-    # 4. Radius (Distance)
-    if 'distance_to_target' in tags.columns:
-        r = tags['distance_to_target']
-    else:
-        r = np.random.uniform(0.5, 1.5, len(tags))
-
-    # 5. Plot the Quivers
-    ax.quiver(theta, r, u, v,
-              color='red',
-              alpha=0.6,
-              scale=30,           # Adjust scale: Higher = Shorter arrows
-              pivot='mid',        # Pivot at center of arrow to show flow
-              headwidth=3,
-              headlength=4,
-              label='It Drone Heading')
-
-    # 6. Context Markers
-    # Runner in Center
-    ax.plot(0, 0, marker='^', markersize=15, color='blue', label='Runner (Target)')
-    
-    # Labels
+    # Sector Labels
     r_max = ax.get_ylim()[1]
     plt.text(0, r_max*1.1, "HEAD\n(Front)", ha='center', fontweight='bold')
     plt.text(np.pi, r_max*1.1, "TAIL\n(Rear)", ha='center', fontweight='bold')
     plt.text(np.pi/2, r_max*1.1, "Right Flank", ha='center', fontsize=9)
     plt.text(-np.pi/2, r_max*1.1, "Left Flank", ha='center', fontsize=9)
     
-    plt.title("Actual Flight Direction of 'It' Drones\n(Relative to Runner)", fontsize=15, y=1.08)
-    plt.legend(loc='lower right')
+    # Titles and Speed Labels
+    plt.title("Drone Dogfight Analysis: Approach Vectors", fontsize=18, y=1.12, fontweight='bold')
+    
+    # Subtitle with Speed Stats
+    speed_text = (f"Avg It Speed: {avg_it_speed:.2f} m/s  |  "
+                  f"Avg Target Speed: {avg_runner_speed:.2f} m/s\n"
+                  f"('It' is {avg_it_speed - avg_runner_speed:.2f} m/s faster on average)")
+    
+    plt.figtext(0.5, 0.93, speed_text, ha='center', fontsize=12, 
+                bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.5'))
+
+    # Legend
+    plt.legend(loc='lower right', bbox_to_anchor=(1.3, 0.0))
     plt.show()
 
-# plot_dogfight_actual_headings(df_analyzed)
+# plot_dogfight_final(df_analyzed)
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 

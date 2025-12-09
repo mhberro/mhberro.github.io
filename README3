@@ -488,16 +488,26 @@ PG-35: Susceptibility Modeling
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.ticker as ticker  # Import ticker for custom labels
 import seaborn as sns
 
 def plot_dogfight_final_units(df_analyzed):
-    # Set figure size
     plt.figure(figsize=(12, 12))
     ax = plt.subplot(111, projection='polar')
     
     # 1. Orientation Setup
     ax.set_theta_zero_location("N") 
     ax.set_theta_direction(-1)
+    
+    # ---------------------------------------------------------
+    # FORMATTING THE DISTANCE UNITS (New Addition)
+    # ---------------------------------------------------------
+    # This adds ' m' to every number on the radial circles
+    ax.yaxis.set_major_formatter(ticker.FormatStrFormatter('%.0f m'))
+    
+    # Move the distance numbers to the 45-degree line so they don't 
+    # overlap with the Head/Tail labels
+    ax.set_rlabel_position(45)
     
     # ---------------------------------------------------------
     # DATA PREPARATION
@@ -526,11 +536,11 @@ def plot_dogfight_final_units(df_analyzed):
             
         theta = np.deg2rad(subset['relative_approach_angle'])
         
-        # Use Distance if available, otherwise mock it for visualization
+        # Check for distance column
         if 'distance_to_target' in subset.columns:
             r = subset['distance_to_target']
         else:
-            r = np.random.uniform(10, 100, len(subset)) # Mocking meters
+            r = np.random.uniform(5, 20, len(subset)) # Using larger numbers to show 'm' clearly
             
         if r.max() > max_radius_found:
             max_radius_found = r.max()
@@ -555,34 +565,23 @@ def plot_dogfight_final_units(df_analyzed):
                   label=group['label'])
 
     # ---------------------------------------------------------
-    # LABELS, UNITS & FORMATTING
+    # LABELS
     # ---------------------------------------------------------
     
-    # Set limit slightly larger than max data
+    # Set limit slightly higher than max data to fit everything
     ax.set_ylim(0, max_radius_found * 1.15)
-    
-    # A. UNIT LABELS (New Addition)
-    # Move the radial numbers (10, 20, 30...) to the 45-degree angle
-    ax.set_rlabel_position(45) 
-    
-    # Add the text "Distance (m)" next to the outermost grid line
-    plt.text(np.deg2rad(45), max_radius_found * 1.05, "  Distance (m)", 
-             color='gray', ha='left', va='center', fontsize=10, fontweight='bold')
-
-    # B. SECTOR LABELS
-    r_label_pos = max_radius_found * 1.25
+    r_label_pos = max_radius_found * 1.25 
     
     plt.text(0, r_label_pos, "HEAD\n(Front)", ha='center', va='bottom', fontweight='bold', fontsize=11)
     plt.text(np.pi, r_label_pos, "TAIL\n(Rear)", ha='center', va='top', fontweight='bold', fontsize=11)
     plt.text(np.pi/2, r_label_pos, "Right Flank", ha='left', va='center', fontsize=10)
     plt.text(-np.pi/2, r_label_pos, "Left Flank", ha='right', va='center', fontsize=10)
     
-    # C. RUNNER MARKER
     ax.plot(0, 0, marker='^', markersize=15, color='black', label='Target Runner')
 
-    # D. TITLE & STATS
     plt.title("Drone Dogfight Analysis: Approach Vectors", fontsize=16, y=1.15, fontweight='bold')
     
+    # Speed Stats Box
     speed_text = (f"STATS:\n"
                   f"Avg It Speed: {avg_it_speed:.1f} m/s\n"
                   f"Avg Target Speed: {avg_runner_speed:.1f} m/s\n"

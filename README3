@@ -13,16 +13,15 @@ def fr_feature_plot(
 
     - 2D mode:
         * If 1 feature:
-            - NUMERIC: scatter of raw feature values vs FR (per run).
-            - CATEGORICAL: bar chart of average FR by category (no binning).
+            - Bar chart of average FR by *raw* feature value (no binning).
         * If 2 features:
-            - Two side-by-side plots (one per feature), applying the same logic.
+            - Two side-by-side bar charts (one per feature).
     - 3D mode:
         * Requires exactly 2 features.
         * 3D scatter: x = feature1, y = feature2, z = FR (per run),
           colored by FR.
-        * Categorical features are encoded as integers for plotting,
-          but axes are labeled with the original category values.
+        * Categorical features are encoded as integers for plotting, but axes
+          are labeled with the original category values.
     """
     fig = go.Figure()
 
@@ -121,7 +120,7 @@ def fr_feature_plot(
             )
         )
 
-        # Configure axes so ticks show the original feature values (for categoricals)
+        # Configure axes so ticks show the original feature values
         scene_cfg = dict(
             xaxis_title=f1,
             yaxis_title=f2,
@@ -152,40 +151,43 @@ def fr_feature_plot(
         return fig
 
     # ------------------------ 2D MODE ------------------------
-    # Helper: build a 2D trace for one feature (NUMERIC → scatter of raw values, CATEGORICAL → bar of mean FR)
-    def trace_for_feature(feature: str, name: str | None = None) -> go.Scatter | go.Bar:
+    # Helper for a single feature: average FR by *raw* value (no binning),
+    # returning both numeric x-values and string labels for axis ticks.
+    def avg_fr_by_feature(feature: str) -> tuple[np.ndarray, list[str], np.ndarray, bool]:
         s = df[feature]
-        if is_numeric(s):
-            # RAW values, per run – no binning, no rounding
-            return go.Scatter(
-                x=s.values,
-                y=FR.values,
-                mode="markers",
-                name=name or feature,
-                hovertext=[
-                    f"Test Run ID: {trid}<br>{feature}: {val}<br>FR: {fr:.3f}"
-                    for trid, val, fr in zip(
-                        df.get("Test_Run_ID", df.index),
-                        s,
-                        FR,
-                    )
-                ],
-                hoverinfo="text",
-            )
+
+        # Average FR per raw value
+        grouped = df.groupby(feature)["FR"].mean()
+
+        # Decide how to sort and what to use for x-axis
+        is_num = is_numeric(s)
+        max_categories = 50  # safety limit for readability
+
+        if is_num:
+            # Numeric: x-axis is numeric, but we control ticktext ourselves
+            vals = np.array(grouped.index, dtype=float)
+            order = np.argsort(vals)
+            vals = vals[order]
+            grouped_sorted = grouped.iloc[order]
+
+            if len(vals) > max_categories:
+                vals = vals[:max_categories]
+                grouped_sorted = grouped_sorted.iloc[:max_categories]
+
+            labels = [str(v) for v in vals]  # raw numeric values as strings
+            y_vals = grouped_sorted.values
+            return vals, labels, y_vals, True
         else:
-            # Categorical: average FR by category (no binning)
-            grouped = df.groupby(feature)["FR"].mean()
-            # Limit to keep plot readable if huge cardinality
-            max_cats = 50
-            if len(grouped) > max_cats:
-                grouped = grouped.sort_values(ascending=False).iloc[:max_cats]
-            x_labels = [str(idx) for idx in grouped.index]
-            y_vals = grouped.values
-            return go.Bar(
-                x=x_labels,
-                y=y_vals,
-                name=name or feature,
-            )
+            # Categorical: use category labels directly
+            grouped_sorted = grouped  # keep natural index order
+            if len(grouped_sorted) > max_categories:
+                grouped_sorted = grouped_sorted.iloc[:max_categories]
+
+            labels = [str(idx) for idx in grouped_sorted.index]
+            y_vals = grouped_sorted.values
+            # For categorical, we just use labels as x and let Plotly handle
+            vals = np.arange(len(labels))
+            return vals, labels, y_vals, False
 
     # 2D, 1 feature
     if len(selected_features) == 1:
@@ -198,19 +200,37 @@ def fr_feature_plot(
             )
             return fig
 
-        trace = trace_for_feature(f)
-        fig.add_trace(trace)
+        x_vals, x_labels, y = avg_fr_by_feature(f)[:3]
+        is_num = is_numeric(df[f])
+
+        fig.add_trace(go.Bar(x=x_vals, y=y))
+
+        xaxis_cfg = dict(title=f)
+        if is_num:
+            # Force tick labels to be the raw numeric values (as strings)
+            xaxis_cfg.update(
+                tickmode="array",
+                tickvals=x_vals,
+                ticktext=x_labels,
+            )
+        else:
+            # For categorical, treat the string labels as categories
+            xaxis_cfg.update(
+                tickmode="array",
+                tickvals=x_vals,
+                ticktext=x_labels,
+            )
+
         fig.update_layout(
-            title=f"FR vs {f} (raw values)",
-            xaxis_title=f,
-            yaxis_title="FR",
+            title=f"Average FR by {f} (raw values)",
+            xaxis=xaxis_cfg,
+            yaxis=dict(title="Average FR"),
             height=400,
             margin=dict(l=10, r=10, t=40, b=80),
-            showlegend=False,
         )
         return fig
 
-    # 2D, 2 features => two side-by-side plots
+    # 2D, 2 features => two side-by-side bar charts
     f1, f2 = selected_features[:2]
     if f1 not in df.columns or f2 not in df.columns:
         fig.update_layout(
@@ -220,30 +240,47 @@ def fr_feature_plot(
         )
         return fig
 
+    x1_vals, x1_labels, y1, _ = avg_fr_by_feature(f1)
+    x2_vals, x2_labels, y2, _ = avg_fr_by_feature(f2)
+
     fig = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=[f"FR vs {f1}", f"FR vs {f2}"],
+        subplot_titles=[f"Average FR by {f1}", f"Average FR by {f2}"],
     )
 
-    t1 = trace_for_feature(f1, name=f1)
-    t2 = trace_for_feature(f2, name=f2)
+    fig.add_trace(go.Bar(x=x1_vals, y=y1, name=f1), row=1, col=1)
+    fig.add_trace(go.Bar(x=x2_vals, y=y2, name=f2), row=1, col=2)
 
-    fig.add_trace(t1, row=1, col=1)
-    fig.add_trace(t2, row=1, col=2)
+    # Configure x-axes so tick labels reflect raw values
+    fig.update_xaxes(
+        title_text=f1,
+        tickmode="array",
+        tickvals=x1_vals,
+        ticktext=x1_labels,
+        row=1,
+        col=1,
+    )
+    fig.update_yaxes(title_text="Average FR", row=1, col=1)
 
-    fig.update_xaxes(title_text=f1, row=1, col=1)
-    fig.update_yaxes(title_text="FR", row=1, col=1)
-    fig.update_xaxes(title_text=f2, row=1, col=2)
-    fig.update_yaxes(title_text="FR", row=1, col=2)
+    fig.update_xaxes(
+        title_text=f2,
+        tickmode="array",
+        tickvals=x2_vals,
+        ticktext=x2_labels,
+        row=1,
+        col=2,
+    )
+    fig.update_yaxes(title_text="Average FR", row=1, col=2)
 
     fig.update_layout(
-        title="FR vs selected features (raw values)",
+        title="Average FR by selected features (raw values)",
         showlegend=False,
         height=450,
         margin=dict(l=10, r=10, t=40, b=80),
     )
     return fig
+
 
 
 

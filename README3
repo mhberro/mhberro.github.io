@@ -271,6 +271,61 @@ def fr_feature_plot(
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+        if show_segment_compare:
+            st.markdown("#### Feature-wise Failure Rate (FR) Viewer")
+
+            # Limit feature choices to those in FEATURES_FOR_ANALYSIS and in df
+            available_feats = [
+                f for f in globals().get("FEATURES_FOR_ANALYSIS", [])
+                if f in df.columns
+            ]
+            st.caption("Select up to 2 features to see how they relate to FR.")
+
+            selected_features = st.multiselect(
+                "Features",
+                options=available_feats,
+                default=available_feats[:1] if available_feats else [],
+                max_selections=2,
+                key=f"{key_prefix}-frfeat-select",
+            )
+
+            # Plot dimension + Top-N controls side-by-side
+            dim_col, n_col = st.columns([2, 1])
+
+            with dim_col:
+                dim_choice = st.radio(
+                    "Plot dimension",
+                    options=["2D", "3D"],
+                    index=0,
+                    horizontal=True,
+                    key=f"{key_prefix}-frfeat-dim",
+                )
+
+            with n_col:
+                top_n = st.number_input(
+                    "Top-N values",
+                    min_value=1,
+                    max_value=50,
+                    value=10,
+                    step=1,
+                    key=f"{key_prefix}-frfeat-topn",
+                )
+
+            seg_fig = fr_feature_plot(
+                df=df,
+                selected_features=selected_features,
+                mode=dim_choice,
+                top_n=top_n,
+            )
+            st.plotly_chart(seg_fig, use_container_width=True, key=f"{key_prefix}-segplot")
+
+            # FR representation heatmap (High vs Low)
+            st.markdown("#### FR Representation (High / Low)")
+            st.plotly_chart(
+                fr_correlation_heatmap(df),
+                use_container_width=True,
+                key=f"{key_prefix}-frcorr",
+            )
 
 
 

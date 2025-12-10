@@ -15,24 +15,20 @@ def fr_feature_plot(
     """
     Visualize Failure Rate (FR) as a function of up to 2 features.
 
-    - 2D mode:
-        * If 1 feature:
-            - Bar chart of average FR by raw feature value.
-              Values are treated as categories -> equal spacing on the x-axis.
-              Only top-N values (by highest average FR) are shown.
-        * If 2 features:
-            - Two side-by-side bar charts (one per feature), same rules.
-    - 3D mode:
-        * Requires exactly 2 features.
-        * 3D scatter: x = feature1, y = feature2, z = FR (per run),
-          colored by FR.
-        * Categorical features are encoded as integers for plotting, but axes
-          are labeled with the original category values.
+    2D mode:
+        - 1 feature:
+            * Bar chart of average FR by raw feature value.
+            * Values treated as categories -> equal spacing on x-axis.
+            * Top-N values by highest average FR.
+        - 2 features:
+            * Two side-by-side bar charts, same rules.
 
-    Parameters
-    ----------
-    top_n : int
-        Number of top values (by highest average FR) to display per feature in 2D mode.
+    3D mode:
+        - Exactly 2 features required.
+        - x = feature1 (categorical-style positions 0..n-1)
+        - y = feature2 (categorical-style positions 0..m-1)
+        - z = FR per run
+        - Axes tick labels = raw feature values (strings), like in 2D.
     """
     fig = go.Figure()
 
@@ -45,9 +41,6 @@ def fr_feature_plot(
         return fig
 
     FR = df["FR"].astype(float)
-
-    def is_numeric(series: pd.Series) -> bool:
-        return np.issubdtype(series.dtype, np.number)
 
     # No features selected
     if not selected_features:
@@ -80,29 +73,21 @@ def fr_feature_plot(
         s1 = df[f1]
         s2 = df[f2]
 
-        # --- Encode feature 1 (categorical -> codes, numeric stays numeric) ---
-        if not is_numeric(s1):
-            cat1 = s1.astype("category")
-            s1_num = cat1.cat.codes.astype(float)
-            cats1 = list(cat1.cat.categories)
-            tickvals_x = list(range(len(cats1)))
-            ticktext_x = [str(c) for c in cats1]
-        else:
-            s1_num = s1.astype(float)
-            tickvals_x = None
-            ticktext_x = None
+        # Map raw values -> integer positions for equal spacing
+        uniq1 = list(pd.unique(s1))
+        uniq2 = list(pd.unique(s2))
 
-        # --- Encode feature 2 ---
-        if not is_numeric(s2):
-            cat2 = s2.astype("category")
-            s2_num = cat2.cat.codes.astype(float)
-            cats2 = list(cat2.cat.categories)
-            tickvals_y = list(range(len(cats2)))
-            ticktext_y = [str(c) for c in cats2]
-        else:
-            s2_num = s2.astype(float)
-            tickvals_y = None
-            ticktext_y = None
+        map1 = {v: i for i, v in enumerate(uniq1)}
+        map2 = {v: i for i, v in enumerate(uniq2)}
+
+        x_idx = s1.map(map1).astype(float)
+        y_idx = s2.map(map2).astype(float)
+
+        tickvals_x = list(range(len(uniq1)))
+        ticktext_x = [str(v) for v in uniq1]
+
+        tickvals_y = list(range(len(uniq2)))
+        ticktext_y = [str(v) for v in uniq2]
 
         hovertext = [
             f"Test Run ID: {trid}<br>{f1}: {v1}<br>{f2}: {v2}<br>FR: {fr:.3f}"
@@ -116,8 +101,8 @@ def fr_feature_plot(
 
         fig.add_trace(
             go.Scatter3d(
-                x=s1_num,
-                y=s2_num,
+                x=x_idx,
+                y=y_idx,
                 z=FR,
                 mode="markers",
                 marker=dict(
@@ -131,53 +116,39 @@ def fr_feature_plot(
             )
         )
 
-        # Configure axes so ticks show the original feature values
-        scene_cfg = dict(
-            xaxis_title=f1,
-            yaxis_title=f2,
-            zaxis_title="FR",
-        )
-
-        if tickvals_x is not None:
-            scene_cfg["xaxis"] = dict(
-                title=f1,
-                tickmode="array",
-                tickvals=tickvals_x,
-                ticktext=ticktext_x,
-            )
-        if tickvals_y is not None:
-            scene_cfg["yaxis"] = dict(
-                title=f2,
-                tickmode="array",
-                tickvals=tickvals_y,
-                ticktext=ticktext_y,
-            )
-
         fig.update_layout(
-            title=f"FR vs {f1} and {f2} (3D)",
-            scene=scene_cfg,
+            title=f"FR vs {f1} and {f2} (3D, raw values as categories)",
+            scene=dict(
+                xaxis=dict(
+                    title=f1,
+                    tickmode="array",
+                    tickvals=tickvals_x,
+                    ticktext=ticktext_x,
+                ),
+                yaxis=dict(
+                    title=f2,
+                    tickmode="array",
+                    tickvals=tickvals_y,
+                    ticktext=ticktext_y,
+                ),
+                zaxis=dict(title="FR"),
+            ),
             height=600,
             margin=dict(l=10, r=10, t=40, b=10),
         )
         return fig
 
     # ------------------------ 2D MODE ------------------------
-    # Helper for a single feature: average FR by *raw* value, equal spacing,
+    # Helper for a single feature: average FR by raw value, equal spacing,
     # and only top-N values (by highest average FR).
     def avg_fr_by_feature(feature: str) -> tuple[np.ndarray, list[str], np.ndarray]:
-        s = df[feature]
-
-        # Average FR per raw value
         grouped = df.groupby(feature)["FR"].mean()
-
-        # Sort by FR descending: top-N values that are most failure-prone
         grouped_sorted = grouped.sort_values(ascending=False).head(top_n)
 
         labels = [str(idx) for idx in grouped_sorted.index]  # raw values as strings
         y_vals = grouped_sorted.values
+        x_vals = np.arange(len(labels))  # 0..n-1 => equal spacing
 
-        # Positions 0..n-1 => equal spacing on x-axis
-        x_vals = np.arange(len(labels))
         return x_vals, labels, y_vals
 
     # 2D, 1 feature
@@ -202,7 +173,7 @@ def fr_feature_plot(
                 tickmode="array",
                 tickvals=x_vals,
                 ticktext=x_labels,
-                tickangle=45,  # angled for readability
+                tickangle=45,
             ),
             yaxis=dict(title="Average FR"),
             height=400,
@@ -268,64 +239,108 @@ def fr_feature_plot(
 
 
 
+
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-        if show_segment_compare:
-            st.markdown("#### Feature-wise Failure Rate (FR) Viewer")
+def render_sidebar_controls(...):
+    st.sidebar.header("Controls")
 
-            # Limit feature choices to those in FEATURES_FOR_ANALYSIS and in df
-            available_feats = [
-                f for f in globals().get("FEATURES_FOR_ANALYSIS", [])
-                if f in df.columns
-            ]
-            st.caption("Select up to 2 features to see how they relate to FR.")
+    # ... dataset selection & label_choice & show_top remain as you have them ...
 
-            selected_features = st.multiselect(
-                "Features",
-                options=available_feats,
-                default=available_feats[:1] if available_feats else [],
-                max_selections=2,
-                key=f"{key_prefix}-frfeat-select",
-            )
+    st.sidebar.divider()
+    st.sidebar.subheader("PCA Visualization")
 
-            # Plot dimension + Top-N controls side-by-side
-            dim_col, n_col = st.columns([2, 1])
+    # ✅ IMPORTANT: no value= here, and no manual session_state default elsewhere
+    st.sidebar.checkbox(
+        "Show PCA driver arrows",
+        key="show_biplot",
+    )
 
-            with dim_col:
-                dim_choice = st.radio(
-                    "Plot dimension",
-                    options=["2D", "3D"],
-                    index=0,
-                    horizontal=True,
-                    key=f"{key_prefix}-frfeat-dim",
-                )
+    # PCA arrow features
+    available_pca_feats = globals().get("PCA_FEATURES", [])
+    st.sidebar.multiselect(
+        "PCA driver arrows (numeric features)",
+        options=available_pca_feats,
+        default=available_pca_feats,
+        key="pca_arrow_features",
+    )
 
-            with n_col:
-                top_n = st.number_input(
-                    "Top-N values",
-                    min_value=1,
-                    max_value=50,
-                    value=10,
-                    step=1,
-                    key=f"{key_prefix}-frfeat-topn",
-                )
+    st.sidebar.checkbox(
+        "Show global arrows (from origin)",
+        key="show_global_pca_arrows",
+    )
+    st.sidebar.checkbox(
+        "Show Low-FR cluster arrows",
+        key="show_low_fr_arrows",
+    )
+    st.sidebar.checkbox(
+        "Show High-FR cluster arrows",
+        key="show_high_fr_arrows",
+    )
 
-            seg_fig = fr_feature_plot(
-                df=df,
-                selected_features=selected_features,
-                mode=dim_choice,
-                top_n=top_n,
-            )
-            st.plotly_chart(seg_fig, use_container_width=True, key=f"{key_prefix}-segplot")
+    st.sidebar.divider()
+    st.sidebar.subheader("Model hyperparameters")
 
-            # FR representation heatmap (High vs Low)
-            st.markdown("#### FR Representation (High / Low)")
-            st.plotly_chart(
-                fr_correlation_heatmap(df),
-                use_container_width=True,
-                key=f"{key_prefix}-frcorr",
-            )
+    with st.sidebar.expander("Isolation Forest"):
+        st.sidebar.slider(
+            "IF: Contamination (expected anomaly %)",
+            min_value=0.0,
+            max_value=0.2,
+            step=0.005,
+            key="if_contam",
+        )
+        st.sidebar.slider(
+            "IF: Trees (n_estimators)",
+            min_value=100,
+            max_value=1000,
+            step=50,
+            key="if_trees",
+        )
+
+    with st.sidebar.expander("Local Outlier Factor"):
+        st.sidebar.slider(
+            "LOF: Neighbors (n_neighbors)",
+            min_value=5,
+            max_value=100,
+            step=1,
+            key="lof_k",
+        )
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Anomaly Influence Network")
+
+    st.sidebar.selectbox(
+        "Subset",
+        ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+        key="influence_subset",
+    )
+    st.sidebar.slider(
+        "Top-K features",
+        min_value=4,
+        max_value=15,
+        step=1,
+        key="influence_topk",
+    )
+    st.sidebar.slider(
+        "Edge threshold (|corr|)",
+        min_value=0.10,
+        max_value=0.90,
+        step=0.05,
+        key="influence_edge_thresh",
+    )
+    st.sidebar.selectbox(
+        "Correlation method",
+        ["pearson", "spearman"],
+        key="influence_corr_method",
+    )
+    st.sidebar.checkbox(
+        "Show Anomaly Influence Network",
+        key="show_influence_network",
+    )
+
+    # ... return whatever you currently return (selected dataset idx, show_all, etc.) ...
+
 
 
 

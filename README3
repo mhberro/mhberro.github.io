@@ -1,6 +1,6 @@
 F-35 anomaly detection
 
-from plotly.subplots import make_subplots  # ensure this import exists
+from plotly.subplots import make_subplots
 import numpy as np
 import plotly.graph_objects as go
 import pandas as pd
@@ -19,16 +19,17 @@ def fr_feature_plot(
         - 1 feature:
             * Bar chart of average FR by raw feature value.
             * Values treated as categories -> equal spacing on x-axis.
-            * Top-N values by highest average FR.
+            * Top-N values (by highest average FR).
         - 2 features:
             * Two side-by-side bar charts, same rules.
 
     3D mode:
         - Exactly 2 features required.
-        - x = feature1 (categorical-style positions 0..n-1)
-        - y = feature2 (categorical-style positions 0..m-1)
-        - z = FR per run
-        - Axes tick labels = raw feature values (strings), like in 2D.
+        - Aggregate by (feature1, feature2) pairs:
+            * Each point = combination of (f1, f2) with avg FR.
+            * x = f1 category index 0..n-1, y = f2 category index 0..m-1.
+            * Tick labels = raw f1 / f2 values.
+            * Top-N combinations by highest avg FR.
     """
     fig = go.Figure()
 
@@ -70,18 +71,31 @@ def fr_feature_plot(
             )
             return fig
 
-        s1 = df[f1]
-        s2 = df[f2]
+        # Aggregate FR by (f1, f2) combination
+        grouped = (
+            df.groupby([f1, f2])["FR"]
+            .agg(["mean", "count"])
+            .reset_index()
+            .rename(columns={"mean": "FR_mean", "count": "n"})
+        )
+
+        # Top-N combinations by highest average FR
+        grouped = grouped.sort_values("FR_mean", ascending=False).head(top_n)
+
+        s1_vals = grouped[f1]
+        s2_vals = grouped[f2]
+        fr_vals = grouped["FR_mean"].values
+        counts = grouped["n"].values
 
         # Map raw values -> integer positions for equal spacing
-        uniq1 = list(pd.unique(s1))
-        uniq2 = list(pd.unique(s2))
+        uniq1 = list(pd.unique(s1_vals))
+        uniq2 = list(pd.unique(s2_vals))
 
         map1 = {v: i for i, v in enumerate(uniq1)}
         map2 = {v: i for i, v in enumerate(uniq2)}
 
-        x_idx = s1.map(map1).astype(float)
-        y_idx = s2.map(map2).astype(float)
+        x_idx = s1_vals.map(map1).astype(float).values
+        y_idx = s2_vals.map(map2).astype(float).values
 
         tickvals_x = list(range(len(uniq1)))
         ticktext_x = [str(v) for v in uniq1]
@@ -90,26 +104,21 @@ def fr_feature_plot(
         ticktext_y = [str(v) for v in uniq2]
 
         hovertext = [
-            f"Test Run ID: {trid}<br>{f1}: {v1}<br>{f2}: {v2}<br>FR: {fr:.3f}"
-            for trid, v1, v2, fr in zip(
-                df.get("Test_Run_ID", df.index),
-                s1,
-                s2,
-                FR,
-            )
+            f"{f1}: {v1}<br>{f2}: {v2}<br>Avg FR: {fr:.3f}<br>Count: {n}"
+            for v1, v2, fr, n in zip(s1_vals, s2_vals, fr_vals, counts)
         ]
 
         fig.add_trace(
             go.Scatter3d(
                 x=x_idx,
                 y=y_idx,
-                z=FR,
+                z=fr_vals,
                 mode="markers",
                 marker=dict(
-                    size=4,
-                    color=FR,
+                    size=6,
+                    color=fr_vals,
                     colorscale="RdYlGn_r",  # low FR = green, high FR = red
-                    colorbar=dict(title="FR"),
+                    colorbar=dict(title="Avg FR"),
                 ),
                 hovertext=hovertext,
                 hoverinfo="text",
@@ -117,7 +126,7 @@ def fr_feature_plot(
         )
 
         fig.update_layout(
-            title=f"FR vs {f1} and {f2} (3D, raw values as categories)",
+            title=f"Average FR by (top-{top_n}) {f1} × {f2} combinations",
             scene=dict(
                 xaxis=dict(
                     title=f1,
@@ -131,7 +140,7 @@ def fr_feature_plot(
                     tickvals=tickvals_y,
                     ticktext=ticktext_y,
                 ),
-                zaxis=dict(title="FR"),
+                zaxis=dict(title="Average FR"),
             ),
             height=600,
             margin=dict(l=10, r=10, t=40, b=10),
@@ -139,8 +148,7 @@ def fr_feature_plot(
         return fig
 
     # ------------------------ 2D MODE ------------------------
-    # Helper for a single feature: average FR by raw value, equal spacing,
-    # and only top-N values (by highest average FR).
+    # Helper: average FR by raw value, equal spacing, top-N by FR
     def avg_fr_by_feature(feature: str) -> tuple[np.ndarray, list[str], np.ndarray]:
         grouped = df.groupby(feature)["FR"].mean()
         grouped_sorted = grouped.sort_values(ascending=False).head(top_n)
@@ -223,8 +231,7 @@ def fr_feature_plot(
         tickvals=x2_vals,
         ticktext=x2_labels,
         tickangle=45,
-        row=1,
-        col=2,
+        row=1, col=2,
     )
     fig.update_yaxes(title_text="Average FR", row=1, col=2)
 
@@ -243,50 +250,128 @@ def fr_feature_plot(
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-def render_sidebar_controls(...):
+from pathlib import Path
+import streamlit as st
+
+
+def render_sidebar_controls(
+    csv_paths: list[Path],
+    dataset_labels: list[str],
+    LABEL_DICT: dict,
+    PCA_FEATURES: list[str],
+):
+    """
+    Sidebar controls for:
+      - Dataset selection
+      - Label choice & top-N anomalies
+      - PCA Visualization options
+      - Model hyperparameters (IF / LOF)
+      - Storyboard toggles
+      - Anomaly Influence Network
+    """
     st.sidebar.header("Controls")
 
-    # ... dataset selection & label_choice & show_top remain as you have them ...
+    # ---------------- Dataset selection ----------------
+    if dataset_labels:
+        dataset_label_list = dataset_labels
+    else:
+        dataset_label_list = [p.name for p in csv_paths]
+
+    selected_idx = st.sidebar.selectbox(
+        "Dataset",
+        options=list(range(len(dataset_label_list))),
+        format_func=lambda i: dataset_label_list[i],
+        index=0,
+        key="selected_dataset_idx",
+    )
+
+    show_all = st.sidebar.checkbox(
+        "Show all datasets",
+        value=False,
+        key="show_all_datasets",
+    )
+
+    # ---------------- Label / grouping ----------------
+    st.sidebar.subheader("Color / Group by")
+
+    label_names = list(LABEL_DICT.keys())
+    st.sidebar.selectbox(
+        "Label",
+        options=label_names,
+        index=0,
+        key="label_choice",  # session_state["label_choice"] will hold the selected name
+    )
+
+    st.sidebar.number_input(
+        "Top-N anomalies table (0 to hide)",
+        min_value=0,
+        max_value=1000,
+        value=10,
+        step=1,
+        key="show_top",
+    )
 
     st.sidebar.divider()
+
+    # ---------------- PCA Visualization ----------------
     st.sidebar.subheader("PCA Visualization")
 
-    # ✅ IMPORTANT: no value= here, and no manual session_state default elsewhere
     st.sidebar.checkbox(
         "Show PCA driver arrows",
+        value=True,
         key="show_biplot",
     )
 
-    # PCA arrow features
-    available_pca_feats = globals().get("PCA_FEATURES", [])
     st.sidebar.multiselect(
         "PCA driver arrows (numeric features)",
-        options=available_pca_feats,
-        default=available_pca_feats,
+        options=PCA_FEATURES,
+        default=PCA_FEATURES,
         key="pca_arrow_features",
     )
 
     st.sidebar.checkbox(
         "Show global arrows (from origin)",
+        value=True,
         key="show_global_pca_arrows",
     )
     st.sidebar.checkbox(
         "Show Low-FR cluster arrows",
+        value=True,
         key="show_low_fr_arrows",
     )
     st.sidebar.checkbox(
         "Show High-FR cluster arrows",
+        value=True,
         key="show_high_fr_arrows",
     )
 
     st.sidebar.divider()
+
+    # ---------------- Storyboard options ----------------
+    st.sidebar.subheader("Storyboard")
+
+    st.sidebar.checkbox(
+        "Show Feature-wise FR Viewer + FR heatmap",
+        value=True,
+        key="show_segment_compare",
+    )
+    st.sidebar.checkbox(
+        "Show 'Why this run?' panel",
+        value=True,
+        key="show_selection_why",
+    )
+
+    st.sidebar.divider()
+
+    # ---------------- Model hyperparameters ----------------
     st.sidebar.subheader("Model hyperparameters")
 
-    with st.sidebar.expander("Isolation Forest"):
+    with st.sidebar.expander("Isolation Forest", expanded=False):
         st.sidebar.slider(
             "IF: Contamination (expected anomaly %)",
             min_value=0.0,
             max_value=0.2,
+            value=0.02,
             step=0.005,
             key="if_contam",
         )
@@ -294,31 +379,37 @@ def render_sidebar_controls(...):
             "IF: Trees (n_estimators)",
             min_value=100,
             max_value=1000,
+            value=300,
             step=50,
             key="if_trees",
         )
 
-    with st.sidebar.expander("Local Outlier Factor"):
+    with st.sidebar.expander("Local Outlier Factor", expanded=False):
         st.sidebar.slider(
             "LOF: Neighbors (n_neighbors)",
             min_value=5,
             max_value=100,
+            value=20,
             step=1,
             key="lof_k",
         )
 
     st.sidebar.divider()
+
+    # ---------------- Anomaly Influence Network ----------------
     st.sidebar.subheader("Anomaly Influence Network")
 
     st.sidebar.selectbox(
         "Subset",
         ["Anomalous (top 5%)", "Normal (bottom 5%)", "All runs"],
+        index=0,
         key="influence_subset",
     )
     st.sidebar.slider(
         "Top-K features",
         min_value=4,
         max_value=15,
+        value=10,
         step=1,
         key="influence_topk",
     )
@@ -326,20 +417,27 @@ def render_sidebar_controls(...):
         "Edge threshold (|corr|)",
         min_value=0.10,
         max_value=0.90,
+        value=0.40,
         step=0.05,
         key="influence_edge_thresh",
     )
     st.sidebar.selectbox(
         "Correlation method",
         ["pearson", "spearman"],
+        index=0,
         key="influence_corr_method",
     )
     st.sidebar.checkbox(
         "Show Anomaly Influence Network",
+        value=True,
         key="show_influence_network",
     )
 
-    # ... return whatever you currently return (selected dataset idx, show_all, etc.) ...
+    # ---------------- Return values for main ----------------
+    return {
+        "selected_idx": selected_idx,
+        "show_all": show_all,
+    }
 
 
 

@@ -1,5 +1,7 @@
 F-35 anomaly detection
-from plotly.subplots import make_subplots  # add near your imports at the top
+
+
+from plotly.subplots import make_subplots  # ensure this is imported near your other imports
 
 
 def fr_feature_plot(
@@ -12,13 +14,16 @@ def fr_feature_plot(
 
     - 2D mode:
         * If 1 feature:
-            - Bar chart of average FR by binned (numeric) or categorical values.
+            - Bar chart of average FR by *raw* feature value
+              (no binning; numeric values are used directly).
         * If 2 features:
             - Two side-by-side bar charts (one per feature).
     - 3D mode:
         * Requires exactly 2 features.
         * 3D scatter: x = feature1, y = feature2, z = FR (per run),
           colored by FR.
+        * Categorical features are encoded as integers for plotting,
+          but axes are labeled with the original category values.
     """
     fig = go.Figure()
 
@@ -66,16 +71,29 @@ def fr_feature_plot(
         s1 = df[f1]
         s2 = df[f2]
 
-        # Encode categoricals as codes so we can place them on axes
+        # --- Encode feature 1 (categorical -> codes, numeric stays numeric) ---
         if not is_numeric(s1):
-            s1_num = s1.astype("category").cat.codes.astype(float)
+            cat1 = s1.astype("category")
+            s1_num = cat1.cat.codes.astype(float)
+            cats1 = list(cat1.cat.categories)
+            tickvals_x = list(range(len(cats1)))
+            ticktext_x = [str(c) for c in cats1]
         else:
             s1_num = s1.astype(float)
+            tickvals_x = None
+            ticktext_x = None
 
+        # --- Encode feature 2 ---
         if not is_numeric(s2):
-            s2_num = s2.astype("category").cat.codes.astype(float)
+            cat2 = s2.astype("category")
+            s2_num = cat2.cat.codes.astype(float)
+            cats2 = list(cat2.cat.categories)
+            tickvals_y = list(range(len(cats2)))
+            ticktext_y = [str(c) for c in cats2]
         else:
             s2_num = s2.astype(float)
+            tickvals_y = None
+            ticktext_y = None
 
         hovertext = [
             f"Test Run ID: {trid}<br>{f1}: {v1}<br>{f2}: {v2}<br>FR: {fr:.3f}"
@@ -103,48 +121,64 @@ def fr_feature_plot(
                 hoverinfo="text",
             )
         )
+
+        # Configure axes so ticks show the original feature values
+        scene_cfg = dict(
+            xaxis_title=f1,
+            yaxis_title=f2,
+            zaxis_title="FR",
+        )
+
+        if tickvals_x is not None:
+            scene_cfg["xaxis"] = dict(
+                title=f1,
+                tickmode="array",
+                tickvals=tickvals_x,
+                ticktext=ticktext_x,
+            )
+        if tickvals_y is not None:
+            scene_cfg["yaxis"] = dict(
+                title=f2,
+                tickmode="array",
+                tickvals=tickvals_y,
+                ticktext=ticktext_y,
+            )
+
         fig.update_layout(
             title=f"FR vs {f1} and {f2} (3D)",
-            scene=dict(
-                xaxis_title=f1,
-                yaxis_title=f2,
-                zaxis_title="FR",
-            ),
+            scene=scene_cfg,
             height=600,
             margin=dict(l=10, r=10, t=40, b=10),
         )
         return fig
 
     # ------------------------ 2D MODE ------------------------
-    # Helper for a single feature: average FR by bin/category
+    # Helper for a single feature: average FR by *raw* value (no binning)
     def avg_fr_by_feature(feature: str) -> tuple[list[str], np.ndarray]:
         s = df[feature]
+
+        # Average FR per raw value
+        grouped = df.groupby(feature)["FR"].mean()
+
+        # For numeric, sort by numeric order; for categorical, keep label order
         if is_numeric(s):
             try:
-                # Bin into up to 10 quantile bins
-                q = pd.qcut(
-                    s.rank(method="first"),
-                    10,
-                    duplicates="drop",
-                )
-                grouped = df.assign(_bin=q).groupby("_bin")["FR"].mean()
-                x_labels = [str(idx) for idx in grouped.index]
-                y_vals = grouped.values
+                grouped = grouped.sort_index()
             except Exception:
-                # Fallback: treat raw values (may be messy)
-                grouped = df.groupby(feature)["FR"].mean()
-                x_labels = [str(idx) for idx in grouped.index]
-                y_vals = grouped.values
+                # In case index is mixed or not sortable, just leave as-is
+                pass
         else:
-            grouped = df.groupby(feature)["FR"].mean()
-            # Show top 15 by frequency / mean FR
-            counts = df[feature].value_counts()
-            top_vals = counts.index[:15]
-            grouped = grouped.loc[grouped.index.intersection(top_vals)]
-            grouped = grouped.sort_values(ascending=False)
-            x_labels = [str(idx) for idx in grouped.index]
-            y_vals = grouped.values
+            # Optional: you can sort by FR descending or by frequency; here we keep as-is
+            pass
 
+        # Safety: if there are *too many* unique values, limit to a subset
+        # to keep plots readable (e.g., first 50 after sorting)
+        max_categories = 50
+        if len(grouped) > max_categories:
+            grouped = grouped.iloc[:max_categories]
+
+        x_labels = [str(idx) for idx in grouped.index]
+        y_vals = grouped.values
         return x_labels, y_vals
 
     # 2D, 1 feature
@@ -161,7 +195,7 @@ def fr_feature_plot(
         x, y = avg_fr_by_feature(f)
         fig.add_trace(go.Bar(x=x, y=y))
         fig.update_layout(
-            title=f"Average FR by {f}",
+            title=f"Average FR by {f} (raw values)",
             xaxis_title=f,
             yaxis_title="Average FR",
             height=400,
@@ -197,7 +231,7 @@ def fr_feature_plot(
     fig.update_yaxes(title_text="Average FR", row=1, col=2)
 
     fig.update_layout(
-        title="Average FR by selected features",
+        title="Average FR by selected features (raw values)",
         showlegend=False,
         height=450,
         margin=dict(l=10, r=10, t=40, b=80),
@@ -207,231 +241,9 @@ def fr_feature_plot(
 
 
 
-
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-def _render_table_and_plot(
-    df: pd.DataFrame,
-    PCs: np.ndarray,
-    scores01: np.ndarray,
-    raw_scores: np.ndarray,
-    method_label: str,
-    key_prefix: str,
-    pca,                  # fitted PCA object (for loadings/arrows)
-    pca_arrow_features: list[str],  # user-selected PCA features for arrows
-):
-    """
-    Renders, for a given anomaly scoring method:
-
-      1) Top anomalies table with row selection
-      2) PCA scatter plot (3D) with optional highlight and PCA driver arrows
-      3) Secondary tab set:
-           - Storyboard:
-               * Feature-wise FR viewer (2D/3D)
-               * 'Why this run?' bar chart for selected run
-           - Anomaly Influence Network:
-               * Feature co-movement network among top-K features
-    """
-    df = df.copy()
-    df["anomaly_score"] = scores01
-    df["raw_anomaly_score"] = raw_scores
-
-    st.markdown(f"### {method_label}")
-
-    # -------------------------------------------------------------------------
-    # Top anomalies table & selection
-    # -------------------------------------------------------------------------
-    highlight_pos: int | None = None
-    show_top = st.session_state.get("show_top", 10)
-
-    if show_top > 0:
-        cols_keep = [
-            "Test_Run_ID",
-            "FR",
-            "Num_Tests",
-            "total_init_time",
-            "anomaly_score",
-            "raw_anomaly_score",
-            "Simulation_Host",
-            "Simulation_Node",
-            "Capability",
-            "Script_File",
-            "V",
-            "s_number",
-            "Build",
-        ]
-        cols_keep = [c for c in cols_keep if c in df.columns]
-
-        top = df.sort_values("anomaly_score", ascending=False).head(show_top)
-
-        st.markdown("**Top anomalies**")
-        editable = top[cols_keep].copy()
-        editable.insert(0, "Select", False)
-
-        edited = st.data_editor(
-            editable,
-            use_container_width=True,
-            num_rows="fixed",
-            disabled={c: True for c in editable.columns if c != "Select"},
-            key=f"{key_prefix}-table",
-        )
-
-        # Map selected row back to original df index
-        selected_original_idxs = edited.index[edited["Select"]].tolist()
-        if selected_original_idxs:
-            pos = df.index.get_indexer([selected_original_idxs[0]])
-            if len(pos) and pos[0] != -1:
-                highlight_pos = int(pos[0])
-
-    # -------------------------------------------------------------------------
-    # PCA plot (full width) with optional driver arrows
-    # -------------------------------------------------------------------------
-    label_choice = st.session_state.get("label_choice", "Failure Rate")
-
-    fig = plot_for_df(
-        df,
-        PCs,
-        label_choice=label_choice,
-        highlight_pos=highlight_pos,
-    )
-
-    show_biplot = st.session_state.get("show_biplot", True)
-    if show_biplot and PCs.shape[1] >= 2 and pca is not None:
-        from typing import cast
-        default_arrow_feats = cast(list[str], globals().get("PCA_FEATURES", []))
-        arrow_feats = st.session_state.get("pca_arrow_features", pca_arrow_features) or default_arrow_feats
-
-        show_global_pca_arrows = st.session_state.get("show_global_pca_arrows", True)
-        show_low_fr_arrows = st.session_state.get("show_low_fr_arrows", True)
-        show_high_fr_arrows = st.session_state.get("show_high_fr_arrows", True)
-
-        # Global arrows from origin
-        if show_global_pca_arrows:
-            try:
-                add_pca_loadings_3d(fig, pca, arrow_feats, scale=2.0)
-            except Exception:
-                pass
-
-        # Segment-anchored arrows near Low-FR and High-FR bands
-        try:
-            seg = make_fr_segments(df)  # "Low FR" / "High FR"
-
-            if seg is not None:
-                if show_low_fr_arrows:
-                    low_mask = (seg == "Low FR").values
-                    if np.any(low_mask):
-                        low_anchor = PCs[low_mask].mean(axis=0)
-                        add_biplot_arrows_at_anchor_3d(
-                            fig,
-                            pca,
-                            arrow_feats,
-                            low_anchor,
-                            scale=1.2,
-                            color="green",
-                            name_prefix="Low FR ",
-                            showlegend=False,
-                        )
-
-                if show_high_fr_arrows:
-                    high_mask = (seg == "High FR").values
-                    if np.any(high_mask):
-                        high_anchor = PCs[high_mask].mean(axis=0)
-                        add_biplot_arrows_at_anchor_3d(
-                            fig,
-                            pca,
-                            arrow_feats,
-                            high_anchor,
-                            scale=1.2,
-                            color="red",
-                            name_prefix="High FR ",
-                            showlegend=False,
-                        )
-        except Exception:
-            pass
-
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}-plot")
-
-    # -------------------------------------------------------------------------
-    # Secondary tabs: Storyboard | Anomaly Influence Network
-    # -------------------------------------------------------------------------
-    sub_story, sub_net = st.tabs(["Storyboard", "Anomaly Influence Network"])
-
-    # --- Storyboard tab ------------------------------------------------------
-    with sub_story:
-        st.session_state["active_secondary"] = "Storyboard"
-
-        show_segment_compare = st.session_state.get("show_segment_compare", True)
-        show_selection_why = st.session_state.get("show_selection_why", True)
-
-        # ---------- NEW Segment Comparison: Feature-wise FR viewer ----------
-        if show_segment_compare:
-            st.markdown("#### Feature-wise Failure Rate (FR) Viewer")
-
-            # Limit feature choices to those in FEATURES_FOR_ANALYSIS and in df
-            available_feats = [
-                f for f in globals().get("FEATURES_FOR_ANALYSIS", [])
-                if f in df.columns
-            ]
-            st.caption("Select up to 2 features to see how they relate to FR.")
-
-            selected_features = st.multiselect(
-                "Features",
-                options=available_feats,
-                default=available_feats[:1] if available_feats else [],
-                max_selections=2,
-                key=f"{key_prefix}-frfeat-select",
-            )
-
-            dim_choice = st.radio(
-                "Plot dimension",
-                options=["2D", "3D"],
-                index=0,
-                horizontal=True,
-                key=f"{key_prefix}-frfeat-dim",
-            )
-
-            seg_fig = fr_feature_plot(
-                df=df,
-                selected_features=selected_features,
-                mode=dim_choice,
-            )
-            st.plotly_chart(seg_fig, use_container_width=True, key=f"{key_prefix}-segplot")
-
-        # Per-selection “Why this run?”
-        if show_selection_why and highlight_pos is not None:
-            st.markdown("#### Why this run?")
-            st.plotly_chart(
-                per_point_contribution_bar(df, highlight_pos),
-                use_container_width=True,
-                key=f"{key_prefix}-whybar",
-            )
-
-    # --- Anomaly Influence Network tab --------------------------------------
-    with sub_net:
-        st.session_state["active_secondary"] = "Anomaly Influence Network"
-
-        show_influence_network = st.session_state.get("show_influence_network", True)
-        if show_influence_network:
-            subset = st.session_state.get("influence_subset", "Anomalous (top 5%)")
-            top_k = st.session_state.get("influence_topk", 10)
-            edge_thresh = st.session_state.get("influence_edge_thresh", 0.40)
-            corr_method = st.session_state.get("influence_corr_method", "pearson")
-
-            net_fig = anomaly_influence_network_figure(
-                df,
-                scores01,
-                subset=subset,
-                q=0.95,
-                top_k=top_k,
-                edge_thresh=edge_thresh,
-                corr_method=corr_method,
-            )
-            st.plotly_chart(
-                net_fig,
-                use_container_width=True,
-                key=f"{key_prefix}-influence",
-            )
 
 
 =========================================================================================================================================================================

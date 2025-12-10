@@ -10,6 +10,7 @@ def fr_feature_plot(
     df: pd.DataFrame,
     selected_features: list[str],
     mode: str = "2D",
+    top_n: int = 10,
 ) -> go.Figure:
     """
     Visualize Failure Rate (FR) as a function of up to 2 features.
@@ -18,7 +19,7 @@ def fr_feature_plot(
         * If 1 feature:
             - Bar chart of average FR by raw feature value.
               Values are treated as categories -> equal spacing on the x-axis.
-              Only top-10 values (by highest average FR) are shown.
+              Only top-N values (by highest average FR) are shown.
         * If 2 features:
             - Two side-by-side bar charts (one per feature), same rules.
     - 3D mode:
@@ -27,6 +28,11 @@ def fr_feature_plot(
           colored by FR.
         * Categorical features are encoded as integers for plotting, but axes
           are labeled with the original category values.
+
+    Parameters
+    ----------
+    top_n : int
+        Number of top values (by highest average FR) to display per feature in 2D mode.
     """
     fig = go.Figure()
 
@@ -157,15 +163,15 @@ def fr_feature_plot(
 
     # ------------------------ 2D MODE ------------------------
     # Helper for a single feature: average FR by *raw* value, equal spacing,
-    # and only top-10 values (by highest average FR).
+    # and only top-N values (by highest average FR).
     def avg_fr_by_feature(feature: str) -> tuple[np.ndarray, list[str], np.ndarray]:
         s = df[feature]
 
         # Average FR per raw value
         grouped = df.groupby(feature)["FR"].mean()
 
-        # Sort by FR descending: top-10 values that are most failure-prone
-        grouped_sorted = grouped.sort_values(ascending=False).head(10)
+        # Sort by FR descending: top-N values that are most failure-prone
+        grouped_sorted = grouped.sort_values(ascending=False).head(top_n)
 
         labels = [str(idx) for idx in grouped_sorted.index]  # raw values as strings
         y_vals = grouped_sorted.values
@@ -190,7 +196,7 @@ def fr_feature_plot(
         fig.add_trace(go.Bar(x=x_vals, y=y))
 
         fig.update_layout(
-            title=f"Average FR by top-10 {f} values (raw)",
+            title=f"Average FR by top-{top_n} {f} values (raw)",
             xaxis=dict(
                 title=f,
                 tickmode="array",
@@ -220,7 +226,10 @@ def fr_feature_plot(
     fig = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=[f"Average FR by top-10 {f1}", f"Average FR by top-10 {f2}"],
+        subplot_titles=[
+            f"Average FR by top-{top_n} {f1}",
+            f"Average FR by top-{top_n} {f2}",
+        ],
     )
 
     fig.add_trace(go.Bar(x=x1_vals, y=y1, name=f1), row=1, col=1)
@@ -249,12 +258,13 @@ def fr_feature_plot(
     fig.update_yaxes(title_text="Average FR", row=1, col=2)
 
     fig.update_layout(
-        title="Average FR by selected features (top-10 values, raw labels)",
+        title="Average FR by selected features (top-N values, raw labels)",
         showlegend=False,
         height=450,
         margin=dict(l=10, r=10, t=40, b=80),
     )
     return fig
+
 
 
 

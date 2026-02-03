@@ -1,112 +1,33 @@
-import streamlit as st
-import plotly.graph_objects as go
-import pandas as pd
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-import numpy as np
+Epic 1: Build & Package Modernization
+Objective: Transform the automation toolset into a single, version-controlled deployable artifact.
 
-st.set_page_config(layout="wide")
-st.title("Anomaly Detection Dashboard")
+User Story 1.1: Containerize the automation toolset using Docker to ensure environment consistency across local and server deployments.
 
-# DATA_PATH = "data/DART_VMFF.xlsx"
-DATA_PATH = "data/VMFF/DART Report/20250603_40S02.04_R2_SysTest_t_VMFF_Tx_CAS_Req_PP_CAS_MS3.csv"
-# df = pd.read_excel(DATA_PATH)
-df = pd.read_csv(DATA_PATH)
+User Story 1.2: Implement a semantic versioning schema that is automatically injected into the build metadata and the user interface.
 
+User Story 1.3: Configure a CI/CD pipeline that triggers on main-branch merges to automate the creation of the production-ready artifact.
 
-columns = {
-    "te_id": "Test_Run_ID",
-    "script_file_name": "Script_File",
-    "passes": "P",
-    "fails": "F",
-    "blocks": "B",
-    "unattempts": "U",
-    "test_venue": "Venue",
-    " capability": "Capability",
-    "simulation_host": "Simulation_Host",
-    " build": "Build"
-}
+Epic 2: Automated Server Deployment
+Objective: Meet the requirement for an unattended deployment that completes in under 15 minutes with a rapid boot-up.
 
-df = df.rename(columns=columns)
-df = df.dropna(subset=["Simulation_Host"])
-print(df.columns)
+User Story 2.1: Develop configuration management scripts (e.g., Ansible or Terraform) to provision the server and install all necessary dependencies without manual intervention.
 
-df['Simulation_Node'] = df['Simulation_Host'].apply(lambda x: x.split("-")[0])
+User Story 2.2: Optimize the application startup sequence to ensure the UI and API endpoints reach a "Ready" state within 30 seconds of server initialization.
 
-data = df[["P", "F", "B", "U", "total_init_time"]]
+User Story 2.3: Establish a health check endpoint to provide real-time verification of the tool's operational status post-deployment.
 
-data['FR'] = np.where(
-    (data['P'] + data['F'] + data['B'] + data['U']) != 0,
-    data['F'] / (data['P'] + data['F'] + data['B'] + data['U']),
-    1
-)
+Epic 3: Unified Reporting Module
+Objective: Consolidate the export-report functionality to generate multi-format, metadata-rich artifacts.
 
-data["Num_Tests"] = (data['P'] + data['F'] + data['B'] + data['U'])
-df['FR'] = data["FR"]
-df['Num_Tests'] = data["Num_Tests"]
+User Story 3.1: Update the report engine to generate a unified PDF that summarizes high-level Pass/Fail metrics.
 
+User Story 3.2: Enable on-demand CSV exports of raw data to support secondary analysis and data processing.
 
-scaler = StandardScaler()
-scaled_data = scaler.fit_transform(data)
+User Story 3.3: Integrate mandatory metadata into all exported reports, specifically the version tag and the precise execution timestamp.
 
-pca = PCA(n_components=3)
-principal_components = pca.fit_transform(scaled_data)
+Epic 4: Centralized Logging & Observability
+Objective: Ensure all system logs are persistent, searchable, and structured.
 
+User Story 4.1: Redirect all application logs to a designated persistent storage path on the server to prevent data loss during reboots.
 
-continuous_labels = ["FR", "Num_Tests", "total_init_time"]
-label_dict = {
-    "Failure Rate": "FR",
-    "Total Tests": "Num_Tests",
-    "Total Time": "total_init_time",
-    "Simulation Host": "Simulation_Host", 
-    "Simulation Node": "Simulation_Node",
-    "Capability": "Capability",
-    "Script File": "Script_File",
-    "Venue": "Venue",
-    "Ship Number": "ship_number",
-    "Build": "Build",
-}
-label_options = ["Simulation_Host", "Simulation_Node", "Capability", "Script_File", "Venue", "Failure Rate"]
-selected_label_name = st.selectbox("Select label", label_dict.keys(), width=500)
-selected_label = label_dict[selected_label_name]
-
-mean = np.mean(principal_components, axis=0)
-std_dev = np.std(principal_components, axis=0)
-
-df["ship_number"] = df["ship_number"].astype(str)
-
-if selected_label in continuous_labels:
-    fig = go.Figure()
-
-    label_data = principal_components
-    hovertext = df[['Test_Run_ID', 'FR', "Num_Tests", "total_init_time"]].values.tolist()
-    anomaly_scores = np.linalg.norm(label_data - mean, axis=1) / std_dev.max()
-    hovertext = [f"Test Run ID: {x[0]},\nFailure Rate: {x[1]:.2f},\nTotal Tests: {x[2]},\n Total Time {x[3]},\nAnomaly Score: {anomaly_score:.2f}" for x, anomaly_score in zip(hovertext, anomaly_scores)]
-    value_rates = df[selected_label].values
-    if selected_label == "FR":
-        marker = dict(color=value_rates, cmin=0, cmax=1, colorscale=[[0, 'green'], [1, 'red']])
-    else:
-        max_failure_rate = max(value_rates)
-        value_rates = np.sqrt(value_rates / max_failure_rate)
-        marker = dict(color=value_rates, cmin=0, cmax=1, colorscale=[[0, 'blue'], [1, 'red']])
-    fig.add_trace(go.Scatter3d(x=label_data[:, 0], y=label_data[:, 1], z=label_data[:, 2], mode='markers', hovertext=hovertext, hoverinfo='text', marker=marker))
-
-else:
-    unique_labels = df[selected_label].unique()
-
-    fig = go.Figure()
-
-    for label in unique_labels:
-        label_data = principal_components[df[selected_label] == label]
-        hovertext = df.loc[df[selected_label] == label, ['Test_Run_ID', "FR", "Num_Tests", selected_label]].values.tolist()
-        anomaly_scores = np.linalg.norm(label_data - mean, axis=1) / std_dev.max()
-        hovertext = [f"Test Run ID: {x[0]},\nFailure Rate: {x[1]:.2f},\nTotal Tests: {x[2]},\n{selected_label}: {x[3]},\nAnomaly Score: {anomaly_score:.2f}" for x, anomaly_score in zip(hovertext, anomaly_scores)]
-        fig.add_trace(go.Scatter3d(x=label_data[:, 0], y=label_data[:, 1], z=label_data[:, 2], mode='markers', name=label, hovertext=hovertext, hoverinfo='text', legendwidth=200))
-fig.update_layout(scene = dict(
-                    xaxis_title='x',
-                    yaxis_title='y',
-                    zaxis_title='z'),
-                    width=1600,
-                    height=800)
-
-st.plotly_chart(fig, use_container_width=True)
+User Story 4.2: Implement a log indexing or search utility to allow for efficient querying by timestamp, severity level, or error code.

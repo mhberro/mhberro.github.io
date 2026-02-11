@@ -1,33 +1,13 @@
-Epic 1: Build & Package Modernization
-Objective: Transform the automation toolset into a single, version-controlled deployable artifact.
-
-User Story 1.1: Containerize the automation toolset using Docker to ensure environment consistency across local and server deployments.
-
-User Story 1.2: Implement a semantic versioning schema that is automatically injected into the build metadata and the user interface.
-
-User Story 1.3: Configure a CI/CD pipeline that triggers on main-branch merges to automate the creation of the production-ready artifact.
-
-Epic 2: Automated Server Deployment
-Objective: Meet the requirement for an unattended deployment that completes in under 15 minutes with a rapid boot-up.
-
-User Story 2.1: Develop configuration management scripts (e.g., Ansible or Terraform) to provision the server and install all necessary dependencies without manual intervention.
-
-User Story 2.2: Optimize the application startup sequence to ensure the UI and API endpoints reach a "Ready" state within 30 seconds of server initialization.
-
-User Story 2.3: Establish a health check endpoint to provide real-time verification of the tool's operational status post-deployment.
-
-Epic 3: Unified Reporting Module
-Objective: Consolidate the export-report functionality to generate multi-format, metadata-rich artifacts.
-
-User Story 3.1: Update the report engine to generate a unified PDF that summarizes high-level Pass/Fail metrics.
-
-User Story 3.2: Enable on-demand CSV exports of raw data to support secondary analysis and data processing.
-
-User Story 3.3: Integrate mandatory metadata into all exported reports, specifically the version tag and the precise execution timestamp.
-
-Epic 4: Centralized Logging & Observability
-Objective: Ensure all system logs are persistent, searchable, and structured.
-
-User Story 4.1: Redirect all application logs to a designated persistent storage path on the server to prevent data loss during reboots.
-
-User Story 4.2: Implement a log indexing or search utility to allow for efficient querying by timestamp, severity level, or error code.
+AI/ML question: Is there a known issue training models if I have say one feature that a big number O(100k) and one feature that is tiny O(1e-6)?
+ 
+ 
+you typically want to avoid that
+ 
+and normalize your data
+ 
+This makes sense why my GRDTH frame is working when I use the scalar.
+ 
+Yeah, generally you want to normalize. Hypothetically I'd think a NN would detect and weight the variables to normalize it within the first step, but almost every NN lesson/study I've seen says to normalize first
+ 
+Zach is spot on. Normalization layers can help, but general rule of thumb is to normalize inputs since the larger magnitude values will be more influential through the forward pass (especially in full connected layers because everything is matrix multiplied together more or less and weights are usually initialized to small values between -1 and 1) than the lower magnitude values and therefor impact weight updates. So you might see that no matter what the values are for those O(1-6) they don't influence the model training
+ 

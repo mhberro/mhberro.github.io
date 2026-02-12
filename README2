@@ -1,50 +1,39 @@
-N.L. said:
-this is super helpful! yeah good point it would probably be better to go with 2
-i tested with 3rd and 2nd degree but my noise might not have been large enough to make it apparent
-both looked good
-but yeah small window, 2nd degree is probably better
-and good catch on t_window[3]! yes, it should be 2, thats a mistype
-i tested with 3rd and 2nd degree but my noise might not have been large enough to make it apparent
-I'd like to do a little trade study on this but i haven't had the time yet
-I've got some ideas on potential studies as well. We should maybe discuss that as a potential action item later this afternoon.
-also we're having an onnx issue. To integrate into the build, the platform wont accept any binary files. So we cant just drop in onnx models. Is there a good clean way of exporting and managing models that isn't binary like a .pt or .onnx
+The purpose of this document is to convey the proposition for establishing a correlation between the hostdaemon files (log files) to the Report.
+2.	Common Terms and Definitions
+The common terms and definitions used in this document are listed below. 
+Term	Definition
+Report:	Report that provides a concise view of executed batches. 
+Hostdaemon file	A log file that records every action within the simulation environment.
+Batch ID	A serialized number assigned to each automated script test execution.
 
-D. said: 
-I put the feature range check into tactical. Some of the ranges look not possible to me but at least the framework is there
-I haven't had a chance to implement anything in the build regarding smoothing. the platform looks like they will require our models in plaintext, so no binary at all. 
 
-N.L. said:
-do you mean we had like some crazy training paths? We could use a 3 sigma maybe 
+ 
+3.	Proposition
+The tool designated by the NBF AI Script Anomaly Detection team should be able to read hostdaemon files associated with a script execution and decide on the cause of recorded failures on the Report.
+3.1 Background
+The Report provides a concise summary of an executed set of automated scripts including the results and the simulation host that executed the script. Detailed information about the results is not presented in the Report and requires a manual review of the hostdaemon file (log file) of the associated batch.
+ 
+Figure 1-Overview of the Report for t.py
+The hostdaemon file records every action leading to the test execution, the test execution itself, and the conclusion of the test. The test environment is documented detailing what components of the test environment failed and the occurrence of the script failure.  
+When a failure is recorded in the Report, the tool should be able to read the associated hostdaemon file and provide exact details on the recorded failure. 
+In Figure 1, the highlighted batch is Batch ID 7. A review of the associated hostdaemon file details the test step where the failure occurred and an explanation of the recorded failure.
+ 
+Figure 2-Excerpt of hostdaemon file for Batch 7
+3.2 Execution
+The correlation yields opportunities to better improve the tool’s decision machine as to the cause of recorded script failures beyond what the Report provides.
+The execution of this proposition is the tool establishes a correlation between the Report and the associated hostdaemon files using Batch IDs. The tool then draws from the expanded information provided by the hostdaemon to elaborate the cause of the observed failures for each Batch ID. The tool would decide if any factors led to the recorded script failure and/or code errors within the script itself and whether the same failure was observed in previous batches.
+This information could be displayed on a table that filters down to the test point and presents that information alongside the test point as well.
 
-D. said:
-I am able to export it using into a json and then reload but there is still a raw data field of basically binary containing all of our weights and biases
- 
-N.L said:
-and theyre ok with that?
- 
-D. said:
-Like on the genre model the max values for some features look way higher than I would expect lol, would like to get T. to look at it too
-But probably not. I can convert that rawdata field in the json to like floats or something myself but its kind of a hacky solution
+Example: Concept of Correlation Information Display
+Batch ID: 7	
+Test Point: [-4]
+Description:	The Notification Text Window did NOT flash for 5 seconds and/or did NOT remained solid
+Cause:	Environment – Node MA0 Dead; Node MA1 Dead
 
-N.L. said:
-the json has the weights as actual numbers right?
- 
-D. said:
-nope
- 
-import onnx
-from google.protobuf import json_format
-def onnx_to_json(onnx_path, json_path):
-    # Load the ONNX model    
-    model = onnx.load(onnx_path)
-    # Convert the ONNX model to JSON    
-    model_json = json_format.MessageToJson(model)
-    # Write to file
-    with open(json_path, 'w') as f:
-        f.write(model_json)
-# Example usage
-onnx_to_json('model.onnx', 'model.json')
- 
-Thats what I am doing
-All of the weights and biases show as just a hex string representing some binary
- 
+
+3.3 Applications
+The correlation between the Report and the associated hostdaemon files yields potential features that can be included in the tool. 
+Simulation Host Health can be expanded down to the granular environment components and provide better diagnoses for abnormal performance.
+Another application is simulation execution forecasts where the expected simulation behavior can be forecasted prior to full automated testing, simulation health data is drawn and analyzed from the executed run, future forecasts are made based on the conclusion. This application is akin to weather forecasting where weather predictions are made, analyses are conducted after the event, and future forecasts are improved from the conclusions of prior forecasts.     
+4.	Conclusion
+The correlation between the Report and the associated hostdaemon files expands the Script Anomaly Detection tool to factor environmental issues that yield a failure during script execution. The conclusions made by the tool will be more accurate beyond using patterns to determine script failures.  

@@ -1,13 +1,142 @@
-AI/ML question: Is there a known issue training models if I have say one feature that a big number O(100k) and one feature that is tiny O(1e-6)?
+hey fellas
+ 
+what do we think of this initial cut at smoothing?
+ 
+well lol tried to put in in code view
+ 
+there we go
+ 
+hang in lemme fix something
  
  
-you typically want to avoid that
+def smooth_window(y_window, t_window, degree=3):
+    """
+    y_window: shape(5,)
+    t_window: shape(5,)
+    Returns: shape(5,)
+    """
+    y_window = np.asarray(y_window)
+    t_window = np.asarray(t_window)
+    t0 = t_window[3]
+    dt = t_window - t0
+    coeffs = np.polyfit(dt, y_window, deg=degree)
+    y_smoothed = np.polyval(coeffs, dt)
+    return y_smoothed
  
-and normalize your data
+Its super simple but we could test it on a couple noised windows 
  
-This makes sense why my GRDTH frame is working when I use the scalar.
+dylan lemme ask navigator to convert this to c++
  
-Yeah, generally you want to normalize. Hypothetically I'd think a NN would detect and weight the variables to normalize it within the first step, but almost every NN lesson/study I've seen says to normalize first
+i tested it on some generic noised data i generate and it looked like it smoothed it well. It'll take a bit more work to test on individual samples unclass since we cut into windows after we convert from ecef to features
  
-Zach is spot on. Normalization layers can help, but general rule of thumb is to normalize inputs since the larger magnitude values will be more influential through the forward pass (especially in full connected layers because everything is matrix multiplied together more or less and weights are usually initialized to small values between -1 and 1) than the lower magnitude values and therefor impact weight updates. So you might see that no matter what the values are for those O(1-6) they don't influence the model training
+ 
+// smooth_window.cpp
+// ------------------------------------------------------------
+//  C++ version of the Python `smooth_window` function
+//  (requires Eigen – a header‑only linear‑algebra library)
+// ------------------------------------------------------------
+#include <iostream>
+#include <vector>
+#include <Eigen/Dense>
+// ------------------------------------------------------------------
+// Helper: fit a polynomial of given degree to (x, y) data points.
+// Returns a vector of coefficients [c0, c1, …, c_degree] such that
+//   p(x) = c0 + c1*x + … + c_degree*x^degree
+// ------------------------------------------------------------------
+std::vector<double> polyfit(const std::vector<double>& x,
+                            const std::vector<double>& y,
+                            int degree)
+{
+    const int N = static_cast<int>(x.size());
+    const int D = degree + 1;                    // number of coeffs
+    // Build the Vandermonde matrix A (size N × D)
+    Eigen::MatrixXd A(N, D);
+    for (int i = 0; i < N; ++i)
+    {
+        double xi = 1.0;
+        for (int j = 0; j < D; ++j)
+        {
+            A(i, j) = xi;       // x_i^j
+            xi *= x[i];
+        }
+    }
+    // Convert y to an Eigen vector
+    Eigen::VectorXd b = Eigen::Map<const Eigen::VectorXd>(y.data(), N);
+    // Solve the least‑squares problem A * coeffs ≈ b
+    Eigen::VectorXd coeffs = A.colPivHouseholderQr().solve(b);
+    // Copy result into std::vector
+    std::vector<double> result(D);
+    for (int i = 0; i < D; ++i)
+        result[i] = coeffs(i);
+    return result;
+}
+// ------------------------------------------------------------------
+// Evaluate a polynomial (given by coeffs) at points x.
+// coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + …
+// ------------------------------------------------------------------
+std::vector<double> polyval(const std::vector<double>& coeffs,
+                            const std::vector<double>& x)
+{
+    std::vector<double> y(x.size(), 0.0);
+    for (size_t i = 0; i < x.size(); ++i)
+    {
+        double xi = 1.0;
+        for (double c : coeffs)
+        {
+            y[i] += c * xi;
+            xi *= x[i];
+        }
+    }
+    return y;
+}
+// ------------------------------------------------------------
+// smooth_window – direct translation of the Python version
+// ------------------------------------------------------------
+std::vector<double> smooth_window(const std::vector<double>& y_window,
+                                  const std::vector<double>& t_window,
+                                  int degree = 3)
+{
+    if (y_window.size() != 5 || t_window.size() != 5)
+        throw std::runtime_error("Both input windows must have length 5.");
+    // Convert to double vectors (already done by the signature)
+    double t0 = t_window[3];                 // same index as Python (0‑based)
+    std::vector<double> dt(5);
+    for (size_t i = 0; i < 5; ++i)
+        dt[i] = t_window[i] - t0;
+    // Fit polynomial of requested degree
+    std::vector<double> coeffs = polyfit(dt, y_window, degree);
+    // Evaluate the fitted polynomial at the same dt values
+    std::vector<double> y_smoothed = polyval(coeffs, dt);
+    return y_smoothed;
+}
+// ------------------------------------------------------------
+// Example usage
+// ------------------------------------------------------------
+int main()
+{
+    std::vector<double> y = {1.2, 2.5, 3.1, 4.0, 5.3};
+    std::vector<double> t = {0.0, 1.0, 2.0, 3.0, 4.0};
+    try
+    {
+        std::vector<double> result = smooth_window(y, t, 3);
+        std::cout << "Smoothed values:\n";
+        for (double v : result)
+            std::cout << v << " ";
+        std::cout << '\n';
+    }
+    catch (const std::exception& ex)
+    {
+        std::cerr << "Error: " << ex.what() << '\n';
+        return 1;
+    }
+    return 0;
+}
+ 
+ 
+Netjes, Luke (US)
+// smooth_window.cpp// ------------------------------------------------------------//  C++ version of the Python `smooth_window` function//  (requires Eigen – a header‑only linear‑algebra library)// ------------------------------------------------------------#include <iostream>#include <vector>
+this is how navigator would transpose to C++. Do we have eigen?
+ 
+Netjes, Luke (US) added Bittner, Tyler J (US) to the chat and shared all chat history.
+
  

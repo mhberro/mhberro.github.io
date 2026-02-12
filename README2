@@ -1,142 +1,50 @@
-hey fellas
- 
-what do we think of this initial cut at smoothing?
- 
-well lol tried to put in in code view
- 
-there we go
- 
-hang in lemme fix something
- 
- 
-def smooth_window(y_window, t_window, degree=3):
-    """
-    y_window: shape(5,)
-    t_window: shape(5,)
-    Returns: shape(5,)
-    """
-    y_window = np.asarray(y_window)
-    t_window = np.asarray(t_window)
-    t0 = t_window[3]
-    dt = t_window - t0
-    coeffs = np.polyfit(dt, y_window, deg=degree)
-    y_smoothed = np.polyval(coeffs, dt)
-    return y_smoothed
- 
-Its super simple but we could test it on a couple noised windows 
- 
-dylan lemme ask navigator to convert this to c++
- 
-i tested it on some generic noised data i generate and it looked like it smoothed it well. It'll take a bit more work to test on individual samples unclass since we cut into windows after we convert from ecef to features
- 
- 
-// smooth_window.cpp
-// ------------------------------------------------------------
-//  C++ version of the Python `smooth_window` function
-//  (requires Eigen – a header‑only linear‑algebra library)
-// ------------------------------------------------------------
-#include <iostream>
-#include <vector>
-#include <Eigen/Dense>
-// ------------------------------------------------------------------
-// Helper: fit a polynomial of given degree to (x, y) data points.
-// Returns a vector of coefficients [c0, c1, …, c_degree] such that
-//   p(x) = c0 + c1*x + … + c_degree*x^degree
-// ------------------------------------------------------------------
-std::vector<double> polyfit(const std::vector<double>& x,
-                            const std::vector<double>& y,
-                            int degree)
-{
-    const int N = static_cast<int>(x.size());
-    const int D = degree + 1;                    // number of coeffs
-    // Build the Vandermonde matrix A (size N × D)
-    Eigen::MatrixXd A(N, D);
-    for (int i = 0; i < N; ++i)
-    {
-        double xi = 1.0;
-        for (int j = 0; j < D; ++j)
-        {
-            A(i, j) = xi;       // x_i^j
-            xi *= x[i];
-        }
-    }
-    // Convert y to an Eigen vector
-    Eigen::VectorXd b = Eigen::Map<const Eigen::VectorXd>(y.data(), N);
-    // Solve the least‑squares problem A * coeffs ≈ b
-    Eigen::VectorXd coeffs = A.colPivHouseholderQr().solve(b);
-    // Copy result into std::vector
-    std::vector<double> result(D);
-    for (int i = 0; i < D; ++i)
-        result[i] = coeffs(i);
-    return result;
-}
-// ------------------------------------------------------------------
-// Evaluate a polynomial (given by coeffs) at points x.
-// coeffs[0] + coeffs[1]*x + coeffs[2]*x^2 + …
-// ------------------------------------------------------------------
-std::vector<double> polyval(const std::vector<double>& coeffs,
-                            const std::vector<double>& x)
-{
-    std::vector<double> y(x.size(), 0.0);
-    for (size_t i = 0; i < x.size(); ++i)
-    {
-        double xi = 1.0;
-        for (double c : coeffs)
-        {
-            y[i] += c * xi;
-            xi *= x[i];
-        }
-    }
-    return y;
-}
-// ------------------------------------------------------------
-// smooth_window – direct translation of the Python version
-// ------------------------------------------------------------
-std::vector<double> smooth_window(const std::vector<double>& y_window,
-                                  const std::vector<double>& t_window,
-                                  int degree = 3)
-{
-    if (y_window.size() != 5 || t_window.size() != 5)
-        throw std::runtime_error("Both input windows must have length 5.");
-    // Convert to double vectors (already done by the signature)
-    double t0 = t_window[3];                 // same index as Python (0‑based)
-    std::vector<double> dt(5);
-    for (size_t i = 0; i < 5; ++i)
-        dt[i] = t_window[i] - t0;
-    // Fit polynomial of requested degree
-    std::vector<double> coeffs = polyfit(dt, y_window, degree);
-    // Evaluate the fitted polynomial at the same dt values
-    std::vector<double> y_smoothed = polyval(coeffs, dt);
-    return y_smoothed;
-}
-// ------------------------------------------------------------
-// Example usage
-// ------------------------------------------------------------
-int main()
-{
-    std::vector<double> y = {1.2, 2.5, 3.1, 4.0, 5.3};
-    std::vector<double> t = {0.0, 1.0, 2.0, 3.0, 4.0};
-    try
-    {
-        std::vector<double> result = smooth_window(y, t, 3);
-        std::cout << "Smoothed values:\n";
-        for (double v : result)
-            std::cout << v << " ";
-        std::cout << '\n';
-    }
-    catch (const std::exception& ex)
-    {
-        std::cerr << "Error: " << ex.what() << '\n';
-        return 1;
-    }
-    return 0;
-}
- 
- 
-Netjes, Luke (US)
-// smooth_window.cpp// ------------------------------------------------------------//  C++ version of the Python `smooth_window` function//  (requires Eigen – a header‑only linear‑algebra library)// ------------------------------------------------------------#include <iostream>#include <vector>
-this is how navigator would transpose to C++. Do we have eigen?
- 
-Netjes, Luke (US) added Bittner, Tyler J (US) to the chat and shared all chat history.
+N.L. said:
+this is super helpful! yeah good point it would probably be better to go with 2
+i tested with 3rd and 2nd degree but my noise might not have been large enough to make it apparent
+both looked good
+but yeah small window, 2nd degree is probably better
+and good catch on t_window[3]! yes, it should be 2, thats a mistype
+i tested with 3rd and 2nd degree but my noise might not have been large enough to make it apparent
+I'd like to do a little trade study on this but i haven't had the time yet
+I've got some ideas on potential studies as well. We should maybe discuss that as a potential action item later this afternoon.
+also we're having an onnx issue. To integrate into the build, the platform wont accept any binary files. So we cant just drop in onnx models. Is there a good clean way of exporting and managing models that isn't binary like a .pt or .onnx
 
+D. said: 
+I put the feature range check into tactical. Some of the ranges look not possible to me but at least the framework is there
+I haven't had a chance to implement anything in the build regarding smoothing. the platform looks like they will require our models in plaintext, so no binary at all. 
+
+N.L. said:
+do you mean we had like some crazy training paths? We could use a 3 sigma maybe 
+
+D. said:
+I am able to export it using into a json and then reload but there is still a raw data field of basically binary containing all of our weights and biases
+ 
+N.L said:
+and theyre ok with that?
+ 
+D. said:
+Like on the genre model the max values for some features look way higher than I would expect lol, would like to get T. to look at it too
+But probably not. I can convert that rawdata field in the json to like floats or something myself but its kind of a hacky solution
+
+N.L. said:
+the json has the weights as actual numbers right?
+ 
+D. said:
+nope
+ 
+import onnx
+from google.protobuf import json_format
+def onnx_to_json(onnx_path, json_path):
+    # Load the ONNX model    
+    model = onnx.load(onnx_path)
+    # Convert the ONNX model to JSON    
+    model_json = json_format.MessageToJson(model)
+    # Write to file
+    with open(json_path, 'w') as f:
+        f.write(model_json)
+# Example usage
+onnx_to_json('model.onnx', 'model.json')
+ 
+Thats what I am doing
+All of the weights and biases show as just a hex string representing some binary
  

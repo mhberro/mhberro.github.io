@@ -1,0 +1,28 @@
+## Algorithm Details
+
+[cite_start]The susceptibility training and inference pipeline follows a standard deep-learning lifecycle: **data loading → dataset splitting → feature extraction → model instantiation → iterative training → validation → checkpointing → inference**. [cite: 2]
+
+[cite_start]Each stage is implemented across the `lm_ai_susceptibility_modeling` package; hyperlinks point to the exact source locations within the repository. [cite: 3]
+
+---
+
+1.  [cite_start]**Data Ingestion & Parsing** – The pipeline supports batch processing via CSV or single-engagement analysis via JSON. [cite: 4] [cite_start]Raw string representations of lists (e.g., coordinates) are deserialized into native Python containers using literal evaluation. [cite: 6, 7]
+    * [cite_start]*Function:* [`_parse_list`](https://gitlab.us.com/cto-ai/dataset.py#L9) [cite: 8]
+
+2.  [cite_start]**Target Asset Identification** – Because multiple friendly assets may be present in a single engagement scenario, the system searches the asset name list to identify the specific index containing the substring “target”. [cite: 9]
+    * [cite_start]*Function:* [`ThreatAssetDataset._target_index`](https://gitlab.us.com/cto-ai/dataset.py#L69) [cite: 10]
+
+3.  [cite_start]**Kinematic Feature Assembly** – A fixed-length feature vector of 11 variables is constructed for each engagement. [cite: 11] [cite_start]This includes the threat's 3D location, heading, and speed, concatenated with the target asset's 3D location, heading, bearing, and speed. [cite: 11]
+    * *Function:* [`ThreatAssetDataset.__getitem__`](https://gitlab.us.com/cto-ai/dataset.py#L76)
+
+4.  **Stochastic Noise Injection** – During the dataset preparation phase, optional noise can be applied to the threat's positional coordinates to improve model robustness and prevent overfitting on exact coordinate values.
+    * *Function:* [`add_noise`](https://gitlab.us.com/cto-ai/dataset.py#L16)
+
+5.  **Binary Classifier Architecture** – The model is a multi-layer perceptron (MLP) consisting of two hidden layers with 256 neurons each and ReLU activation functions. The final layer produces a single logit representing the "HIT" vs "MISS" probability.
+    * *Class:* [`SimpleBinaryClassifier`](https://gitlab.us.com/cto-ai/model.py#L4)
+
+6.  **Iterative Optimization** – The training routine utilizes the Adam optimizer and Binary Cross-Entropy with Logits loss ($BCEWithLogitsLoss$). It tracks validation accuracy across epochs, preserving the "best" model state based on validation performance.
+    * *Function:* [`train_one_epoch`](https://gitlab.us.com/cto-ai/train.py#L15)
+
+7.  [cite_start]**Inference & Prediction** – During deployment, the saved checkpoint is loaded to process new data. [cite: 2] [cite_start]The output logit is passed through a sigmoid function to produce a probability $[0, 1]$; a decision threshold of $0.5$ is applied to determine the final "HIT" or "MISS" classification. [cite: 2]
+    * *Function:* [`predict`](https://gitlab.us.com/cto-ai/infer.py#L52)

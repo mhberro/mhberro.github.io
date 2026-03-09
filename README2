@@ -52,3 +52,448 @@ Finalize the choice between Docker CE and Podman.
 Get the "Containers" feature enabled on the server.
 
 Run the first test of the build.ps1 script on the actual host.
+
+==========================================================================================================
+
+train.py
+
+import argparse
+import pathlib
+import time
+
+import torch
+from torch.nn import BCEWithLogitsLoss
+from torch.optim import Adam
+from torch.utils.data import DataLoader
+
+from lm_ai_susceptibility_modeling.dataset import ThreatAssetDataset
+from lm_ai_susceptibility_modeling.model import SimpleBinaryClassifier
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    epoch_loss = 0.0
+    for feats, lbl in loader:
+        feats = feats.to(device)
+        lbl = lbl.to(device)
+
+        optimizer.zero_grad()
+        logits = model(feats)  # (B,1)
+        loss = criterion(logits, lbl)
+        loss.backward()
+        optimizer.step()
+
+        epoch_loss += loss.item() * feats.size(0)
+    return epoch_loss / len(loader.dataset)
+
+
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    epoch_loss = 0.0
+    correct = 0
+    with torch.no_grad():
+        for feats, lbl in loader:
+            feats = feats.to(device)
+            lbl = lbl.to(device)
+
+            logits = model(feats)
+            loss = criterion(logits, lbl)
+            epoch_loss += loss.item() * feats.size(0)
+
+            preds = torch.sigmoid(logits) >= 0.5
+            correct += (preds.float() == lbl).sum().item()
+    avg_loss = epoch_loss / len(loader.dataset)
+    acc = correct / len(loader.dataset)
+    return avg_loss, acc
+
+
+def main(args):
+    dataset = ThreatAssetDataset(str(args.data))
+    train_set, val_set = dataset.train_val_split(val_ratio=args.val_split)
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch,
+        shuffle=True,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SimpleBinaryClassifier(in_features=len(dataset.FEATURE_NAMES)).to(
+        device
+    )
+
+    criterion = BCEWithLogitsLoss()
+    optimizer = Adam(model.parameters(), lr=args.lr)
+
+    best_val_acc = 0.0
+    out_dir = pathlib.Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for epoch in range(1, args.epochs + 1):
+        start = time.time()
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, device
+        )
+        val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+        epoch_time = time.time() - start
+
+        print(
+            f"Epoch {epoch:02d} | "
+            f"train loss {train_loss:.4f} | "
+            f"val loss {val_loss:.4f} | val acc {val_acc:.4f} | "
+            f"time {epoch_time:.1f}s"
+        )
+
+        # simple checkpoint, keep the best validation accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            ckpt_path = out_dir / "best_model.pt"
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_acc": val_acc,
+                    "val_loss": val_loss,
+                    "feature_names": dataset.FEATURE_NAMES,
+                },
+                ckpt_path,
+            )
+            print(f"   >>> saved new best model to {ckpt_path}")
+
+    print(f"\nTraining finished – best val acc: {best_val_acc:.4f}")
+    print(f"Best model stored at: {out_dir / 'best_model.pt'}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Train a tiny threat‑vs‑asset binary classifier"
+    )
+    parser.add_argument(
+        "--data",
+        type=pathlib.Path,
+        required=True,
+        help="Path to the CSV containing the rows (e.g. data.csv)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=pathlib.Path,
+        default="outputs",
+        help="Directory where the best checkpoint will be saved",
+    )
+    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--batch", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--val-split",
+        type=float,
+        default=0.2,
+        help="Fraction of data used for validation",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=0, help="Number of DataLoader workers"
+    )
+    args = parser.parse_args()
+    main(args)
+
+==========================================================================================================
+model.py
+
+from torch import nn
+
+
+class SimpleBinaryClassifier(nn.Module):
+    """Very small fully‑connected network.
+    Input size = number of engineered features (default = 11)
+    Output: single logit → torch.nn.BCEWithLogitsLoss
+    """
+
+    def __init__(self, in_features: int = 11, hidden_dim: int = 256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_features, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1), 
+        )
+
+    def forward(self, x):
+        """x: Tensor of shape (batch, in_features)
+        returns: Tensor of shape (batch, 1) (logits)
+        """
+        return self.net(x)
+
+==========================================================================================================
+infer.py
+
+import argparse
+import json
+import pathlib
+
+import pandas as pd
+import torch
+
+from lm_ai_susceptibility_modeling.dataset import ThreatAssetDataset
+from lm_ai_susceptibility_modeling.model import SimpleBinaryClassifier
+
+
+def load_checkpoint(ckpt_path: pathlib.Path, device):
+    ckpt = torch.load(str(ckpt_path), map_location=device)
+    feature_names = ckpt["feature_names"]
+    model = SimpleBinaryClassifier(in_features=len(feature_names)).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    return model, feature_names
+
+
+def preprocess_row(row: pd.Series, feature_names):
+    threat_loc = ThreatAssetDataset._parse_list(row["threat_location"])
+    threat_heading = float(row["threat_heading_deg"])
+    threat_speed = float(row["threat_speed_mps"])
+    assets_name = ThreatAssetDataset._parse_list(row["assets_name"])
+    assets_loc = ThreatAssetDataset._parse_list(row["assets_location"])
+    assets_heading = ThreatAssetDataset._parse_list(row["assets_heading_deg"])
+    assets_bearing = ThreatAssetDataset._parse_list(row["assets_bearing_deg"])
+    assets_speed = ThreatAssetDataset._parse_list(row["assets_speed_mps"])
+
+    tgt_idx = ThreatAssetDataset._target_index(assets_name)
+
+    try:
+        asset_loc = assets_loc[tgt_idx]
+    except Exception:
+        asset_loc = [0.0, 0.0, 0.0]
+
+    asset_heading = float(assets_heading[tgt_idx]) if assets_heading else 0.0
+    asset_bearing = float(assets_bearing[tgt_idx]) if assets_bearing else 0.0
+    asset_speed = float(assets_speed[tgt_idx]) if assets_speed else 0.0
+
+    feature_vals = (
+        threat_loc
+        + [threat_heading, threat_speed]
+        + asset_loc
+        + [asset_heading, asset_bearing, asset_speed]
+    )
+    assert len(feature_vals) == len(feature_names)
+
+    return torch.tensor([feature_vals], dtype=torch.float32)  # shape (1, F)
+
+
+def predict(model, tensor, device):
+    with torch.no_grad():
+        logits = model(tensor.to(device))
+        prob = torch.sigmoid(logits).cpu().item()
+        pred = "HIT" if prob >= 0.5 else "MISS"
+    return prob, pred
+
+
+def main(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, feature_names = load_checkpoint(args.ckpt, device)
+
+    if args.input.suffix.lower() == ".csv":
+        df = pd.read_csv(str(args.input))
+        results = []
+        for idx, row in df.iterrows():
+            feats = preprocess_row(row, feature_names)
+            prob, pred = predict(model, feats, device)
+            results.append(
+                {
+                    "row_index": int(idx),
+                    "probability_hit": prob,
+                    "prediction": pred,
+                }
+            )
+        out = pd.DataFrame(results)
+        out.to_csv(str(args.output), index=False)
+        print(f"Saved predictions for {len(df)} rows → {args.output}")
+
+    else:
+        with open(args.input) as f:
+            data = json.load(f)
+        row = pd.Series(data)
+        feats = preprocess_row(row, feature_names)
+        prob, pred = predict(model, feats, device)
+        out = {"probability_hit": prob, "prediction": pred}
+        with open(args.output, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"Prediction saved to {args.output}")
+        print(out)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run inference with the saved model"
+    )
+    parser.add_argument(
+        "--ckpt",
+        type=pathlib.Path,
+        required=True,
+        help="Path to the checkpoint produced by train.py (best_model.pt)",
+    )
+    parser.add_argument(
+        "--input",
+        type=pathlib.Path,
+        required=True,
+        help="CSV with rows OR a JSON file containing ONE row",
+    )
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        required=True,
+        help="Where to write predictions (CSV for batch, JSON for single)",
+    )
+    args = parser.parse_args()
+    main(args)
+
+==========================================================================================================
+dataset.py
+
+import ast
+import random
+
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, random_split
+
+
+def _parse_list(col):
+    # if pd.isna(col):
+    #     return []
+    column_after = ast.literal_eval(col)
+    return column_after
+
+
+def add_noise(
+    values: list[float], noise_pct: float, *, seed: int | None = None
+) -> list[float]:
+    """Return a new list where each element has random noise applied.
+
+    Args
+    values
+        Original numeric values (e.g., threat locations).
+    noise_pct
+        Maximum noise magnitude expressed as a percentage of each value.
+        For example, 5.0 adds noise in the range [-5 %, +5 %] of the value.
+
+    Returns:
+        Values with noise applied.
+
+    """
+    if seed is not None:
+        random.seed(seed)
+
+    noisy = []
+    for v in values:
+        factor = 1 + random.uniform(-noise_pct, noise_pct) / 100.0
+        noisy.append(v * factor)
+    return noisy
+
+
+class ThreatAssetDataset(Dataset):
+    """Each row of the CSV yields:
+    - feature Tensor (float32) of shape (11,)
+    - label Tensor (float32) of shape (1,)
+    """
+
+    FEATURE_NAMES = [
+        "threat_loc_x",
+        "threat_loc_y",
+        "threat_loc_z",
+        "threat_heading_deg",
+        "threat_speed_mps",
+        "asset_loc_x",
+        "asset_loc_y",
+        "asset_loc_z",
+        "asset_heading_deg",
+        "asset_bearing_deg",
+        "asset_speed_mps",
+    ]
+
+    def __init__(self, csv_path: str):
+        self.df = pd.read_csv(csv_path)
+
+    def __len__(self):
+        return len(self.df)
+
+    @staticmethod
+    def _target_index(assets_name: list[str]) -> int:
+        for i, name in enumerate(assets_name):
+            if "target" in str(name).lower():
+                return i
+        return 0
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        row = self.df.iloc[idx]
+
+        threat_loc = _parse_list(row["threat_location"])  # [x,y,z]
+        threat_heading = float(row["threat_heading_deg"])
+        threat_heading = 0
+        threat_speed = float(row["threat_speed_mps"])
+        threat_loc = add_noise(threat_loc, 0)
+
+        assets_name = _parse_list(row["assets_name"])
+        assets_loc = _parse_list(
+            row["assets_location"]
+        )  # [[x,y,z], [x,y,z], ...]
+        assets_heading = _parse_list(row["assets_heading_deg"])
+        assets_bearing = _parse_list(row["assets_bearing_deg"])
+        assets_speed = _parse_list(row["assets_speed_mps"])
+
+        tgt_idx = self._target_index(assets_name)
+
+        try:
+            asset_loc = assets_loc[tgt_idx]  # [x,y,z]
+        except Exception:
+            raise Exception
+            asset_loc = [0.0, 0.0, 0.0]
+
+        asset_heading = (
+            float(assets_heading[tgt_idx]) if assets_heading else 0.0
+        )
+        asset_bearing = (
+            float(assets_bearing[tgt_idx]) if assets_bearing else 0.0
+        )
+        asset_speed = float(assets_speed[tgt_idx]) if assets_speed else 0.0
+
+        feature_vals = (
+            threat_loc
+            + [threat_heading, threat_speed]
+            + asset_loc
+            + [asset_heading, asset_bearing, asset_speed]
+        )  # length == 11
+
+        if len(feature_vals) != len(self.FEATURE_NAMES):
+            raise ValueError(
+                f"Feature length mismatch (got {len(feature_vals)}) "
+                f"expected {len(self.FEATURE_NAMES)}"
+            )
+
+        features = torch.tensor(feature_vals, dtype=torch.float32)
+
+        outcome_raw = str(row["outcome"]).strip().upper()
+        label = 1 if outcome_raw == "HIT" else 0.0
+        label = torch.tensor([label], dtype=torch.float32)
+
+        return features, label
+
+    def train_val_split(self, val_ratio: float = 0.2, seed: int = 42):
+        total = len(self)
+        val_len = int(total * val_ratio)
+        train_len = total - val_len
+        generator = torch.Generator().manual_seed(seed)
+        train_set, val_set = random_split(
+            self, [train_len, val_len], generator=generator
+        )
+        return train_set, val_set
+

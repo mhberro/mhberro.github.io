@@ -1,21 +1,12 @@
-# Role: Python Static Analysis Specialist
+# Roo: Stop Analyzing and Start Fixing
 
-# Task: Resolve all mypy errors in the current directory.
+The previous `uv run mypy .` command showed errors. I need you to move into the "Fix" phase now.
 
-# Rules of Engagement:
-1. **Zero Logic Changes:** Do NOT modify the runtime behavior, algorithms, or logic of the code. Your changes should only affect type hints, annotations, or imports.
-2. **Environment:** Always use `uv run mypy .` to check for errors. Do not use a global mypy installation.
-3. **Fix Strategy:**
-   - Prioritize adding proper type annotations (e.g., `-> None`, `list[int]`).
-   - Use `from typing import cast` if mypy cannot infer a type that you are certain of.
-   - Use `if TYPE_CHECKING:` blocks for complex circular dependencies.
-4. **The "Last Resort" Rule:** If a mypy error is caused by a third-party library without stubs or a complex dynamic pattern that cannot be typed, use a specific `# type: ignore[error-code]` comment. Do NOT use a blanket `# type: ignore`.
-5. **No Refactoring:** Do not rename variables or "clean up" code that is not directly causing a mypy error.
-6. **Verification Loop:** - Run `uv run mypy .` 
-   - Analyze the output.
-   - Apply fixes.
-   - Run `uv run mypy .` again to verify the fix.
-   - Repeat until the error count decreases or reaches zero.
+### Your Instructions:
+1. **Pick One:** Identify the first file in the mypy output that has the most errors.
+2. **Read:** Read the content of that specific file.
+3. **Execute:** Apply the necessary type-hinting fixes to resolve the errors for **only that file**.
+4. **Verify:** Run `uv run mypy [path_to_file]` to confirm those specific errors are gone.
+5. **Report:** Tell me which file you fixed and then ask for permission to move to the next file.
 
-# Current Task:
-Start by running `uv run mypy .` and provide a summary of the errors found before beginning the fixes.
+**Do not run a full scan again until you have fixed at least one file.** Start with the first file listed in the previous output now.

@@ -90,7 +90,57 @@ In 2026, I plan to bridge the gap between experimental AI research and the archi
 In 2026, I am looking to grow by pivoting into the development of autonomous systems—intelligent technologies capable of perceiving, reasoning, and acting independently in dynamic environments with minimal human intervention. Building on my current progress in EDA and model building, I want to transition into the end-to-end architecture of these self-operating systems. My goal is to move beyond standalone model performance and focus on how AI enables a platform to make real-time decisions under uncertainty. I look forward to collaborating cross-functionally to translate our latest research into mission-critical autonomous capabilities, ensuring our systems can navigate unpredictable scenarios with high reliability and performance.
 =========================================================================================================================================================================
 =========================================================================================================================================================================
+import pandas as pd
+from fpdf import FPDF
+from datetime import datetime
+import os
 
+VERSION = "1.0.0"
+
+class AnomalyReport(FPDF):
+    def header(self):
+        self.set_font("Arial", "B", 12)
+        self.cell(0, 10, f"Anomaly Detection Report - v{VERSION}", border=True, ln=1, align="C")
+        self.ln(5)
+
+def analyze_root_cause(log_path):
+    """Parses hostdaemon files to correlate failures."""
+    if not os.path.exists(log_path):
+        return "Unknown", "Log file missing"
+    
+    with open(log_path, 'r') as f:
+        logs = f.read()
+        if "Network unreachable" in logs or "Disk I/O error" in logs:
+            return "Environmental", "System/Network failure detected in hostdaemon."
+        elif "IndexError" in logs or "ValueError" in logs:
+            return "Script/Code Error", "Logic failure detected in application code."
+    return "Pass", "No critical failures detected."
+
+def generate_unified_report(data, status_summary, output_path):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    pdf = AnomalyReport()
+    pdf.add_page()
+    
+    # 1. High-Level Summary
+    pdf.set_font("Arial", "B", 14)
+    pdf.cell(0, 10, f"Status: {status_summary}", ln=1)
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 10, f"Execution Timestamp: {timestamp}", ln=1)
+    
+    # 2. Add Root Cause Correlation
+    category, detail = analyze_root_cause("C:/app/logs/hostdaemon.log")
+    pdf.set_font("Arial", "I", 10)
+    pdf.multi_cell(0, 10, f"Root Cause Analysis: [{category}] - {detail}")
+    
+    # Save PDF
+    pdf_filename = f"Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
+    pdf.output(os.path.join(output_path, pdf_filename))
+    
+    # 3. On-Demand CSV Export
+    csv_filename = f"RawData_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    data.to_csv(os.path.join(output_path, csv_filename), index=False)
+    
+    return pdf_filename, csv_filename
 
 
 =========================================================================================================================================================================

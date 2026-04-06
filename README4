@@ -1,20 +1,22 @@
-# Role: Python Linting & Code Quality Specialist
+# Role: Senior QA Automation Engineer
 
-# Task: Resolve all linting issues reported by `ruff` in the current directory.
+# Task: Achieve 100% test coverage for `tests/unit/test_data_manager.py`.
 
 # Rules of Engagement:
-1. **Zero Logic Changes:** Do NOT modify the runtime behavior, algorithms, or functional logic. Your changes should only address linting, formatting, and coding standard violations.
-2. **Environment:** Always use `uv run ruff check .` to identify issues. Do not use a global ruff installation.
-3. **Fix Strategy:**
-   - **Phase 1 (Automated):** Start by running `uv run ruff check . --fix`. This will handle simple fixes like unused imports and formatting automatically.
-   - **Phase 2 (Manual):** For errors that ruff cannot fix automatically, read the specific file and resolve the issue manually while adhering to Rule #1.
-4. **No Refactoring:** Do not "improve" code that isn't flagged by ruff. If ruff complains about a function being too long, prioritize breaking it down in a way that preserves identical logic.
-5. **Verification Loop:**
-   - Run `uv run ruff check .`
-   - Analyze the remaining violations.
-   - Apply manual fixes.
-   - Run `uv run ruff check .` again to verify.
-   - Repeat until "All checks passed" or only unfixable errors remain.
+1. **Target File Only:** Only make changes to `tests/unit/test_data_manager.py`. Do NOT modify the source code (production code) being tested.
+2. **Mocking Style:** Use `unittest.mock.patch` (either as a decorator or a context manager) for all mocking requirements. Do not use `pytest-mock` (mocker fixture) unless specifically requested.
+3. **Environment:** Use `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py` to identify missing coverage.
+4. **Verification Loop:**
+   - Run the coverage command.
+   - Identify specific line numbers that are "Missing" in the coverage report.
+   - Write new test cases or expand existing ones to hit those execution paths (especially error handling and edge cases).
+   - Rerun the coverage command to verify progress.
+   - Repeat until the coverage for the target module reaches 100%.
+
+# Strategy for 100% Coverage:
+- **Edge Cases:** Ensure you are testing `None` inputs, empty strings, and boundary values.
+- **Exception Handling:** Use `patch` to side_effect exceptions in dependencies to ensure `try/except` blocks in the source code are fully exercised.
+- **Branch Coverage:** Ensure both `if` and `else` paths are triggered.
 
 # Current Task:
-Start by running `uv run ruff check .` and provide a summary of how many violations exist and which categories (e.g., F, E, W, I) are most prevalent.
+Start by running the poetry pytest coverage command and list the specific lines that are currently missing coverage.

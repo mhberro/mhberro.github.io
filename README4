@@ -20,3 +20,22 @@
 
 # Current Task:
 Start by running the poetry pytest coverage command and list the specific lines that are currently missing coverage.
+
+=======================================================================================================================================
+
+# Roo: Stop Analyzing and Start Implementing Tests
+
+The coverage report has identified specific missing lines. You are now in "Implementation Mode." Do not run another full coverage report until you have added at least one new test case.
+
+### Your Iterative Workflow:
+1. **Identify the Gap:** Look at the most recent `term-missing` report. Pick the **first** set of missing line numbers.
+2. **Analyze the Source:** Read the source code file corresponding to those line numbers. Determine what logic (e.g., an `if` branch, an `except` block, or a specific edge case) is preventing those lines from executing.
+3. **Draft the Test:** - Use `unittest.mock.patch` to simulate the necessary conditions. 
+   - If the missing line is inside an `except` block, use `patch(...).side_effect = Exception("test")` to force that path.
+   - If it's a conditional branch, provide the specific input data or mock return value to trigger it.
+4. **Write to File:** Use your `write_to_file` or `replace_in_file` tool to append this new test to `tests/unit/test_data_manager.py`.
+5. **Verify:** Run `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py`.
+6. **Repeat:** Move to the next set of missing lines.
+
+### Critical Requirement:
+You must modify `tests/unit/test_data_manager.py` NOW. Start with the very first missing line reported in your last execution.

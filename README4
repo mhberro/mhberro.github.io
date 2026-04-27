@@ -39,3 +39,19 @@ The coverage report has identified specific missing lines. You are now in "Imple
 
 ### Critical Requirement:
 You must modify `tests/unit/test_data_manager.py` NOW. Start with the very first missing line reported in your last execution.
+
+================================================================================================================================================
+
+Resolved the volume mounting disconnect; artifacts (PDFs/CSVs) are now successfully persisting to the G: drive across container teardowns.
+
+The New Issue: File Access Locking & Resource Latency
+Now that the app is successfully pointing to the hostdaemon.log, we have encountered a common "Windows-ism": Concurrent Access Conflicts.
+
+The Problem:
+Because the hostdaemon on the Windows Server is frequently writing to the log file, the Streamlit app occasionally hits a PermissionError (Error 13). Windows is locking the file for writing, which prevents our Python regex engine from opening it for reading. Furthermore, as the log grows in size, performing a full regex sweep on every UI interaction is causing Streamlit to lag.
+
+Solutions in Development
+To keep the search utility responsive and "crash-proof," I am implementing the following logic:
+
+1. Non-Blocking Read (The "Shadow Copy" Method)
+Instead of opening the active log directly, the utility will now utilize a temporary buffer or the shutil.copy2 method. This allows us to read a "snapshot" of the log without triggering a file-lock conflict with the host daemon.

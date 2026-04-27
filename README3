@@ -1,80 +1,45 @@
 F-35 anomaly detection
 
-def add_pca_loadings_3d(
-    fig: go.Figure,
-    pca,
-    feature_names: list[str],
-    scale: float = 2.0,
-):
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import IsolationForest
+
+def run_analysis(input_df):
     """
-    Overlay PCA loading arrows (global biplot) for first 2–3 PCs.
-
-    feature_names must correspond to the numeric features used to fit the PCA.
+    Simulates the AI detection engine.
+    In your real app, 'input_df' would be the data loaded from the G: drive.
     """
-    loadings = getattr(pca, "components_", None)
-    if loadings is None:
-        return fig
-    loadings = loadings.T  # shape: (n_features, n_components)
-    k = min(3, loadings.shape[1])
-    if k < 2:
-        return fig
+    # 1. Feature Selection (Assuming numerical columns for analysis)
+    # Adjust 'features' to match the columns in your specific dataset
+    features = input_df.select_dtypes(include=[np.number]).columns
+    
+    # 2. Initialize the Isolation Forest Model
+    # contamination=0.05 means we expect ~5% anomalies
+    model = IsolationForest(contamination=0.05, random_state=42)
+    
+    # 3. Fit and Predict
+    # Result of -1 is an anomaly, 1 is normal
+    input_df['anomaly_label'] = model.fit_predict(input_df[features])
+    
+    # 4. Map to user-friendly labels and scores
+    # We convert -1 to True (Anomaly) and 1 to False (Normal)
+    input_df['is_anomaly'] = input_df['anomaly_label'].apply(lambda x: True if x == -1 else False)
+    
+    # Calculate a simple "Anomaly Score" for the report
+    input_df['score'] = model.decision_function(input_df[features])
+    
+    # --- THIS IS df_results ---
+    df_results = input_df.copy()
+    
+    # --- THIS IS has_anomalies ---
+    # We check if 'True' exists anywhere in the 'is_anomaly' column
+    has_anomalies = df_results['is_anomaly'].any()
+    
+    return df_results, has_anomalies
 
-    # Try to align by feature_names_in_ if available
-    base_names = list(getattr(pca, "feature_names_in_", []))
-    indices = []
-    labels = []
-    if base_names:
-        for fname in feature_names:
-            if fname in base_names:
-                i = base_names.index(fname)
-                if i < loadings.shape[0]:
-                    indices.append(i)
-                    labels.append(fname)
-    else:
-        # Fallback: assume same order as feature_names
-        for i, fname in enumerate(feature_names):
-            if i < loadings.shape[0]:
-                indices.append(i)
-                labels.append(fname)
-
-    for idx, fname in zip(indices, labels):
-        vec = loadings[idx, :k] * scale
-        if k >= 3:
-            x, y, z = [0, float(vec[0])], [0, float(vec[1])], [0, float(vec[2])]
-            fig.add_trace(
-                go.Scatter3d(
-                    x=x,
-                    y=y,
-                    z=z,
-                    mode="lines",
-                    line=dict(width=5),
-                    name=f"→ {fname}",
-                    showlegend=False,
-                )
-            )
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[x[-1]],
-                    y=[y[-1]],
-                    z=[z[-1]],
-                    mode="text",
-                    text=[fname],
-                    showlegend=False,
-                )
-            )
-        else:
-            x, y = [0, float(vec[0])], [0, float(vec[1])]
-            fig.add_trace(
-                go.Scatter(
-                    x=x,
-                    y=y,
-                    mode="lines+text",
-                    text=[None, fname],
-                    textposition="top center",
-                    showlegend=False,
-                )
-            )
-    return fig
+# Example Usage in your Streamlit App:
+# raw_data = pd.read_csv("G:/docker-storage/data/sensor_readings.csv")
+# df_results, has_anomalies = run_analysis(raw_data)
 
 
 

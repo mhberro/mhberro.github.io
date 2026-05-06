@@ -1,0 +1,126 @@
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".bzr",
+    ".direnv",
+    ".eggs",
+    ".git",
+    ".git-rewrite",
+    ".hg",
+    ".ipynb_checkpoints",
+    ".mypy_cache",
+    ".nox",
+    ".pants.d",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".svn",
+    ".tox",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "buck-out",
+    "build",
+    "dist",
+    "node_modules",
+    "site-packages",
+    "venv",
+]
+
+# Same as Black.
+indent-width = 4
+line-length = 88
+
+# TODO: (ANYONE!) Adjust this for the Python version used by your project.
+# Assume Python 3.12.
+target-version = "py313"
+
+[lint]
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+# Allow fix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+
+# Ignore specific errors codes during linting.
+# See https://docs.astral.sh/ruff/rules/ for a complete list
+ignore = [
+    # Always ignore COM812 and ISC001 to avoid conflicts with Ruff formatting.
+    "COM812",
+    "ISC001",
+    # Allow TODO comments that are linked to issues.
+    "FIX002",
+    "TD002",
+    # Add project specifics below as needed.
+]
+
+select = ["ALL"]
+
+unfixable = []
+
+[lint.isort]
+# Ensure that nothing else is imported from the same namespace as star imports.
+combine-as-imports = true
+
+# Enforce one aliased import (e.g. import A as B) per line in grouped imports.
+force-wrap-aliases = true
+
+# Group all imports prefixed with "lm_ai_" in the first-party section.
+known-first-party = ["lm_ai_*"]
+
+
+[lint.mccabe]
+# Cap cyclomatic complexity at 10:
+#   https://en.wikipedia.org/wiki/Cyclomatic_complexity
+max-complexity = 10
+
+[lint.per-file-ignores]
+# Ignore specific errors codes when linting tests.
+"tests/*" = [
+    "S101",   # Allow usage of the `assert` keyword in your test code.
+    "ANN201", # Missing return type annotation for public function
+    "D103",   # Do not require docstrings in unit test functions.
+    "E501",   # Test names are long.
+    "PLR0913", # Tests can have a lot of fixtures / parameterization.
+    # Add project specifics below as needed.
+    "FBT001",  # Bool args in tests are fine (usually parameterization).
+]
+
+[lint.pydocstyle]
+# Enforce Numpy-style docstrings:
+#   https://numpydoc.readthedocs.io/en/latest/format.html
+convention = "numpy"
+
+[lint.pylint]
+# Do not permit functions and methods to have more than 3 parameters
+# as per Clean Code recommendations
+max-args = 3
+
+[format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+# Enable auto-formatting of code examples in docstrings. Markdown,
+# reStructuredText code/literal blocks and doctests are all supported.
+#
+# This is currently disabled by default, but it is planned for this
+# to be opt-out in the future.
+docstring-code-format = false
+
+# Set the line length limit used when formatting code snippets in
+# docstrings.
+#
+# This only has an effect when the `docstring-code-format` setting is
+# enabled.
+docstring-code-line-length = "dynamic"

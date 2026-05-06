@@ -1,0 +1,86 @@
+# Copyright 2026 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
+
+# Project Metadata
+# ----------------
+
+[project]
+name = "distillery"
+dynamic = ["version"]
+description = "Summarize, destil wisdom, and extract key insights from youtube videos and playlists."
+readme = "README.md"
+license-files = ["LICEN[CS]E*"]
+authors = [{ name = "Lockheed Martin Corporation" }]
+requires-python = ">=3.12"
+dependencies = [
+    "cyclopts>=4.0.0",
+    "pydantic-ai>=1.84.1",
+    "pydantic-settings>=2.12.0",
+    "pydantic>=2.12.5",
+    "rich>=14.2.0",
+    "youtube-transcript-api>=1.2.4",
+]
+
+[dependency-groups]
+dev = [
+    "cyclonedx-bom>=7.0.0",
+    "deptry>=0.23.0",
+    "mypy>=1.17.0",
+    "pytest>=8.4.1",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=6.2.1",
+    "pytest-sugar>=1.1.1",
+    "ruff>=0.12.7",
+]
+docs = [
+    "mike>=2.1.3",
+    "mkdocs-callouts>=1.16.0",
+    "mkdocs-git-revision-date-localized-plugin>=1.4.7",
+    "mkdocs-macros-plugin>=1.3.7",
+    "mkdocs-material>=9.6.16",
+    "mkdocs-mermaid2-plugin>=1.2.1",
+    "mkdocstrings[python]>=0.30.0",
+]
+
+[build-system]
+requires = ["hatchling", "versioningit"]
+build-backend = "hatchling.build"
+
+# Dynamic Versioning
+# ------------------
+
+[tool.hatch.version]
+source = "versioningit"
+
+[tool.versioningit]
+[tool.versioningit.format]
+distance = "{base_version}+{distance}.{vcs}{rev}"
+# Example formatted version: 1.2.3+42.ge174a1f
+
+dirty = "{base_version}+{distance}.{vcs}{rev}.dirty"
+# Example formatted version: 1.2.3+42.ge174a1f.dirty
+
+distance-dirty = "{base_version}+{distance}.{vcs}{rev}.dirty"
+# Example formatted version: 1.2.3+42.ge174a1f.dirty
+
+[tool.versioningit.vcs]
+default-tag = "0.0.0"
+
+# CLI Entrypoint
+# --------------
+
+[project.scripts]
+distil = "distillery.main:app"
+
+# Package indexes
+# ---------------
+
+[[tool.uv.index]]
+name = "efoss"
+url = "https://nexus.global.lmco.com/repository/pypi-proxy/simple/"
+priority = "default"
+
+[[tool.uv.index]]
+name = "lm-innersource-global"
+url = "https://nexus.global.lmco.com/repository/lm-innersource/simple/"
+priority = "supplemental"

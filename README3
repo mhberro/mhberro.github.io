@@ -1,87 +1,96 @@
 F-35 anomaly detection
 
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import IsolationForest
+import logging
 
-def run_analysis(input_df):
+# Define the persistent path mapped to G:\docker-storage\logs
+LOG_DIR = "C:/app/logs"
+APP_LOG_FILE = os.path.join(LOG_DIR, "app_runtime.log")
+
+# Ensure the directory exists internally
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR)
+
+# Configure logging to write to the persistent volume
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(APP_LOG_FILE),
+        logging.StreamHandler() # Also outputs to Docker console
+    ]
+)
+
+logger = logging.getLogger("AnomalyApp")
+logger.info("Application initialized with persistent logging.")
+
+
+
+
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+
+def get_structured_logs(log_path):
     """
-    Simulates the AI detection engine.
-    In your real app, 'input_df' would be the data loaded from the G: drive.
+    Reads raw logs and converts them into a searchable DataFrame.
     """
-    # 1. Feature Selection (Assuming numerical columns for analysis)
-    # Adjust 'features' to match the columns in your specific dataset
-    features = input_df.select_dtypes(include=[np.number]).columns
+    if not os.path.exists(log_path):
+        return pd.DataFrame(columns=["Timestamp", "Level", "Message"])
     
-    # 2. Initialize the Isolation Forest Model
-    # contamination=0.05 means we expect ~5% anomalies
-    model = IsolationForest(contamination=0.05, random_state=42)
-    
-    # 3. Fit and Predict
-    # Result of -1 is an anomaly, 1 is normal
-    input_df['anomaly_label'] = model.fit_predict(input_df[features])
-    
-    # 4. Map to user-friendly labels and scores
-    # We convert -1 to True (Anomaly) and 1 to False (Normal)
-    input_df['is_anomaly'] = input_df['anomaly_label'].apply(lambda x: True if x == -1 else False)
-    
-    # Calculate a simple "Anomaly Score" for the report
-    input_df['score'] = model.decision_function(input_df[features])
-    
-    # --- THIS IS df_results ---
-    df_results = input_df.copy()
-    
-    # --- THIS IS has_anomalies ---
-    # We check if 'True' exists anywhere in the 'is_anomaly' column
-    has_anomalies = df_results['is_anomaly'].any()
-    
-    return df_results, has_anomalies
-
-# Example Usage in your Streamlit App:
-# raw_data = pd.read_csv("G:/docker-storage/data/sensor_readings.csv")
-# df_results, has_anomalies = run_analysis(raw_data)
-
-
-
-
+    log_data = []
+    with open(log_path, 'r') as f:
+        for line in f:
+            try:
+                # Basic parsing logic for common log formats
+                parts = line.split(" - ")
+                if len(parts) >= 3:
+                    log_data.append({
+                        "Timestamp": parts[0].strip(),
+                        "Level": parts[1].strip(),
+                        "Message": " - ".join(parts[2:]).strip()
+                    })
+            except Exception:
+                continue
+                
+    return pd.DataFrame(log_data)
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
+st.divider()
+st.header("Epic 4: Log Search & Observability")
 
+# Log Source Selection
+log_choice = st.radio("Select Log Source", ["Host Daemon", "App Runtime"], horizontal=True)
+target_path = "C:/app/logs/hostdaemon.log" if log_choice == "Host Daemon" else APP_LOG_FILE
 
+# Load and Filter Logs
+df_logs = get_structured_logs(target_path)
 
-In 2026, I plan to bridge the gap between experimental AI research and the architectural rigor required for mission-critical autonomous systems. I will continue advancing our core ML and computer vision algorithms, but with an increased focus on developing formal implementation requirements that ensure system-level reliability. By interfacing more deeply with the simulation and modeling teams, I aim to optimize our prototypes for deployment in complex, multi-domain environments. My goal is to evolve from an algorithm-specific expert into a lead who oversees how AI components integrate securely within larger mission systems. This includes applying the latest research in model robustness and explainability to meet the high standards of defense-grade autonomy. Ultimately, I want to drive development cycles that prioritize both high-end performance and the long-term safety of our autonomous platforms.
-In 2026, I am looking to grow by pivoting into the development of autonomous systems—intelligent technologies capable of perceiving, reasoning, and acting independently in dynamic environments with minimal human intervention. Building on my current progress in EDA and model building, I want to transition into the end-to-end architecture of these self-operating systems. My goal is to move beyond standalone model performance and focus on how AI enables a platform to make real-time decisions under uncertainty. I look forward to collaborating cross-functionally to translate our latest research into mission-critical autonomous capabilities, ensuring our systems can navigate unpredictable scenarios with high reliability and performance.
-=========================================================================================================================================================================
-=========================================================================================================================================================================
+if not df_logs.empty:
+    col1, col2 = st.columns([1, 3])
+    
+    with col1:
+        # Story 4.2: Filter by Severity
+        levels = ["ALL"] + sorted(df_logs["Level"].unique().tolist())
+        selected_level = st.selectbox("Severity Level", levels)
+        
+    with col2:
+        # Story 4.2: Efficient querying by keyword
+        search_query = st.text_input("Search Message (Regex supported)", "")
 
-import streamlit as st
+    # Apply Filters
+    filtered_logs = df_logs.copy()
+    if selected_level != "ALL":
+        filtered_logs = filtered_logs[filtered_logs["Level"] == selected_level]
+    
+    if search_query:
+        filtered_logs = filtered_logs[filtered_logs["Message"].str.contains(search_query, case=False, na=False)]
 
-# ... existing analysis logic that creates 'df_results' ...
-
-st.header("Step 4: Finalize & Export")
-
-# The Entry Point Trigger
-if st.button("Generate Unified Audit Report"):
-    with st.spinner("Correlating root causes and generating PDF..."):
-        try:
-            # 1. Define the output path (Mapped to G: drive via Docker)
-            report_dir = "C:/app/reports"
-            
-            # 2. Call the entry point function
-            pdf_file, csv_file = generate_unified_report(
-                data=df_results, 
-                status_summary="Anomaly Detected" if has_anomalies else "Clear",
-                output_path=report_dir
-            )
-            
-            # 3. UI Feedback
-            st.success(f"Reports successfully exported to G: drive!")
-            st.info(f"Files created: {pdf_file} and {csv_file}")
-            
-        except Exception as e:
-            st.error(f"Report Generation Failed: {str(e)}")
+    # Display the structured logs
+    st.dataframe(filtered_logs, use_container_width=True, hide_index=True)
+else:
+    st.info(f"No logs found in {target_path}")
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

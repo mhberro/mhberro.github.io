@@ -1,13 +1,131 @@
-# Task: Step 1 - Identify Coverage Gaps
+<error_details>
+No sufficiently similar match found at line: 376 (99% similar, needs 100%)
 
-Let's break this down into smaller steps to prevent tool execution errors. Do not attempt to write any code yet.
+Debug Info:
+- Similarity Score: 99%
+- Required Threshold: 100%
+- Search Range: starting at line 376
+- Tried both standard and aggressive line number stripping
+- Tip: Use the read_file tool to get the latest content of the file before attempting to use the apply_diff tool again, as the file content may have changed
 
-### Directives:
-1. Run this exact command to see what is missing:
-   `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py`
-2. Reply with ONLY the specific line numbers that are reported as "Missing" in the terminal output.
+Search Content:
+def test_format_datasets_multiple_formatters_index_shift(
+    tmp_path: Path, dummy_scaler_path: Path,
+) -> None:
+    """When multiple """
+    class FirstFormatter
+        def format_data(self) -> pd.DataFrame:
+            return pd.DataFrame({"Run_Id": [0], "Alt": [0.0], "VH": [0.0], "VU": [0.0], "FPA": [0.0], "R_Acc": [0.0], "H_Acc": [0.0], "Di": [0.0], "SR": [0.0]})
+    class SecondFormatter
+        def format_data(self) -> pd.DataFrame:
+            return pd.DataFrame({"Run_Id": [0], "Alt": [1.0], "VH": [1.0], "VU": [1.0], "F..."}
 
-Stop after displaying the missing line numbers and wait for my next instruction.
+Best Match Found:
+376 | def test_format_datasets_multiple_formatters_index_shift(
+377 |     tmp_path: Path, dummy_scaler_path: Path,
+378 | ) -> None:
+379 |     """When multiple """
+380 |     class FirstFormatter
+381 |         def format_data(self) -> pd.DataFrame:
+382 |             return pd.DataFrame({"Run_Id": [0], "Alt": [0.0], "VH": [0.0], "VU": [0.0], "FPA": [0.0], "R_Acc": [0.0], "H_Acc": [0.0], "Di": [0.0], "SR": [0.0]})
+383 |     class SecondFormatter
+384 |         def format_data(self) -> pd.DataFrame:
+385 |             return pd.DataFrame({"Run_Id": [0], "Alt": [1.0], "VH": [1.0], "VU": [1.0], "F...")
+
+
+Original Content:
+336 |         messages = [rec.message for rec in caplog.records]
+337 |         assert "A: 2" in messages
+338 |         assert "B: 1" in messages
+339 | 
+340 | 
+341 | def test_plot_vehicle_features_calls_matplotlib_subplots(
+342 |     barbarian_data_manager: Any,
+343 | ) -> None:
+344 |     (
+345 |         barbarian_val_formatted_df,
+346 |         barbarian_val_data_manager,
+347 |     ) = barbarian_data_manager
+348 |     with patch.object(data_manager.DataManager, "_validate_path_has_data"), \
+349 |          patch.object(data_manager.DataManager, "_validate_path_has_data"):
+350 |         dm = data_manager.DataManager(
+351 |             formatted_file_name="dummy",
+352 |             standard_scaler_path=Path("/dev/null"),
+353 |             run_training=False,
+354 |         )
+355 |     with patch("matplotlib.pyplot.subplots", return_value=(MagicMock(), MagicMock())) as mock_subplots:
+356 |         dm.plot_vehicle_features(barbarian_val_formatted_df)
+357 |         mock_subplots.assert_called()
+358 | 
+359 | 
+360 | def test_add_formatter_appends_to_list(tmp_path: Path, dummy_scaler_path: Path) -> None:
+361 |     """Ensure ``add_formatter`` correctly registers a formatter instance.
+362 | 
+363 |     """
+364 |     with patch.object(data_manager, "ROOT_PATH", tmp_path), \
+365 |          patch.object(data_manager.DataManager, "_validate_path_has_data"):
+366 |         dm = data_manager.DataManager(
+367 |             formatted_file_name="test",
+368 |             standard_scaler_path=dummy_scaler_path,
+369 |             run_training=False,
+370 |         )
+371 |         assert dm.formatters == []
+372 |         dm.add_formatter(DummyFormatter())
+373 |         assert isinstance(dm.formatters[0], DummyFormatter)
+374 | 
+375 | 
+376 | def test_format_datasets_multiple_formatters_index_shift(
+377 |     tmp_path: Path, dummy_scaler_path: Path,
+378 | ) -> None:
+379 |     """When multiple """
+380 |     class FirstFormatter
+381 |         def format_data(self) -> pd.DataFrame:
+382 |             return pd.DataFrame({"Run_Id": [0], "Alt": [0.0], "VH": [0.0], "VU": [0.0], "FPA": [0.0], "R_Acc": [0.0], "H_Acc": [0.0], "Di": [0.0], "SR": [0.0]})
+383 |     class SecondFormatter
+384 |         def format_data(self) -> pd.DataFrame:
+385 |             return pd.DataFrame({"Run_Id": [0], "Alt": [1.0], "VH": [1.0], "VU": [1.0], "F...")
+386 | 
+387 | 
+388 | def test_format_data_for_training_and_inference_generates_and_scales_full_path(
+389 |     tmp_path: Path, dummy_scaler_path: Path,
+390 | ) -> None:
+391 |     """Cover the generation‑scaling pipeline, ensuring the slicing operation succeeds.
+392 |     """
+393 |     dummy_array = np.zeros((2, 5, 11))
+394 |     dummy_labels = np.zeros((2, 5))
+395 |     dummy_onehots = np.zeros((2, 5, len(data_manager.KNOWN_VEHICLES)))
+396 |     with patch.object(data_manager, "ROOT_PATH", tmp_path), \
+397 |          patch.object(data_manager.DataManager, "_validate_path_has_data"):
+398 |         dm = data_manager.DataManager(
+399 |             formatted_file_name="gen",
+400 |             standard_scaler_path=dummy_scaler_path,
+401 |             run_training=False,
+402 |         )
+403 |         with patch.object(dm, "generate_time_windows_and_labels_test", \
+404 |                         return_value=(dummy_array, dummy_labels, dummy_onehots)), \
+405 |              patch(
+406 |                 "kinematic_classifier.data_manager.scale_windowed_samples",
+407 |                 return_value={"scaled": True},
+408 |              ) as mock_scale:
+409 |             result = dm.format_data_for_training_and_inference(
+410 |                 filtered_trajectories_df=pd.DataFrame(),
+411 |                 length_sliding_window=5,
+412 |                 n_slices_per_trajectory=10,
+413 |             )
+414 |             mock_scale.assert_called_once()
+415 |             assert result == {"scaled": True}
+416 | 
+417 | 
+418 | def test_plot_vehicle_features_calls_matplotlib(
+419 |     tmp_path: Path, dummy_scaler_path: Path,
+420 | ) -> None:
+421 |     """Ensure ``plot_vehicle_features`` invokes matplotlib subplots.
+422 | 
+423 |     The test creates a minimal DataFrame and verifies that ``subplots`` is called.
+424 |     """
+425 |     df = pd.DataFrame({
+
+</error_details>
 
 =======================================================================================================================================
 

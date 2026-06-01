@@ -1,44 +1,27 @@
-# Role: Senior QA Automation Engineer
+# Task: Step 1 - Identify Coverage Gaps
 
-# Task: Achieve 100% test coverage for `tests/unit/test_data_manager.py`.
+Let's break this down into smaller steps to prevent tool execution errors. Do not attempt to write any code yet.
 
-# Rules of Engagement:
-1. **Target File Only:** Only make changes to `tests/unit/test_data_manager.py`. Do NOT modify the source code (production code) being tested.
-2. **Mocking Style:** Use `unittest.mock.patch` (either as a decorator or a context manager) for all mocking requirements. Do not use `pytest-mock` (mocker fixture) unless specifically requested.
-3. **Environment:** Use `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py` to identify missing coverage.
-4. **Verification Loop:**
-   - Run the coverage command.
-   - Identify specific line numbers that are "Missing" in the coverage report.
-   - Write new test cases or expand existing ones to hit those execution paths (especially error handling and edge cases).
-   - Rerun the coverage command to verify progress.
-   - Repeat until the coverage for the target module reaches 100%.
+### Directives:
+1. Run this exact command to see what is missing:
+   `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py`
+2. Reply with ONLY the specific line numbers that are reported as "Missing" in the terminal output.
 
-# Strategy for 100% Coverage:
-- **Edge Cases:** Ensure you are testing `None` inputs, empty strings, and boundary values.
-- **Exception Handling:** Use `patch` to side_effect exceptions in dependencies to ensure `try/except` blocks in the source code are fully exercised.
-- **Branch Coverage:** Ensure both `if` and `else` paths are triggered.
-
-# Current Task:
-Start by running the poetry pytest coverage command and list the specific lines that are currently missing coverage.
+Stop after displaying the missing line numbers and wait for my next instruction.
 
 =======================================================================================================================================
 
-# Roo: Stop Analyzing and Start Implementing Tests
+# Task: Step 2 - Fix Lines 45-50
 
-The coverage report has identified specific missing lines. You are now in "Implementation Mode." Do not run another full coverage report until you have added at least one new test case.
+Great. Now let's implement a single test case to cover exactly those lines.
 
-### Your Iterative Workflow:
-1. **Identify the Gap:** Look at the most recent `term-missing` report. Pick the **first** set of missing line numbers.
-2. **Analyze the Source:** Read the source code file corresponding to those line numbers. Determine what logic (e.g., an `if` branch, an `except` block, or a specific edge case) is preventing those lines from executing.
-3. **Draft the Test:** - Use `unittest.mock.patch` to simulate the necessary conditions. 
-   - If the missing line is inside an `except` block, use `patch(...).side_effect = Exception("test")` to force that path.
-   - If it's a conditional branch, provide the specific input data or mock return value to trigger it.
-4. **Write to File:** Use your `write_to_file` or `replace_in_file` tool to append this new test to `tests/unit/test_data_manager.py`.
-5. **Verify:** Run `poetry run pytest --cov=path/to/source_file --cov-report=term-missing tests/unit/test_data_manager.py`.
-6. **Repeat:** Move to the next set of missing lines.
+### Instructions:
+1. Read the production code file where lines 45-50 live so you understand the logic.
+2. Open `tests/unit/test_data_manager.py` and write ONE new test function at the bottom of the file that uses `unittest.mock.patch` to force execution through those specific lines.
+3. Save the file.
+4. Run the coverage command again to confirm those lines are no longer missing.
 
-### Critical Requirement:
-You must modify `tests/unit/test_data_manager.py` NOW. Start with the very first missing line reported in your last execution.
+Do not move on to any other lines until this single edit is successful.
 
 ================================================================================================================================================
 

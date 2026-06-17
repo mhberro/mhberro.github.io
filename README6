@@ -12,25 +12,26 @@ from copy import deepcopy
 from pathlib import Path
 
 # 3rd party
+import matplotlib.pyplot as plt
 import numpy as np
 import onnx
+import pandas as pd
 import psutil
 import scipy
 import seaborn as sns
 import torch
-import matplotlib.pyplot as plt
 from scipy.interpolate import make_interp_spline  # TODO: cubic hermite spline?
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
-from sklearn.compose import ColumnTransformer
 
 # LM packages
 from lm_ai_torch_models.activations import Activation
 from lm_ai_torch_training.configuration import TrainingConfiguration
 from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.optimizers.adam import AdamOptimizer
 from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
+from lm_ai_torch_training.optimizers.adam import AdamOptimizer
 from prediction.mlearn.ffnn.architecture import FFNNArchitecture
 from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
 from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
@@ -45,16 +46,9 @@ from coordinate_transform_functions import (
     ned_to_ecef,
     ned_to_ecef_velocity,
 )
+from energy_functions import mechanical_energy
 from load_truth import load_single_truth
-from torchdiffeq_solver import TorchdiffeqSolver
-from NEXT_frames import (
-    ecef_to_next_dcu,
-    ecef_to_next_grdth,
-    next_dcu_to_ecef,
-    next_grdth_to_ecef,
-    ecef_to_local_geodesic_vec,
-    local_geodesic_to_ecef_vec,
-)
+from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
 
 # from prediction.mlearn.neural_ode.neural_ode import (
 #     DEFAULT_LOSS,
@@ -68,8 +62,15 @@ from neural_ode_mod import (
     ModelCheckpoint,
     NODEPredictor,
 )
-from loss_functions import EnergyMSELoss, WrappedMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss
-from energy_functions import mechanical_energy
+from NEXT_frames import (
+    ecef_to_local_geodesic_vec,
+    ecef_to_next_dcu,
+    ecef_to_next_grdth,
+    local_geodesic_to_ecef_vec,
+    next_dcu_to_ecef,
+    next_grdth_to_ecef,
+)
+from torchdiffeq_solver import TorchdiffeqSolver
 from trajectory_helpers import (
     ACC_SLICE,
     DOWN_DOT_INDEX,
@@ -115,6 +116,134 @@ if torch.cuda.device_count() != 0:
 
 BUCKET_SIZE = 5000  # [m]
 
+class GRUODEFunc(torch.nn.Module):
+    """
+    ODE right‑hand side implemented with a GRU cell.
+
+    The ODE state is a concatenation of:
+        [physical_state (len = state_len),
+         hidden_state   (len = hidden_dim),
+         aug_state      (len = aug_dim, optional)]
+
+    The GRU cell receives ``[physical_state, aug_state]`` as its input
+    and updates the hidden state.  The hidden state is then linearly
+    mapped to the physical derivative ``dx/dt``.
+    """
+
+    def __init__(self, state_len: int, hidden_dim: int, aug_dim: int = 0):
+        super().__init__()
+        self.state_len = state_len
+        self.hidden_dim = hidden_dim
+        self.aug_dim = aug_dim
+
+        input_dim = state_len + aug_dim          # what we feed the GRU
+        self.gru = torch.nn.GRUCell(input_dim, hidden_dim)
+
+        # Map hidden → derivative of the physical state
+        self.to_dx = torch.nn.Linear(hidden_dim, state_len)
+
+        # Counter for diagnostics (same name used by the original ODEfunc)
+        self.nfe = 0
+
+    def forward(self, t, state):
+        """
+        Parameters
+        ----------
+        t : torch scalar (ignored – required by torchdiffeq)
+        state : tensor of shape (..., state_len + hidden_dim + aug_dim)
+                concatenated as [x, h, aug]
+        Returns
+        -------
+        d(state)/dt with the same shape
+        """
+        self.nfe += 1
+
+        # ------------------------------------------------------------------
+        # Split the concatenated state
+        # ------------------------------------------------------------------
+        total_len = state.shape[-1]
+        aug_start = self.state_len + self.hidden_dim
+
+        x   = state[..., :self.state_len]                     # physical part
+        h   = state[..., self.state_len:aug_start]           # hidden part
+        aug = (
+            state[..., aug_start:] if self.aug_dim > 0 else None
+        )  # optional augmentation
+
+        # ------------------------------------------------------------------
+        # GRU step – treat (x + aug) as the GRU input
+        # ------------------------------------------------------------------
+        gru_input = x if aug is None else torch.cat([x, aug], dim=-1)
+        h_next = self.gru(gru_input, h)          # new hidden state
+
+        # derivative of the physical state comes from the hidden vector
+        dx_dt = self.to_dx(h_next)               # (…, state_len)
+
+        # hidden state does not have a physical derivative – keep it static
+        dh_dt = torch.zeros_like(h)
+
+        # augmentation (if any) also has zero derivative
+        if self.aug_dim > 0:
+            daug_dt = torch.zeros_like(aug)
+            dstate = torch.cat([dx_dt, dh_dt, daug_dt], dim=-1)
+        else:
+            dstate = torch.cat([dx_dt, dh_dt], dim=-1)
+
+        return dstate
+    
+class GRUODEArchitecture:
+    """
+    Wrapper class so that ``NODEPredictor`` can treat the GRU‑ODE exactly
+    like it treats an FFNNArchitecture.
+
+    Required public methods / attributes (used by neural_ode_mod):
+      • get_model()          → returns a torch.nn.Module ready for .to(device)
+      • get_input_dim()      → length of the *physical* input (state_len)
+      • get_output_dim()     → length of the *physical* output (same as input)
+      • get_aug_dim()        → augmentation dimension (may be 0)
+    """
+
+    def __init__(self, state_len: int, hidden_dim: int = 128, aug_dim: int = 0):
+        self.state_len  = state_len          # e.g. 6 for (pos, vel)
+        self.hidden_dim = hidden_dim
+        self.aug_dim    = aug_dim
+
+    # ------------------------------------------------------------------
+    # The predictor calls this to actually build the torch model
+    # ------------------------------------------------------------------
+    def get_model(self) -> torch.nn.Module:
+        """
+        Returns an instance of GRUODEFunc that already knows the sizes.
+        The returned module has the same attribute ``nfe`` as the original
+        ODEfunc so logging works unchanged.
+        """
+        model = GRUODEFunc(
+            state_len=self.state_len,
+            hidden_dim=self.hidden_dim,
+            aug_dim=self.aug_dim,
+        )
+        return model
+
+    # ------------------------------------------------------------------
+    # Helper methods – these are queried by `neural_ode_mod` for logging
+    # ------------------------------------------------------------------
+    def get_input_dim(self) -> int:
+        """Length of the *physical* state that enters the ODE (no hidden)."""
+        return self.state_len
+
+    def get_output_dim(self) -> int:
+        """The ODE outputs the same number of physical dimensions."""
+        return self.state_len
+
+    def get_aug_dim(self) -> int:
+        """Size of the zero‑augmentation slice (may be 0)."""
+        return self.aug_dim
+
+    # ------------------------------------------------------------------
+    # Optional: expose the hidden dimension for external callers
+    # ------------------------------------------------------------------
+    def get_hidden_dim(self) -> int:
+        return self.hidden_dim
 
 class ODEfunc(torch.nn.Module):
     def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
@@ -340,12 +469,28 @@ def train_NEXT(
     # early_stop_metric_name = "val_loss_unweighted"
 
     # Define the Neural ODE model
+    # node = NODEPredictor(
+    #     architecture=FFNNArchitecture(
+    #         layer_channels=[5, 5],  # this doesn't do anything when using ODEfunc
+    #         # layer_activation=Activation.RELU,
+    #         # layer_activation=Activation.TANH,
+    #         layer_activation=Activation.SILU,
+    #     ),
+    #     training_configuration=training_configuration,
+    #     solver=ode_solver,
+    #     logging_interval=5,
+    #     loss_func=loss_func,
+    #     early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
+    #     checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+    #     aug_dim=aug_dim,
+    # )
+
+    # GRU ODE model
     node = NODEPredictor(
-        architecture=FFNNArchitecture(
-            layer_channels=[5, 5],  # this doesn't do anything when using ODEfunc
-            # layer_activation=Activation.RELU,
-            # layer_activation=Activation.TANH,
-            layer_activation=Activation.SILU,
+        architecture=GRUODEArchitecture(
+            state_len=model_states,
+            hidden_dim=nhidden,
+            aug_dim=aug_dim
         ),
         training_configuration=training_configuration,
         solver=ode_solver,
@@ -355,6 +500,7 @@ def train_NEXT(
         checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
         aug_dim=aug_dim,
     )
+
     if HAVE_GPU:
         node.device = torch.device(f"cuda:{gpu_index}")
         node._initialize_losses(node.criterion)
@@ -607,9 +753,26 @@ def prep_trajectory(x):
 
     # BEGIN SBI HighE HGV handling
     # remove launch phase from SBI
-    end_of_launch_index = 125  # SBI HighE HGV
+    # end_of_launch_index = 122  # SBI HighE HGV
+    end_of_launch_index = 62  # SBI LowE 3f39bfb6 HGV and for the 555063a9 too?
 
-    ecef_data = ecef_data[end_of_launch_index:]
+    # write the boost out to CSV
+    # boost_ecef = ecef_data[:end_of_launch_index]
+    sbi_target_name = "LowE_555063a9_HGV"
+    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "boost"), exist_ok=True)
+    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "impact"), exist_ok=True)
+    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "glide"), exist_ok=True)
+    # pd.DataFrame(boost_ecef, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
+    #     Path("SBI_boost-glide", sbi_target_name, "boost", traj_number), index=False
+    # )
+    # impact_slice = np.atleast_2d(ecef_data[-1])
+    # df = pd.DataFrame(impact_slice)
+    # print("baaa", df)
+    # pd.DataFrame(impact_slice, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
+    #     Path("SBI_boost-glide", sbi_target_name, "impact", traj_number), index=False
+    # )
+
+    # ecef_data = ecef_data[end_of_launch_index:]
 
     # filter the points by max slant range from impact
     # TODO: can this be done with np.where?
@@ -663,6 +826,8 @@ def prep_trajectory(x):
                 )(new_times, extrapolate=True)
             ]
         )
+        # for when resampling of the truth data is not desired
+        # resampled_sr_ecef_data = sr_ecef_data
     except Exception as e:
         print(f"warning: {traj_number} had the error with interpolation")
         raise e
@@ -686,28 +851,32 @@ def prep_trajectory(x):
         # Prepend time and only include pos and vel
         next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
         # SBI HighE HGV special things
-        # limit by altitude to remove exo flight
-        remove_exo_index = next_frame_data[:, 3] < 100e3
-        next_frame_data = next_frame_data[remove_exo_index]
-        resampled_sr_ecef_data = resampled_sr_ecef_data[remove_exo_index]
-        # limit by altitude to remove terminal flight
-        remove_terminal_index = next_frame_data[:, 3] > 15e3
-        next_frame_data = next_frame_data[remove_terminal_index]
-        resampled_sr_ecef_data = resampled_sr_ecef_data[remove_terminal_index]
-        # check for time jumps
-        time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        # remove everything before the time jump
-        time_jump_index = np.argmax(time_diffs) + 1
-        next_frame_data = next_frame_data[time_jump_index:]
-        resampled_sr_ecef_data = resampled_sr_ecef_data[time_jump_index:]
-        # recalc for the check
-        time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        if np.any(time_diffs > trajectory_dt):
-            print("time diffs are weird", time_diffs)
-            raise ValueError("woah there! we've got a time gap")
+        # # limit by altitude to remove exo flight
+        # remove_exo_index = next_frame_data[:, 3] < 100e3
+        # next_frame_data = next_frame_data[remove_exo_index]
+        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_exo_index]
+        # # limit by altitude to remove terminal flight
+        # remove_terminal_index = next_frame_data[:, 3] > 15e3
+        # next_frame_data = next_frame_data[remove_terminal_index]
+        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_terminal_index]
+        # # check for time jumps
+        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
+        # # remove everything before the time jump
+        # time_jump_index = np.argmax(time_diffs) + 1
+        # next_frame_data = next_frame_data[time_jump_index:]
+        # resampled_sr_ecef_data = resampled_sr_ecef_data[time_jump_index:]
+        # # recalc for the check
+        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
+        # if np.any(time_diffs > trajectory_dt):
+        #     print("time diffs are weird", time_diffs)
+        #     raise ValueError("woah there! we've got a time gap")
         check_ecef = local_geodesic_to_ecef_vec(
             np.hstack([next_frame_data, np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE])]), ref_ecef
         )
+        # write the glide out to a csv
+        # pd.DataFrame(resampled_sr_ecef_data, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
+        #     Path("SBI_boost-glide", sbi_target_name, "glide", traj_number), index=False
+        # )
     else:
         # convert ecef truth to the training frame
         next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)

@@ -1,96 +1,217 @@
 F-35 anomaly detection
 
-import logging
-
-# Define the persistent path mapped to G:\docker-storage\logs
-LOG_DIR = "C:/app/logs"
-APP_LOG_FILE = os.path.join(LOG_DIR, "app_runtime.log")
-
-# Ensure the directory exists internally
-if not os.path.exists(LOG_DIR):
-    os.makedirs(LOG_DIR)
-
-# Configure logging to write to the persistent volume
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(APP_LOG_FILE),
-        logging.StreamHandler() # Also outputs to Docker console
-    ]
-)
-
-logger = logging.getLogger("AnomalyApp")
-logger.info("Application initialized with persistent logging.")
-
-
-
-
-=========================================================================================================================================================================
-=========================================================================================================================================================================
-
-
-def get_structured_logs(log_path):
+def render_one(path_or_filefile):
     """
-    Reads raw logs and converts them into a searchable DataFrame.
+    Location 1: Main Panel Data Ingestion
+    Captures both the dataset and the raw filename to fuel the Epic 3 path builder.
     """
-    if not os.path.exists(log_path):
-        return pd.DataFrame(columns=["Timestamp", "Level", "Message"])
+    # If path_or_file is a Streamlit UploadedFile object, it has a .name attribute
+    if hasattr(path_or_file, "name"):
+        df = pd.read_csv(path_or_file)
+        filename = path_or_file.name
+    else:
+        # If it's a standard Path object
+        df = pd.read_csv(path_or_file)
+        filename = os.path.basename(str(path_or_file))
+
+    # Save to session state for sidebar access
+    st.session_state["active_df"] = df
+    st.session_state["dart_filename"] = filename
     
-    log_data = []
-    with open(log_path, 'r') as f:
-        for line in f:
-            try:
-                # Basic parsing logic for common log formats
-                parts = line.split(" - ")
-                if len(parts) >= 3:
-                    log_data.append({
-                        "Timestamp": parts[0].strip(),
-                        "Level": parts[1].strip(),
-                        "Message": " - ".join(parts[2:]).strip()
-                    })
-            except Exception:
-                continue
-                
-    return pd.DataFrame(log_data)
+    # ... rest of your dashboard visual layouts/plots ...
+
+
+
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================
 
-st.divider()
-st.header("Epic 4: Log Search & Observability")
-
-# Log Source Selection
-log_choice = st.radio("Select Log Source", ["Host Daemon", "App Runtime"], horizontal=True)
-target_path = "C:/app/logs/hostdaemon.log" if log_choice == "Host Daemon" else APP_LOG_FILE
-
-# Load and Filter Logs
-df_logs = get_structured_logs(target_path)
-
-if not df_logs.empty:
-    col1, col2 = st.columns([1, 3])
+def generate_comprehensive_unified_report(active_dataframe, trace_log_dir, output_directory, dart_filename=None):
+    """
+    EPIC 3 ENGINE REFACTOR: Dynamically resolves trace log paths using the 
+    mandated convention: VMFF > Log Files > (Script Name) > [Batch_ID], [TE_ID].txt
+    """
+    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    file_safe_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    with col1:
-        # Story 4.2: Filter by Severity
-        levels = ["ALL"] + sorted(df_logs["Level"].unique().tolist())
-        selected_level = st.selectbox("Severity Level", levels)
+    total_analyzed_runs = len(active_dataframe)
+    
+    # 1. Defensive Case-Insensitive Column Resolver
+    cols_map = {str(c).lower().strip(): c for c in active_dataframe.columns}
+    issue_col = cols_map.get('issue')
+    host_col = cols_map.get('simulation_host')
+    batch_col = cols_map.get('batch_id')
+    te_col = cols_map.get('te_id')
+    config_col = cols_map.get('config_file_name')
+
+    # Determine Truth Trigger state
+    if issue_col:
+        anomaly_mask = (
+            active_dataframe[issue_col].notna() & 
+            (~active_dataframe[issue_col].astype(str).str.strip().isin(['N/A', 'NaN', 'nan', '']))
+        )
+    else:
+        f_col, b_col, u_col = cols_map.get('f'), cols_map.get('b'), cols_map.get('u')
+        f_mask = active_dataframe[f_col] > 0 if f_col else pd.Series(False, index=active_dataframe.index)
+        b_mask = active_dataframe[b_col] > 0 if b_col else pd.Series(False, index=active_dataframe.index)
+        u_mask = active_dataframe[u_col] > 0 if u_col else pd.Series(False, index=active_dataframe.index)
+        anomaly_mask = f_mask | b_mask | u_mask
+
+    flagged_dataframe = active_dataframe[anomaly_mask]
+    executive_status = "FAIL" if len(flagged_dataframe) > 0 else "PASS"
+    
+    # 2. Extract Script Name dynamically (Defensive Strategy)
+    script_name = "Unknown_Script"
+    if config_col and len(active_dataframe) > 0:
+        # Extract from dataframe column (e.g., 't_VMFF_Rx_CANTCO_Com_Prob_Res.xml' -> 't_VMFF_Rx_CANTCO_Com_Prob_Res')
+        raw_config = str(active_dataframe[config_col].iloc[0])
+        script_name = os.path.splitext(raw_config)[0]
+    elif dart_filename:
+        # Fallback: Extract from DART report filename prefix split rules
+        # e.g., '20251118_40S03.00_R2_SysTest_t_VMFF_Existing_CAS_OSR_Mod.csv'
+        clean_name = dart_filename.replace(".csv", "")
+        parts = clean_name.split("_")
+        if len(parts) >= 4:
+            # Re-join everything after the execution date and SDL baseline tags
+            script_name = "_".join(parts[4:]) if "SysTest" in clean_name else "_".join(parts[2:])
+
+    # 3. Initialize high-fidelity FPDF Layout
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 16)
+    pdf.cell(0, 10, "Unified System Execution Audit Summary", ln=1, align="C")
+    pdf.ln(5)
+    
+    # Mandatory Metadata Headers
+    pdf.set_font("Arial", "", 10)
+    pdf.cell(0, 6, f"Execution Time: {current_time_str}", ln=1)
+    pdf.cell(0, 6, f"Target Script Context: {script_name}", ln=1)
+    pdf.cell(0, 6, f"Deployment Version Tag: v{VERSION}", ln=1)
+    pdf.cell(0, 6, f"Overall Run Status Assessment: {executive_status}", ln=1)
+    pdf.ln(5)
+    
+    # Render Structural Error Summary Table Section
+    pdf.set_font("Arial", "B", 11)
+    pdf.cell(0, 10, "Error Summary Section", ln=1)
+    
+    pdf.set_font("Arial", "B", 9)
+    pdf.set_fill_color(220, 220, 220)
+    pdf.cell(20, 8, "Batch ID", border=1, fill=True)
+    pdf.cell(45, 8, "Host Error", border=1, fill=True)
+    pdf.cell(50, 8, "Simulator State", border=1, fill=True)
+    pdf.cell(55, 8, "OFP Defect", border=1, fill=True)
+    pdf.cell(20, 8, "Log Link", border=1, fill=True, ln=1)
+    
+    pdf.set_font("Arial", "", 8)
+    processed_summary_rows = []
+    
+    for idx, row in active_dataframe.iterrows():
+        if anomaly_mask.iloc[idx]:
+            batch_id = str(row[batch_col]).strip() if batch_col else "00000"
+            te_id = str(row[te_col]).strip() if te_col else "000000"
+            sim_host = str(row[host_col]) if host_col else "Unknown_Host"
+            issue_val = str(row[issue_col]) if issue_col else "Anomaly Recorded"
+
+            # 4. RESOLVE DYNAMIC TARGET PATH CONVENTION
+            # Map structural format: trace_log_dir / VMFF / Log Files / Script_Name / Batch_ID, TE_ID.txt
+            resolved_log_path = os.path.join(
+                trace_log_dir, 
+                "VMFF", 
+                "Log Files", 
+                script_name, 
+                f"{batch_id}, {te_id}.txt"
+            )
+            
+            metrics = extract_detailed_error_summary(resolved_log_path, issue_val)
+            
+            # Highlight text flags in red
+            pdf.set_text_color(220, 0, 0)
+            pdf.cell(20, 8, batch_id, border=1)
+            pdf.cell(45, 8, metrics["Host_Error"][:24], border=1)
+            pdf.cell(50, 8, metrics["Simulator_State"][:28], border=1)
+            pdf.cell(55, 8, metrics["OFP_Defect"][:32], border=1)
+            
+            # Python 3.11 safe backslash-free string replacement mapping
+            clean_abs_path = os.path.abspath(resolved_log_path).replace('\\', '/')
+            log_url = f"file:///{clean_abs_path}"
+            
+            pdf.cell(20, 8, "[Raw Log]", border=1, link=log_url)
+            pdf.ln(8)
+            pdf.set_text_color(0, 0, 0) # Reset color channel
+            
+            metrics.update({"Batch_ID": batch_id, "TE_ID": te_id, "Simulation_Host": sim_host})
+            processed_summary_rows.append(metrics)
+
+    # Export output documents
+    pdf_output_filename = f"Unified_Executive_Health_Report_{file_safe_timestamp}.pdf"
+    pdf.output(os.path.join(output_directory, pdf_output_filename))
+    
+    if processed_summary_rows:
+        summary_csv_df = pd.DataFrame(processed_summary_rows)
+    else:
+        summary_csv_df = pd.DataFrame(columns=["Batch_ID", "TE_ID", "Simulation_Host", "Host_Error", "Simulator_State", "OFP_Defect"])
         
-    with col2:
-        # Story 4.2: Efficient querying by keyword
-        search_query = st.text_input("Search Message (Regex supported)", "")
-
-    # Apply Filters
-    filtered_logs = df_logs.copy()
-    if selected_level != "ALL":
-        filtered_logs = filtered_logs[filtered_logs["Level"] == selected_level]
+    summary_csv_df['extraction_timestamp_metadata'] = current_time_str
+    summary_csv_df['framework_version_metadata'] = VERSION
     
-    if search_query:
-        filtered_logs = filtered_logs[filtered_logs["Message"].str.contains(search_query, case=False, na=False)]
+    csv_output_filename = f"Processed_Health_Metrics_{file_safe_timestamp}.csv"
+    summary_csv_df.to_csv(os.path.join(output_directory, csv_output_filename), index=False, encoding='utf-8-sig')
+    
+    return pdf_output_filename, csv_output_filename
 
-    # Display the structured logs
-    st.dataframe(filtered_logs, use_container_width=True, hide_index=True)
-else:
-    st.info(f"No logs found in {target_path}")
+=========================================================================================================================================================================
+=========================================================================================================================================================================
+
+def render_sidebar_controls():
+    """
+    Location 2: Sidebar Control Trigger Integration
+    Extracts the active tracking dataframe and filename context from shared session state.
+    """
+    st.sidebar.title("Dashboard Controls")
+    # ... configuration sliders ...
+    st.sidebar.markdown("---")
+    st.sidebar.header("Step 4: Finalize & Export")
+
+    if st.sidebar.button("Generate Unified Test Analysis Report", key="unified_test_report_btn"):
+        
+        # Verify dataset presence using bracket syntax lookups
+        if "active_df" in st.session_state and st.session_state["active_df"] is not None:
+            active_dataset = st.session_state["active_df"]
+            
+            # Fetch filename context if tracked, default safely to None
+            active_filename = st.session_state.get("dart_filename", None)
+            
+            with st.spinner("Processing cross-file log mappings..."):
+                try:
+                    persistent_log_dir = "C:/app/logs"
+                    persistent_report_dir = "C:/app/reports"
+                    os.makedirs(persistent_report_dir, exist_ok=True)
+
+                    # Trigger updated structural reporting routine
+                    pdf_filename, csv_filename = generate_comprehensive_unified_report(
+                        active_dataframe=active_dataset,
+                        trace_log_dir=persistent_log_dir,
+                        output_directory=persistent_report_dir,
+                        dart_filename=active_filename
+                    )
+
+                    st.sidebar.success("Artifacts saved to persistent volume!")
+                    st.sidebar.markdown(f"**Executive Report:** `{pdf_filename}`")
+                    
+                    pdf_full_path = os.path.join(persistent_report_dir, pdf_filename)
+                    if os.path.exists(pdf_full_path):
+                        with open(pdf_full_path, "rb") as pdf_file:
+                            st.sidebar.download_button(
+                                label="📥 Download PDF Audit Summary",
+                                data=pdf_file,
+                                file_name=pdf_filename,
+                                mime="application/pdf",
+                                key="pdf_download_control"
+                            )
+                except Exception as e:
+                    st.sidebar.error(f"Reporting Module Failure: {str(e)}")
+        else:
+            st.sidebar.error("Pipeline context missing. Please ensure a DART CSV file is loaded in the main panel first.")
 
 =========================================================================================================================================================================
 =========================================================================================================================================================================

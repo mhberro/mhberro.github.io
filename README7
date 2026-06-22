@@ -1,0 +1,105 @@
+
+MO:
+Hey Charles! I was able to execute a test run using the example execution command you mentioned yesterday (line 98). I noticed that a new directory "model_outputs" is created containing eight files (please see attached). Are there any other particular outputs that are generated that details the model's performance? Pretty much is there any particular file or metric you're using to gauge how well your model is performing?
+
+CHARLIE: 
+Nice! So there are 2 metrics. One is from the l1 loss values that get printed to the console during training. After training the model, you need to run it through the simple sim to run inference and then run the metrics script to compare the extrapolations to the truth data (I used to do both in one script, but ended up needing to separate them). That will get the SoftDTW metric plots. Duy got it up and running yesterday for a boost model.
+
+MO:
+Great! Thanks for providing the details! This is very helpful
+And apologies if you already went through this during one of our meetings. I got tied up in fixing my own issues that I might have missed this important detail 
+
+CHARLIE
+You're good! Having more people working the problem is more helpful
+
+MO:
+Also I'm attempting to repurpose one of the example commands (line 69) from your "test commands" section in the Simple_Sims. Regarding the first argument in the command (datasets/all/PrSM/*), where did you get the PrSM dataset from? The datasets I pulled are the All_ICBM_Trajs and the phases datasets -- of which I don't see PrSM in either of them.
+
+CHARLIE:
+It was a set I got from the cognitive modules sandbox a while back. I would skip over using that dataset though since it's in FRD and everything else is ECEF
+
+MO:
+Cool, so I had used the All_ICBM_Trajs/DF_5 dataset to train the model. Should I use that same dataset for Simple_Sim?
+
+CHARLIE:
+Yep!
+Oh one other thing is that the Simple_Sim is set up to use the full trajectories. Not the cut up phase ones.
+
+MO:
+Oh good point! I was planning on using full already, but still important to know that detail
+so if I trained a model on the phase dataset, is there a Simple_Sim alternative I can use to run the model on?
+
+CHARLIE:
+I added the array slicing to the simple sim to inference only on the boost phase. See the change on this line as a reference line_bf4fd2518_A582 and the other number to change is down here line_bf4fd2518_A582 
+And I attempted to add support for inferencing on the glide phase portion with these changes. Not sure what is broken though. 
+
+MO:
+Gotcha! Thanks for taking the time to provide these details!
+Hey Charles, I just pulled your latest changes and noticed that the --use-grdth argument is no longer part of the CLI command. I tried checking out the updated model_training_cms.bash file but see that the command for the All_ICBM_Trajs dataset still uses use-grdth. is it still possible to run the All_ICBM_Trajs dataset for NEXT_training?
+
+CHARLIE:
+Yes. I didn't update that line my bad. The change is to use --frame grdth
+
+MO:
+Apologies if you specified this in the group chat. I tried going through the chat history but didn't see any mention -- I might have overlooked it.
+
+CHARLIE:
+sorry for the interface breaks this late in the game
+
+MO:
+no worries -- totally understandable given the situation
+sorry running into another issue. NEXT_training is looking for the boost dataset even though i'm providing it the All_ICBM_Trajs dataset. I was going to go through the code to see what I'm doing wrong, but wanted to quickly ask if i'm supposed to modify the arguments to have NEXT_training understand the input dataset is for All_ICBM_Trajs
+
+CHARLIE:
+oh right....that would be broken now because of my changes...um.
+
+MO:
+This is the command I'm attempting to execute:
+python NEXT_training.py --tgt-data-paths trajectory_library/full/All_ICBM_Trajs/DF_5 --sr 100000 --use-scalar --frame grdth --aug 0 --nhidden 100 -o model_outputs/SBI/DF_5_v001
+
+CHARLIE:
+it will definitely work with the HGVs split up in phases. We've put the TBMs to the side since we will only need to do boost for those and if we can figure out HGV boost, we can come back to do the TBMs
+
+MO:
+Gotcha, so pretty much just focus on the phases dataset and don't use the All_ICBM_Trajs dataset? If so would the Simple_Sim work for the phases now?
+
+CHARLIE:
+Yes it should
+There is some manual tweaking to be done. Boost works for sure and is in main
+I pushed a branch to try and get glide working in the simple sim. I tried to do 2 things at once (geodesic frame and glide phase) and broke something along the way. It might have been the model that I was trying to use that was causing issues.
+
+MO:
+I see i see. I had rolled back to a prior branch that was able to use the full dataset, but I'll re-pull the newer branch and give it a try.
+
+CHARLIE:
+Simple_sim.py doesn't have the fancy CLI parameters to change phase. I left it at some code blocks that need to be commented on and off to change phase. I did put in START and END comments for the blocks as if they were cpp pragma
+
+MO:
+Cool! Thanks for the heads up about that! I'm shifting gears a bit to focus on filling out the slide deck Luke is asking about. Then I'll go back to the code
+
+=====================================================
+
+MO:
+Hey Jackson! Quick question, what CLI command did you use to call the NEXT_Training script? 
+Want to use the same setup you did for your training runs.
+
+JACKSON:
+python NEXT_training.py --tgt-data-paths datasets/2026/2-Working-Data/SBI-boost-glide/HighE_HGV/ --sr 100000 --use-scalar --aug 0 --nhidden 100 -o model_outputs/SBI/GRUODE/DCU/boost
+your tgt-data-paths may be different.
+Also you can change which frames you use with the arguments like --use-grdth or --use-geodesic. adding no argument gives you the DCU frame which is what Im training on right now.
+Also Charlie added a new argument for the phase you want to train on. its --sbi-phase (glide or boost) it defaults to boost. I have been doing all my training on boost so far since its an easier problem than all the maneuvers in glide.
+
+MO:
+Got it! Also meant to ask if you have the Simple_Sim.py command you execute?
+
+JACKSON:
+python Simple_Sim.py datasets/mini/PrSM/* -o simple_sim_output\SBI\GRUODE\DCU\boost\HighE_HGV-m model_outputs/SBI/GRUODE/DCU/boost/HighE_HGV/{your onnx model generated}.onnx -s model_outputs/SBI/GRUODE/DCU/boost/HighE_HGV/{your .pickle file generated}
+I was running into some issues with it generating properly but Charlie pushed some changes so I'll try it out again when my model is done training.
+
+MO:
+Great! Thanks for those details! Also where did you happen to get the PrSM dataset from?
+
+JACKSON:
+sorry I typed out the wrong thing for that dataset. For the simple sim you need to run it on the whole file for HighE_HGV. 
+ 
+ 

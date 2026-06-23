@@ -1,46 +1,14 @@
-# --------------------------------------------------------------------
-    #  GRU ODE model Configuration
-    # --------------------------------------------------------------------
-    # Force the numerical solver to track and continuously integrate the hidden
-    # recurrent memory layers alongside the primary physical coordinates.
-    total_solver_aug = aug_dim + nhidden if model_type == "gruode" else aug_dim
-
-    node = NODEPredictor(
-        architecture=GRUODEArchitecture(
-            state_len=model_states,
-            hidden_dim=nhidden,
-            aug_dim=aug_dim
-        ),
-        training_configuration=training_configuration,
-        solver=ode_solver,
-        logging_interval=5,
-        loss_func=loss_func,
-        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
-        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
-        aug_dim=total_solver_aug,  # <-- Hijack the solver registration size
-    )
-
-===================================
-
-# --------------------------------------------------------------------
-    #  ONNX Binary Export Routine
-    # --------------------------------------------------------------------
-    # Use node.aug_dim to ensure example inputs match the expanded state register
-    if isinstance(ode_solver, TorchdiffeqSolver):
-        example_input = (
-            None,
-            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(node.aug_dim))).to(node.device),
-        )
-    else:
-        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(node.aug_dim))).to(node.device)
-        
-    model_onx = torch.onnx.export(
-        node.model,
-        example_input,
-        os.path.join(model_save_path, model_name + ".onnx"),
-        export_params=True,
-        opset_version=18,
-        external_data=False,
-        input_names=["input"],
-        output_names=["output"],
-    )
+Activating Continuous-Time Physics-Informed GRU-ODE Tracking Module.
+Successfully JIT-compiled the trajectory vector field execution graph.
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f5a2a16c290>, 0.0001)
+/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/torch/_inductor/compile_fx.py:312: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+W0623 23:05:49.627000 46178 .venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:1358] [0/8] torch._dynamo hit config.recompile_limit (8)
+W0623 23:05:49.627000 46178 .venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:1358] [0/8]    function: 'forward' (/home/jovyan/lm_cm_repos/next/NEXT_training.py:170)
+W0623 23:05:49.627000 46178 .venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:1358] [0/8]    last reason: 0/7: self.nfe == 7                                            # self.nfe += 1  # NEXT_training.py:175 in forward (HINT: torch.compile considers integer attributes of the nn.Module to be static. If you are observing recompilation, you might want to make this integer dynamic using torch._dynamo.config.allow_unspec_int_on_nn_module = True, or convert this integer into a tensor.)
+W0623 23:05:49.627000 46178 .venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:1358] [0/8] To log all recompilation reasons, use TORCH_LOGS="recompiles".
+W0623 23:05:49.627000 46178 .venv/lib/python3.12/site-packages/torch/_dynamo/convert_frame.py:1358] [0/8] To diagnose recompilation issues, see https://pytorch.org/docs/main/torch.compiler_troubleshooting.html
+W0623 23:05:50.410000 46178 .venv/lib/python3.12/site-packages/torch/_inductor/utils.py:1613] [0/7] Not enough SMs to use max_autotune_gemm mode
+[INFO] Epoch 5: loss: 31.2546005 pos_err: 3206688.2500000 vel_err: 438.0163879 val_loss: 31.4666386 val_pos_err: 3275507.0000000 val_vel_err: 477.3284302
+[INFO] Epoch 10: loss: 21.3581181 pos_err: 2748999.5000000 vel_err: 575.8826904 val_loss: 21.8092327 val_pos_err: 2820702.5000000 val_vel_err: 595.5729370
+[INFO] Epoch 15: loss: 14.7675123 pos_err: 2288392.2500000 vel_err: 800.0316162 val_loss: 15.2376652 val_pos_err: 2360363.7500000 val_vel_err: 808.6762085

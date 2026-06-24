@@ -1,506 +1,640 @@
-def train_NEXT(
-    model_name,
-    traj_targets_train,
-    traj_targets_test,
-    scaler_traj,
-    model_save_path,
-    trajectory_dt,
-    batch_size,
-    use_scalar,
-    model_states,
-    aug_dim,
-    nhidden,
-    gpu_index,
-    model_type: str = "node",
-    frame: str = "dcu",
-):
-    # Define initial training configuration
-    training_configuration = TrainingConfiguration(
-        n_epochs=1,
-        optimizer=AdamOptimizer(learning_rate=1e-3),
-        batch_size=batch_size,
-        num_workers=100,
-        verbose=True,
-    )
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
+# Copyright 2026 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
 
-    if frame in ("dcu", "geodesic"):
-        velocity_indicies = (3, 4, 5)
-    elif frame in ("grdth",):
-        velocity_indicies = (2, 3, 4)
-    else:
-        raise ValueError("That frame is not known for what the velocity indicies are")
+import argparse
+import json
+import math
+import os
+import pickle
+import re
+import traceback
+from copy import deepcopy
 
-    early_stop_metric_name = "val_loss"
-    loss_func = WrappedMSELoss(
-        height_idx=1,
-        vel_indices=velocity_indicies,
-        scaler=scaler_traj if use_scalar else None,
-        N_FEATURES=model_states,
-    )
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+import onnxruntime
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.signal import resample_poly
+from sklearn.metrics import mean_absolute_error
 
-    # Define the Neural ODE predictor wrapper
-    node = NODEPredictor(
-        architecture=FFNNArchitecture(
-            layer_channels=[5, 5],
-            layer_activation=Activation.SILU,
-        ),
-        training_configuration=training_configuration,
-        solver=ode_solver,
-        logging_interval=5,
-        loss_func=loss_func,
-        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
-        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
-        aug_dim=aug_dim,
-    )
-    
-    if HAVE_GPU:
-        node.device = torch.device(f"cuda:{gpu_index}")
-        node._initialize_losses(node.criterion)
-        node._initialize_model()
-        node._initialize_optimizer()
+from coordinate_transform_functions import (
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    ned_to_dcu,
+    frd_to_dcu,
+    dcu_to_ned,
+    ned_to_ecef_velocity,
+    ned_to_ecef,
+)
+from load_truth import load_single_truth
+from NEXT_training import (
+    ecef_to_next_grdth,
+    next_grdth_to_ecef,
+    ecef_to_next_dcu,
+    next_dcu_to_ecef,
+    ecef_to_local_geodesic_vec,
+    local_geodesic_to_ecef_vec,
+)
+from ibcs_tools_helpers import multiline, custom_cmap, add_classification_markings, add_lmpi_markings, Classification
+from trajectory_helpers import (
+    check_time_series,
+    resample_traj_data,
+    TIME_INDEX,
+    POS_SLICE,
+    VEL_SLICE,
+    ACC_SLICE,
+    GR_INDEX,
+    GR_DOT_INDEX,
+    THETA_DOT_INDEX,
+    DOWN_INDEX,
+    DOWN_DOT_INDEX,
+)
 
-    # --------------------------------------------------------------------
-    #  Build the requested model architecture
-    # --------------------------------------------------------------------
-    if model_type == "node":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "anode":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=aug_dim,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "sonode":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=slice(3, 6),
-        ).to(node.device)
-    elif model_type == "latentode":
-        latent_dim = nhidden // 2 if nhidden >= 20 else 8
-        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
-        recon_criterion = WrappedMSELoss(
-            height_idx=1,
-            vel_indices=[3, 4, 5],
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-        )
-        def latent_ode_loss_fn(recon, target, mu, logvar):
-            return recon_criterion(recon, target) + 0.1 * _kl_divergence(mu, logvar)
-        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
-        
-    elif model_type == "gruodebayes":
-        # Instantiate continuous recurrent framework for handling irregular gaps natively [cite: 8, 9]
-        node.model = GRUODEBayesModel(input_dim=model_states, hidden_dim=nhidden).to(node.device)
-        recon_criterion = WrappedMSELoss(
-            height_idx=1,
-            vel_indices=velocity_indicies,
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-        )
-        # Adapt loss check wrapper to handle structural output configurations
-        def gruode_loss_fn(pred, true):
-            true_y = true[0] if isinstance(true, (tuple, list)) else true
-            return recon_criterion(pred[0], true_y)
-        node.loss_func = gruode_loss_fn
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
+measurement_dt = 1.0  # [s]
+extrapolation_dt = 1.0  # [s]
+max_traj_states = int(300 / extrapolation_dt)  # total time of 300 seconds
 
-    # Process and scale state profiles
-    if use_scalar:
-        scaled_traj_targets_train_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
-        ]
-        scaled_traj_targets_test_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
-        ]
-    else:
-        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
-        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
-        
-    gen_model = False
-    try:
-        node.load(directory=model_save_path, model_name=model_name)
-    except ValueError:
-        gen_model = True
+plt.rcParams["axes.formatter.limits"] = [-3, 4]
+plt.rcParams["figure.figsize"] = [6, 5]
+plt.rcParams.update(
+    {
+        "lines.linewidth": 0.5,
+        "axes.formatter.useoffset": False,
+        "savefig.dpi": 200,
+    }
+)
 
-    if gen_model:
-        if model_type == "latentode":
-            OBS_WINDOW = 10
-            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]
-            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
-        elif model_type == "gruodebayes":
-            # Structure sequences paired with binary masks and explicit timestamps 
-            train_data = [
-                (traj, torch.ones_like(traj), torch.arange(0, traj.size(0), dtype=torch.float32) * trajectory_dt)
-                for traj in scaled_traj_targets_train_posvel
-            ]
-            test_data = [
-                (traj, torch.ones_like(traj), torch.arange(0, traj.size(0), dtype=torch.float32) * trajectory_dt)
-                for traj in scaled_traj_targets_test_posvel
-            ]
-
-        # Temporal curriculum configuration array
-        length_strategies = [
-            (0.1, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.5, 3000, EarlyStopper(20, 5e-5, metric_name=early_stop_metric_name), 1e-4),
-            (0.7, 2000, EarlyStopper(20, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-3),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 5000, EarlyStopper(50, 5e-3, metric_name=early_stop_metric_name), 1e-7),
-        ]
-
-        for len_strat in length_strategies:
-            print("running length strategy", len_strat)
-            data_fraction, epochs, early_stopper, learning_rate = len_strat
-            node.training_configuration = TrainingConfiguration(
-                n_epochs=epochs,
-                optimizer=AdamOptimizer(learning_rate=learning_rate),
-                batch_size=batch_size,
-                num_workers=2,
-                verbose=True,
-            )
-
-            node.optimizer_config = node.training_configuration.optimizer
-            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
-            node.training_metrics = {}
-            node._initialize_optimizer()
-            node.early_stopper = early_stopper
-
-            min_states = 5
-            
-            if model_type == "latentode":
-                fraction_of_data = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )
-                    for (obs, tgt) in train_data
-                ]
-                fraction_of_data_val = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )
-                    for (obs, tgt) in test_data
-                ]
-            elif model_type == "gruodebayes":
-                # Execute length strategies by parsing slices down sequence lengths
-                fraction_of_data = [
-                    (
-                        y[: max(math.ceil(y.shape[0] * data_fraction), min_states), :],
-                        m[: max(math.ceil(m.shape[0] * data_fraction), min_states), :],
-                        t[: max(math.ceil(t.shape[0] * data_fraction), min_states)]
-                    )
-                    for (y, m, t) in train_data
-                ]
-                fraction_of_data_val = [
-                    (
-                        y[: max(math.ceil(y.shape[0] * data_fraction), min_states), :],
-                        m[: max(math.ceil(m.shape[0] * data_fraction), min_states), :],
-                        t[: max(math.ceil(t.shape[0] * data_fraction), min_states)]
-                    )
-                    for (y, m, t) in test_data
-                ]
-            else:
-                fraction_of_data = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_train_posvel
-                ]
-                fraction_of_data_val = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_test_posvel
-                ]
-
-            metrics = node.fit(
-                x=fraction_of_data,
-                validation_data=fraction_of_data_val,
-                enable_checkpoints=True if data_fraction == 1.0 else False,
-            )
-            
-        p = Path(model_save_path, model_name + ".checkpoint.pt")
-        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
-
-    node.load(directory=model_save_path, model_name=model_name)
-    node.model.train(False)
-    node.model.eval()
-
-    # --------------------------------------------------------------------
-    #  Exporting pipeline setups to ONNX binaries
-    # --------------------------------------------------------------------
-    if model_type == "gruodebayes":
-        # Structural trace setup mapping dynamic sequences into tracking windows
-        example_input = (
-            scaled_traj_targets_train_posvel[0][:10].unsqueeze(0).to(node.device), 
-            torch.ones_like(scaled_traj_targets_train_posvel[0][:10]).unsqueeze(0).to(node.device),
-            (torch.arange(0, 10, dtype=torch.float32) * trajectory_dt).to(node.device)
-        )
-    elif isinstance(ode_solver, TorchdiffeqSolver):
-        example_input = (
-            None,
-            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device),
-        )
-    else:
-        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
-        
-    model_onx = torch.onnx.export(
-        node.model,
-        example_input if model_type == "gruodebayes" else (example_input,),
-        os.path.join(model_save_path, model_name + ".onnx"),
-        export_params=True,
-        opset_version=18,
-        external_data=False,
-        input_names=["input"],
-        output_names=["output"],
-    )
-
-    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
-        f.write(onnx.printer.to_text(model_onx.model_proto))
-
-    # Parameter text dumping block
-    if isinstance(scaler_traj, MinMaxScaler):
-        min_input = scaler_traj.min_
-        scale_input = scaler_traj.scale_
-        data_min_input = scaler_traj.data_min_
-        data_max_input = scaler_traj.data_max_
-
-        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
-            for m, s, dmin, dmax in zip(min_input, scale_input, data_min_input, data_max_input):
-                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
-    elif isinstance(scaler_traj, StandardScaler):
-        scale_input = scaler_traj.scale_
-        mean_input = scaler_traj.mean_
-        var_input = scaler_traj.var_
-
-        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
-            for s, m, v in zip(scale_input, mean_input, var_input):
-                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
-                
-    return node, model_name
-
-=======================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Training script for creating NEXT models",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = argparse.ArgumentParser(description="System NeXT Tactical Simulation Harness")
     parser.add_argument(
-        "--tgt-data-paths",
-        default=[],
-        type=str,
+        "truths",
         nargs="+",
-        help="A list of directories where training data can be found. Data will be test/train split if validation data is not provided. It is suggested that the final directory in the path be named for the target. Ex: datasets/train/PrSM",
-    )
-    parser.add_argument(
-        "--validation-data-paths",
-        default=[],
         type=str,
-        nargs="+",
-        help="A list of directories where validation data can be found. Helpful for when the test/train split has already been done. Ex: datasets/test/PrSM",
+        help="list of files to run the sim with. all output will end up in a single directory",
+    )
+    parser.add_argument("-o", dest="output", required=True, default=None, help="dir to place results")
+    parser.add_argument("-m", dest="model", required=True, default=None, help="onnx file")
+    parser.add_argument(
+        "-s",
+        dest="scalar",
+        required=True,
+        default=None,
+        help="this is currently only the pickled scalar.",
     )
     parser.add_argument(
-        "--sr",
-        default=100000,
+        "--sr-min",
         type=int,
-        help="The maximum slant range to trim data at. All data less than this value will be used. [meters]",
+        default=1000,
+        help="run the sim until the target gets near this slant range",
     )
     parser.add_argument(
-        "-o",
-        default="model_outputs",
-        type=str,
-        help="Directory to place pickles, JSON, checkpoints, ModelProto, and ONNX files related to the model",
-    )
-    parser.add_argument(
-        "--use-scalar",
-        default=False,
-        action="store_true",
-        help="Enable training with a scalar",
-    )
-    parser.add_argument(
-        "--frame",
-        default="dcu",
-        choices=["dcu", "grdth", "geodesic"],
-        help="Select which frame to put the data in for training the model",
-    )
-    parser.add_argument(
-        "--sbi-phase",
-        default="boost",
-        choices=["boost", "glide"],
-        help="Select which SBI phase to train a model for",
-    )
-    parser.add_argument(
-        "--nhidden",
-        default=200,
+        "--sr-max",
         type=int,
-        help="The size of the hidden layers of the MLP/FFNN",
-    )
-    parser.add_argument(
-        "--aug",
-        default=0,
-        type=int,
-        help="The size of the zeros augmented to the initial states",
-        dest="aug_dim",
-    )
-    parser.add_argument(
-        "--gpuidx",
-        default=0,
-        type=int,
-        help="The index of the gpu to use",
-        dest="gpu_index",
-    )
-    # UPDATED: Added "gruodebayes" to choices and appended to documentation
-    parser.add_argument(
-        "--model-type",
-        default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruodebayes"],
-        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, or GRU-ODE-Bayes.",
-    )
-    parser.add_argument(
-        "--dt",
-        default=0.1,
-        type=float,
-        help="The delta time to use for resampling the truth trajectory to align the time grid",
+        default=150000,
+        help="start the sim no further than this slant range",
     )
 
     args = parser.parse_args()
 
-    model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
-    if args.frame in ("grdth",):  
-        model_states = 5
+    if args.sr_min >= args.sr_max:
+        raise ValueError("sr min must be less than sr max")
 
-    trajectory_dt = args.dt  # [s]
+    if not os.path.exists(args.model):
+        raise ValueError(f"There is no model at {args.model}")
 
-    seed = 47
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    model_path = os.path.dirname(args.model)
+    model_name = ".".join(os.path.basename(args.model).split(".")[:-1])
 
-    target_strs = [Path(x).name for x in args.tgt_data_paths]
-    model_name_target_str = "+".join(target_strs)
-    model_path = args.o
-    model_save_path = os.path.join(model_path, model_name_target_str)
+    train_test_split_file = os.path.join(model_path, model_name + "_train_test_split.json")
+    train_test_trajs = None
+    if os.path.exists(train_test_split_file):
+        with open(train_test_split_file) as f:
+            train_test_trajs = json.load(f)
 
-    batch_size = 512  # increase the number when more RAM is available
-    if HAVE_HIGH_MEMORY:
-        batch_size = 1024
+    sim_many_truths(args, model_name, train_test_trajs)
 
-    # UPDATED: Added {args.model_type} into the string pattern to prevent execution run collisions
-    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{args.model_type}_{args.frame}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
-    if args.use_scalar:
-        model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
 
-    model_name = f"{model_name_wo_epochs}"
+def sim_many_truths(args, model_name, train_test_trajs):
+    tgt_metric = []
+    for p in args.truths:
+        print("Running sim for", p, flush=True)
+        t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
+        if t is not None:
+            tgt_metric.append(t)
 
-    # load data
-    traj_targets_train = []
-    traj_targets_test = []
-    
-    if len(args.validation_data_paths) == 0:
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets = load_data_dir(tgt_data_path, trajectory_dt, args, do_prep=False)
-            traj_targets_train_one_tgt, traj_targets_test_one_tgt = train_test_split(
-                traj_targets, test_size=0.2, random_state=26525
-            )
-            traj_targets_train.extend(traj_targets_train_one_tgt)
-            traj_targets_test.extend(traj_targets_test_one_tgt)
+
+def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
+    truth = load_single_truth(path_to_truth)
+    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, args)
+
+    truth_filename = os.path.basename(path_to_truth)
+    if len(trajs) == 0:
+        print(f"No extrapolations were created for {truth_filename}")
+        return None
+
+    if isinstance(truth_states_sr_cut, int):
+        if all((-1 == x for x in (truth_states_sr_cut, trajs, truth_trajs))):
+            print("skipping bad truth file", path_to_truth)
+            return
+
+    s = f"{model_name}_{truth_filename}"
+
+    if not os.path.exists(output):
+        os.makedirs(output, exist_ok=True)
+    plot_sim_result(
+        truth_states_sr_cut,
+        trajs,
+        args,
+        train_test_trajs,
+        model_name,
+        traj_number=truth_filename,
+        filename=s,
+        save=True,
+        show=False,
+        output=output,
+    )
+    save_sim_result(output, trajs, truth_filename)
+    try:
+        traj_metric = calc_sim_metric(output, trajs, truth_trajs, truth_filename)
+    except Exception:
+        traj_metric = None
+    return traj_metric
+
+
+def calc_sim_metric(output, trajs, truth_trajs, truth_filename):
+    ingress_metric = []
+    for next_traj, truth_traj in zip(trajs, truth_trajs):
+        ingress_metric.append(calc_sim_metric_for_one_pair(truth_traj, next_traj))
+    return np.mean(ingress_metric)
+
+
+def calc_sim_metric_for_one_pair(truth_traj, test_traj):
+    t = truth_traj
+    if len(truth_traj) != len(test_traj):
+        reduction_factor = np.gcd(len(test_traj), len(truth_traj))
+        t = resample_poly(
+            truth_traj,
+            len(test_traj) / reduction_factor,
+            len(truth_traj) / reduction_factor,
+            padtype="line",
+        )
+    return mean_absolute_error(t[:, POS_SLICE], test_traj[:, POS_SLICE])
+
+
+def save_sim_result(output, trajs, truth_filename):
+    print(f"Saving {len(trajs)} extrapolations to disk")
+    dfs = [None] * len(trajs)
+    for i, traj in enumerate(trajs):
+        df = pd.DataFrame(
+            traj,
+            columns=(
+                "time",
+                "x_pos_ecef",
+                "y_pos_ecef",
+                "z_pos_ecef",
+                "x_vel_ecef",
+                "y_vel_ecef",
+                "z_vel_ecef",
+                "x_acc_ecef",
+                "y_acc_ecef",
+                "z_acc_ecef",
+            ),
+        )
+
+        df["curr_time"] = df["time"][0]
+        df["pred_num"] = i + 1
+        df["validity_time"] = df["time"][0]
+        dfs[i] = df
+
+    big_df = pd.concat(dfs)
+    big_df["system_track_number"] = 1701
+    big_df["threat_id"] = 47
+    big_df["true_object_id"] = 31
+    big_df["hyp_id"] = 1
+    big_df["asset_id"] = 0
+    big_df["threat_genre"] = "HGV"
+    big_df["eng_status"] = "ELIGIBLE"
+    big_df["traj_genre"] = "MRV"
+    big_df["traj_genre_score"] = 0
+    big_df["reach_assess"] = 0
+    big_df["extrap_in_SR"] = "Y"
+
+    s = f"NEXT_extraps_{truth_filename}"
+    os.makedirs(os.path.join(output, f"extrap-dt_{extrapolation_dt}"), exist_ok=True)
+    big_df.to_csv(os.path.join(output, f"extrap-dt_{extrapolation_dt}", s), index=False)
+
+
+def plot_sim_result(
+    truth,
+    trajs,
+    args,
+    train_test_trajs,
+    model_name,
+    traj_number="",
+    filename="",
+    save=False,
+    show=False,
+    output=None,
+):
+    if save and not output:
+        raise ValueError("Cannot save figures without an output path")
+    fig, (ax11, ax12) = plt.subplots(2, 1, sharex=True)
+    fig2, ax21 = plt.subplots(1, 1)
+    fig3, ax31 = plt.subplots(1, 1)
+    fig4, (ax41, ax42, ax43) = plt.subplots(1, 3, sharex=True)
+    fig5, (ax51, ax52) = plt.subplots(2, 1, sharex=True)
+
+    impact_ecef = deepcopy(truth[-1, POS_SLICE])
+    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
+    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
+
+    plot_traj_truth = deepcopy(truth)
+    plot_trajs_next = deepcopy(trajs)
+
+    for i, traj in enumerate([plot_traj_truth] + plot_trajs_next):
+        for j in range(traj.shape[0]):
+            traj[j, POS_SLICE] = ecef_to_ned(traj[j, POS_SLICE], impact_ecef)
+            traj[j, VEL_SLICE] = ecef_to_ned_velocity(traj[j, VEL_SLICE], impact_ecef)
+            traj[j, POS_SLICE] = ned_to_dcu(traj[j, POS_SLICE], ref_angle)
+            traj[j, VEL_SLICE] = ned_to_dcu(traj[j, VEL_SLICE], ref_angle)
+
+        axes = (ax11, ax12, ax21, ax31, ax41, ax42, ax43)
+        plot_single_traj(i, traj, axes)
+
+    plot_color_trajs(plot_traj_truth, plot_trajs_next, ax51, ax52)
+
+    ax11.legend()
+    ax21.legend()
+    ax31.legend()
+    ax43.legend()
+    ax11.set_xlim([-10, args.sr_max / 1e3])
+    ax11.grid(True)
+    ax12.grid(True)
+    ax21.grid(True)
+    ax31.grid(True)
+    ax41.grid(True)
+    ax42.grid(True)
+    ax43.grid(True)
+    ax51.grid(True)
+    ax52.grid(True)
+    add_classification_markings(fig, Classification.UNCLASSIFIED)
+    add_classification_markings(fig2, Classification.UNCLASSIFIED)
+    add_classification_markings(fig3, Classification.UNCLASSIFIED)
+    add_classification_markings(fig4, Classification.UNCLASSIFIED)
+    add_classification_markings(fig5, Classification.UNCLASSIFIED)
+    add_lmpi_markings(fig)
+    add_lmpi_markings(fig2)
+    add_lmpi_markings(fig3)
+    add_lmpi_markings(fig4)
+    add_lmpi_markings(fig5)
+
+    title = f"{traj_number}"
+    if train_test_trajs is not None:
+        if title in train_test_trajs["test"]:
+            title = title + " (from test set)"
+        elif title in train_test_trajs["train"]:
+            title = title + " (from train set)"
+        else:
+            title = title + " (outside model scope)"
+    ax11.set_title(title, wrap=True)
+    ax21.set_title(title, wrap=True)
+    ax31.set_title(title, wrap=True)
+    ax51.set_title(title, wrap=True)
+    fig4.suptitle(title, wrap=True)
+    fig.canvas.manager.set_window_title(title)
+    fig2.canvas.manager.set_window_title(title)
+    fig3.canvas.manager.set_window_title(title)
+    fig4.canvas.manager.set_window_title(title)
+    fig5.canvas.manager.set_window_title(title)
+
+    figure_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}", "plots")
+    os.makedirs(figure_dir, exist_ok=True)
+
+    if save:
+        fig2.savefig(os.path.join(figure_dir, filename + "_sim_Speed.png"), format="png")
+        fig3.savefig(os.path.join(figure_dir, filename + "_sim_Accel.png"), format="png")
+        fig4.savefig(os.path.join(figure_dir, filename + "_sim_Vel.png"), format="png")
+        fig5.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR_color.png"), format="png")
+
+    if show:
+        plt.show()
+        input("press enter to continue")
+    plt.close("all")
+
+
+def plot_single_traj(i, traj, axes):
+    (ax11, ax12, ax21, ax31, ax41, ax42, ax43) = axes
+    if i == 0:
+        color = "k"
+        lw = 1
+        label = "Truth"
+        zorder = 8
+    elif i == 1:
+        color = "tab:orange"
+        lw = 0.5
+        label = "NEXT"
+        zorder = None
     else:
-        print("split already done")
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
-        for tgt_data_path in args.validation_data_paths:
-            traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+        color = "tab:orange"
+        lw = 0.5
+        label = "_nolegend_"
+        zorder = None
 
-    print(
-        f"There are {len(traj_targets_train)} training trajs and {len(traj_targets_test)} validation trajs. "
-        f"There will be {(len(traj_targets_train) // batch_size) + 1} batch(es) for training and "
-        f"{(len(traj_targets_test) // batch_size) + 1} for validation"
+    ax11.plot(traj[:, 1] / 1e3, traj[:, 3] / 1e3, label=label, color=color, lw=lw, zorder=zorder)
+    ax12.plot(traj[:, 1] / 1e3, traj[:, 2] / 1e3, label=label, color=color, lw=lw, zorder=zorder)
+    ax21.plot(traj[1:, 3] / 1e3, np.linalg.norm(traj[1:, VEL_SLICE], axis=1), label=label, color=color, lw=lw, zorder=zorder)
+    ax31.plot(traj[1:, 3] / 1e3, np.linalg.norm(traj[1:, ACC_SLICE], axis=1), label=label, color=color, lw=lw, zorder=zorder)
+    ax41.plot(traj[:, 3] / 1e3, traj[:, 4], color=color, lw=lw, zorder=zorder)
+    ax42.plot(traj[:, 3] / 1e3, traj[:, 5], color=color, lw=lw, zorder=zorder)
+    ax43.plot(traj[:, 3] / 1e3, traj[:, 6], label=label, color=color, lw=lw, zorder=zorder)
+
+    ax11.set_ylabel("Up [km]")
+    ax12.set_xlabel("Down [km]")
+    ax12.set_ylabel("Cross [km]")
+    ax21.set_xlabel("Up [km]")
+    ax21.set_ylabel("Speed [m/s]")
+    ax31.set_xlabel("Up [km]")
+    ax31.set_ylabel("Acceleration Magnitude [m/s/s]")
+    ax41.set_xlabel("Up [km]")
+    ax42.set_xlabel("Up [km]")
+    ax43.set_xlabel("Up [km]")
+    ax41.set_ylabel("Velocity [m/s]")
+    ax41.set_title("Down")
+    ax42.set_title("Cross")
+    ax43.set_title("Up")
+
+
+def plot_color_trajs(truth, extraps, ax51, ax52):
+    color = "lime"
+    linestyle = "--"
+    lw = 1
+    label = "Truth"
+    zorder = 8
+    ax51.plot(truth[:, 1] / 1e3, truth[:, 3] / 1e3, label=label, color=color, lw=lw, zorder=zorder, linestyle=linestyle)
+    ax52.plot(truth[:, 1] / 1e3, truth[:, 2] / 1e3, label=label, color=color, lw=lw, zorder=zorder, linestyle=linestyle)
+
+    tall = []
+    dall = []
+    call = []
+    uall = []
+    for i in range(len(extraps)):
+        ex = extraps[i]
+        t, d, c, u, *_ = ex.T
+        tall.append(t)
+        dall.append(d / 1e3)
+        call.append(c / 1e3)
+        uall.append(u / 1e3)
+
+    init_times = tuple(x[0][0] for x in extraps)
+    plot = multiline(dall, uall, init_times, ax=ax51, cmap="plasma", lw=0.5, label="NEXT")
+    multiline(dall, call, init_times, ax=ax52, cmap="plasma", lw=0.5)
+
+    cbar = ax51.get_figure().colorbar(plot, ax=[ax51, ax52])
+    cbar.set_label(label="Trajectory Initial Point Validity Time")
+
+    ax51.set_xlabel("Down [km]")
+    ax51.set_ylabel("Up [km]")
+    ax52.set_ylabel("Cross [km]")
+
+
+def sim_ingress(truth_states, args):
+    impact_ecef = deepcopy(truth_states[-1, POS_SLICE])
+    impact_time = truth_states[-1, 0]
+
+    # Filters timeline to cleanly capture raw tracking states
+    truth_states_sr_cut = np.asarray(
+        tuple(x for x in truth_states if x[TIME_INDEX] < 122.0 and not np.allclose(x[VEL_SLICE], [0, 0, 0])),
+        dtype=np.float64,
     )
 
-    # split the trajectory data from the metadata
-    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
-    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
+    if truth_states_sr_cut.shape[0] == 0:
+        return truth_states, [], []
+
+    firm_track_time = truth_states_sr_cut[0][0]
+    sim_time = deepcopy(firm_track_time)
+    trajs = []
+    truth_trajs = []
+
+    while sim_time <= impact_time - measurement_dt:
+        tgt_state_ecef_index = np.where(truth_states_sr_cut[:, 0] == sim_time)
+        tgt_state_ecef_index_forward = np.where(truth_states_sr_cut[:, 0] >= sim_time)
+        if len(tgt_state_ecef_index[0]) == 0:
+            try:
+                tgt_state_ecef_index = np.array(tgt_state_ecef_index_forward[0][0])
+            except IndexError:
+                return truth_states_sr_cut, trajs, truth_trajs
+            sim_time = truth_states_sr_cut[tgt_state_ecef_index].squeeze()[0]
+        tgt_state_ecef = truth_states_sr_cut[tgt_state_ecef_index]
+        truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
+
+        x0 = tgt_state_ecef.squeeze()
+        traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, args)
+        if traj is not None:
+            if isinstance(traj, int) and traj == -1:
+                break
+            trajs.append(traj)
+            truth_trajs.append(truth_traj_forward)
+        sim_time += measurement_dt
+    return truth_states_sr_cut, trajs, truth_trajs
+
+
+def bound(low, high, x):
+    return max(low, min(high, x))
+
+
+def round_to(x, base):
+    return base * round(x / base)
+
+
+ort_sess_stash = None
+
+
+def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, args):
+    initial_state_slant_range = np.linalg.norm(initial_state_ecef[POS_SLICE] - guide_point_ecef)
+    if initial_state_slant_range < args.sr_min:
+        print("target too close", initial_state_slant_range, args.sr_min)
+        return -1
+
+    use_grdth = "_grdth_" in os.path.basename(args.model)
+    use_geodesic = "_geod_" in os.path.basename(args.model) or "_geodesic_" in os.path.basename(args.model)
+    global ort_sess_stash
     
-    split_dict = {
-        "train": traj_targets_train_traj_numbers,
-        "test": traj_targets_test_traj_numbers,
-    }
-    os.makedirs(os.path.join(model_path, model_name_target_str), exist_ok=True)
-    with open(
-        os.path.join(model_path, model_name_target_str, f"{model_name_wo_epochs}_train_test_split.json"),
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(split_dict, f)
-
-    phase_to_model = args.sbi_phase
-    traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
-    traj_targets_test = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_test]
-
-    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
-    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
-
-    time_series_point_count = [x.shape[0] for x in traj_targets_train + traj_targets_test]
-    if any(x < 10 for x in time_series_point_count):
-        raise ValueError(
-            "Some of the training or test data has less than 10 time series points. Consider changing the trajectory_dt or extending to a further slant range",
-            time_series_point_count,
+    if use_grdth:
+        initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        if ort_sess_stash:
+            ort_sess = ort_sess_stash
+        else:
+            ort_sess = onnxruntime.InferenceSession(args.model)
+            ort_sess_stash = ort_sess
+    elif use_geodesic:
+        _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+            np.atleast_2d(initial_state_ecef[POS_SLICE]),
+            np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+            np.zeros_like(np.atleast_2d(initial_state_ecef[VEL_SLICE])),
+            guide_point_ecef,
         )
-
-    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
-    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
-
-    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any(
-        [torch.isnan(x).any() for x in traj_targets_test_posvel]
-    ):
-        print("traj_targets_train_posvel", traj_targets_train)
-        print("traj_targets_test_posvel", traj_targets_test)
-        raise ValueError(
-            "There are NaN(s) in the training or validation data. See the data dump above for where the NaN(s) are."
-        )
-
-    stacked_posvel = np.vstack(traj_targets_train_posvel)
-    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
-    if args.frame == "grdth":
-        column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
+        initial_state_NEXT_frame = np.hstack([np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]])[0]
+        if ort_sess_stash:
+            ort_sess = ort_sess_stash
+        else:
+            ort_sess = onnxruntime.InferenceSession(args.model)
+            ort_sess_stash = ort_sess
+    else:
+        initial_state_NEXT_frame, initial_point_heading, flip_c = ecef_to_next_dcu(initial_state_ecef, guide_point_ecef)
+        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+        bucket_range = 100000
+        rounded_sr = int(bound(bucket_range, args.sr_max, round_to(initial_state_slant_range, bucket_range)) / 1e3)
+        model_name_to_load = re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", args.model)
         
-    plot_column_distributions(
-        stacked_posvel,
-        column_names=column_names,
-        data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)),
-    )
-    plot_correlation_matrix(
-        stacked_posvel,
-        column_names=column_names,
-        data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)),
-    )
+        # Adjust scalar paths for DCU buckets dynamically if they match naming structures
+        if os.path.exists(model_name_to_load):
+            scalar_name_to_load = os.path.join(
+                os.path.dirname(args.scalar), re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", os.path.basename(args.scalar))
+            )
+            if os.path.exists(scalar_name_to_load):
+                args.scalar = scalar_name_to_load
+            ort_sess = onnxruntime.InferenceSession(model_name_to_load)
+        else:
+            ort_sess = onnxruntime.InferenceSession(args.model)
 
-    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+    try:
+        NEXT_extrap = NEXT_extrapolation(
+            initial_state_NEXT_frame, dt, n_steps, initial_point_heading, use_grdth, args, ort_sess
+        )
+    except ValueError as e:
+        print("Extrap failed", traceback.format_exc())
+        return None
 
-    # This call now cleanly passes args.model_type = "gruodebayes" down into the refactored training loop
-    (node, model_name) = train_NEXT(
-        model_name=model_name,
-        traj_targets_train=traj_targets_train_posvel,
-        traj_targets_test=traj_targets_test_posvel,
-        scaler_traj=scaler_traj,
-        model_save_path=model_save_path,
-        trajectory_dt=trajectory_dt,
-        batch_size=batch_size,
-        use_scalar=args.use_scalar,
-        model_states=model_states,
-        aug_dim=args.aug_dim,
-        nhidden=args.nhidden,
-        gpu_index=args.gpu_index,
-        model_type=args.model_type,
-        frame=args.frame,
-    )
+    if use_grdth:
+        NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
+    elif use_geodesic:
+        NEXT_extrap_ecef = np.hstack(
+            [
+                NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+                local_geodesic_to_ecef_vec(
+                    np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]), guide_point_ecef
+                ),
+            ],
+        )[:, :7]
+    else:
+        NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
+
+    a = np.gradient(NEXT_extrap_ecef[:, VEL_SLICE], axis=0)
+    NEXT_extrap_ecef = np.hstack([NEXT_extrap_ecef, a])
+    return NEXT_extrap_ecef
+
+
+def NEXT_extrapolation(
+    initial_state_next_frame,
+    dt: float,
+    n_steps: int,
+    ref_angle,
+    use_grdth: bool,
+    args,
+    ort_sess: onnxruntime.InferenceSession,
+):
+    use_scalar = "_scalarOn" in os.path.basename(args.model)
+    if use_scalar:
+        with open(args.scalar, "rb") as scalar_pickle:
+            NEXT_scalar = pickle.load(scalar_pickle)
+            
+    state_size = 5 if use_grdth else 6
+
+    # --------------------------------------------------------------------
+    # Dynamic Hidden Parameter Extraction Matrix
+    # --------------------------------------------------------------------
+    model_base = os.path.basename(args.model)
+    hid_match = re.search(r"_(\d+)hid_", model_base)
+    aug_match = re.search(r"_(\d+)aug_", model_base)
+    
+    hidden_dim = int(hid_match.group(1)) if hid_match else 0
+    model_augmentation_dim = int(aug_match.group(1)) if aug_match else 0
+    is_gruode = hidden_dim > 0 or "gruode" in args.model.lower()
+
+    extrap = np.array([np.hstack([initial_state_next_frame])])
+    validity_time = deepcopy(initial_state_next_frame[0])
+    
+    # Initialize the hidden memory registry to neutral parameters at t0
+    current_hidden_state = np.zeros((1, hidden_dim), dtype=np.float32) if is_gruode else None
+    augmentation_state = np.zeros((1, model_augmentation_dim), dtype=np.float32) if model_augmentation_dim > 0 else None
+
+    temp_iter = 0
+    while temp_iter < n_steps and float(validity_time) < 122.0:
+        temp_iter = temp_iter + 1
+        validity_time += dt
+
+        if use_scalar:
+            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
+            scaled_pos_vel = NEXT_scalar.transform(pos_vel).astype(np.float32)
+            
+            # Pack input matrix configurations based on the evaluated model type
+            if is_gruode:
+                model_input = np.hstack([scaled_pos_vel, current_hidden_state])
+                if model_augmentation_dim > 0:
+                    model_input = np.hstack([model_input, augmentation_state])
+            else:
+                if model_augmentation_dim > 0:
+                    model_input = np.hstack([scaled_pos_vel, augmentation_state])
+                else:
+                    model_input = scaled_pos_vel
+            
+            # Evaluate vector field derivative arrays via the ONNX Runtime engine
+            model_output = ort_sess.run(["output"], {"input": model_input[0].astype(np.float32)})[-1].reshape(1, -1)
+            
+            if is_gruode:
+                # Isolate distinct component derivatives from the continuous state matrix
+                dx_dt = model_output[:, :state_size]
+                dh_dt = model_output[:, state_size : state_size + hidden_dim]
+                
+                # Propagate both coordinates and hidden recurrent vector fields simultaneously
+                current_hidden_state = current_hidden_state + dh_dt * dt
+                scaled_pos_vel_next = scaled_pos_vel + dx_dt * dt
+                next_state = NEXT_scalar.inverse_transform(scaled_pos_vel_next)
+            else:
+                next_state_raw = model_output * dt + model_input[:, :state_size]
+                if model_augmentation_dim > 0:
+                    augmentation_state = next_state_raw[:, state_size:]
+                next_state = NEXT_scalar.inverse_transform(next_state_raw[:, :state_size])
+        else:
+            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]], dtype=np.float32)
+            if is_gruode:
+                model_input = np.hstack([pos_vel, current_hidden_state])
+                if model_augmentation_dim > 0:
+                    model_input = np.hstack([model_input, augmentation_state])
+            else:
+                model_input = np.hstack([pos_vel, augmentation_state]) if model_augmentation_dim > 0 else pos_vel
+                
+            model_output = ort_sess.run(["output"], {"input": model_input[0].astype(np.float32)})[-1].reshape(1, -1)
+            
+            if is_gruode:
+                dx_dt = model_output[:, :state_size]
+                dh_dt = model_output[:, state_size : state_size + hidden_dim]
+                current_hidden_state = current_hidden_state + dh_dt * dt
+                next_state = pos_vel + dx_dt * dt
+            else:
+                next_state = model_output * dt + model_input[:, :state_size]
+                if model_augmentation_dim > 0:
+                    augmentation_state = next_state[:, state_size:]
+                next_state = next_state[:, :state_size]
+
+        next_state = np.insert(next_state, 0, validity_time)
+        temp_extrap = np.vstack([extrap, next_state])
+
+        # REMOVED STRATEGIC ICBM CRITERIA: Bypasses the 2,600 km early termination check to protect tactical runs
+        extrap = np.vstack([extrap, next_state])
+
+    if extrap.shape[0] < 3:
+        raise ValueError(f"Extrap was too short {extrap.shape}")
+
+    return extrap
+
+
+if __name__ == "__main__":
+    main()
+
+print("", end="", flush=True)

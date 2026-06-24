@@ -1,97 +1,271 @@
+# Copyright 2026 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
+
+# Built-ins
+import argparse
+import json
 import math
+import multiprocessing as mp
+import os
+import pickle
+from copy import deepcopy
+from pathlib import Path
+
+# 3rd party
+import matplotlib.pyplot as plt
+import numpy as np
+import onnx
+import pandas as pd
+import psutil
+import scipy
+import seaborn as sns
 import torch
 import torch.nn as nn
+from scipy.interpolate import make_interp_spline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+
+# LM packages
+from lm_ai_torch_models.activations import Activation
+from lm_ai_torch_training.configuration import TrainingConfiguration
+from lm_ai_torch_training.hyperparameters import TrainingParam
+from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
+from lm_ai_torch_training.optimizers.adam import AdamOptimizer
+from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
+from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
+
+# Local
+from coordinate_transform_functions import (
+    dcu_to_ned,
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    frd_to_dcu,
+    ned_to_dcu,
+    ned_to_ecef,
+    ned_to_ecef_velocity,
+)
+from energy_functions import mechanical_energy
+from load_truth import load_single_truth
+from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+
+from neural_ode_mod import (
+    DEFAULT_LOSS,
+    EarlyStopper,
+    ModelCheckpoint,
+    NODEPredictor,
+)
+from NEXT_frames import (
+    ecef_to_local_geodesic_vec,
+    ecef_to_next_dcu,
+    ecef_to_next_grdth,
+    local_geodesic_to_ecef_vec,
+    next_dcu_to_ecef,
+    next_grdth_to_ecef,
+)
+from torchdiffeq_solver import TorchdiffeqSolver
+from trajectory_helpers import (
+    ACC_SLICE,
+    DOWN_DOT_INDEX,
+    DOWN_INDEX,
+    GR_DOT_INDEX,
+    GR_INDEX,
+    POS_SLICE,
+    THETA_DOT_INDEX,
+    TIME_INDEX,
+    VEL_SLICE,
+    check_time_series,
+    resample_traj_data,
+)
 from torchdiffeq import odeint
 
+HAVE_HIGH_MEMORY = False
+if psutil.virtual_memory().total > 64e9:
+    HAVE_HIGH_MEMORY = True
+
+HAVE_GPU = False
+if torch.cuda.device_count() != 0:
+    HAVE_GPU = True
+    print("there is a gpu in this node")
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i))
+
+BUCKET_SIZE = 5000  # [m]
+
+
+class ODEfunc(torch.nn.Module):
+    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
+        super(ODEfunc, self).__init__()
+        self.order_shift_slice = order_shift_slice
+        self.len_of_order_shift_slice = 0
+        if self.order_shift_slice is not None:
+            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
+            self.len_of_order_shift_slice = len(order_indicies)
+        self.act1 = torch.nn.SiLU(inplace=False)
+        self.act2 = torch.nn.SiLU(inplace=False)
+        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
+        self.fc2 = torch.nn.Linear(nhidden, nhidden)
+        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
+        self.nfe = 0
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.order_shift_slice is not None:
+            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
+        self.nfe += 1
+        out = self.fc1(x)
+        out = self.act1(out)
+        out = self.fc2(out)
+        out = self.act2(out)
+        out = self.fc4(out)
+        if self.order_shift_slice is not None:
+            return torch.cat((v, out), dim=x.ndim - 1)
+        else:
+            return out
+
+
+class Normaliser(torch.nn.Module):
+    def __init__(self, scaler):
+        super().__init__()
+        self.mean = torch.nn.Parameter(torch.tensor(scaler.mean_, dtype=torch.float32), requires_grad=False)
+        self.scale = torch.nn.Parameter(torch.tensor(scaler.scale_, dtype=torch.float32), requires_grad=False)
+
+    def forward(self, x):
+        return (x - self.mean) / self.scale
+
+    def inverse(self, z):
+        return z * self.scale + self.mean
+
+
+class Encoder(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.rnn = torch.nn.GRU(input_size=6, hidden_size=hidden, batch_first=True, num_layers=1)
+        self.mu_head = torch.nn.Linear(hidden, latent_dim)
+        self.logvar_head = torch.nn.Linear(hidden, latent_dim)
+
+    def forward(self, x):
+        _, h_n = self.rnn(x)
+        h = h_n.squeeze(0)
+        mu = self.mu_head(h)
+        logvar = self.logvar_head(h)
+        return mu, logvar
+
+
+class LatentODEFunc(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, latent_dim),
+        )
+
+    def forward(self, t, z):
+        return self.net(z)
+
+
+class Decoder(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 6),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
+from torchdiffeq import odeint_adjoint
+
+class LatentNODE(torch.nn.Module):
+    def __init__(self, latent_dim=8):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.odefunc = LatentODEFunc(latent_dim)
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, obs_window_and_times: tuple[torch.Tensor, torch.Tensor]):
+        obs_window, t_eval = obs_window_and_times
+        mu, logvar = self.encoder(obs_window)
+
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z0 = mu + eps * std
+
+        z_t = odeint_adjoint(self.odefunc, z0, t_eval, atol=1e-5, rtol=1e-5)
+        z_t = z_t.permute(1, 0, 2)
+
+        recon = self.decoder(z_t)
+        return recon, mu, logvar
+
+
+# -------------------------------------------------
+# GRU-ODE-Bayes ("Grood") Implementation Subsystems
+# -------------------------------------------------
 class GRUODEFunc(nn.Module):
-    """
-    Computes the continuous-time derivative dh(t)/dt for the GRU-ODE hidden state.
-    Implements Lipschitz continuous bounded transitions over unobserved gaps.
-    """
+    """Computes continuous state dynamics dh(t)/dt between radar tracking updates."""
     def __init__(self, hidden_dim: int):
         super(GRUODEFunc, self).__init__()
         self.hidden_dim = hidden_dim
-        
-        # Continuous parameterization weights
         self.w_r = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.w_z = nn.Linear(hidden_dim, hidden_dim, bias=True)
         self.w_h = nn.Linear(hidden_dim, hidden_dim, bias=True)
         
     def forward(self, t, h: torch.Tensor) -> torch.Tensor:
-        """
-        Autonomous forward pass handling batch dimensions safely.
-        h shape: (Batch_Size, Hidden_Dim)
-        """
-        # Since x(t) = 0 in autonomous tracking, transformations rely solely on h
         r = torch.sigmoid(self.w_r(h))
         z = torch.sigmoid(self.w_z(h))
         g = torch.tanh(self.w_h(r * h))
-        
-        # Bounded continuous derivative equation
-        dhdt = (1.0 - z) * (g - h)
-        return dhdt
+        return (1.0 - z) * (g - h)
 
 
 class GRUBayesUpdate(nn.Module):
-    """
-    Processes sporadic incoming radar vectors and maps multi-variable constraints
-    via an integrated observation error projection layer.
-    """
+    """Processes sporadic tracking updates and maps structural covariance states."""
     def __init__(self, input_dim: int, hidden_dim: int):
         super(GRUBayesUpdate, self).__init__()
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         
-        # Generates predicted mean and log-variance for the feature space
         self.f_obs = nn.Sequential(
             nn.Linear(hidden_dim, 25),
             nn.ReLU(),
-            nn.Linear(25, input_dim * 2) # [mean_1, ..., mean_D, logvar_1, ..., logvar_D]
+            nn.Linear(25, input_dim * 2)
         )
-        
-        # Per-dimension projection mapping for prep vector q_d
-        # q_d size: 2 (theta) + 1 (y_val) + 1 (norm_error) = 4
         self.d_proj = nn.Linear(4, hidden_dim)
         self.gru_cell = nn.GRUCell(hidden_dim * input_dim, hidden_dim)
         
     def forward(self, h_pre: torch.Tensor, y: torch.Tensor, mask: torch.Tensor):
-        """
-        Executes discrete state updates based on observed values.
-        h_pre shape: (B, H), y shape: (B, D), mask shape: (B, D)
-        """
         batch_size = h_pre.size(0)
         theta_all = self.f_obs(h_pre)
         mu, logvar = torch.chunk(theta_all, 2, dim=-1)
         sigma = torch.exp(0.5 * logvar) + 1e-6
-        
-        # Normalized kinematic tracking residuals
         norm_err = (y - mu) / sigma
         
-        # Build multi-dimensional feature space transformations safely
         q_elements = []
         for d in range(self.input_dim):
-            # Gather attributes for current dimension across batch
-            theta_d = torch.stack([mu[:, d], logvar[:, d]], dim=-1) # (B, 2)
-            y_d = y[:, d].unsqueeze(-1) # (B, 1)
-            err_d = norm_err[:, d].unsqueeze(-1) # (B, 1)
+            theta_d = torch.stack([mu[:, d], logvar[:, d]], dim=-1)
+            y_d = y[:, d].unsqueeze(-1)
+            err_d = norm_err[:, d].unsqueeze(-1)
             
-            q_d = torch.cat([theta_d, y_d, err_d], dim=-1) # (B, 4)
-            proj_d = torch.relu(self.d_proj(q_d)) # (B, H)
-            
-            # Nullify unobserved channels using the tracking mask
+            q_d = torch.cat([theta_d, y_d, err_d], dim=-1)
+            proj_d = torch.relu(self.d_proj(q_d))
             proj_d = proj_d * mask[:, d].unsqueeze(-1)
             q_elements.append(proj_d)
             
-        f_prep = torch.cat(q_elements, dim=-1) # (B, H * D)
+        f_prep = torch.cat(q_elements, dim=-1)
         h_post = self.gru_cell(f_prep, h_pre)
         return h_post, mu, sigma
 
 
 class GRUODEBayesModel(nn.Module):
-    """
-    Complete System NeXT trajectory forecasting pipeline wrapping continuous flow
-    and sequential filtering steps. Conforms to production ONNX requirements.
-    """
+    """Top-level pipeline processing continuous-time updates with structural jumps."""
     def __init__(self, input_dim: int, hidden_dim: int):
         super(GRUODEBayesModel, self).__init__()
         self.input_dim = input_dim
@@ -99,43 +273,430 @@ class GRUODEBayesModel(nn.Module):
         
         self.ode_flow = GRUODEFunc(hidden_dim)
         self.bayes_update = GRUBayesUpdate(input_dim, hidden_dim)
-        
-        # Maps latent state space [-1, 1] back out to real-world physical kinematics
         self.decoder = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, input_dim)
         )
         
-    def forward(self, y_seq: torch.Tensor, mask_seq: torch.Tensor, t_seq: torch.Tensor) -> tuple:
-        """
-        Executes a trajectory pass over uneven temporal observation steps.
-        y_seq/mask_seq shape: (B, T, D) - Target sequence trajectories
-        t_seq shape: (T,) or (B, T) - Measurement timestamps
-        """
+    def forward(self, packed_inputs: tuple) -> tuple:
+        y_seq, mask_seq, t_seq = packed_inputs
         device = y_seq.device
         batch_size, seq_len, _ = y_seq.size()
         
-        # Initialize hidden state within the stable bounded region
         h = torch.zeros((batch_size, self.hidden_dim), device=device)
-        
         pred_means = []
-        pred_sigmas = []
         
-        # Iterate over structural time steps sequentially to allow discrete updates
         for k in range(seq_len):
             if k > 0:
-                # Continuous prediction step across variable sensor lookback timelines
                 dt_step = t_seq[k] - t_seq[k-1]
                 if dt_step > 0:
                     t_span = torch.tensor([0.0, dt_step.item()], device=device)
-                    # Integrate hidden dynamics over the variable interval
                     h_integrated = odeint(self.ode_flow, h, t_span, method='rk4', options={'step_size': 0.1})
-                    h = h_integrated[-1] # Extract integration endpoint
+                    h = h_integrated[-1]
             
-            # Discrete filtering step using incoming observations
             h, mu, sigma = self.bayes_update(h, y_seq[:, k, :], mask_seq[:, k, :])
             pred_means.append(self.decoder(h).unsqueeze(1))
-            pred_sigmas.append(sigma.unsqueeze(1))
             
-        return torch.cat(pred_means, dim=1), torch.cat(pred_sigmas, dim=1)
+        return torch.cat(pred_means, dim=1)
+
+
+def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return 0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar), dim=1))
+
+
+def _make_obs_target(traj: torch.Tensor, obs_len: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
+    assert traj.shape[0] > obs_len, "trajectory shorter than observation window"
+    obs_window = traj[:obs_len].unsqueeze(0)
+    target = traj.unsqueeze(0)
+    return obs_window, target
+
+
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+    raw_train_meta=None,
+    raw_test_meta=None,
+):
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=100,
+        verbose=True,
+    )
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
+
+    if frame in ("dcu", "geodesic"):
+        velocity_indicies = (3, 4, 5)
+    elif frame in ("grdth",):
+        velocity_indicies = (2, 3, 4)
+    else:
+        raise ValueError("That frame is not known for what the velocity indices are")
+
+    early_stop_metric_name = "val_loss"
+    loss_func = WrappedMSELoss(
+        height_idx=1,
+        vel_indices=velocity_indicies,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+    )
+
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(
+            layer_channels=[5, 5],
+            layer_activation=Activation.SILU,
+        ),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    # Model Branch Router Configuration
+    if model_type == "node":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=0, order_shift_slice=None).to(node.device)
+    elif model_type == "anode":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=aug_dim, order_shift_slice=None).to(node.device)
+    elif model_type == "sonode":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=0, order_shift_slice=slice(3, 6)).to(node.device)
+    elif model_type == "latentode":
+        latent_dim = nhidden // 2 if nhidden >= 20 else 8
+        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
+        recon_criterion = WrappedMSELoss(height_idx=1, vel_indices=[3, 4, 5], scaler=scaler_traj if use_scalar else None, N_FEATURES=model_states)
+        def latent_ode_loss_fn(recon, target, mu, logvar):
+            return recon_criterion(recon, target) + 0.1 * _kl_divergence(mu, logvar)
+        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    elif model_type == "gruode":
+        node.model = GRUODEBayesModel(input_dim=model_states, hidden_dim=nhidden).to(node.device)
+        node.loss_func = WrappedMSELoss(height_idx=1, vel_indices=velocity_indicies, scaler=scaler_traj if use_scalar else None, N_FEATURES=model_states)
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
+
+    if gen_model:
+        if model_type == "latentode":
+            OBS_WINDOW = 10
+            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]
+            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
+        elif model_type == "gruode":
+            # Structure packed inputs: (y_scaled, mask, t_timestamps)
+            train_data = []
+            for idx, traj in enumerate(scaled_traj_targets_train_posvel):
+                t_arr = torch.Tensor(raw_train_meta[idx][:, 0])
+                m_arr = torch.ones_like(traj)
+                train_data.append((traj.unsqueeze(0), m_arr.unsqueeze(0), t_arr))
+            test_data = []
+            for idx, traj in enumerate(scaled_traj_targets_test_posvel):
+                t_arr = torch.Tensor(raw_test_meta[idx][:, 0])
+                m_arr = torch.ones_like(traj)
+                test_data.append((traj.unsqueeze(0), m_arr.unsqueeze(0), t_arr))
+
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(20, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(20, 5e-4, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-3),
+            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(50, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+        for len_strat in length_strategies:
+            print("running length strategy", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs, optimizer=AdamOptimizer(learning_rate=learning_rate),
+                batch_size=batch_size, num_workers=2, verbose=True,
+            )
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
+
+            min_states = 5
+            if model_type == "latentode":
+                fraction_of_data = [(obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)]) for (obs, tgt) in train_data]
+                fraction_of_data_val = [(obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)]) for (obs, tgt) in test_data]
+            elif model_type == "gruode":
+                fraction_of_data = []
+                for (y, m, t) in train_data:
+                    slice_max = max(math.ceil(y.size(1) * data_fraction), min_states)
+                    fraction_of_data.append((y[:, :slice_max, :], m[:, :slice_max, :], t[:slice_max]))
+                fraction_of_data_val = []
+                for (y, m, t) in test_data:
+                    slice_max = max(math.ceil(y.size(1) * data_fraction), min_states)
+                    fraction_of_data_val.append((y[:, :slice_max, :], m[:, :slice_max, :], t[:slice_max]))
+            else:
+                fraction_of_data = [x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :] for x in scaled_traj_targets_train_posvel]
+                fraction_of_data_val = [x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :] for x in scaled_traj_targets_test_posvel]
+
+            metrics = node.fit(x=fraction_of_data, validation_data=fraction_of_data_val, enable_checkpoints=True if data_fraction == 1.0 else False)
+        
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
+
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.train(False)
+    node.model.eval()
+
+    if isinstance(ode_solver, TorchdiffeqSolver):
+        example_input = (None, torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device))
+    else:
+        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    
+    # Standard ONNX conversion sequence 
+    if model_type != "gruode":
+        model_onx = torch.onnx.export(
+            node.model, example_input, os.path.join(model_save_path, model_name + ".onnx"),
+            export_params=True, opset_version=18, input_names=["input"], output_names=["output"]
+        )
+        with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
+            f.write(onnx.printer.to_text(model_onx.model_proto))
+
+    if isinstance(scaler_traj, MinMaxScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
+                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
+    elif isinstance(scaler_traj, StandardScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
+                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
+    return node, model_name
+
+
+def prep_trajectory(x):
+    ecef_data, traj_number, max_sr, trajectory_dt, args = x
+    ecef_data = ecef_data[:, 0:7]
+    print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        ecef_data = ecef_data[1:]
+
+    end_of_launch_index = 62
+    sbi_target_name = "LowE_555063a9_HGV"
+
+    sr_ecef_data = np.asarray(tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr), dtype=np.float64)
+
+    if sr_ecef_data.shape[-1] < 5:
+        print(f"{traj_number} does not have enough timestamps for this slant range")
+        return None, None
+    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
+    if np.any(time_diff < 0):
+        raise ValueError(f"warning: {traj_number} has backward time transitions.")
+
+    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
+
+    try:
+        resampled_sr_ecef_data = np.hstack([np.atleast_2d(new_times).T] + [make_interp_spline(sr_ecef_data[:, 0], sr_ecef_data[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)])
+    except Exception as e:
+        print(f"warning: {traj_number} had correlation or interpolation failure")
+        raise e
+
+    if args.frame == "grdth":
+        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
+    elif args.frame == "geodesic":
+        next_frame_data = ecef_to_local_geodesic_vec(resampled_sr_ecef_data[:, POS_SLICE], resampled_sr_ecef_data[:, VEL_SLICE], np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE]), ref_ecef)
+        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
+    elif args.frame == "dcu":
+        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
+    else:
+        raise NotImplementedError("That framework target is not verified yet")
+
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
+
+    return next_frame_data, traj_number
+
+
+def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
+    target_path = Path(path)
+    boost_ecef, glide_ecef, impact_ecef = [], [], []
+    for phase in ["boost", "glide", "impact"]:
+        phase_path = target_path / phase
+        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
+        if len(traj_files) == 0:
+            raise ValueError("bad target path", path)
+        traj_targets = [load_single_truth(x, debug=False, low_memory=not HAVE_HIGH_MEMORY, memory_map=HAVE_HIGH_MEMORY, min_state_vector_size=7) for x in traj_files]
+        if phase == "boost": boost_ecef = traj_targets
+        elif phase == "glide": glide_ecef = traj_targets
+        elif phase == "impact": impact_ecef = traj_targets
+
+    if not do_prep:
+        return list(zip(list(zip(boost_ecef, glide_ecef, impact_ecef)), [x.name for x in traj_files]))
+
+    cpu_count = psutil.cpu_count(logical=False) or mp.cpu_count()
+    print(f"there are {cpu_count} cpus being used for trajectory prep")
+    with mp.Pool(processes=cpu_count) as pool:
+        tmp_data = pool.map(prep_trajectory, traj_targets)
+
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+    print("post-prep. how many made it though prep", len(tmp_data))
+    return tmp_data
+
+
+def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
+    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
+    scaler_traj = StandardScaler().fit(stacked_posvel)
+    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
+    with open(pickle_scalar_name, "wb") as o:
+        pickle.dump(scaler_traj, o)
+    return scaler_traj
+
+
+def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
+    if data.ndim != 2: raise ValueError("`data` must be a 2-D array.")
+    n_cols = data.shape[1]
+    max_per_row = 5
+    n_rows = int(np.ceil(n_cols / max_per_row))
+    n_cols_plot = min(n_cols, max_per_row)
+    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
+    if n_rows == 1: axes = np.expand_dims(axes, axis=0)
+    colors = plt.get_cmap(cmap).colors
+    for idx in range(data.shape[1]):
+        row, col = idx // max_per_row, idx % max_per_row
+        ax = axes[row, col]
+        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
+        ax.set_title(column_names[idx] if column_names else f"Column {idx}")
+    plt.savefig(data_path + "_feature_distribution.png")
+
+
+def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
+    corr = np.corrcoef(data, rowvar=False) if method == "pearson" else scipy.stats.spearmanr(data, axis=0)[0]
+    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, linewidths=0.5)
+    labels = column_names if column_names else [f"Col {i}" for i in range(corr.shape[0])]
+    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels)
+    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels)
+    plt.tight_layout()
+    plt.savefig(data_path + "_correlation_matrix.png")
+
+
+def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
+    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
+    if timeseries_to_transform.shape[0] < 10: return None
+    new_times = np.arange(timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt)
+    resampled_timeseries = np.hstack([np.atleast_2d(new_times).T] + [make_interp_spline(timeseries_to_transform[:, TIME_INDEX], timeseries_to_transform[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)])
+    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
+
+    if args.frame == "dcu":
+        timeseries_in_next_frame, _, _ = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
+    elif args.frame == "grdth":
+        timeseries_in_next_frame, _ = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
+    elif args.frame == "geodesic":
+        timeseries_in_next_frame = ecef_to_local_geodesic_vec(resampled_timeseries[:, POS_SLICE], resampled_timeseries[:, VEL_SLICE], np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE]), ref_ecef)
+        timeseries_in_next_frame = np.hstack([resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]])
+    return timeseries_in_next_frame
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Training script for creating NEXT models")
+    parser.add_argument("--tgt-data-paths", default=[], type=str, nargs="+")
+    parser.add_argument("--validation-data-paths", default=[], type=str, nargs="+")
+    parser.add_argument("--sr", default=100000, type=int)
+    parser.add_argument("-o", default="model_outputs", type=str)
+    parser.add_argument("--use-scalar", default=False, action="store_true")
+    parser.add_argument("--frame", default="dcu", choices=["dcu", "grdth", "geodesic"])
+    parser.add_argument("--sbi-phase", default="boost", choices=["boost", "glide"])
+    parser.add_argument("--nhidden", default=200, type=int)
+    parser.add_argument("--aug", default=0, type=int, dest="aug_dim")
+    parser.add_argument("--gpuidx", default=0, type=int, dest="gpu_index")
+    parser.add_argument("--model-type", default="node", choices=["node", "anode", "sonode", "latentode", "gruode"])
+    parser.add_argument("--dt", default=0.1, type=float)
+
+    args = parser.parse_args()
+    model_states = 5 if args.frame == "grdth" else 6
+    trajectory_dt = args.dt
+
+    np.random.seed(47)
+    torch.manual_seed(47)
+
+    target_strs = [Path(x).name for x in args.tgt_data_paths]
+    model_name_target_str = "+".join(target_strs)
+    model_save_path = os.path.join(args.o, model_name_target_str)
+    batch_size = 1024 if HAVE_HIGH_MEMORY else 512
+
+    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{args.frame}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    if args.use_scalar: model_name_wo_epochs += "_scalarOn"
+
+    traj_targets_train, traj_targets_test = [], []
+    for tgt_data_path in args.tgt_data_paths:
+        traj_targets = load_data_dir(tgt_data_path, trajectory_dt, args, do_prep=False)
+        t_train, t_test = train_test_split(traj_targets, test_size=0.2, random_state=26525)
+        traj_targets_train.extend(t_train)
+        traj_targets_test.extend(t_test)
+
+    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
+    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
+
+    os.makedirs(os.path.join(args.o, model_name_target_str), exist_ok=True)
+    with open(os.path.join(args.o, model_name_target_str, f"{model_name_wo_epochs}_train_test_split.json"), "w", encoding="utf-8") as f:
+        json.dump({"train": traj_targets_train_traj_numbers, "test": traj_targets_test_traj_numbers}, f)
+
+    # Transform tracking frames cleanly based on operational flags
+    raw_train_transformed = [sbi_trajectory_prep(x, args.sbi_phase, trajectory_dt, args) for x in traj_targets_train]
+    raw_test_transformed = [sbi_trajectory_prep(x, args.sbi_phase, trajectory_dt, args) for x in traj_targets_test]
+
+    raw_train_transformed = list(filter(lambda x: x is not None, raw_train_transformed))
+    raw_test_transformed = list(filter(lambda x: x is not None, raw_test_transformed))
+
+    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in raw_train_transformed]
+    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in raw_test_transformed]
+
+    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any([torch.isnan(x).any() for x in traj_targets_test_posvel]):
+        raise ValueError("NaN variables detected across trajectory state spaces.")
+
+    stacked_posvel = np.vstack(traj_targets_train_posvel)
+    column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"] if args.frame == "grdth" else ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
+    
+    plot_column_distributions(stacked_posvel, column_names=column_names, data_path=str(Path(args.o, model_name_target_str, model_name_wo_epochs)))
+    plot_correlation_matrix(stacked_posvel, column_names=column_names, data_path=str(Path(args.o, model_name_target_str, model_name_wo_epochs)))
+
+    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+
+    train_NEXT(
+        model_name_wo_epochs, traj_targets_train_posvel, traj_targets_test_posvel,
+        scaler_traj, model_save_path, trajectory_dt, batch_size, args.use_scalar,
+        model_states, args.aug_dim, args.nhidden, args.gpu_index, args.model_type, args.frame,
+        raw_train_meta=raw_train_transformed, raw_test_meta=raw_test_transformed
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,11 +1,133 @@
-Extrap failed Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/Simple_Sim_mo.py", line 563, in NEXT_tactical_interface
-    NEXT_extrap = NEXT_extrapolation(
-                  ^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/Simple_Sim_mo.py", line 646, in NEXT_extrapolation
-    model_input = np.hstack([scaled_pos_vel, current_hidden_state, augmentation_state])
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.12/lib/python/site-packages/numpy/_core/shape_base.py", line 365, in hstack
-    return _nx.concatenate(arrs, 1, dtype=dtype, casting=casting)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ValueError: all the input arrays must have same number of dimensions, but the array at index 0 has 2 dimension(s) and the array at index 2 has 1 dimension(s)
+def NEXT_extrapolation(
+    initial_state_next_frame,
+    dt: float,
+    n_steps: int,
+    ref_angle,
+    use_grdth: bool,
+    args,
+    ort_sess: onnxruntime.InferenceSession,
+):
+    use_scalar = "_scalarOn" in os.path.basename(args.model)
+    if use_scalar:
+        with open(args.scalar, "rb") as scalar_pickle:
+            NEXT_scalar = pickle.load(scalar_pickle)
+            
+    state_size = 5 if use_grdth else 6
+
+    # Model-Driven Graph Inspection Matrix
+    try:
+        onnx_input_dim = ort_sess.get_inputs()[0].shape[-1]
+        if not isinstance(onnx_input_dim, int):
+            onnx_input_dim = state_size
+    except Exception:
+        onnx_input_dim = state_size
+
+    model_base = os.path.basename(args.model)
+    hid_match = re.search(r"_(\d+)hid_", model_base)
+    aug_match = re.search(r"_(\d+)aug_", model_base)
+    
+    hidden_dim = int(hid_match.group(1)) if hid_match else 0
+    model_augmentation_dim = int(aug_match.group(1)) if aug_match else 0
+    
+    is_gruode = (onnx_input_dim == state_size + hidden_dim) or (onnx_input_dim == state_size + hidden_dim + model_augmentation_dim)
+
+    extrap = np.array([np.hstack([initial_state_next_frame])])
+    validity_time = deepcopy(initial_state_next_frame[0])
+    
+    current_hidden_state = np.zeros((1, hidden_dim), dtype=np.float32) if is_gruode else None
+    augmentation_state = np.zeros((1, model_augmentation_dim), dtype=np.float32) if model_augmentation_dim > 0 else None
+
+    temp_iter = 0
+    while temp_iter < n_steps and float(validity_time) < 122.0:
+        temp_iter = temp_iter + 1
+        validity_time += dt
+
+        if use_scalar:
+            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
+            scaled_pos_vel = NEXT_scalar.transform(pos_vel).astype(np.float32)
+            
+            # Enforce 2D array layouts explicitly across all hstack combinations
+            if is_gruode:
+                if onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
+                    model_input = np.hstack([
+                        np.atleast_2d(scaled_pos_vel), 
+                        np.atleast_2d(current_hidden_state), 
+                        np.atleast_2d(augmentation_state)
+                    ])
+                else:
+                    model_input = np.hstack([
+                        np.atleast_2d(scaled_pos_vel), 
+                        np.atleast_2d(current_hidden_state)
+                    ])
+            else:
+                if model_augmentation_dim > 0 and onnx_input_dim == state_size + model_augmentation_dim:
+                    model_input = np.hstack([
+                        np.atleast_2d(scaled_pos_vel), 
+                        np.atleast_2d(augmentation_state)
+                    ])
+                else:
+                    model_input = np.atleast_2d(scaled_pos_vel)
+            
+            model_output = ort_sess.run(["output"], {"input": model_input[0].astype(np.float32)})[-1].reshape(1, -1)
+            
+            if is_gruode:
+                dx_dt = model_output[:, :state_size]
+                dh_dt = model_output[:, state_size : state_size + hidden_dim]
+                
+                # Active propagation of the hidden tracking memory state
+                current_hidden_state = current_hidden_state + dh_dt * dt
+                
+                # If present, parse and update augmentation parameters from the output vector field
+                if model_augmentation_dim > 0 and model_output.shape[-1] >= state_size + hidden_dim + model_augmentation_dim:
+                    daug_dt = model_output[:, state_size + hidden_dim : state_size + hidden_dim + model_augmentation_dim]
+                    augmentation_state = np.atleast_2d(augmentation_state) + daug_dt * dt
+                    
+                scaled_pos_vel_next = scaled_pos_vel + dx_dt * dt
+                next_state = NEXT_scalar.inverse_transform(scaled_pos_vel_next)
+            else:
+                next_state_raw = model_output * dt + model_input[:, :state_size]
+                if model_augmentation_dim > 0 and next_state_raw.shape[-1] > state_size:
+                    augmentation_state = next_state_raw[:, state_size:]
+                next_state = NEXT_scalar.inverse_transform(next_state_raw[:, :state_size])
+        else:
+            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]], dtype=np.float32)
+            if is_gruode:
+                if onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
+                    model_input = np.hstack([
+                        np.atleast_2d(pos_vel), 
+                        np.atleast_2d(current_hidden_state), 
+                        np.atleast_2d(augmentation_state)
+                    ])
+                else:
+                    model_input = np.hstack([
+                        np.atleast_2d(pos_vel), 
+                        np.atleast_2d(current_hidden_state)
+                    ])
+            else:
+                model_input = np.hstack([np.atleast_2d(pos_vel), np.atleast_2d(augmentation_state)]) if (model_augmentation_dim > 0 and onnx_input_dim == state_size + model_augmentation_dim) else np.atleast_2d(pos_vel)
+                
+            model_output = ort_sess.run(["output"], {"input": model_input[0].astype(np.float32)})[-1].reshape(1, -1)
+            
+            if is_gruode:
+                dx_dt = model_output[:, :state_size]
+                dh_dt = model_output[:, state_size : state_size + hidden_dim]
+                current_hidden_state = current_hidden_state + dh_dt * dt
+                
+                if model_augmentation_dim > 0 and model_output.shape[-1] >= state_size + hidden_dim + model_augmentation_dim:
+                    daug_dt = model_output[:, state_size + hidden_dim : state_size + hidden_dim + model_augmentation_dim]
+                    augmentation_state = np.atleast_2d(augmentation_state) + daug_dt * dt
+                    
+                next_state = pos_vel + dx_dt * dt
+            else:
+                next_state_raw = model_output * dt + model_input[:, :state_size]
+                if model_augmentation_dim > 0 and next_state_raw.shape[-1] > state_size:
+                    augmentation_state = next_state_raw[:, state_size:]
+                next_state = next_state_raw[:, :state_size]
+
+        next_state = np.insert(next_state, 0, validity_time)
+        extrap = np.vstack([extrap, next_state])
+
+    if extrap.shape[0] < 3:
+        raise ValueError(f"Extrap was too short {extrap.shape}")
+
+    return extrap

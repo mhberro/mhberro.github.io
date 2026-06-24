@@ -46,9 +46,9 @@ def NEXT_extrapolation(
             pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
             scaled_pos_vel = NEXT_scalar.transform(pos_vel).astype(np.float32)
             
-            # Enforce 2D array layouts explicitly across all hstack combinations
+            # Added explicit augmentation dimensions guardrails to resolve the Got: 107 error
             if is_gruode:
-                if onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
+                if model_augmentation_dim > 0 and onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
                     model_input = np.hstack([
                         np.atleast_2d(scaled_pos_vel), 
                         np.atleast_2d(current_hidden_state), 
@@ -74,10 +74,8 @@ def NEXT_extrapolation(
                 dx_dt = model_output[:, :state_size]
                 dh_dt = model_output[:, state_size : state_size + hidden_dim]
                 
-                # Active propagation of the hidden tracking memory state
                 current_hidden_state = current_hidden_state + dh_dt * dt
                 
-                # If present, parse and update augmentation parameters from the output vector field
                 if model_augmentation_dim > 0 and model_output.shape[-1] >= state_size + hidden_dim + model_augmentation_dim:
                     daug_dt = model_output[:, state_size + hidden_dim : state_size + hidden_dim + model_augmentation_dim]
                     augmentation_state = np.atleast_2d(augmentation_state) + daug_dt * dt
@@ -92,7 +90,7 @@ def NEXT_extrapolation(
         else:
             pos_vel = np.asarray([extrap[-1][1 : state_size + 1]], dtype=np.float32)
             if is_gruode:
-                if onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
+                if model_augmentation_dim > 0 and onnx_input_dim == state_size + hidden_dim + model_augmentation_dim:
                     model_input = np.hstack([
                         np.atleast_2d(pos_vel), 
                         np.atleast_2d(current_hidden_state), 

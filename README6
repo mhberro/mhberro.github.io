@@ -1,67 +1,72 @@
-# --------------------------------------------------------------------
-    #  Build the requested model
-    # --------------------------------------------------------------------
-    if model_type == "gruode":
-        # Retain the continuous recurrent state architecture instance
-        # Pull model directly from the configured wrapper block
-        print("Activating Continuous-Time Physics-Informed GRU-ODE Tracking Module.")
-        node.model = node.architecture.get_model().to(node.device)
-        
-    elif model_type == "node":
-        # plain NODE (no augmentation, no order-shift)
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "anode":
-        # Augmented NODE – aug_dim comes from the CLI flag
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=aug_dim,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "sonode":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=slice(3, 6),
-        ).to(node.device)
-    elif model_type == "latentode":
-        latent_dim = nhidden // 2 if nhidden >= 20 else 8
-        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
-        recon_criterion = WrappedMSELoss(
-            height_idx=1,
-            vel_indices=velocity_indicies,
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-        )
+# AFTER
+HAVE_GPU = False
+if torch.cuda.is_available():
+    DEVICE_TYPE = "cuda"
+    HAVE_GPU = True
+    print("CUDA hardware detected. Vector fields mapped to CUDA kernels.")
+elif torch.backends.mps.is_available():
+    DEVICE_TYPE = "mps"
+    HAVE_GPU = True
+    print("Apple Silicon MPS hardware detected. Vector fields mapped to Metal backend.")
+else:
+    DEVICE_TYPE = "cpu"
+    HAVE_GPU = False
+    print("No dedicated accelerator detected. Operating on host CPU.")
 
-        def latent_ode_loss_fn(recon, target, mu, logvar):
-            recon_loss = recon_criterion(recon, target)
-            kl = _kl_divergence(mu, logvar)
-            return recon_loss + 0.1 * kl
+====================
 
-        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+# AFTER
+    # Restrict memory pinning exclusively to CUDA devices to avoid macOS MPS storage leakage
+    should_pin = (DEVICE_TYPE == "cuda")
+
+    if should_pin:
+        traj_targets_train_posvel = [torch.tensor(x[:, 1 : model_states + 1], dtype=torch.float32).pin_memory() for x in traj_targets_train]
+        traj_targets_test_posvel = [torch.tensor(x[:, 1 : model_states + 1], dtype=torch.float32).pin_memory() for x in traj_targets_test]
     else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
+        traj_targets_train_posvel = [torch.tensor(x[:, 1 : model_states + 1], dtype=torch.float32) for x in traj_targets_train]
+        traj_targets_test_posvel = [torch.tensor(x[:, 1 : model_states + 1], dtype=torch.float32) for x in traj_targets_test]
 
-    # Invoke PyTorch 2.0 graph compilation for accelerated hardware tracking execution
-    if HAVE_GPU:
+===========================
+
+# AFTER
+    if DEVICE_TYPE == "cuda":
+        node.device = torch.device(f"cuda:{gpu_index}")
+    elif DEVICE_TYPE == "mps":
+        node.device = torch.device("mps")
+    else:
+        node.device = torch.device("cpu")
+
+    node._initialize_losses(node.criterion)
+    node._initialize_model()
+    node._initialize_optimizer()
+
+    # Apply specialized GRU-ODE tracking wrapper configurations
+    if model_type == "gruode":
+        node.model = node.architecture.get_model().to(node.device)
+    else:
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=total_solver_aug, order_shift_slice=None).to(node.device)
+
+    # Restrict JIT compilation to CUDA environments to avoid CPU/MPS compilation exceptions
+    if DEVICE_TYPE == "cuda":
         try:
             node.model = torch.compile(node.model)
             print("Successfully JIT-compiled the trajectory vector field execution graph.")
         except Exception as e:
-            print(f"Skipping graph compilation due to environment constraints: {e}")
+            print(f"Skipping graph compilation: {e}")
 
-====================================
-
-parser.add_argument(
-        "--model-type",
-        default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode"],
-        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, or Continuous GRU-ODE.",
-    )
+    # Synchronize data normalization tensors with active device targets
+    should_pin = (DEVICE_TYPE == "cuda")
+    if use_scalar:
+        if should_pin:
+            scaled_traj_targets_train_posvel = [torch.tensor(scaler_traj.transform(i[:, 0 : model_states + 1]), dtype=torch.float32).pin_memory() for i in traj_targets_train]
+            scaled_traj_targets_test_posvel = [torch.tensor(scaler_traj.transform(i[:, 0 : model_states + 1]), dtype=torch.float32).pin_memory() for i in traj_targets_test]
+        else:
+            scaled_traj_targets_train_posvel = [torch.tensor(scaler_traj.transform(i[:, 0 : model_states + 1]), dtype=torch.float32).to(node.device) for i in traj_targets_train]
+            scaled_traj_targets_test_posvel = [torch.tensor(scaler_traj.transform(i[:, 0 : model_states + 1]), dtype=torch.float32).to(node.device) for i in traj_targets_test]
+    else:
+        if should_pin:
+            scaled_traj_targets_train_posvel = [torch.tensor(i[:, 0 : model_states + 1], dtype=torch.float32).pin_memory() for i in traj_targets_train]
+            scaled_traj_targets_test_posvel = [torch.tensor(i[:, 0 : model_states + 1], dtype=torch.float32).pin_memory() for i in traj_targets_test]
+        else:
+            scaled_traj_targets_train_posvel = [torch.tensor(i[:, 0 : model_states + 1], dtype=torch.float32).to(node.device) for i in traj_targets_train]
+            scaled_traj_targets_test_posvel = [torch.tensor(i[:, 0 : model_states + 1], dtype=torch.float32).to(node.device) for i in traj_targets_test]

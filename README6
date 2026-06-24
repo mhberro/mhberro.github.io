@@ -1,147 +1,35 @@
-import torch
-from torchdiffeq import odeint
+# Initialize the optimizer exactly once prior to running curriculum iterations
+node._initialize_optimizer()
 
-class GRUODEFunc(torch.nn.Module):
-    """
-    Refactored Continuous-Time ODE right‑hand side function using a GRU cell.
-    Integrates continuous hidden state evolution and Kinematic Second-Order Injection.
-    """
-
-    def __init__(self, state_len: int, hidden_dim: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
-        super().__init__()
-        self.state_len = state_len
-        self.hidden_dim = hidden_dim
-        self.aug_dim = aug_dim
-        self.order_shift_slice = order_shift_slice
-
-        self.len_of_order_shift_slice = 0
-        if self.order_shift_slice is not None:
-            # Calculate the length of the states to be mapped directly via kinematic injection
-            order_indices = tuple(range(*self.order_shift_slice.indices(state_len)))
-            self.len_of_order_shift_slice = len(order_indices)
-
-        # Input dimension maps physical states and optional augmentation vectors
-        input_dim = state_len + aug_dim
-        self.gru = torch.nn.GRUCell(input_dim, hidden_dim)
-
-        # If second-order injection is enabled, the linear layer maps hidden states 
-        # exclusively to the remaining higher-order derivatives (e.g., acceleration)
-        output_dim = state_len - self.len_of_order_shift_slice
-        self.to_dx = torch.nn.Linear(hidden_dim, output_dim)
-
-        # Diagnostic Counter for Number of Function Evaluations
-        self.nfe = 0
-
-    def forward(self, t, state):
-        """
-        Evaluates the joint continuous derivative space for physical, hidden, and augmented vectors.
-        """
-        self.nfe += 1
-
-        # Determine indices boundaries for state slicing
-        aug_start = self.state_len + self.hidden_dim
-
-        x = state[..., :self.state_len]                      # Physical kinematic components
-        h = state[..., self.state_len:aug_start]             # Dynamic hidden memory block
-        aug = state[..., aug_start:] if self.aug_dim > 0 else None  # Optional zero-augmentation parameters
-
-        # Pack input for the GRU cell step evaluation
-        gru_input = x if aug is None else torch.cat([x, aug], dim=-1)
-        h_next = self.gru(gru_input, h)                      # Target hidden state matrix
-
-        # RESOLVED BUG: Eliminate dh_dt = 0. Allow hidden state memory to evolve continuously
-        dh_dt = h_next - h
-
-        # Compute higher-order physical derivatives through the projection head
-        raw_dx = self.to_dx(h_next)
-
-        if self.order_shift_slice is not None:
-            # Kinematic Second-Order Injection: Map velocity states directly to position derivatives
-            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
-            dx_dt = torch.cat([v, raw_dx], dim=-1)
-        else:
-            dx_dt = raw_dx
-
-        # Concatenate derivatives back into unified continuous state space
-        if self.aug_dim > 0:
-            daug_dt = torch.zeros_like(aug)
-            dstate = torch.cat([dx_dt, dh_dt, daug_dt], dim=-1)
-        else:
-            dstate = torch.cat([dx_dt, dh_dt], dim=-1)
-
-        return dstate
-
-
-class GRUODEArchitecture:
-    """
-    Architecture wrapper class enabling NODEPredictor interfacing with GRU-ODE structures.
-    Supports integration configuration parameters for Kinematic Second-Order Injection.
-    """
-
-    def __init__(self, state_len: int, hidden_dim: int = 128, aug_dim: int = 0, order_shift_slice: slice | None = None):
-        self.state_len = state_len
-        self.hidden_dim = hidden_dim
-        self.aug_dim = aug_dim
-        self.order_shift_slice = order_shift_slice
-
-    def get_model(self) -> torch.nn.Module:
-        return GRUODEFunc(
-            state_len=self.state_len,
-            hidden_dim=self.hidden_dim,
-            aug_dim=self.aug_dim,
-            order_shift_slice=self.order_shift_slice
-        )
-
-    def get_input_dim(self) -> int:
-        return self.state_len
-
-    def get_output_dim(self) -> int:
-        return self.state_len
-
-    def get_aug_dim(self) -> int:
-        return self.aug_dim
-
-    def get_hidden_dim(self) -> int:
-        return self.hidden_dim
-
-
-def execute_forward_prediction(model, initial_physical_state, t_eval, hidden_dim, aug_dim=0, method="rk4"):
-    """
-    Standalone automated inference function to execute forward lookahead predictions 
-    from an isolated initial tracking point, completely bypassing the legacy SimpleSim tool.
-    """
-    model.eval()
-    device = initial_physical_state.device
+for len_strat in length_strategies:
+    data_fraction, epochs, early_stopper, learning_rate = len_strat
     
-    # Handle both single trajectory inputs and batched tensor matrices
-    is_batched = initial_physical_state.ndim > 1
-    batch_size = initial_physical_state.shape[0] if is_batched else 1
+    # Update the learning rate parameter directly inside the active optimizer tracking buffers
+    for param_group in node.optimizer.param_groups:
+        param_group['lr'] = learning_rate
+        
+    node.early_stopper = early_stopper
     
-    # Initialize hidden state tracking memory to standard zeros
-    h0 = torch.zeros(batch_size, hidden_dim, device=device)
+    # Construct scaled data fractions...
+    metrics = node.fit(x=fraction_of_data, validation_data=fraction_of_data_val)
+
+=====================
+
+if self.order_shift_slice is not None:
+    # Extract the normalized velocity elements from the state tensor
+    v_norm = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
     
-    # Restructure input if non-batched
-    p_state = initial_physical_state if is_batched else initial_physical_state.unsqueeze(0)
-    
-    # Construct complete continuous initial condition state vector
-    if aug_dim > 0:
-        aug0 = torch.zeros(batch_size, aug_dim, device=device)
-        state0 = torch.cat([p_state, h0, aug0], dim=-1)
+    if scaler_traj is not None:
+        # Extract mean and scale parameter vectors from the wrapped normalizer layer
+        # Assumes normalizer mean/scale attributes match position and velocity array slices
+        mean_p = model_normalizer.mean[:3]
+        scale_p = model_normalizer.scale[:3]
+        mean_v = model_normalizer.mean[3:6]
+        scale_v = model_normalizer.scale[3:6]
+        
+        # Rescale the velocity tensor back out to physical coordinates, then scale by the position variance
+        v_phys = (v_norm * scale_v) + mean_v
+        v_injection = v_phys / scale_p
+        dx_dt = torch.cat([v_injection, raw_dx], dim=-1)
     else:
-        state0 = torch.cat([p_state, h0], dim=-1)
-        
-    # Execute numerical solver integration loop across requested timeline evaluation nodes
-    with torch.no_grad():
-        trajectory_out = odeint(model, state0, t_eval, method=method, atol=1e-5, rtol=1e-5)
-        
-    # Re-align dimensions from (T, B, total_dim) back to standard (B, T, total_dim)
-    trajectory_out = trajectory_out.permute(1, 0, 2)
-    
-    # Isolate real-world physical prediction tracking vectors from hidden dimensions
-    state_len = initial_physical_state.shape[-1]
-    physical_predictions = trajectory_out[..., :state_len]
-    
-    if not is_batched:
-        physical_predictions = physical_predictions.squeeze(0)
-        
-    return physical_predictions
+        dx_dt = torch.cat([v_norm, raw_dx], dim=-1)

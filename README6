@@ -372,61 +372,65 @@ class GRUODEFunc(torch.nn.Module):
 
 
 class GRUODELatentModel(torch.nn.Module):
-    """End-to-end GRU-ODE forecaster: encode → integrate latent GRU-ODE → decode.
+    """GRU-ODE as a PHYSICAL-SPACE vector field, drop-in for ``ODEfunc``.
 
-    This is the object the trainer assigns to ``node.model`` for model_type
-    'gruode' / 'gruode-min'. It carries an injected ODE solver so the whole
-    forward pass (including integration) is a single nn.Module — which is what
-    the ONNX exporter and the NODEPredictor.fit loop expect.
+    This codebase treats ``node.model`` as the field f in  ṡ = f(t, s):  the
+    injected solver calls ``model(t, state)`` at every integration step and
+    integrates the result itself. So this module must (a) accept the two
+    positional args (t, x) and (b) return a derivative with the SAME shape as
+    the physical state x — exactly like ODEfunc. It does NOT integrate
+    internally and does NOT take a list of evaluation times.
 
-    forward(initial_state_phys, t_eval) ->
-        recon_phys : (..., T, D)    physical-state trajectory at t_eval
+    The induced physical field is
+
+        h    = Enc(x)              lift to bounded latent  (h ∈ (-1,1)^H)
+        ḣ    = GRU-ODE(h)          continuous-time GRU vector field
+        ẋ    = J_dec(h) · ḣ        push the latent velocity back to phys space
+
+    where J_dec·ḣ is a forward-mode Jacobian-vector product through the
+    decoder (exact, cheap, ONNX-traceable). Boundedness and the K=2 Lipschitz
+    property of the latent field carry through the smooth Enc/Dec maps, giving
+    the trajectory-stabilisation prior in physical space.
+
+    Note: because the field re-encodes x each step, the latent state is not
+    itself the integrated quantity (the solver carries x, not h). If you want
+    strict latent continuity (the canonical GRU-ODE-Bayes formulation), carry h
+    as the solver state instead — that requires changing the predictor's state
+    plumbing and is left as a deliberate, separate change.
     """
 
-    def __init__(self, func: GRUODEFunc, solver, aug_dim: int = 0):
+    def __init__(self, func: GRUODEFunc, solver=None, aug_dim: int = 0):
         super().__init__()
         self.func = func
-        self.solver = solver  # e.g. TorchdiffeqSolver(method='dopri5' | 'rk4')
-        self.aug_dim = aug_dim
+        self.aug_dim = aug_dim  # zero-augmentation is subsumed by the latent lift
+        self.nfe = 0
 
-    def forward(self, x):
-        """``x`` mirrors ODEfunc/NODEPredictor usage.
+    def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(t, h)
+        # ẋ = d/dt Dec(h) = J_dec(h) · dh  (forward-mode JVP through the decoder)
+        _, xdot = torch.autograd.functional.jvp(
+            self.func.decode, h, v=dh, create_graph=self.training, strict=False
+        )
+        return xdot
 
-        Two supported call shapes for solver/ONNX parity:
-          * x == (t_eval, s0)   tuple  -> torchdiffeq-style (t, state)
-          * x == s0             tensor -> autonomous single-step field eval
-        where s0 is the *physical* initial state (..., D) (+ optional aug zeros,
-        which we strip since the latent lift replaces augmentation).
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        """Physical-space derivative ẋ = f(t, x), same shape as x.
+
+        Matches ODEfunc.forward(self, t, x). If upstream appended zero
+        augmentation to the state we strip it, evaluate the field on the true
+        physical state, and pad the derivative with zeros so the returned
+        vector matches the augmented state dimension the solver carries.
         """
-        if isinstance(x, (tuple, list)):
-            t_eval, s0 = x
-        else:
-            t_eval, s0 = None, x
-
-        # Strip any zero-augmentation appended upstream: the learned latent
-        # lift subsumes ANODE-style augmentation.
-        if self.aug_dim > 0:
-            s0 = s0.narrow(-1, 0, s0.shape[-1] - self.aug_dim)
-
-        h0 = self.func.encode(s0)  # (..., H), bounded in (-1,1)
-
-        if t_eval is None:
-            # Single field evaluation in physical space (used by some solvers
-            # and by a minimal ONNX trace): ẋ ≈ Dec'(h)·ḣ via finite latent step
-            # is unnecessary here — we return the decoded latent derivative
-            # mapped through the decoder Jacobian implicitly by autograd-free
-            # readout: advance one solver dt then difference.
-            return self.func.decode(h0)
-
-        # Integrate the latent ODE over the requested evaluation times.
-        h_t = self.solver.integrate(self.func, h0, t_eval)  # (T, ..., H) or (..., T, H)
-        # Normalise layout to (..., T, H): torchdiffeq returns (T, B, H).
-        if h_t.dim() == h0.dim() + 1 and h_t.shape[0] == len(t_eval):
-            # (T, ..., H) -> (..., T, H)
-            perm = list(range(1, h_t.dim() - 1)) + [0, h_t.dim() - 1]
-            h_t = h_t.permute(*perm)
-        recon = self.func.decode(h_t)  # (..., T, D)
-        return recon
+        self.nfe += 1
+        if self.aug_dim > 0 and x.shape[-1] > self.func.state_vector_len:
+            x_core = x.narrow(-1, 0, self.func.state_vector_len)
+            xdot_core = self._field(t, x_core)
+            pad = torch.zeros(
+                *xdot_core.shape[:-1], self.aug_dim, dtype=xdot_core.dtype, device=xdot_core.device
+            )
+            return torch.cat((xdot_core, pad), dim=-1)
+        return self._field(t, x)
 
 
 class GRUBayes(torch.nn.Module):
@@ -942,17 +946,10 @@ def train_NEXT(
     # TODO: move this conversion to a separate script
     # export the model to ONNX binary (protobuf) format
     #
-    # For GRU-ODE the trained model integrates in latent space, but downstream
-    # trackers expect a PHYSICAL-SPACE vector field they integrate themselves
-    # (same contract as ODEfunc). We therefore export the induced physical
-    # field via GRUODEFieldForONNX rather than the internally-integrating model.
-    if isinstance(node.model, GRUODELatentModel):
-        export_model = GRUODEFieldForONNX(node.model.func).to(node.device).eval()
-        example_input = (
-            None,
-            scaled_traj_targets_train_posvel[0][0].to(node.device),  # physical state, no aug
-        )
-    elif isinstance(ode_solver, TorchdiffeqSolver):
+    # GRUODELatentModel is itself a physical-space field with the standard
+    # (t, x) contract (same as ODEfunc), so it exports like any other field —
+    # no special adapter needed.
+    if isinstance(ode_solver, TorchdiffeqSolver):
         export_model = node.model
         example_input = (
             None,

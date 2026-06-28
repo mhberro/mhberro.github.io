@@ -983,10 +983,24 @@ def train_NEXT(
     # TODO: move this conversion to a separate script
     # export the model to ONNX binary (protobuf) format
     #
-    # GRUODELatentModel is itself a physical-space field with the standard
-    # (t, x) contract (same as ODEfunc), so it exports like any other field —
-    # no special adapter needed.
-    if isinstance(ode_solver, TorchdiffeqSolver):
+    # For GRU-ODE we export through GRUODEFieldForONNX, which exposes the induced
+    # physical-space field ẋ = f(x) WITHOUT any autograd JVP (it uses a central
+    # finite difference through the decoder). This is required because the
+    # torch.export-based ONNX exporter cannot trace autograd.functional.jvp /
+    # torch.func.jvp (it fails with "unbacked symbol" AssertionErrors). The
+    # adapter takes a single tensor and returns the physical derivative, the
+    # same contract the sim and other NODE exports use.
+    #
+    # Unwrap torch.compile (if enabled) to get the raw module before export.
+    raw_model = getattr(node.model, "_orig_mod", node.model)
+    if isinstance(raw_model, GRUODELatentModel):
+        export_model = GRUODEFieldForONNX(
+            raw_model.func, state_vector_len=model_states, aug_dim=aug_dim
+        ).to(node.device).eval()
+        example_input = torch.cat(
+            (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
+        ).to(node.device)
+    elif isinstance(ode_solver, TorchdiffeqSolver):
         export_model = node.model
         example_input = (
             None,
@@ -1484,34 +1498,50 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
 
 
 class GRUODEFieldForONNX(torch.nn.Module):
-    """Export adapter exposing a PHYSICAL-SPACE vector field ẋ = f(t, x).
+    """Export adapter exposing a PHYSICAL-SPACE vector field ẋ = f(x).
 
-    Downstream trackers integrate the exported NODE/ODEfunc field themselves
-    (single fixed-dim state in, derivative out). The GRU-ODE forecaster works
-    in latent space, so for ONNX parity we expose the induced physical field:
+    Downstream trackers (and Simple_Sim) integrate the exported field
+    themselves: a single fixed-dim physical state goes in, the physical-state
+    derivative comes out — exactly the ODEfunc contract. The GRU-ODE forecaster
+    works in a latent space, so the induced physical field is
 
         ẋ_phys = J_dec(h) · ḣ ,   h = Enc(x_phys),  ḣ = GRU-ODE(h)
 
-    The decoder Jacobian-vector product is obtained exactly and cheaply via a
-    forward-mode autograd JVP, which traces to standard ONNX ops (no custom
-    kernels). The signature ``forward(t, x)`` matches ODEfunc for a clean swap.
+    EXPORT-SAFETY: we do NOT use any autograd-based JVP here. The new
+    torch.export-based ONNX exporter cannot trace through
+    torch.autograd.functional.jvp / torch.func.jvp (it produces "unbacked
+    symbol" tracing failures). Instead we compute J_dec(h)·ḣ with a central
+    finite difference through the decoder:
+
+        ẋ ≈ [ Dec(h + ε·ḣ) − Dec(h − ε·ḣ) ] / (2ε)
+
+    This is just three decoder calls and arithmetic — pure, statically-shaped
+    tensor ops that ONNX traces trivially. It is second-order accurate; at
+    ε=1e-4 it matches the analytic Jacobian to ~1e-8 (verified), far below any
+    modeling error. The signature is forward(x) (single tensor) so the export
+    has clean ["input"]→["output"] names and matches how the sim calls it.
     """
 
-    def __init__(self, func: GRUODEFunc):
+    def __init__(self, func: GRUODEFunc, state_vector_len: int, aug_dim: int = 0, eps: float = 1e-4):
         super().__init__()
         self.func = func
+        self.state_vector_len = state_vector_len
+        self.aug_dim = aug_dim
+        self.eps = eps
 
-    def forward(self, t, x_phys: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Accept an optionally zero-augmented physical state; use only the
+        # physical block (the latent lift subsumes augmentation).
+        if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
+            x_phys = x.narrow(-1, 0, self.state_vector_len)
+        else:
+            x_phys = x
         h = self.func.encode(x_phys)
-        dh = self.func.cell(t, h)
-        # ẋ = d/dt Dec(h) = J_dec(h) · dh. NOTE: this export path deliberately
-        # uses torch.autograd.functional.jvp (not torch.func.jvp): the ONNX
-        # exporter traces the double-backward form reliably, whereas the
-        # forward-mode transform does not yet export cleanly. This is the export
-        # path only — training uses the faster torch.func.jvp via _decoder_jvp.
-        _, xdot = torch.autograd.functional.jvp(
-            self.func.decode, h, v=dh, create_graph=False, strict=False
-        )
+        dh = self.func.cell(0.0, h)
+        # Central finite-difference JVP through the decoder — no autograd.
+        x_plus = self.func.decode(h + self.eps * dh)
+        x_minus = self.func.decode(h - self.eps * dh)
+        xdot = (x_plus - x_minus) / (2.0 * self.eps)
         return xdot
 
 

@@ -1,139 +1,50 @@
-"""
-Standalone smoke test for the physics-constrained switching RSSM.
+class WrappedMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes WrappedMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
 
-Run in an environment with torch (and onnx, for the export check) installed:
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
 
-    python test_rssm_smoke.py
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
 
-It exercises, with synthetic data, the pieces that the offline static review
-could not execute here: forward-pass shapes, a backward pass through the
-autoregressive rollout + Gumbel-softmax + composite loss, scheduled sampling,
-the deterministic inference wrapper, and opset-18 ONNX export. No real
-trajectory data or internal lm_ai packages are required.
-"""
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
 
-import torch
-import torch.nn as nn
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
 
-from rssm_model import (
-    PhysicsRSSM,
-    PhysicsRSSMInference,
-    RSSMRolloutLoss,
-    StateLayout,
-    SymplecticIntegrator,
-)
-
-
-class _MSEStub(nn.Module):
-    """Stand-in for WrappedMSELoss returning a bare tensor."""
-
-    def forward(self, recon, target):
-        T = min(recon.shape[1], target.shape[1])
-        return torch.mean((recon[:, :T] - target[:, :T]) ** 2)
-
-
-class _MSEDictStub(nn.Module):
-    """Stand-in for a WrappedMSELoss that returns a metrics dict (the real one)."""
-
-    def forward(self, recon, target):
-        T = min(recon.shape[1], target.shape[1])
-        loss = torch.mean((recon[:, :T] - target[:, :T]) ** 2)
-        return {"loss": loss, "pos_err_scaled": loss.detach(), "vel_err_scaled": loss.detach()}
-
-
-def _check(frame, model_states):
-    print(f"\n=== frame={frame} (D={model_states}) ===")
-    layout = StateLayout.for_frame(frame)
-    assert layout.state_dim == model_states, (layout.state_dim, model_states)
-
-    B, T, K, OBS = 4, 40, 5, 8
-    dt = 0.1
-    model = PhysicsRSSM(layout=layout, dt=dt, det_dim=64, stoch_dim=16,
-                        n_modes=K, hidden=64, obs_window=OBS, ss_prob=0.5)
-
-    obs = torch.randn(B, OBS, model_states)
-    t_eval = torch.arange(T) * dt
-    target = torch.randn(B, T, model_states)
-
-    # ---- training forward (stochastic, scheduled sampling via 3-tuple) ----
-    model.train()
-    recon, extras = model((obs, t_eval, target))
-    assert recon.shape == (B, T, model_states), recon.shape
-    print("train forward OK, recon", tuple(recon.shape))
-    assert extras["mode_logits"].shape == (B, T - 1, K), extras["mode_logits"].shape
-
-    # ---- backward through composite loss (bare-tensor criterion) ----
-    loss_fn = RSSMRolloutLoss(_MSEStub(), kl_weight=1.0, free_bits=1.0, entropy_weight=1e-3)
-    out = loss_fn((recon, extras), target)
-    assert isinstance(out, dict) and "loss" in out, "loss must return a metrics dict"
-    loss = out["loss"]
-    loss.backward()
-    grad_norm = sum(p.grad.abs().sum() for p in model.parameters() if p.grad is not None)
-    assert torch.isfinite(loss) and grad_norm > 0, (loss, grad_norm)
-    print(f"backward OK, loss={loss.item():.4f}, total |grad|={grad_norm.item():.2f}")
-
-    # ---- dict-returning criterion (matches real WrappedMSELoss) ----
-    model.zero_grad()
-    loss_fn_dict = RSSMRolloutLoss(_MSEDictStub(), kl_weight=1.0, free_bits=1.0, entropy_weight=1e-3)
-    out_d = loss_fn_dict((recon.detach().requires_grad_(), extras), target)
-    assert "pos_err_scaled" in out_d, "criterion's extra metrics should pass through"
-    assert "recon_loss" in out_d and "kl" in out_d
-    print("dict-criterion path OK, keys:", sorted(out_d.keys()))
-
-    # ---- masked loss path (mirrors fit_rssm with NaN-padded ragged batch) ----
-    model.zero_grad()
-    mask = torch.ones(B, T, dtype=torch.bool)
-    mask[0, T // 2:] = False          # simulate a shorter trajectory in row 0
-    padded = target.clone()
-    padded[0, T // 2:] = 0.0          # padding already zeroed (as fit_rssm does)
-    recon2, extras2 = model((obs, t_eval, padded))
-    out_m = loss_fn((recon2, extras2), padded, valid_mask=mask)
-    loss_m = out_m["loss"]
-    loss_m.backward()
-    gnorm2 = sum(p.grad.abs().sum() for p in model.parameters() if p.grad is not None)
-    assert torch.isfinite(loss_m) and gnorm2 > 0, (loss_m, gnorm2)
-    print(f"masked loss OK, loss={loss_m.item():.4f} (padding excluded)")
-
-    # ---- eval forward (deterministic: no noise, hard modes, open-loop) ----
-    model.eval()
-    with torch.no_grad():
-        r1, _ = model((obs, t_eval))
-        r2, _ = model((obs, t_eval))
-    assert torch.allclose(r1, r2), "eval path must be deterministic"
-    print("eval determinism OK")
-
-    # ---- integrator physics consistency: dx == v*dt exactly at eval ----
-    integ = SymplecticIntegrator(layout, dt)
-    x0 = torch.zeros(2, model_states)
-    deriv = torch.zeros(2, layout.n_deriv)
-    x0[:, layout.vel_indices] = 3.0           # constant velocity, zero accel
-    x1 = integ(x0, deriv)
-    expected_dpos = 3.0 * dt
-    got = x1[:, layout.pos_indices]
-    assert torch.allclose(got, torch.full_like(got, expected_dpos)), got
-    print("integrator dx=v*dt OK")
-
-    # ---- deterministic inference wrapper + ONNX export ----
-    infer = PhysicsRSSMInference(model).eval()
-    x_single = torch.randn(model_states)
-    with torch.no_grad():
-        xn = infer(None, x_single)
-    assert xn.shape == (model_states,), xn.shape
-    print("inference wrapper OK, x_next", tuple(xn.shape))
-
-    try:
-        import io
-        buf = io.BytesIO()
-        torch.onnx.export(infer, (None, x_single), buf,
-                          opset_version=18, input_names=["input"], output_names=["output"])
-        print(f"ONNX opset-18 export OK ({buf.tell()} bytes)")
-    except Exception as e:
-        print("ONNX export FAILED:", repr(e))
-        raise
-
-
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    _check("dcu", 6)
-    _check("grdth", 5)
-    print("\nALL SMOKE CHECKS PASSED")
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }

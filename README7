@@ -68,6 +68,17 @@ from NEXT_frames import (
     next_grdth_to_ecef,
 )
 from torchdiffeq_solver import TorchdiffeqSolver
+
+# Physics-constrained switching RSSM (see "AI Model Design" trade study).
+# A discrete-time, mode-switching, physics-integrated state-space model that
+# the design document concluded outperforms a continuous-time ODE backbone for
+# this regime (regular-rate sampling, 5-10s evasive-maneuver horizons).
+from rssm_model import (
+    PhysicsRSSM,
+    PhysicsRSSMInference,
+    RSSMRolloutLoss,
+    StateLayout,
+)
 from trajectory_helpers import (
     ACC_SLICE,
     DOWN_DOT_INDEX,
@@ -93,22 +104,6 @@ if torch.cuda.device_count() != 0:
     print("there is a gpu in this node")
     for i in range(torch.cuda.device_count()):
         print(torch.cuda.get_device_properties(i))
-
-    # --- GPU throughput defaults --------------------------------------------
-    # TF32 gives a large matmul speedup on Ampere+ (A100/P100-no, A100/H100-yes)
-    # at negligible accuracy cost for this regression task. Safe no-op on GPUs
-    # that don't support it.
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    # Autotune the best conv/matmul algorithms for the (fixed) tensor shapes we
-    # use; the encoder/decoder/cell shapes are constant across steps so the
-    # one-time tuning cost is amortised immediately.
-    torch.backends.cudnn.benchmark = True
-    # Prefer high-throughput matmul kernels.
-    try:
-        torch.set_float32_matmul_precision("high")
-    except Exception:
-        pass
 
 BUCKET_SIZE = 5000  # [m]
 
@@ -157,341 +152,6 @@ class ODEfunc(torch.nn.Module):
             # return torch.cat((v, out), dim=x.ndim - 1)  # TODO: subtract a small MLP here for dissipation on the acceleration term
         else:
             return out
-
-
-# =====================================================================
-#  GRU-ODE  (De Brouwer et al., NeurIPS 2019 — GRU-ODE-Bayes)
-# ---------------------------------------------------------------------
-#  Continuous-time GRU vector field for the latent state h(t):
-#
-#       dh/dt = (1 - z(t)) ⊙ (g(t) - h(t))            (paper Eq. 3 / App. A)
-#
-#  with the continuous-time gates
-#       r(t) = σ(W_r x + U_r h + b_r)
-#       z(t) = σ(W_z x + U_z h + b_z)
-#       g(t) = tanh(W_h x + U_h (r ⊙ h) + b_h)
-#
-#  Key properties exploited here for chaotic kinematic forecasting:
-#    * Boundedness:   h(0) ∈ [-1,1]  ⇒  h(t) ∈ [-1,1] ∀t  (negative
-#      feedback term -(1-z)⊙h points inward at the boundary). This bounds
-#      long-horizon rollouts and collapses S-curve / phugoid divergence.
-#    * Lipschitz K=2: globally smooth vector field ⇒ adaptive solvers
-#      (DOPRI) stay stable and can take large steps.
-#    * Continuity prior on h(t): a smooth latent flow that regularises the
-#      forecaster, especially valuable in the low-sample regime.
-#
-#  Design note for THIS pipeline: the truth data is resampled onto a uniform
-#  grid and is fully observed (no per-feature mask), so the Bayesian filtering
-#  half of the paper (GRU-Bayes + KL post-jump loss) has nothing to filter at
-#  train time. We therefore use the GRU-ODE *cell* as a bounded latent vector
-#  field and expose the GRU-Bayes jump as an OPT-IN path (GRUODEBayesPredictor)
-#  for when genuinely sporadic/masked observations are available. The autonomous
-#  forecaster below (no continuous input x(t)) is the default — g and z then
-#  depend on h(t) only, exactly the autonomous case described in paper §2.1.
-# =====================================================================
-class FullGRUODECell(torch.nn.Module):
-    """The GRU-ODE vector field dh/dt = (1 - z) ⊙ (g - h).
-
-    Operates on a *latent* state h ∈ R^H. If a continuous control/observation
-    signal x(t) ∈ R^D is supplied it is injected into all three gates; if not,
-    the cell is autonomous (the default for forecasting).
-
-    The forward signature is (t, h) to match torchdiffeq and the existing
-    TorchdiffeqSolver / ONNX export contract used by ODEfunc.
-    """
-
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        # --- OPTIMIZED weight layout -------------------------------------
-        # The r and z gates depend on h directly; g depends on the RESET-GATED
-        # hidden state (r ⊙ h). Computing them in one packed 3H×H matmul forces
-        # the wasted product U_h·h to be computed and then subtracted out. We
-        # instead split into:
-        #   lin_hrz : (2H, H)  -> U_r, U_z      applied to h
-        #   lin_hg  : ( H, H)  -> U_h           applied to (r ⊙ h)
-        # This is two matmuls instead of three, mathematically identical to the
-        # packed-and-correct form (verified to machine precision), and removes
-        # the per-step subtraction. Fewer/larger fused GEMMs also map better to
-        # GPU tensor cores.
-        self.lin_hrz = torch.nn.Linear(hidden_size, 2 * hidden_size, bias=False)
-        self.lin_hg = torch.nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            # Input weights for all three gates: W_r, W_z (for r,z) and W_h (g).
-            self.lin_xrz = torch.nn.Linear(input_size, 2 * hidden_size, bias=bias)
-            self.lin_xg = torch.nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            # Learnable gate biases so the autonomous field is not pinned to the
-            # origin. Registered as parameters (broadcast over batch).
-            if bias:
-                self.bias_rz = torch.nn.Parameter(torch.zeros(2 * hidden_size))
-                self.bias_g = torch.nn.Parameter(torch.zeros(hidden_size))
-            else:
-                self.register_parameter("bias_rz", None)
-                self.register_parameter("bias_g", None)
-
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        """Return dh/dt with the same trailing-dim layout as h.
-
-        h : (..., H)   latent state (any batch/sequence leading dims)
-        x : (..., D)   optional continuous input aligned on the last dim
-
-        No host-syncing side effects (no nfe counter) so the field is safe for
-        CUDA-graph capture and torch.compile.
-        """
-        pre_rz = self.lin_hrz(h)
-        if self.input_size > 0:
-            pre_rz = pre_rz + self.lin_xrz(x)
-        elif self.bias_rz is not None:
-            pre_rz = pre_rz + self.bias_rz
-        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
-
-        pre_g = self.lin_hg(r * h)
-        if self.input_size > 0:
-            pre_g = pre_g + self.lin_xg(x)
-        elif self.bias_g is not None:
-            pre_g = pre_g + self.bias_g
-        g = torch.tanh(pre_g)
-
-        return (1.0 - z) * (g - h)
-
-
-class MinimalGRUODECell(torch.nn.Module):
-    """Minimal GRU-ODE (paper App. G):
-
-        dh/dt = (1 - f) ⊙ (σ(W_h x + U_h (h ⊙ f) + b_h) - h)
-
-    Fewer parameters than the full cell; retains boundedness and the K=2
-    Lipschitz property. Useful when latent H is large or data is scarce.
-    """
-
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hf = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_f
-        self.lin_hh = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_h
-        if input_size > 0:
-            self.lin_xf = torch.nn.Linear(input_size, hidden_size, bias=bias)
-            self.lin_xh = torch.nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
-            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
-
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_f = self.lin_hf(h)
-        if self.input_size > 0:
-            pre_f = pre_f + self.lin_xf(x)
-        elif self.bias_f is not None:
-            pre_f = pre_f + self.bias_f
-        f = torch.sigmoid(pre_f)
-
-        pre_h = self.lin_hh(f * h)
-        if self.input_size > 0:
-            pre_h = pre_h + self.lin_xh(x)
-        elif self.bias_h is not None:
-            pre_h = pre_h + self.bias_h
-        g = torch.tanh(pre_h)
-
-        dh = (1.0 - f) * (g - h)
-        return dh
-
-
-class GRUODEFunc(torch.nn.Module):
-    """Drop-in replacement for ``ODEfunc`` that integrates a GRU-ODE field in a
-    BOUNDED LATENT SPACE and decodes back to the physical kinematic state.
-
-    Pipeline per integration call (single physical state, autonomous):
-
-        x_phys (..., D)
-           │  encoder (Linear→SiLU→Linear→tanh)        lift to latent
-           ▼
-        h (..., H) ∈ (-1, 1)                            boundedness precondition
-           │  ∫ FullGRUODECell  dt   (handled by the external solver)
-           ▼
-        h(t) (..., H) ∈ (-1, 1)                         stays bounded ∀t
-           │  decoder (Linear→SiLU→Linear)             project to physical
-           ▼
-        x_phys(t) (..., D)
-
-    To keep a SINGLE state vector flowing through the existing solver / ONNX
-    export (which integrate a vector field of fixed dimension), we expose the
-    *augmented* state  s = [x_phys, h]  ∈ R^{D+H}  and define its derivative:
-
-        d/dt [x_phys] = decoder_jacobian-free readout:  ẋ_phys = J·ḣ  ≈  Dec(h+εḣ) trick
-        d/dt [h]      = FullGRUODECell(h)
-
-    In practice, decoding every step is cheap and exact, so we instead carry h
-    as the integrated state and the physical readout is produced by the decoder
-    AFTER integration (see GRUODELatentModel). For ONNX/solver parity we still
-    provide a fixed-dim ``forward(t, s)`` that advances the latent block and
-    holds the physical block via its decoded velocity, supporting the
-    second-order (order_shift_slice) kinematic prior.
-
-    For the common case we recommend using ``GRUODELatentModel`` end-to-end,
-    which the trainer wires up automatically.
-    """
-
-    def __init__(
-        self,
-        state_vector_len: int,
-        nhidden: int,
-        latent_dim: int | None = None,
-        minimal: bool = False,
-        encoder_hidden: int | None = None,
-    ):
-        super().__init__()
-        self.state_vector_len = state_vector_len
-        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
-        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
-
-        # Encoder: physical → bounded latent. Final tanh guarantees h ∈ (-1,1),
-        # satisfying the GRU-ODE boundedness precondition.
-        self.encoder = torch.nn.Sequential(
-            torch.nn.Linear(state_vector_len, enc_h),
-            torch.nn.SiLU(),
-            torch.nn.Linear(enc_h, self.latent_dim),
-            torch.nn.Tanh(),
-        )
-        # The continuous-time GRU vector field (autonomous: input_size=0).
-        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
-        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
-        # Decoder: bounded latent → physical state.
-        self.decoder = torch.nn.Sequential(
-            torch.nn.Linear(self.latent_dim, enc_h),
-            torch.nn.SiLU(),
-            torch.nn.Linear(enc_h, state_vector_len),
-        )
-
-    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
-        """Vector field on the LATENT state h (this is what the solver integrates).
-
-        Accepts h of shape (..., latent_dim) and returns dh/dt of the same shape.
-        Boundedness is structural, so no clamping is required.
-        """
-        return self.cell(t, h)
-
-    # --- convenience maps used by the latent wrapper / ONNX model ---
-    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x_phys)
-
-    def decode(self, h: torch.Tensor) -> torch.Tensor:
-        return self.decoder(h)
-
-
-# Forward-mode JVP: prefer torch.func (single forward pass) over
-# torch.autograd.functional.jvp (double-backward, ~3x cost and an extra graph).
-try:  # torch >= 2.0
-    from torch.func import jvp as _func_jvp
-
-    def _decoder_jvp(decode_fn, h, dh):
-        # (output, J·dh) in one forward-mode pass — no backward graph built.
-        return _func_jvp(decode_fn, (h,), (dh,))
-except Exception:  # pragma: no cover - older torch fallback
-    def _decoder_jvp(decode_fn, h, dh):
-        return torch.autograd.functional.jvp(decode_fn, h, v=dh, create_graph=True, strict=False)
-
-
-class GRUODELatentModel(torch.nn.Module):
-    """GRU-ODE as a PHYSICAL-SPACE vector field, drop-in for ``ODEfunc``.
-
-    This codebase treats ``node.model`` as the field f in  ṡ = f(t, s):  the
-    injected solver calls ``model(t, state)`` at every integration step and
-    integrates the result itself. So this module must (a) accept the two
-    positional args (t, x) and (b) return a derivative with the SAME shape as
-    the physical state x — exactly like ODEfunc. It does NOT integrate
-    internally and does NOT take a list of evaluation times.
-
-    The induced physical field is
-
-        h    = Enc(x)              lift to bounded latent  (h ∈ (-1,1)^H)
-        ḣ    = GRU-ODE(h)          continuous-time GRU vector field
-        ẋ    = J_dec(h) · ḣ        push the latent velocity back to phys space
-
-    where J_dec·ḣ is a forward-mode Jacobian-vector product through the
-    decoder (exact, cheap, ONNX-traceable). Boundedness and the K=2 Lipschitz
-    property of the latent field carry through the smooth Enc/Dec maps, giving
-    the trajectory-stabilisation prior in physical space.
-
-    Note: because the field re-encodes x each step, the latent state is not
-    itself the integrated quantity (the solver carries x, not h). If you want
-    strict latent continuity (the canonical GRU-ODE-Bayes formulation), carry h
-    as the solver state instead — that requires changing the predictor's state
-    plumbing and is left as a deliberate, separate change.
-    """
-
-    def __init__(self, func: GRUODEFunc, solver=None, aug_dim: int = 0):
-        super().__init__()
-        self.func = func
-        self.aug_dim = aug_dim  # zero-augmentation is subsumed by the latent lift
-
-    def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
-        h = self.func.encode(x_phys)
-        dh = self.func.cell(t, h)
-        # ẋ = d/dt Dec(h) = J_dec(h) · dh, computed in a single forward-mode pass.
-        _, xdot = _decoder_jvp(self.func.decode, h, dh)
-        return xdot
-
-    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
-        """Physical-space derivative ẋ = f(t, x), same shape as x.
-
-        Matches ODEfunc.forward(self, t, x). If upstream appended zero
-        augmentation to the state we strip it, evaluate the field on the true
-        physical state, and pad the derivative with zeros so the returned
-        vector matches the augmented state dimension the solver carries.
-        """
-        if self.aug_dim > 0 and x.shape[-1] > self.func.state_vector_len:
-            x_core = x.narrow(-1, 0, self.func.state_vector_len)
-            xdot_core = self._field(t, x_core)
-            pad = torch.zeros(
-                *xdot_core.shape[:-1], self.aug_dim, dtype=xdot_core.dtype, device=xdot_core.device
-            )
-            return torch.cat((xdot_core, pad), dim=-1)
-        return self._field(t, x)
-
-
-class GRUBayes(torch.nn.Module):
-    """OPT-IN Bayesian jump update (paper §2.3, Eq. 4 + App. D fprep).
-
-    Only used when genuinely sporadic / masked observations are present. Given
-    the pre-jump latent h(t-), an observation y[k] and its mask m[k], it
-    produces a discrete update h(t+) = GRU(h(t-), fprep(y, m, h)). Because
-    GRU-ODE keeps h ∈ [-1,1], a standard GRUCell is range-compatible.
-
-    The trainer leaves this dormant for the current uniformly-resampled,
-    fully-observed pipeline; it is provided so the architecture is complete and
-    activates without code changes once masked inputs are wired in.
-    """
-
-    def __init__(self, latent_dim: int, obs_dim: int, prep_hidden: int):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.obs_dim = obs_dim
-        # fprep: per-dimension [θ (mean,logvar), y, (y-μ)/σ] -> prep_hidden, ReLU,
-        # zeroed where unobserved. Implemented as a grouped linear over dims.
-        self.obs_to_theta = torch.nn.Linear(latent_dim, 2 * obs_dim)  # fobs: μ, logσ²
-        self.prep = torch.nn.Linear(4 * obs_dim, prep_hidden * obs_dim)
-        self.gru = torch.nn.GRUCell(prep_hidden * obs_dim, latent_dim)
-
-    def fobs(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        theta = self.obs_to_theta(h)
-        mu, logvar = theta.chunk(2, dim=-1)
-        return mu, logvar
-
-    def forward(self, h_minus: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        mu, logvar = self.fobs(h_minus)
-        sigma = torch.exp(0.5 * logvar)
-        norm_err = (y - mu) / (sigma + 1e-6)
-        # Per-dim feature vector q_d = [μ, logσ², y, norm_err], masked.
-        q = torch.cat([mu, logvar, y, norm_err], dim=-1)
-        q = torch.relu(self.prep(q))
-        # Zero out contributions where there was no observation.
-        m_rep = m.repeat_interleave(self.prep.out_features // self.obs_dim, dim=-1)
-        q = q * m_rep
-        h_plus = self.gru(q, h_minus)
-        # Re-bound to the GRU-ODE operating region (defensive; GRUCell ≈ in-range).
-        return torch.tanh(h_plus)
 
 
 # wrap the sklearn StandardScalar
@@ -644,6 +304,12 @@ def train_NEXT(
     gpu_index,
     model_type: str = "node",
     frame: str = "dcu",
+    n_modes: int = 5,
+    obs_window: int = 10,
+    kl_weight: float = 1.0,
+    free_bits: float = 1.0,
+    mode_entropy_weight: float = 1e-3,
+    ss_prob: float = 0.0,
 ):
     # define initial training configuration
     training_configuration = TrainingConfiguration(
@@ -656,14 +322,6 @@ def train_NEXT(
     )
     # ode_solver = EulerSolver(dt=trajectory_dt)
     # ode_solver = RK4Solver(dt=trajectory_dt)
-    # Fixed-step RK4 with adjoint=False stores the forward graph for exact, fast
-    # gradients — appropriate here because the GRU-ODE field is K=2 Lipschitz, so
-    # a fixed step is numerically stable. Tradeoffs for GRU-ODE specifically:
-    #   * method="dopri5": adaptive step — fewer evals on smooth stretches, more
-    #     near sharp dynamics; better stability at the cost of variable runtime.
-    #   * adjoint=True: O(1) memory in the number of steps (recompute on the
-    #     backward pass) — switch this on if long horizons OOM the GPU; it trades
-    #     memory for ~2x compute and is the setting the paper uses for big latents.
     ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
 
     if frame in ("dcu", "geodesic"):
@@ -765,48 +423,6 @@ def train_NEXT(
             aug_dim=0,
             order_shift_slice=slice(3, 6),
         ).to(node.device)
-    elif model_type in ("gruode", "gruode-min"):
-        # ------------------------------------------------------------
-        #  GRU-ODE forecaster (De Brouwer et al., 2019).
-        #  Bounded latent vector field; encode → ∫GRU-ODE → decode.
-        #  'gruode'     -> full GRU-ODE cell
-        #  'gruode-min' -> minimal GRU-ODE cell (fewer params)
-        # ------------------------------------------------------------
-        minimal = model_type == "gruode-min"
-        # Latent dimension: default to a comfortable lift above the physical
-        # state. nhidden controls the encoder/decoder MLP width.
-        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
-        gruode_func = GRUODEFunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            latent_dim=latent_dim,
-            minimal=minimal,
-        ).to(node.device)
-        node.model = GRUODELatentModel(
-            func=gruode_func,
-            solver=ode_solver,
-            aug_dim=aug_dim,
-        ).to(node.device)
-        # Optional JIT compilation of the field for extra GPU throughput.
-        # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
-        # solver's autograd path (especially adjoint) and the forward-mode JVP;
-        # we use mode="reduce-overhead" (CUDA graphs) and fall back silently if
-        # the backend can't trace the graph on this torch/driver combo.
-        if HAVE_GPU and os.environ.get("NEXT_COMPILE", "0") == "1":
-            try:
-                node.model = torch.compile(node.model, mode="reduce-overhead", fullgraph=False)
-                print("torch.compile enabled for GRU-ODE field (reduce-overhead)")
-            except Exception as e:
-                print(f"torch.compile unavailable, running eager: {e}")
-        # The GRU-ODE forecaster outputs a physical-state trajectory directly,
-        # so the existing physical-space loss (WrappedMSELoss, already assigned
-        # to loss_func above) applies unchanged. The structural boundedness of
-        # the latent state supplies the trajectory-stabilisation prior that
-        # otherwise required an explicit boundary penalty.
-        #
-        # Optional: couple a light physical boundary / energy penalty by
-        # swapping loss_func for EnergyMSELoss above — the GRU-ODE recon is a
-        # drop-in target for any of the existing loss wrappers.
     elif model_type == "latentode":
         # ------------------------------------------------------------
         #  Latent-ODE model – a completely different object
@@ -837,6 +453,48 @@ def train_NEXT(
         # NOTE: NODEPredictor expects a callable that takes (pred, true).
         # We therefore bind the extra arguments via a lambda.
         node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    elif model_type == "rssm":
+        # ------------------------------------------------------------
+        #  Physics-constrained switching RSSM (design-doc optimal model)
+        # ------------------------------------------------------------
+        # Discrete-time recurrent state-space model with:
+        #   * acceleration output + symplectic integrator (physics manifold)
+        #   * Gumbel-softmax discrete mode-latent over K dynamics regimes
+        #   * stochastic latent (prior/posterior) for distributional rollout
+        #   * multi-step rollout loss (set up in the fit loop below)
+        # The continuous-time ODE solver is bypassed entirely for this model;
+        # integration happens internally at the fixed trajectory dt.
+        layout = StateLayout.for_frame(frame)
+        det_dim = max(nhidden, 64)
+        stoch_dim = max(nhidden // 4, 16)
+        node.model = PhysicsRSSM(
+            layout=layout,
+            dt=trajectory_dt,
+            det_dim=det_dim,
+            stoch_dim=stoch_dim,
+            n_modes=n_modes,
+            hidden=nhidden,
+            obs_window=obs_window,
+            ss_prob=ss_prob,
+        ).to(node.device)
+
+        # Reconstruction criterion reuses the existing frame-aware MSE wrapper,
+        # so scaling/height/velocity conventions match the rest of the pipeline.
+        recon_criterion = WrappedMSELoss(
+            height_idx=1,
+            vel_indices=list(velocity_indicies),
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+        )
+        rssm_loss = RSSMRolloutLoss(
+            recon_criterion=recon_criterion,
+            kl_weight=kl_weight,
+            free_bits=free_bits,
+            entropy_weight=mode_entropy_weight,
+        )
+        # NODEPredictor passes (pred, true); PhysicsRSSM returns (recon, extras),
+        # and RSSMRolloutLoss consumes that tuple directly.
+        node.loss_func = lambda pred, true: rssm_loss(pred, true)
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -870,22 +528,16 @@ def train_NEXT(
         # except Exception as e:
         #     print("failed to compile the nn due to", e)
 
-        if model_type == "latentode":
-            # Choose a short window (e.g. 10 time-steps).  You can expose this
-            # as another CLI argument if you wish.
-            OBS_WINDOW = 10
+        if model_type in ("latentode", "rssm"):
+            # Both models consume (obs_window, target) tuples: a short warm-start
+            # window for the encoder and the full trajectory as the rollout
+            # target. obs_window length is configurable for the RSSM.
+            OBS_WINDOW = obs_window if model_type == "rssm" else 10
 
             train_data = [
                 _make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel
             ]  # list of (obs_window, target)
             test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
-            # reshape for NODEPredictor: it expects a list of tensors.
-            # We will pack the tuple into a single tensor where the first two
-            # dimensions are (B, K/ T) and let the model unpack them.
-            # The simplest approach is to keep them as tuples and let the
-            # training loop handle them.
-            # → In the `node.fit` call below replace `fraction_of_data` /
-            #   `fraction_of_data_val` with these lists.
 
         # length strategies is a trick from NODE literature to initialize the model on shorter time frames
         length_strategies = [
@@ -936,22 +588,20 @@ def train_NEXT(
             min_states = 5
             if math.ceil(scaled_traj_targets_train_posvel[0].shape[0] * data_fraction) < min_states:
                 print("length strategy results in too few states. overriding to maintain stability")
-            if model_type == "latentode":
-                # each element is a tuple (obs_window, target)
-                fraction_of_data = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],  # obs_window
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )  # target
-                    for (obs, tgt) in train_data
-                ]
-                fraction_of_data_val = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )
-                    for (obs, tgt) in test_data
-                ]
+            if model_type in ("latentode", "rssm"):
+                # each element is a tuple (obs_window, target). The target is
+                # truncated by the length-strategy fraction; the warm-start
+                # window must never be longer than the (fractioned) target,
+                # otherwise the rollout would index past the available steps.
+                def _frac_tuple(obs, tgt):
+                    tgt_len = max(math.ceil(tgt.shape[0] * data_fraction), min_states)
+                    tgt_f = tgt[:tgt_len]
+                    obs_len = min(obs.shape[0], tgt_len)
+                    obs_f = obs[:obs_len]
+                    return (obs_f, tgt_f)
+
+                fraction_of_data = [_frac_tuple(obs, tgt) for (obs, tgt) in train_data]
+                fraction_of_data_val = [_frac_tuple(obs, tgt) for (obs, tgt) in test_data]
             else:
                 # existing behaviour (plain NODE/ANODE/SONODE)
                 fraction_of_data = [
@@ -982,24 +632,17 @@ def train_NEXT(
 
     # TODO: move this conversion to a separate script
     # export the model to ONNX binary (protobuf) format
-    #
-    # For GRU-ODE we export through GRUODEFieldForONNX, which exposes the induced
-    # physical-space field ẋ = f(x) WITHOUT any autograd JVP (it uses a central
-    # finite difference through the decoder). This is required because the
-    # torch.export-based ONNX exporter cannot trace autograd.functional.jvp /
-    # torch.func.jvp (it fails with "unbacked symbol" AssertionErrors). The
-    # adapter takes a single tensor and returns the physical derivative, the
-    # same contract the sim and other NODE exports use.
-    #
-    # Unwrap torch.compile (if enabled) to get the raw module before export.
-    raw_model = getattr(node.model, "_orig_mod", node.model)
-    if isinstance(raw_model, GRUODELatentModel):
-        export_model = GRUODEFieldForONNX(
-            raw_model.func, state_vector_len=model_states, aug_dim=aug_dim
-        ).to(node.device).eval()
-        example_input = torch.cat(
-            (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
-        ).to(node.device)
+    if model_type == "rssm":
+        # The full training model is stochastic and autoregressive (Gumbel
+        # sampling + Python rollout loop), which does not export cleanly.
+        # Export the deterministic single-step transition wrapper instead:
+        # it has the same (t, x) -> x_next contract the tracker expects from
+        # the TorchdiffeqSolver path, with argmax mode selection, mean latents,
+        # and no random sampling -> opset-18 clean.
+        export_model = PhysicsRSSMInference(node.model).to(node.device)
+        export_model.eval()
+        single_state = scaled_traj_targets_train_posvel[0][0].to(node.device)  # (D,)
+        example_input = (None, single_state)
     elif isinstance(ode_solver, TorchdiffeqSolver):
         export_model = node.model
         example_input = (
@@ -1497,54 +1140,6 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
     return timeseries_in_next_frame
 
 
-class GRUODEFieldForONNX(torch.nn.Module):
-    """Export adapter exposing a PHYSICAL-SPACE vector field ẋ = f(x).
-
-    Downstream trackers (and Simple_Sim) integrate the exported field
-    themselves: a single fixed-dim physical state goes in, the physical-state
-    derivative comes out — exactly the ODEfunc contract. The GRU-ODE forecaster
-    works in a latent space, so the induced physical field is
-
-        ẋ_phys = J_dec(h) · ḣ ,   h = Enc(x_phys),  ḣ = GRU-ODE(h)
-
-    EXPORT-SAFETY: we do NOT use any autograd-based JVP here. The new
-    torch.export-based ONNX exporter cannot trace through
-    torch.autograd.functional.jvp / torch.func.jvp (it produces "unbacked
-    symbol" tracing failures). Instead we compute J_dec(h)·ḣ with a central
-    finite difference through the decoder:
-
-        ẋ ≈ [ Dec(h + ε·ḣ) − Dec(h − ε·ḣ) ] / (2ε)
-
-    This is just three decoder calls and arithmetic — pure, statically-shaped
-    tensor ops that ONNX traces trivially. It is second-order accurate; at
-    ε=1e-4 it matches the analytic Jacobian to ~1e-8 (verified), far below any
-    modeling error. The signature is forward(x) (single tensor) so the export
-    has clean ["input"]→["output"] names and matches how the sim calls it.
-    """
-
-    def __init__(self, func: GRUODEFunc, state_vector_len: int, aug_dim: int = 0, eps: float = 1e-4):
-        super().__init__()
-        self.func = func
-        self.state_vector_len = state_vector_len
-        self.aug_dim = aug_dim
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Accept an optionally zero-augmented physical state; use only the
-        # physical block (the latent lift subsumes augmentation).
-        if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
-            x_phys = x.narrow(-1, 0, self.state_vector_len)
-        else:
-            x_phys = x
-        h = self.func.encode(x_phys)
-        dh = self.func.cell(0.0, h)
-        # Central finite-difference JVP through the decoder — no autograd.
-        x_plus = self.func.decode(h + self.eps * dh)
-        x_minus = self.func.decode(h - self.eps * dh)
-        xdot = (x_plus - x_minus) / (2.0 * self.eps)
-        return xdot
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Training script for creating NEXT models",
@@ -1618,8 +1213,48 @@ def main():
     parser.add_argument(
         "--model-type",
         default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"],
-        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, GRU-ODE, or minimal GRU-ODE.",
+        choices=["node", "anode", "sonode", "latentode", "rssm"],
+        help=(
+            "Which architecture to train: regular NODE, Augmented NODE, "
+            "Second-Order NODE, Latent-ODE, or the physics-constrained "
+            "switching RSSM (design-doc optimal; discrete-time, mode-switching)."
+        ),
+    )
+    parser.add_argument(
+        "--n-modes",
+        default=5,
+        type=int,
+        help="RSSM only: number of discrete dynamics modes (cruise/juke/spiral/etc.).",
+    )
+    parser.add_argument(
+        "--obs-window",
+        default=10,
+        type=int,
+        help="RSSM/Latent-ODE: number of warm-start observation steps fed to the encoder.",
+    )
+    parser.add_argument(
+        "--kl-weight",
+        default=1.0,
+        type=float,
+        help="RSSM only: weight on the posterior-vs-prior KL term.",
+    )
+    parser.add_argument(
+        "--free-bits",
+        default=1.0,
+        type=float,
+        help="RSSM only: free-bits floor below which KL is not penalised.",
+    )
+    parser.add_argument(
+        "--mode-entropy-weight",
+        default=1e-3,
+        type=float,
+        help="RSSM only: weight encouraging mode-usage entropy (prevents mode collapse).",
+    )
+    parser.add_argument(
+        "--ss-prob",
+        default=0.0,
+        type=float,
+        help="RSSM only: scheduled-sampling probability of feeding ground truth during rollout (0 = fully open-loop).",
     )
     parser.add_argument(
         "--dt",
@@ -1811,6 +1446,12 @@ def main():
         args.gpu_index,
         args.model_type,
         args.frame,
+        args.n_modes,
+        args.obs_window,
+        args.kl_weight,
+        args.free_bits,
+        args.mode_entropy_weight,
+        args.ss_prob,
     )
     # NOTE: After this was the whole chain of evaluation functions. Skipping adding that to this unclass side for now. It really should be a separate script.
 

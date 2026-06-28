@@ -1,13 +1,155 @@
-Traceback (most recent call last):
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_rssm.py", line 1460, in <module>
-    main()
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_rssm.py", line 1434, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_rssm.py", line 617, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 193, in fit
-    max_len = max([i.size(dim=0) for i in x_batch_list])
-                   ^^^^^^
-AttributeError: 'tuple' object has no attribute 'size'
+def fit(
+        self,
+        x: list[torch.Tensor],
+        extra_feat: torch.Tensor | None = None,
+        *,
+        shuffle: bool = True,
+        validation_data: list[torch.Tensor] | None = None,
+        enable_checkpoints: bool = False,
+    ) -> dict[str, list[float]]:
+        """Fits a model to a dataset.
+
+        Args:
+            x: List of tensors that contain the time series targets.
+                Each tensor should be of shape (n_time_steps, n_features), where
+                the first point is the initial condition for the ODE solver.
+            extra_feat: Extra features used in training.
+                This will be passed to the extra features of the Neural ODE. It
+                should be of shape (len(x), n_extra_features).
+            shuffle: Flag to shuffle the data for batching.
+                The data will not be shuffled when set to False.
+            validation_data: List of tensors that contain the time series targets.
+                Each tensor should be of shape (n_time_steps, n_features), where
+                the first point is the initial condition for the ODE solver.
+
+        Returns:
+            A dictionary of training losses and metrics.
+        """
+        if extra_feat is not None:
+            extra_feat = extra_feat.to(self.device)
+
+        for epoch in range(1, self.n_epochs + 1):
+            pool_index = list(range(len(x)))
+            if shuffle:
+                random.shuffle(pool_index)
+            for _ in range(math.ceil(len(x) / self.batch_size)):
+                batch_idx = [
+                    pool_index.pop(0)
+                    for _ in range(
+                        min(
+                            len(pool_index),
+                            self.batch_size,
+                        )
+                    )
+                ]
+                x_batch_list = [x[i] for i in batch_idx]
+                max_len = max([i.size(dim=0) for i in x_batch_list])
+                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
+                for i in range(len(x_batch_list)):
+                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
+
+                if extra_feat is None:
+                    metrics = self.batch_loss(x=x_batch.to(self.device))
+                else:
+                    metrics = self.batch_loss(
+                        x=x_batch.to(self.device),
+                        extra_feat=extra_feat[batch_idx],
+                    )
+
+                self.optimizer.zero_grad()
+                metrics["loss"].backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
+                    norm_type=2.0,
+                )
+                # # (optional) log the pre‑clip norm so you can monitor it
+                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
+                self.optimizer.step()
+
+            if validation_data is not None:
+                with torch.no_grad():
+                    # repeating the above...it should be another function
+                    pool_index_val = list(range(len(validation_data)))
+                    if shuffle:
+                        random.shuffle(pool_index_val)
+
+                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
+                        batch_idx_val = [
+                            pool_index_val.pop(0)
+                            for _ in range(
+                                min(
+                                    len(pool_index_val),
+                                    self.batch_size,
+                                )
+                            )
+                        ]
+                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
+                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
+                        x_batch_val = float("nan") * torch.ones(
+                            (
+                                len(batch_idx_val),
+                                max_len_val,
+                                x_batch_list_val[0].size(dim=1),
+                            )
+                        )
+                        for i in range(len(x_batch_list_val)):
+                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
+
+                        if extra_feat is None:
+                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
+                        else:
+                            metrics_val = self.batch_loss(
+                                x=x_batch_val.to(self.device),
+                                extra_feat=extra_feat[batch_idx_val],
+                            )
+
+                    for key in metrics_val:
+                        metrics[f"val_{key}"] = metrics_val[key]
+
+                    # update the position and velocity weights only for the loss functions that support this
+                    # and only when looking at the full trajectory
+                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
+                    if hasattr(self.criterion, "wp") and enable_checkpoints:
+                        if epoch % 50 == 0:
+                            if (
+                                metrics["pos_err_scaled"] > self.criterion.delta_pos
+                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
+                            ):
+                                pass
+                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
+                                self.criterion.wp *= 1.2  # amplify position focus
+                                logger.info(
+                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
+                                )
+                                # self.early_stopper.counter = self.early_stopper.counter // 2
+                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
+                                self.criterion.wv *= 1.2
+                                logger.info(
+                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
+                                )
+                                # self.early_stopper.counter = self.early_stopper.counter // 2
+
+            self._add_metrics_to_global_metrics(metrics)
+            self._log_metrics(metrics, iteration=epoch)
+
+            if (
+                enable_checkpoints
+                and validation_data is not None
+                and self.checkpoint is not None
+                and self.checkpoint.save_on_min(
+                    self,
+                    epoch,
+                    metrics[self.early_stopper.metric_name],
+                )
+            ):
+                logger.info(f"Saved checkpoint at {epoch}")
+            if (
+                self.early_stopper is not None
+                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
+                # and metrics["pos_err"] < 5000
+            ):
+                logger.info(f"Early stopping triggered at {epoch}")
+                break
+
+        return self.training_metrics

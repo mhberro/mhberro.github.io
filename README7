@@ -1,75 +1,50 @@
-def fit(
+def batch_loss(
         self,
-        x: list[torch.Tensor],
+        x: torch.Tensor,
         extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
+    ) -> dict[str, torch.Tensor]:
+        """Calculates the loss of the batch.
 
         Args:
-            x: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-            extra_feat: Extra features used in training.
-                This will be passed to the extra features of the Neural ODE. It
-                should be of shape (len(x), n_extra_features).
-            shuffle: Flag to shuffle the data for batching.
-                The data will not be shuffled when set to False.
-            validation_data: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
+            x: Batch targets time series data.
+                This should be of shape (batch_size, series_length, n_features).
+                The first column x(:,0,:) is used as the initial condition for
+                the ODE solver integration.
+            extra_feat: Batch extra features.
+                This is used as the extra features in the ODE solver
+                integration. It should be of shape (batch_size,
+                n_extra_features).
 
         Returns:
-            A dictionary of training losses and metrics.
+            The loss of the batch.
         """
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
+        if self.aug_dim == 0:
+            x0 = x[:, 0]
+        else:
+            zeros = torch.zeros((x.shape[0], self.aug_dim)).to(self.device)
+            x0 = torch.cat((x[:, 0, :], zeros), dim=1)
+        batch_size, time_steps, n_features = x.shape
+        if self.solver.adjoint:
+            x_pred = AdjointMethod.apply(
+                self.solver,
+                self.model,
+                x0,
+                time_steps - 1,
+                extra_feat,
+                *tuple(self.model.parameters()),
+            )[:, :, : x.shape[2]]
+        else:
+            x_pred = self.solver.integrate(
+                func=self.model,
+                x0=x0,
+                steps=time_steps - 1,
+                extra_feat=extra_feat,
+            )[:, :, : x.shape[2]]
 
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
+        x_pred = torch.nan_to_num(x_pred, nan=0)
+        x = torch.nan_to_num(x, nan=0)
 
-                if extra_feat is None:
-                    metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
-                    norm_type=2.0,
-                )
-                # # (optional) log the pre‑clip norm so you can monitor it
-                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-                self.optimizer.step()
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    # repeating the above...it should be another function
+        return self.criterion(x_pred, x)                    # repeating the above...it should be another function
                     pool_index_val = list(range(len(validation_data)))
                     if shuffle:
                         random.shuffle(pool_index_val)

@@ -1,564 +1,885 @@
-"""Loss functions for a Neural Ordinary Differential Equation model."""
+import argparse
+import json
+import math
+import os
+import pickle
+import re
+import traceback
+from copy import deepcopy
 
-from __future__ import annotations
-
-from typing import Callable
-
+import numpy as np
+import pandas as pd
 import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
+import matplotlib.pyplot as plt
+import onnxruntime
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.signal import resample_poly
+from sklearn.metrics import mean_absolute_error
+
+from coordinate_transform_functions import (
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    ned_to_dcu,
+    frd_to_dcu,
+    dcu_to_ned,
+    ned_to_ecef_velocity,
+    ned_to_ecef,
+)
+from load_truth import load_single_truth
+from NEXT_training import (
+    ecef_to_next_grdth,
+    next_grdth_to_ecef,
+    ecef_to_next_dcu,
+    next_dcu_to_ecef,
+    ecef_to_local_geodesic_vec,
+    local_geodesic_to_ecef_vec,
+)
+from ibcs_tools_helpers import multiline, custom_cmap, add_classification_markings, add_lmpi_markings, Classification
+from trajectory_helpers import (
+    check_time_series,
+    resample_traj_data,
+    TIME_INDEX,
+    POS_SLICE,
+    VEL_SLICE,
+    ACC_SLICE,
+    GR_INDEX,
+    GR_DOT_INDEX,
+    THETA_DOT_INDEX,
+    DOWN_INDEX,
+    DOWN_DOT_INDEX,
+)
+
+measurement_dt = 1.0  # [s]
+extrapolation_dt = 1.0  # [s]
+max_traj_states = int(300 / extrapolation_dt)  # total time of 300 seconds
+
+plt.rcParams["axes.formatter.limits"] = [-3, 4]
+plt.rcParams["figure.figsize"] = [6, 5]
+plt.rcParams.update(
+    {
+        "lines.linewidth": 0.5,
+        "axes.formatter.useoffset": False,
+        "savefig.dpi": 200,
+    }
+)
+
+def main():
+    parser = argparse.ArgumentParser(description="")
+    parser.add_argument(
+        "truths",
+        nargs="+",
+        type=str,
+        help="list of files to run the sim with. all output will end up in a single directory",
+    )
+    parser.add_argument("-o", dest="output", required=True, default=None, help="dir to place results")
+    parser.add_argument("-m", dest="model", required=True, default=None, help="onnx file")
+    parser.add_argument(
+        "-s",
+        dest="scalar",
+        required=True,
+        default=None,
+        help="this is currently only the pickled scalar.",
+    )
+    parser.add_argument(
+        "--sr-min",
+        type=int,
+        default=10000,
+        help="run the sim until the target gets near this slant range",
+    )
+    parser.add_argument(
+        "--sr-max",
+        type=int,
+        default=150000,
+        help="start the sim no further than this slant range",
+    )
+
+    args = parser.parse_args()
+
+    # check that the sr min and max values are reasonable
+    if args.sr_min >= args.sr_max:
+        raise ValueError("sr min must be less than sr max")
+
+    # check if the model file exists
+    if not os.path.exists(args.model):
+        raise ValueError(f"There is no model at {args.model}")
+
+    model_path = os.path.dirname(args.model)
+    # split the file extension off of the model name
+    model_name = ".".join(os.path.basename(args.model).split(".")[:-1])
+    # scalar_path = args.scalar
+
+    # check if there is a train_test split file next to the model
+    # split the number of epochs off of the model name
+    # model_name_wo_epoch = "_".join(model_name.split("_")[:-1])
+    # model_name_wo_bucket = re.sub(r"_\d{1,3}sr_", "_", model_name)
+    train_test_split_file = os.path.join(model_path, model_name + "_train_test_split.json")
+    train_test_trajs = None
+    if os.path.exists(train_test_split_file):
+        with open(train_test_split_file) as f:
+            train_test_trajs = json.load(f)
+
+    # run sim
+    sim_many_truths(args, model_name, train_test_trajs)
 
 
-class WrappedMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-    ) -> None:
-        """Initializes WrappedMSELoss."""
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
+def sim_many_truths(args, model_name, train_test_trajs):
+    # TODO: Finish the comment
+    # paths is expected to by a list of...i never finished the comment
+    # TODO: Multi-process? Or just let HPC parallel submissions do that for me
+    tgt_metric = []
+    for p in args.truths:
+        print("Running sim for", p, flush=True)
+        t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
+        if t is not None:
+            tgt_metric.append(t)
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-        loss_data = super().forward(pred, target)
-
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            # "energy_loss": loss_energy,
-        }
+    # Disabled to avoid filling up the drive
+    # with open(
+    #     os.path.join(args.output, "NEXT_sim_metric_" + model_name + ".txt"), "w"
+    # ) as o:
+    #     o.write(str(np.mean(tgt_metric)))
 
 
-# TODO: with a bit of re-work, this could be changed to any-order loss
-# change vel_indices to order_split_indices
-# TODO: What about HuberLoss so that more attention is paid to the order that is above the needed value?
-class SecondOrderSplitMSELoss(torch.nn.Module):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        vel_weight: float | None = 1.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        pos_expect: float = "inf",
-        vel_expect: float = "inf",
-    ) -> None:
-        """Initializes SecondOrderSplitMSELoss."""
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.vel_weight = vel_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.pos_expect = pos_expect
-        self.vel_expect = vel_expect
+def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
+    # load in the truth data and turn it into ECEF truth states
+    # read in truth in ECEF into array
+    truth = load_single_truth(path_to_truth)
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
+    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, args)
 
-        # Compute metrics.
-        # with torch.no_grad():
-        if self.scaler is not None:
-            pred_unscaled = torch.from_numpy(
-                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                    -1, n_timesteps, self.N_FEATURES
-                )
-            )
-            target_unscaled = torch.from_numpy(
-                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                    -1, n_timesteps, self.N_FEATURES
-                )
-            )
+    truth_filename = os.path.basename(path_to_truth)
+    if len(trajs) == 0:
+        print(f"No extrapolations were created for {truth_filename}")
+        return None
+
+    if isinstance(truth_states_sr_cut, int):
+        if all((-1 == x for x in (truth_states_sr_cut, trajs, truth_trajs))):
+            print("skipping bad truth file", path_to_truth)
+            return
+
+    s = f"{model_name}_{truth_filename}"
+
+    if not os.path.exists(output):
+        os.makedirs(output, exist_ok=True)
+    plot_sim_result(
+        truth_states_sr_cut,
+        trajs,
+        args,
+        train_test_trajs,
+        model_name,
+        traj_number=truth_filename,
+        filename=s,
+        save=True,
+        show=False,
+        output=output,
+    )
+    save_sim_result(output, trajs, truth_filename)
+    try:
+        traj_metric = calc_sim_metric(output, trajs, truth_trajs, truth_filename)
+    except Exception:
+        traj_metric = None
+    return traj_metric
+
+
+def calc_sim_metric(output, trajs, truth_trajs, truth_filename):
+    ingress_metric = []
+    for next_traj, truth_traj in zip(trajs, truth_trajs):
+        ingress_metric.append(calc_sim_metric_for_one_pair(truth_traj, next_traj))
+    return np.mean(ingress_metric)
+
+
+def calc_sim_metric_for_one_pair(truth_traj, test_traj):
+    # TODO: remove this when we get DTW
+    # check if the truth needs to be resampled
+    t = truth_traj
+    if len(truth_traj) != len(test_traj):
+        # use scipy to adjust the truth data
+        reduction_factor = np.gcd(len(test_traj), len(truth_traj))
+        t = resample_poly(
+            truth_traj,
+            len(test_traj) / reduction_factor,
+            len(truth_traj) / reduction_factor,
+            padtype="line",
+        )
+    return mean_absolute_error(t[:, POS_SLICE], test_traj[:, POS_SLICE])
+
+
+def save_sim_result(output, trajs, truth_filename):
+    print(f"Saving {len(trajs)} extrapolations to disk")
+    dfs = [None] * len(trajs)
+    for i, traj in enumerate(trajs):
+        # create a df from the numpy array where the columns are time, pos, vel
+        df = pd.DataFrame(
+            traj,
+            columns=(
+                "time",
+                "x_pos_ecef",
+                "y_pos_ecef",
+                "z_pos_ecef",
+                "x_vel_ecef",
+                "y_vel_ecef",
+                "z_vel_ecef",
+                "x_acc_ecef",
+                "y_acc_ecef",
+                "z_acc_ecef",
+            ),
+        )
+
+        # these columns change per traj
+        # curr_time, pred_num, validity_time
+        df["curr_time"] = df["time"][0]
+        df["pred_num"] = i + 1
+        df["validity_time"] = df["time"][0]
+        dfs[i] = df
+
+    # combine the dfs into one larger df
+    big_df = pd.concat(dfs)
+
+    # now add the static columns
+    big_df["system_track_number"] = 1701
+    big_df["threat_id"] = 47
+    big_df["true_object_id"] = 31
+    big_df["hyp_id"] = 1
+    big_df["asset_id"] = 0
+    big_df["threat_genre"] = "HGV"
+    big_df["eng_status"] = "ELIGIBLE"
+    big_df["traj_genre"] = "MRV"
+    big_df["traj_genre_score"] = 0
+    big_df["reach_assess"] = 0
+    big_df["extrap_in_SR"] = "Y"
+
+    # write to file
+    s = f"NEXT_extraps_{truth_filename}"
+    big_df.to_csv(os.path.join(output, f"extrap-dt_{extrapolation_dt}", s), index=False)
+
+
+def plot_sim_result(
+    truth,
+    trajs,
+    args,
+    train_test_trajs,
+    model_name,
+    traj_number="",
+    filename="",
+    save=False,
+    show=False,
+    output=None,
+):
+    if save and not output:
+        raise ValueError("Cannot save figures without an output path")
+    fig, (ax11, ax12) = plt.subplots(2, 1, sharex=True)
+    fig2, ax21 = plt.subplots(1, 1)
+    fig3, ax31 = plt.subplots(1, 1)
+    fig4, (ax41, ax42, ax43) = plt.subplots(1, 3, sharex=True)
+    fig5, (ax51, ax52) = plt.subplots(2, 1, sharex=True)
+
+    impact_ecef = deepcopy(truth[-1, POS_SLICE])
+    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
+    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
+
+    plot_traj_truth = deepcopy(truth)
+    plot_trajs_next = deepcopy(trajs)
+
+    # all of the data inputs are in ecef and have at least time, pos, and vel states
+    for i, traj in enumerate([plot_traj_truth] + plot_trajs_next):
+        # transform the ecef to ned to dcu
+        for j in range(traj.shape[0]):
+            traj[j, POS_SLICE] = ecef_to_ned(traj[j, POS_SLICE], impact_ecef)
+            traj[j, VEL_SLICE] = ecef_to_ned_velocity(traj[j, VEL_SLICE], impact_ecef)
+            # traj[j, ACC_SLICE] = ecef_to_ned_velocity(traj[j, ACC_SLICE], impact_ecef)
+
+            traj[j, POS_SLICE] = ned_to_dcu(traj[j, POS_SLICE], ref_angle)
+            traj[j, VEL_SLICE] = ned_to_dcu(traj[j, VEL_SLICE], ref_angle)
+            # traj[j, ACC_SLICE] = ned_to_dcu(traj[j, ACC_SLICE], ref_angle)
+
+        # TODO: redo this to use multiline
+        axes = (ax11, ax12, ax21, ax31, ax41, ax42, ax43)
+        plot_single_traj(i, traj, axes)
+
+    plot_color_trajs(plot_traj_truth, plot_trajs_next, ax51, ax52)
+
+    # set up variables for the figures
+
+    ax11.legend()
+    ax21.legend()
+    ax31.legend()
+    ax43.legend()
+    ax11.set_xlim([-10, args.sr_max / 1e3])
+    ax11.grid(True)
+    ax12.grid(True)
+    ax21.grid(True)
+    ax31.grid(True)
+    ax41.grid(True)
+    ax42.grid(True)
+    ax43.grid(True)
+    ax51.grid(True)
+    ax52.grid(True)
+    add_classification_markings(fig, Classification.UNCLASSIFIED)
+    add_classification_markings(fig2, Classification.UNCLASSIFIED)
+    add_classification_markings(fig3, Classification.UNCLASSIFIED)
+    add_classification_markings(fig4, Classification.UNCLASSIFIED)
+    add_classification_markings(fig5, Classification.UNCLASSIFIED)
+    add_lmpi_markings(fig)
+    add_lmpi_markings(fig2)
+    add_lmpi_markings(fig3)
+    add_lmpi_markings(fig4)
+    add_lmpi_markings(fig5)
+
+    # give the figure a title
+    title = f"{traj_number}"
+    if train_test_trajs is not None:
+        if title in train_test_trajs["test"]:
+            title = title + " (from test set)"
+        elif title in train_test_trajs["train"]:
+            title = title + " (from train set)"
         else:
-            pred_unscaled = pred.detach()
-            target_unscaled = target.detach()
+            title = title + " (outside model scope)"
+    ax11.set_title(title, wrap=True)
+    ax21.set_title(title, wrap=True)
+    ax31.set_title(title, wrap=True)
+    # ax41.set_title(title, wrap=True)
+    ax51.set_title(title, wrap=True)
+    fig4.suptitle(title, wrap=True)
+    fig.canvas.manager.set_window_title(title)
+    fig2.canvas.manager.set_window_title(title)
+    fig3.canvas.manager.set_window_title(title)
+    fig4.canvas.manager.set_window_title(title)
+    fig5.canvas.manager.set_window_title(title)
 
-        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
-        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
-        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
-        vel_target_unscaled = target_unscaled[..., self.vel_indices]
+    # create the directory to place figures
+    figure_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}", "plots")
+    os.makedirs(figure_dir, exist_ok=True)
 
-        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
-        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
+    if save:
+        # fig.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR.png"), format="png")
+        fig2.savefig(os.path.join(figure_dir, filename + "_sim_Speed.png"), format="png")
+        fig3.savefig(os.path.join(figure_dir, filename + "_sim_Accel.png"), format="png")
+        fig4.savefig(os.path.join(figure_dir, filename + "_sim_Vel.png"), format="png")
+        fig5.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR_color.png"), format="png")
 
-        pos_pred = pred[..., : self.vel_indices[0]]
-        pos_target = target[..., : self.vel_indices[0]]
-        vel_pred = pred[..., self.vel_indices]
-        vel_target = target[..., self.vel_indices]
-
-        # calculate vel weight based on how far above the expectation each error is
-        # piecewise above expect ratio
-        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
-        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
-
-        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
-        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
-        total_loss = pos_loss + vel_loss
-
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            # "energy_loss": loss_energy,
-        }
+    if show:
+        plt.show()
+        input("press enter to continue")
+    plt.close("all")
 
 
-class PhysicsSplitMSELoss(torch.nn.Module):
-    """Position/velocity-weighted MSE with an optional physics-residual coupling.
+def plot_single_traj(i, traj, axes):
+    # TODO: Fix the axis labels
+    # TODO: Split this out into plotting functions like I do in IBCS Tools
+    (ax11, ax12, ax21, ax31, ax41, ax42, ax43) = axes
+    if i == 0:
+        color = "k"
+        lw = 1
+        label = "Truth"
+        zorder = 8
+    elif i == 1:
+        color = "tab:orange"
+        lw = 0.5
+        label = "NEXT"
+        zorder = None
+    else:
+        color = "tab:orange"
+        lw = 0.5
+        label = "_nolegend_"
+        zorder = None
 
-    Combines the two requested GRU-ODE improvements in one loss, each behind a
-    weight that defaults to recovering plain summed MSE:
+    # DR-UP
+    ax11.plot(
+        traj[:, 1] / 1e3,
+        traj[:, 3] / 1e3,
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
 
-      total = w_pos * MSE(pos) + w_vel * MSE(vel) + w_phys * MSE(d/dt pos - vel)
+    # DR-CR
+    ax12.plot(
+        traj[:, 1] / 1e3,
+        traj[:, 2] / 1e3,
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
 
-    1. Velocity weighting (w_vel): the laggard in the training logs was velocity
-       (val_vel_err ~58 while position kept improving). w_vel lets you up- or
-       down-weight the velocity MSE relative to position. (The old
-       SecondOrderSplitMSELoss declared a vel_weight but never applied it; here
-       it is actually used.)
+    # UP-Speed
+    ax21.plot(
+        traj[1:, 3] / 1e3,
+        np.linalg.norm(traj[1:, VEL_SLICE], axis=1),
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
 
-    2. Physics residual (w_phys): the geodesic `gruode` path sets no
-       order_shift_slice, so predicted position and velocity are untied — the
-       model can output a position trajectory inconsistent with its own
-       velocity, which compounds into long-horizon drift. This term penalises
-       the violation of the kinematic identity d/dt(position) = velocity,
-       directly coupling the two and damping that drift.
+    # UP-Acceleration
+    ax31.plot(
+        traj[1:, 3] / 1e3,
+        np.linalg.norm(traj[1:, ACC_SLICE], axis=1),
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
 
-    CRITICAL — scaling: the loss sees the StandardScaler-scaled state, in which
-    dx = v*dt does NOT hold (position and velocity have different scale factors).
-    The residual is therefore computed in PHYSICAL units by multiplying each
-    block by its scaler scale_ factor before finite-differencing. The forward
-    difference uses dt (seconds) between consecutive timesteps. With w_phys=0
-    this term and its unscaling are skipped entirely.
+    # UP-Speed
+    ax41.plot(
+        traj[:, 3] / 1e3,
+        traj[:, 4],
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
+    ax42.plot(
+        traj[:, 3] / 1e3,
+        traj[:, 5],
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
+    ax43.plot(
+        traj[:, 3] / 1e3,
+        traj[:, 6],
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+    )
 
-    Returns the {"loss", "pos_err", "vel_err"} dict the early stopper expects
-    (early_stop_metric_name="val_loss"). pos_err/vel_err remain physical-unit
-    L1 metrics, identical in meaning to the other losses, so curves stay
-    comparable across runs.
-    """
+    # label the axes
+    ax11.set_ylabel("Up [km]")
+    ax12.set_xlabel("Down [km]")
+    ax12.set_ylabel("Cross [km]")
 
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        dt: float,
-        pos_weight: float = 1.0,
-        vel_weight: float = 1.0,
-        physics_weight: float = 0.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-    ) -> None:
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.dt = float(dt)
-        self.pos_weight = pos_weight
-        self.vel_weight = vel_weight
-        self.physics_weight = physics_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        # Position block is everything before the first velocity index. For the
-        # balanced 6-state geodesic/DCU layout (vel_indices=[3,4,5]) this gives
-        # position indices [0,1,2], so pos component i pairs with vel component i.
-        self.n_pos = self.vel_indices[0]
-        # Pre-extract per-block physical scale factors (std dev for StandardScaler)
-        # so the physics residual can be evaluated in physical units. Registered
-        # as buffers so they ride along to the correct device.
-        if scaler is not None and physics_weight > 0.0:
-            scale = torch.as_tensor(getattr(scaler, "scale_"), dtype=torch.float32)
-            self.register_buffer("pos_scale", scale[: self.n_pos].clone())
-            self.register_buffer("vel_scale", scale[self.vel_indices].clone())
+    ax21.set_xlabel("Up [km]")
+    ax21.set_ylabel("Speed [m/s]")
+
+    ax31.set_xlabel("Up [km]")
+    ax31.set_ylabel("Acceleration Magnitude [m/s/s]")
+
+    ax41.set_xlabel("Up [km]")
+    ax42.set_xlabel("Up [km]")
+    ax43.set_xlabel("Up [km]")
+    ax41.set_ylabel("Velocity [m/s]")
+    ax41.set_title("Down")
+    ax42.set_title("Cross")
+    ax43.set_title("Up")
+
+
+def plot_color_trajs(truth, extraps, ax51, ax52):
+    # plot the truth
+    color = "lime"
+    linestyle = "--"
+    lw = 1
+    label = "Truth"
+    zorder = 8
+    ax51.plot(
+        truth[:, 1] / 1e3,
+        truth[:, 3] / 1e3,
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+        linestyle=linestyle,
+    )
+    ax52.plot(
+        truth[:, 1] / 1e3,
+        truth[:, 2] / 1e3,
+        label=label,
+        color=color,
+        lw=lw,
+        zorder=zorder,
+        linestyle=linestyle,
+    )
+
+    tall = []
+    dall = []
+    call = []
+    uall = []
+    for i in range(len(extraps)):
+        ex = extraps[i]
+        t, d, c, u, *_ = ex.T
+        tall.append(t)
+        dall.append(d / 1e3)
+        call.append(c / 1e3)
+        uall.append(u / 1e3)
+
+    init_times = tuple(x[0][0] for x in extraps)
+    plot = multiline(dall, uall, init_times, ax=ax51, cmap="plasma", lw=0.5, label="NEXT")
+    multiline(dall, call, init_times, ax=ax52, cmap="plasma", lw=0.5)
+
+    cbar = ax51.get_figure().colorbar(plot, ax=[ax51, ax52])
+    cbar.set_label(label="Trajectory Initial Point Validity Time")
+
+    ax51.set_xlabel("Down [km]")
+    ax51.set_ylabel("Up [km]")
+    ax52.set_ylabel("Cross [km]")
+
+
+def sim_ingress(truth_states, args):
+    # truth states are expected to be an array of format
+    # seconds from launch, position x3, velocity x3, acceleration x3
+
+    # define guide point at truth impact
+    impact_ecef = deepcopy(truth_states[-1, POS_SLICE])
+    impact_time = truth_states[-1, 0]
+
+    # cut truth at firm track range
+    # truth_states_sr_cut = np.asarray(
+    #     tuple(
+    #         x
+    #         for x in truth_states
+    #         if np.linalg.norm(x[POS_SLICE] - impact_ecef) < args.sr_max and not np.allclose(x[VEL_SLICE], [0, 0, 0])
+    #     ),
+    #     dtype=np.float64,
+    # )
+
+    # NOTE: Change the 122.0 to 61.0 for the LowE
+    truth_states_sr_cut = np.asarray(
+        tuple(x for x in truth_states if x[TIME_INDEX] < 122.0 and not np.allclose(x[VEL_SLICE], [0, 0, 0])),
+        dtype=np.float64,
+    )
+
+    # start sim clock at truth firm track range
+    firm_track_time = truth_states_sr_cut[0][0]
+    sim_time = deepcopy(firm_track_time)
+    trajs = []
+    truth_trajs = []
+
+    # sim to the end of the truth
+    while sim_time <= impact_time - measurement_dt:
+        # print("sim time step", sim_time, impact_time, measurement_dt)
+        # grab the current target state
+        tgt_state_ecef_index = np.where(truth_states_sr_cut[:, 0] == sim_time)
+        tgt_state_ecef_index_forward = np.where(truth_states_sr_cut[:, 0] >= sim_time)
+        if len(tgt_state_ecef_index[0]) == 0:
+            # missed a truth point at that time. grab the next one in the chain and update sim time for that step
+            try:
+                tgt_state_ecef_index = np.array(tgt_state_ecef_index_forward[0][0])
+            except IndexError:
+                # ran out of states in the truth
+                return truth_states_sr_cut, trajs, truth_trajs
+            sim_time = truth_states_sr_cut[tgt_state_ecef_index].squeeze()[0]
+        tgt_state_ecef = truth_states_sr_cut[tgt_state_ecef_index]
+        truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
+
+        x0 = tgt_state_ecef.squeeze()
+        traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, args)
+        if traj is not None:
+            if isinstance(traj, int) and traj == -1:
+                # got a stop sim signal for the algorithm under test
+                break
+            trajs.append(traj)
+            truth_trajs.append(truth_traj_forward)
+        # step sim time by measurement dt and repeat
+        sim_time += measurement_dt
+    return truth_states_sr_cut, trajs, truth_trajs
+
+
+def bound(low, high, x):
+    return max(low, min(high, x))
+
+
+def round_to(x, base):
+    return base * round(x / base)
+
+
+ort_sess_stash = None  # TODO: Stop cheating with a global variable. Only used for GRDTH models
+
+
+def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, args):
+    # initial state ecef is expected to be a 1d vector for time in seconds, position x3, and velocity x3 in ECEF
+    # guide point ecef is expected to be...
+
+    # check if target is too close
+    initial_state_slant_range = np.linalg.norm(initial_state_ecef[POS_SLICE] - guide_point_ecef)
+    if initial_state_slant_range < args.sr_min:
+        print("target too close", initial_state_slant_range, args.sr_min)
+        return -1
+
+    # transform into NEXT frame
+    use_grdth = "_grdth_" in os.path.basename(args.model)
+    use_geodesic = "_geod_" in os.path.basename(args.model)
+    global ort_sess_stash
+    if use_grdth:
+        initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        initial_state_slant_range = np.hypot(initial_state_NEXT_frame[GR_INDEX], initial_state_NEXT_frame[DOWN_INDEX])
+        if ort_sess_stash:
+            ort_sess = ort_sess_stash
         else:
-            self.pos_scale = None
-            self.vel_scale = None
+            # load NEXT model
+            ort_sess = onnxruntime.InferenceSession(args.model)
+            ort_sess_stash = ort_sess
+    elif use_geodesic:
+        _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+            np.atleast_2d(initial_state_ecef[POS_SLICE]),
+            np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+            np.zeros_like(
+                np.atleast_2d(initial_state_ecef[VEL_SLICE])
+            ),  # TODO: better handling of acceleration being in the transform functions
+            guide_point_ecef,
+        )
+        # Prepend time and only include pos and vel
+        initial_state_NEXT_frame = np.hstack(
+            [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
+        )[0]
+        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+        if ort_sess_stash:
+            ort_sess = ort_sess_stash
+        else:
+            # load NEXT model
+            ort_sess = onnxruntime.InferenceSession(args.model)
+            ort_sess_stash = ort_sess
+    else:
+        initial_state_NEXT_frame, initial_point_heading, flip_c = ecef_to_next_dcu(initial_state_ecef, guide_point_ecef)
+        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+        bucket_range = 100000
+        rounded_sr = int(bound(bucket_range, args.sr_max, round_to(initial_state_slant_range, bucket_range)) / 1e3)
+        model_name_to_load = re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", args.model)
+        scalar_name_to_load = os.path.join(
+            os.path.dirname(args.scalar), re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", os.path.basename(args.scalar))
+        )
+        args.scalar = scalar_name_to_load
+        ort_sess = onnxruntime.InferenceSession(model_name_to_load)
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
+    # call the extrapolator
+    try:
+        NEXT_extrap = NEXT_extrapolation(
+            initial_state_NEXT_frame, dt, n_steps, initial_point_heading, use_grdth, args, ort_sess
+        )
+    except ValueError as e:
+        print("Extrap failed", traceback.format_exc())
+        return None
 
-        # --- physical-unit L1 metrics (no grad), matching the other losses ---
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(
-                        pred.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
-                    ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(
-                        target.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
-                    ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+    # get back to ECEF
+    if use_grdth:
+        NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
+    elif use_geodesic:
+        NEXT_extrap_ecef = np.hstack(
+            [
+                NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+                local_geodesic_to_ecef_vec(
+                    np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]), guide_point_ecef
+                ),
+            ],
+        )[:, :7]
+    else:
+        NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
 
-            pos_pred_u = pred_unscaled[..., : self.n_pos]
-            pos_target_u = target_unscaled[..., : self.n_pos]
-            vel_pred_u = pred_unscaled[..., self.vel_indices]
-            vel_target_u = target_unscaled[..., self.vel_indices]
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_target_u)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_target_u)
+    # use numpy gradient (second order inner. first order on boundary) for a numerical derivative
+    a = np.gradient(NEXT_extrap_ecef[:, VEL_SLICE], axis=0)
 
-        # --- differentiable position / velocity MSE (scaled space) ---
-        pos_pred = pred[..., : self.n_pos]
-        pos_target = target[..., : self.n_pos]
-        vel_pred = pred[..., self.vel_indices]
-        vel_target = target[..., self.vel_indices]
+    # TODO: move this to outside the model loop
+    def get_acc(x):
+        a = np.zeros_like(x)
+        # TODO: Fix this
+        # for j in range(3):
+        #     # inner points
+        #     a[1:-1, j] = (x[2:, j] - x[:2, j]) / 2
+        #     # boundary points
+        #     a[0, j] = x[1, j] - x[0, j]
+        #     a[-1, j] = x[-1, j] - x[-2, j]
+        return a
 
-        pos_loss = torch.nn.functional.mse_loss(pos_pred, pos_target)
-        vel_loss = torch.nn.functional.mse_loss(vel_pred, vel_target)
-        total_loss = self.pos_weight * pos_loss + self.vel_weight * vel_loss
+    a_test = get_acc(NEXT_extrap_ecef[:, VEL_SLICE])
+    # if not np.allclose(a, a_test):
+    #     print("WOAH! Numerical method did not work")
 
-        # --- optional physics-residual coupling: d/dt(pos) ?= vel ---
-        if self.physics_weight > 0.0 and n_timesteps >= 2:
-            # Convert the predicted blocks to physical units. With a scaler we
-            # multiply by the per-component std; without one we assume the data
-            # is already physical (scale = 1).
-            if self.pos_scale is not None:
-                pos_phys = pos_pred * self.pos_scale.to(pos_pred.device)
-                vel_phys = vel_pred * self.vel_scale.to(vel_pred.device)
-            else:
-                pos_phys = pos_pred
-                vel_phys = vel_pred
-            # forward finite difference along time: (x[t+1]-x[t])/dt vs v[t]
-            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_mid = vel_phys[:, :-1, :]
-            # normalise the residual back by pos_scale so its magnitude is
-            # comparable to the scaled MSE terms (keeps physics_weight ~O(1)).
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pos_pred.device)
-            else:
-                resid = dpos_dt - vel_mid
-            physics_loss = torch.mean(resid**2)
-            total_loss = total_loss + self.physics_weight * physics_loss
+    NEXT_extrap_ecef = np.hstack([NEXT_extrap_ecef, a])
 
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-
-class EnergyMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
-        energy_weight: float | None = 1.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-    ) -> None:
-        """Initializes EnergyMSELoss."""
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.energy_fn = energy_fn
-        self.energy_weight = energy_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-        loss_data = super().forward(pred, target)
-        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
-        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
-        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
-
-        total_loss = loss_data + loss_energy
-
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            "energy_loss": loss_energy,
-        }
+    # output ECEF traj
+    return NEXT_extrap_ecef
 
 
-class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
-    """Reverse Linear Weighting Loss function.
+def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
+    """Pull the dt the model was TRAINED at from its filename.
 
-    The Reverse Linear Weighting Loss function calculates a linearly weighted
-    Mean Absolute Error (MAE) where the last points in the time series data are
-    weighted more than the first points. The weights are calculated linearly,
-    monotonically increasing in weight.
-
-    This loss function helps the NODE model learn the end of the time series
-    target data better by increasing the importance of these points through the
-    weighting scheme.
-
-    Example:
-        If pred = [100 200 300 400 500] and target = [105 205 305 405 505]:
-
-        absolute error = [5 5 5 5 5]
-        reverse_linear_weights = [0 0.1 0.2 0.3 0.4] * 100
-        weighted absolute errors = [0 50 100 150 200]
-        mean weighted absolute error = 100
+    Training writes "..._{trajectory_dt}sec_..." into the model name. The sim
+    integrates at a coarser extrapolation_dt (e.g. 1.0 s), which a plain NODE
+    tolerates but the GRU-ODE field does not: its accuracy is tied to the
+    continuity prior it learned at the training step size. We therefore
+    sub-step the GRU-ODE at (close to) its training dt. Falls back to ``default``
+    if the token is absent.
     """
-
-    def __init__(self) -> None:
-        """Initializes ReverseLinearWeightingLoss."""
-        super().__init__()
-
-    def forward(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-    ) -> torch.Tensor:
-        """Calculates the reverse linear weighting loss.
-
-        Args:
-            pred: The prediction from the model.
-            target: The target data the model should predict.
-
-        Returns:
-            A tensor containing the reverse linear weighting loss.
-        """
-        batch_size, time_steps, n_features = pred.shape
-
-        # Calculate reverse linear weights.
-        # Create a tensor of shape (batch_size, time_steps) row counts up from 0
-        # to time_steps-1.
-        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
-
-        # Normalize accross the rows.
-        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
-
-        # Duplicate in the feature dimension. Final result is tensor of shape
-        # (batch_size, time_steps, n_features) to match pred and target shapes.
-        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
-
-        # Calculate Weighted Mean Absolute Error according to the weight tensor.
-        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
+    m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
+    if m:
+        try:
+            return float(m[-1])
+        except ValueError:
+            pass
+    return default
 
 
-class SoftDTWLossWrapper(SoftDTWLossPyTorch):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        gamma=1,
-        normalize=False,
-        dist_func=None,
-    ):
-        super().__init__(gamma, normalize, dist_func)
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
+def _field_eval(ort_sess, state_phys_scaled, model_augmentation_dim, state_size):
+    """One evaluation of the ONNX vector field ẋ = f(x).
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-        loss_data = super().forward(pred, target)
+    Returns the PHYSICAL-state derivative (length ``state_size``) regardless of
+    how the model handles augmentation. The plain ODEfunc export returns
+    state_size (+aug) outputs; the GRU-ODE export (GRUODEFieldForONNX) returns
+    exactly state_size outputs because the latent lift subsumes augmentation.
+    We slice to state_size so BOTH model families behave identically here.
 
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            # "energy_loss": loss_energy,
-        }
-
-
-class WeightedHuberLoss(torch.nn.Module):
+    state_phys_scaled : 1-D np.ndarray of length (state_size [+ aug])
     """
-    δp, δv are the *normalised* thresholds (already divided by the
-    corresponding std-dev).  wp, wv are optional scalar weights.
+    out = ort_sess.run(["output"], {"input": state_phys_scaled.astype(np.float32)})[-1].reshape(-1)
+    # Only the physical-state derivative is integrated; any extra (aug) outputs
+    # are not part of the physical trajectory.
+    return out[:state_size]
+
+
+def _integrate_one_step(
+    ort_sess,
+    x_scaled,
+    out_dt: float,
+    sub_dt: float,
+    integrator: str,
+    model_augmentation_dim: int,
+    state_size: int,
+):
+    """Advance the SCALED physical state by ``out_dt`` using ``integrator``.
+
+    For GRU-ODE we use RK4 with sub-stepping so the effective step matches the
+    training dt; for the plain NODE the original behaviour (single Euler step)
+    is preserved exactly when integrator='euler' and sub_dt==out_dt.
+
+    Augmentation is held at zero throughout: the GRU-ODE field ignores it, and
+    the plain NODE's aug channel is an internal latent that the original sim
+    only ever seeded with zeros anyway.
     """
+    # Number of sub-steps to cover one output dt at ~sub_dt resolution.
+    n_sub = max(1, int(round(out_dt / sub_dt)))
+    h = out_dt / n_sub  # actual sub-step size (divides out_dt exactly)
 
-    def __init__(
-        self,
-        delta_pos,
-        delta_vel,
-        vel_indices: list[int],
-        weight_pos=1.0,
-        weight_vel=1.0,
-        scaler=None,
-        N_FEATURES: int = 6,
-    ):
-        super().__init__()
-        self.delta_pos = delta_pos
-        self.delta_vel = delta_vel
-        self.delta_pos_unsacled = delta_pos
-        self.delta_vel_unsacled = delta_vel
-        self.vel_indices = vel_indices
-        self.wp = weight_pos
-        self.wv = weight_vel
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        if scaler is not None:
-            # self.compute_normalised_deltas(scaler, delta_pos, delta_vel)
-            sigma = scaler.scale_
-            # simple average, or keep per‑axis
-            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
-            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
+    x = np.asarray(x_scaled, dtype=np.float64).reshape(-1)[:state_size].copy()
 
-    # def compute_normalised_deltas(
-    #     self,
-    #     scaler,
-    #     delta_pos_phys,  # metres
-    #     delta_vel_phys,
-    # ):  # metres / sec
-    #     # scaler.scale_ is an array of length 6: [σ_px, σ_py, σ_pz, σ_vx, σ_vy, σ_vz]
+    def f(state_phys):
+        # Build the model input: physical state (+ zero augmentation if the
+        # model was trained with it, so the input width matches).
+        if model_augmentation_dim > 0:
+            inp = np.concatenate([state_phys, np.zeros(model_augmentation_dim)])
+        else:
+            inp = state_phys
+        return _field_eval(ort_sess, inp, model_augmentation_dim, state_size)
 
-    #     # return delta_pos_norm, delta_vel_norm
-
-    # def huber(self, r, delta):
-    #     """Element-wise Huber for a tensor of residuals."""
-    #     abs_r = torch.abs(r)
-    #     quadratic = 0.5 * r**2
-    #     linear = delta * (abs_r - 0.5 * delta)
-    #     return torch.where(abs_r <= delta, quadratic, linear)
-
-    def forward(self, pred, target):
-        """
-        pred_norm / target_norm : (T,6) tensors in normalised space
-        Returns a scalar loss (mean over all time steps and components)
-        """
-        n_timesteps = pred.size(1)
-
-        pos_pred_scaled = pred[..., : self.vel_indices[0]]
-        pos_target_scaled = target[..., : self.vel_indices[0]]
-        vel_pred_scaled = pred[..., self.vel_indices]
-        vel_target_scaled = target[..., self.vel_indices]
-
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)  # TODO: What about RMSE?
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-            # TODO: What about RMSE?
-            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
-            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
-
-        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
-        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
-
-        # sum over dimensions, then mean over time steps
-        # total_loss = (self.wp * loss_pos.sum(dim=1) + self.wv * loss_vel.sum(dim=1)).mean()
-        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
-        total_loss_unweighted = loss_pos + loss_vel
-        return {
-            "loss": total_loss,
-            "loss_unweighted": total_loss_unweighted,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            "pos_err_scaled": avg_pos_diff_scaled,
-            "vel_err_scaled": avg_vel_diff_scaled,
-        }
+    for _ in range(n_sub):
+        if integrator == "euler":
+            x = x + h * f(x)
+        else:  # rk4
+            k1 = f(x)
+            k2 = f(x + 0.5 * h * k1)
+            k3 = f(x + 0.5 * h * k2)
+            k4 = f(x + h * k3)
+            x = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return x
 
 
-# Latent ODE
-# TODO: finish wrapping this
-def loss_function(recon, target, mu, logvar):
-    # recon & target are still in normalised space
-    mse = torch.mean((recon - target) ** 2)
+def NEXT_extrapolation(
+    initial_state_next_frame,
+    dt: float,
+    n_steps: int,
+    ref_angle,
+    use_grdth: bool,
+    args,
+    ort_sess: onnxruntime.InferenceSession,
+):
+    # print("initial_state_next_frame", initial_state_next_frame)
 
-    # KL divergence between q(z|x) and standard normal p(z)
-    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    return mse + 0.5 * kl  # weight KL by 0.5 (tune as needed)
+    # ort_sess_scalar = onnxruntime.InferenceSession(args.scalar)  # switch to using ONNX for scalar (update: can't)
+    use_scalar = "_scalarOn" in os.path.basename(args.model)
+    if use_scalar:
+        with open(args.scalar, "rb") as scalar_pickle:
+            NEXT_scalar = pickle.load(scalar_pickle)
+    state_size = 6
+    if use_grdth:
+        state_size = 5
+
+    # ------------------------------------------------------------------
+    # Integrator selection.
+    # The original sim took ONE forward-Euler step per output dt, treating the
+    # model output as a velocity. That is fine for the plain ODEfunc (a learned
+    # velocity in the same coordinates) but degrades the GRU-ODE field, whose
+    # accuracy is tied to the continuity prior it learned at the (finer)
+    # training dt, and whose decoder-JVP is the nonlinear part a coarse Euler
+    # step approximates worst. For GRU-ODE we therefore integrate with RK4 and
+    # sub-step down to ~the training dt. The plain NODE keeps its original
+    # single-Euler-step behaviour exactly.
+    model_basename = os.path.basename(args.model)
+    is_gruode = ("_gruode_" in model_basename) or ("_gruode-min_" in model_basename) or ("gruode" in model_basename.lower())
+    if is_gruode:
+        integrator = "rk4"
+        sub_dt = _infer_training_dt(model_basename, default=0.1)
+        print(f"GRU-ODE detected: integrating with RK4, sub-step ~{sub_dt}s over output dt {dt}s")
+    else:
+        integrator = "euler"
+        sub_dt = dt  # one step == original behaviour
+
+    # infer at extrapolation dt
+    # keep going until the termination criteria is met
+    # the initial point will be the initial state
+    model_augmentation_dim = int(re.findall(r"_(\d)aug_", args.model)[-1])
+    extrap = np.array([np.hstack([initial_state_next_frame])])
+    validity_time = deepcopy(initial_state_next_frame[0])
+
+    # n_steps = 5
+    temp_iter = 0
+
+    while temp_iter < n_steps and float(validity_time) < 122.0:
+        temp_iter = temp_iter + 1
+        validity_time += dt
+
+        if use_scalar:
+            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
+            scaled_pos_vel = NEXT_scalar.transform(pos_vel)[0]  # (state_size,)
+            # Integrate in SCALED space (the model was trained in scaled space).
+            next_scaled = _integrate_one_step(
+                ort_sess,
+                scaled_pos_vel,
+                out_dt=dt,
+                sub_dt=sub_dt,
+                integrator=integrator,
+                model_augmentation_dim=model_augmentation_dim,
+                state_size=state_size,
+            )
+            next_state = NEXT_scalar.inverse_transform(
+                next_scaled.reshape(1, -1)
+            )  # skl2onnx does not support inverse_transform; do it in numpy
+        else:
+            cur_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
+            next_phys = _integrate_one_step(
+                ort_sess,
+                cur_phys,
+                out_dt=dt,
+                sub_dt=sub_dt,
+                integrator=integrator,
+                model_augmentation_dim=model_augmentation_dim,
+                state_size=state_size,
+            )
+            next_state = next_phys.reshape(1, -1)
+
+        next_state = np.insert(next_state, 0, validity_time)
+        temp_extrap = np.vstack([extrap, next_state])
+
+        # TODO: What if I scaled the ending criteria so that the extrap can be entirly done in the scalared space?
+        if use_grdth and (temp_extrap[-1, DOWN_INDEX] > 0 or temp_extrap[-1, GR_INDEX] < 2600e3):
+            print("grdth below the ground", temp_extrap[-1, DOWN_INDEX])
+            break
+        # elif not use_grdth and (temp_extrap[-1, 3] < 0 or np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 250e3):
+        elif not use_grdth and (np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 2600e3):
+            print("dcu below the ground", temp_extrap[-1, 3])
+            break
+        extrap = np.vstack([extrap, next_state])
+
+    if extrap.shape[0] < 3:
+        raise ValueError(f"Extrap was too short {extrap.shape}")
+
+    return extrap
+
+
+if __name__ == "__main__":
+    main()
+
+# dump the buffer at the end of the run
+print("", end="", flush=True)

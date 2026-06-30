@@ -410,6 +410,9 @@ class GRUODELatentModel(torch.nn.Module):
         aug_dim: int = 0,
         pos_idx: list[int] | None = None,
         vel_idx: list[int] | None = None,
+        pos_scale=None,       # StandardScaler scale_ (sigma) for the pos block
+        vel_scale=None,       # StandardScaler scale_ (sigma) for the vel block
+        vel_mean=None,        # StandardScaler mean_ (mu) for the vel block
     ):
         super().__init__()
         self.func = func
@@ -420,6 +423,31 @@ class GRUODELatentModel(torch.nn.Module):
             assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
             self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
             self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # CRITICAL: the model works in SCALED units, but the kinematic
+            # identity d/dt(pos)=vel holds in PHYSICAL units. With a
+            # StandardScaler (x_s=(x-mu)/sigma), the correct scaled-space
+            # position derivative is
+            #     xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + (mu_vel/sigma_pos)
+            # NOT vel_s. We precompute the per-axis ratio and offset. If no
+            # scaler stats are supplied we assume physical units (ratio=1,
+            # offset=0), recovering the naive constraint.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.so_ratio = None
+                self.so_offset = None
+                self.scaled_space = False
         else:
             self.pos_idx = None
             self.vel_idx = None
@@ -429,9 +457,12 @@ class GRUODELatentModel(torch.nn.Module):
         dh = self.func.cell(t, h)
         _, xdot = _decoder_jvp(self.func.decode, h, dh)  # noqa: F821 (defined in your script)
         if self.second_order:
-            # Force dpos/dt = vel(current state). index_copy on the last dim,
-            # out-of-place so autograd stays clean and ONNX traces it.
+            # Force d/dt(pos) = vel, expressed correctly in the model's units.
+            # In scaled space the relationship is NOT identity; it is scaled by
+            # sigma_vel/sigma_pos with a mu_vel/sigma_pos offset (see __init__).
             vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
             xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
         return xdot
 
@@ -801,22 +832,27 @@ def train_NEXT(
             latent_dim=latent_dim,
             minimal=minimal,
         ).to(node.device)
-        node.model = GRUODELatentModel(
-            func=gruode_func,
-            solver=ode_solver,
-            aug_dim=aug_dim,
-        ).to(node.device)
-
         if frame in ("dcu", "geodesic"):
             pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
         elif frame == "grdth":
             pos_idx, vel_idx = [0, 1], [2, 3]      # idx 4 (VTheta) left to the network
         else:
             pos_idx, vel_idx = None, None          # constraint off
-        
+
+        # Scaler stats for the scaled-space second-order correction. The model
+        # operates in StandardScaler-scaled units, so d/dt(pos)=vel must be
+        # expressed as xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + mu_vel/sigma_pos.
+        # Without these, the constraint is dimensionally wrong (see _field).
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
         node.model = GRUODELatentModel(
             func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
             pos_idx=pos_idx, vel_idx=vel_idx,
+            pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
         ).to(node.device)
         # Optional JIT compilation of the field for extra GPU throughput.
         # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
@@ -1025,9 +1061,29 @@ def train_NEXT(
     # Unwrap torch.compile (if enabled) to get the raw module before export.
     raw_model = getattr(node.model, "_orig_mod", node.model)
     if isinstance(raw_model, GRUODELatentModel):
+        # Pull the second-order config (and its scaled-space correction stats)
+        # off the constructed model so this works regardless of whether the
+        # model was just built or loaded from disk, and regardless of the local
+        # pos_idx/vel_idx scope.
+        if getattr(raw_model, "second_order", False):
+            _pos_idx = raw_model.pos_idx.tolist()
+            _vel_idx = raw_model.vel_idx.tolist()
+            _pos_scale = raw_model.so_ratio is not None and getattr(raw_model, "scaled_space", False)
+            if getattr(raw_model, "scaled_space", False):
+                # reconstruct the per-block sigma/mu the adapter needs from the
+                # ratio/offset buffers is lossy; instead re-derive from scaler.
+                _ps = scaler_traj.scale_[_pos_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vs = scaler_traj.scale_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vm = scaler_traj.mean_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+            else:
+                _ps = _vs = _vm = None
+        else:
+            _pos_idx = _vel_idx = None
+            _ps = _vs = _vm = None
         export_model = GRUODEFieldForONNX(
             raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
-            pos_idx=pos_idx, vel_idx=vel_idx,
+            pos_idx=_pos_idx, vel_idx=_vel_idx,
+            pos_scale=_ps, vel_scale=_vs, vel_mean=_vm,
         ).to(node.device).eval()
         example_input = torch.cat(
             (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
@@ -1544,6 +1600,9 @@ class GRUODEFieldForONNX(torch.nn.Module):
         eps: float = 1e-4,
         pos_idx: list[int] | None = None,
         vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
     ):
         super().__init__()
         self.func = func
@@ -1554,6 +1613,23 @@ class GRUODEFieldForONNX(torch.nn.Module):
         if self.second_order:
             self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
             self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # Must mirror GRUODELatentModel's scaled-space correction exactly,
+            # or the exported field disagrees with the trained field.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
@@ -1567,6 +1643,8 @@ class GRUODEFieldForONNX(torch.nn.Module):
         xdot = (x_plus - x_minus) / (2.0 * self.eps)
         if self.second_order:
             vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
             xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
         return xdot
 

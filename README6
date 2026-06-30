@@ -1,102 +1,218 @@
-"""Euler Ordinary Differential Equation Solver for NODE implementation."""
-
-from __future__ import annotations
-
-from typing import Callable
-
-import torch
-from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-try:
-    import torchdiffeq as tde
-
-except ModuleNotFoundError:
-    tde = None
-
-
-class TorchdiffeqSolver(ODESolver):
-    """ODE Solver that wraps torchdiffeq"""
-
-    def __init__(self, dt=1, *, adjoint=False, method="dopri5", substeps: int = 1):
-        super().__init__(dt, adjoint=False)  # torchdiffeq provides an adjoint method
-        self.method = method
-        # substeps: number of internal integration steps taken PER data interval.
-        # For fixed-step methods (rk4/euler), torchdiffeq steps between the times
-        # we hand odeint, so by default the integration step equals the data
-        # spacing dt. On chaotic, maneuver-heavy trajectories that coarse step is
-        # where truncation error compounds. substeps>1 integrates on a grid that
-        # is `substeps` times finer (dt/substeps), then returns only the points
-        # aligned to the original dt -- improving accuracy with NO change to the
-        # output shape or the (steps-based) caller contract. substeps=1 exactly
-        # reproduces the original behaviour.
-        if substeps < 1:
-            raise ValueError(f"substeps must be >= 1, got {substeps}")
-        self.substeps = int(substeps)
-        if tde is None:
-            raise ImportError("Prediction Core is not able to use torchdiffeq. Please install torchdiffeq")
-        self.odeint = tde.odeint
-        if adjoint:
-            self.odeint = tde.odeint_adjoint
-
-    def integrate(
-        self,
-        func: torch.nn.Module,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Solves an ODE by integrating it from the initial conditions.
-
-        Euler's Method uses the ODE evaluated at a given point and the
-        approximation that with a small step size, the function is almost
-        linear to solve the ODE. The update step can be written as follows:
-
-        x_i+1 = x_i + dt*f(x_i)
-
-        where x_i is the given state, x_i+1 is the next state, dt is the step
-        size, and f(x_i) is the ODE evaluated at the given state.
-
-        Args:
-            func: Function to be integrated.
-                This should be a Callable with a single torch tensor as an
-                input. It can represent a physical system or in general be
-                anything.
-            x0: A tensor containing the initial conditions.
-                This is expected to be of shape (batch_size, n_features).
-            steps: The number of steps to integrate forward.
-            extra_feat: Optional extra features to include.
-                It is concatenated to the initial conditions and each subsequent
-                step. It can contain "scenario specific" information. It is of
-                shape (batch_size, n_extra_features).
-
-        Returns:
-            The solution to the ODE as a torch tensor.
-                The shape will be (batch_size, steps + 1, n_features).
-        """
-        if extra_feat is not None:
-            raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
-        # subtract epsilon from the end values because torch has inconsistent arange behavior (see torch docs)
-        epsilon = 1e-10
-        if self.substeps == 1:
-            # original behaviour: integrate directly on the data grid
-            times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
-            x = self.odeint(func, x0, times, method=self.method)
-            x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
-            return x
-
-        # sub-stepped integration: build a grid `substeps` times finer so the
-        # solver takes smaller (more accurate) internal steps, then return ONLY
-        # the points aligned to the original dt grid so the output shape and the
-        # caller contract are unchanged: (batch, steps + 1, n_features).
-        fine_dt = self.dt / self.substeps
-        n_fine = steps * self.substeps  # number of fine intervals
-        times = torch.arange(
-            0, fine_dt * n_fine + fine_dt - epsilon, fine_dt, dtype=torch.float64
-        ).to(x0.device)
-        x = self.odeint(func, x0, times, method=self.method)
-        # x: (len(times), batch, n_features). Keep every substeps-th sample,
-        # i.e. indices 0, substeps, 2*substeps, ... which land exactly on the
-        # original dt grid and number steps + 1.
-        x = x[:: self.substeps]
-        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
-        return x
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f8ed69d91c0>, 0.0001)
+[INFO] Epoch 5: loss: 532.9970093 pos_err: 3762338.0000000 vel_err: 3946872.2500000 val_loss: 308.1057434 val_pos_err: 2797289.5000000 val_vel_err: 3035557.7500000
+[INFO] Epoch 10: loss: 36.6624336 pos_err: 798065.7500000 vel_err: 623188.6875000 val_loss: 31.3933830 val_pos_err: 844204.7500000 val_vel_err: 484435.2500000
+[INFO] Epoch 15: loss: 19.9590893 pos_err: 700946.5625000 vel_err: 570539.0625000 val_loss: 15.2252960 val_pos_err: 663473.7500000 val_vel_err: 490420.3750000
+[INFO] Epoch 20: loss: 12.3834982 pos_err: 441972.2812500 vel_err: 490593.9375000 val_loss: 8.4146404 val_pos_err: 447976.0625000 val_vel_err: 471005.9375000
+[INFO] Epoch 25: loss: 6.7015352 pos_err: 393739.8437500 vel_err: 389803.2187500 val_loss: 5.6750975 val_pos_err: 348328.5625000 val_vel_err: 408935.5937500
+[INFO] Epoch 30: loss: 4.4553776 pos_err: 285615.5625000 vel_err: 348841.5937500 val_loss: 4.2695456 val_pos_err: 282255.7812500 val_vel_err: 356520.8125000
+[INFO] Epoch 35: loss: 3.5295963 pos_err: 259331.9218750 vel_err: 232073.6250000 val_loss: 3.3978455 val_pos_err: 235005.2187500 val_vel_err: 326900.0625000
+[INFO] Epoch 40: loss: 2.6407824 pos_err: 188430.5312500 vel_err: 265919.2500000 val_loss: 2.8413820 val_pos_err: 198595.8281250 val_vel_err: 305132.1250000
+[INFO] Epoch 45: loss: 2.4961333 pos_err: 207758.7031250 vel_err: 255421.8281250 val_loss: 2.5314775 val_pos_err: 184207.9062500 val_vel_err: 288033.0625000
+[INFO] Epoch 50: loss: 2.5682712 pos_err: 188449.9687500 vel_err: 224733.7656250 val_loss: 2.3366687 val_pos_err: 176788.4843750 val_vel_err: 265801.4687500
+[INFO] Epoch 55: loss: 2.3650105 pos_err: 190055.6093750 vel_err: 185533.8281250 val_loss: 2.2160635 val_pos_err: 170382.0000000 val_vel_err: 240724.7187500
+[INFO] Epoch 60: loss: 2.0953803 pos_err: 171137.0312500 vel_err: 166008.1562500 val_loss: 2.1447880 val_pos_err: 165644.0625000 val_vel_err: 209611.4375000
+[INFO] Epoch 65: loss: 2.4023993 pos_err: 170889.8437500 vel_err: 140317.3281250 val_loss: 2.0434852 val_pos_err: 161991.3437500 val_vel_err: 152014.3125000
+[INFO] Epoch 70: loss: 2.2397180 pos_err: 155534.7656250 vel_err: 88668.4765625 val_loss: 2.0499723 val_pos_err: 161511.5625000 val_vel_err: 77187.8750000
+[INFO] Epoch 75: loss: 2.2825024 pos_err: 129116.7968750 vel_err: 104340.0703125 val_loss: 1.8536534 val_pos_err: 141767.9843750 val_vel_err: 93603.1875000
+[INFO] Epoch 80: loss: 2.2157950 pos_err: 144944.3281250 vel_err: 100143.1484375 val_loss: 1.8304703 val_pos_err: 142546.7343750 val_vel_err: 96472.8671875
+[INFO] Epoch 85: loss: 2.0546565 pos_err: 151016.3437500 vel_err: 98445.3281250 val_loss: 1.8266279 val_pos_err: 144418.6093750 val_vel_err: 98437.5234375
+[INFO] Epoch 90: loss: 1.8395102 pos_err: 132620.1093750 vel_err: 93933.9687500 val_loss: 1.8125298 val_pos_err: 137631.5937500 val_vel_err: 101258.4062500
+[INFO] Epoch 95: loss: 1.4150794 pos_err: 108065.6718750 vel_err: 79022.1640625 val_loss: 1.8121935 val_pos_err: 134793.7656250 val_vel_err: 105143.2187500
+[INFO] Epoch 100: loss: 2.5157421 pos_err: 133543.0156250 vel_err: 104785.1953125 val_loss: 1.8266475 val_pos_err: 141288.7343750 val_vel_err: 101503.8125000
+[INFO] Epoch 105: loss: 1.6926036 pos_err: 118486.8281250 vel_err: 91633.1406250 val_loss: 1.7925726 val_pos_err: 130107.4296875 val_vel_err: 105227.4843750
+[INFO] Epoch 110: loss: 1.5808067 pos_err: 86093.2265625 vel_err: 72359.0703125 val_loss: 1.7798507 val_pos_err: 124370.8125000 val_vel_err: 108721.6562500
+[INFO] Epoch 115: loss: 2.0604570 pos_err: 122561.5781250 vel_err: 103512.4687500 val_loss: 1.7858424 val_pos_err: 124214.3281250 val_vel_err: 112272.6718750
+[INFO] Epoch 120: loss: 1.9738189 pos_err: 121017.0468750 vel_err: 108113.6953125 val_loss: 1.7701862 val_pos_err: 122120.8359375 val_vel_err: 113156.1406250
+[INFO] Epoch 125: loss: 1.8007212 pos_err: 106962.5937500 vel_err: 99478.7031250 val_loss: 1.7553226 val_pos_err: 118986.6406250 val_vel_err: 113001.4687500
+[INFO] Epoch 130: loss: 2.0305614 pos_err: 109095.3281250 vel_err: 95733.4531250 val_loss: 1.7333438 val_pos_err: 115015.4843750 val_vel_err: 111403.0390625
+[INFO] Epoch 135: loss: 1.5562166 pos_err: 102618.5546875 vel_err: 74181.4140625 val_loss: 1.6834455 val_pos_err: 110993.7656250 val_vel_err: 100434.5390625
+[INFO] Epoch 140: loss: 1.8010051 pos_err: 101504.0781250 vel_err: 91251.7500000 val_loss: 1.6427164 val_pos_err: 96022.2890625 val_vel_err: 100185.0312500
+[INFO] Epoch 145: loss: 2.1230285 pos_err: 98690.0156250 vel_err: 95075.0156250 val_loss: 1.6193154 val_pos_err: 88675.2265625 val_vel_err: 99880.4296875
+[INFO] Epoch 150: loss: 1.9616958 pos_err: 88082.9296875 vel_err: 90008.9140625 val_loss: 1.5947360 val_pos_err: 81810.0937500 val_vel_err: 107877.1015625
+[INFO] Epoch 155: loss: 1.9084296 pos_err: 81958.8906250 vel_err: 108456.7265625 val_loss: 1.5741016 val_pos_err: 77510.1484375 val_vel_err: 101593.3984375
+[INFO] Epoch 160: loss: 1.9511375 pos_err: 84589.7265625 vel_err: 81627.3593750 val_loss: 1.5594450 val_pos_err: 77656.6875000 val_vel_err: 98023.4375000
+[INFO] Epoch 165: loss: 1.5336126 pos_err: 84971.7031250 vel_err: 84851.6406250 val_loss: 1.5490342 val_pos_err: 78183.2031250 val_vel_err: 100020.5468750
+[INFO] Epoch 170: loss: 2.0483575 pos_err: 87239.1640625 vel_err: 86328.8203125 val_loss: 1.5400573 val_pos_err: 75171.9062500 val_vel_err: 99992.6718750
+[INFO] Epoch 175: loss: 1.9926351 pos_err: 80384.2343750 vel_err: 91809.7734375 val_loss: 1.5308632 val_pos_err: 75277.0078125 val_vel_err: 96790.1015625
+[INFO] Epoch 180: loss: 1.8808246 pos_err: 86530.0546875 vel_err: 64302.8242188 val_loss: 1.5300803 val_pos_err: 76223.4062500 val_vel_err: 91075.0078125
+[INFO] Epoch 185: loss: 1.4210490 pos_err: 71691.9843750 vel_err: 79733.0781250 val_loss: 1.5350157 val_pos_err: 75024.1328125 val_vel_err: 100504.3281250
+[INFO] Epoch 190: loss: 2.3714733 pos_err: 84207.8906250 vel_err: 73843.6171875 val_loss: 1.5155727 val_pos_err: 74209.5625000 val_vel_err: 95948.5781250
+[INFO] Epoch 195: loss: 1.7116041 pos_err: 87538.4453125 vel_err: 76067.0937500 val_loss: 1.5139523 val_pos_err: 73971.9375000 val_vel_err: 92793.1796875
+[INFO] Epoch 200: loss: 2.0435481 pos_err: 75663.3984375 vel_err: 78523.5937500 val_loss: 1.5093987 val_pos_err: 74590.5625000 val_vel_err: 90853.9375000
+[INFO] Epoch 205: loss: 2.1220722 pos_err: 92520.5937500 vel_err: 73416.6250000 val_loss: 1.5051893 val_pos_err: 74239.6640625 val_vel_err: 90958.9531250
+[INFO] Epoch 210: loss: 1.9015799 pos_err: 82366.6562500 vel_err: 85255.0468750 val_loss: 1.5019808 val_pos_err: 73858.6640625 val_vel_err: 91658.9375000
+[INFO] Epoch 215: loss: 1.4437776 pos_err: 75467.1875000 vel_err: 62645.4257812 val_loss: 1.5073904 val_pos_err: 72892.8046875 val_vel_err: 94584.7500000
+[INFO] Epoch 220: loss: 1.5760972 pos_err: 85091.2734375 vel_err: 97528.3671875 val_loss: 1.5028608 val_pos_err: 74250.0546875 val_vel_err: 95353.5156250
+[INFO] Epoch 225: loss: 1.7062134 pos_err: 74708.7968750 vel_err: 80956.5390625 val_loss: 1.4983772 val_pos_err: 73687.9218750 val_vel_err: 92736.0156250
+[INFO] Epoch 230: loss: 1.4257034 pos_err: 76253.0703125 vel_err: 77458.7656250 val_loss: 1.4980708 val_pos_err: 74169.8593750 val_vel_err: 90209.9531250
+[INFO] Epoch 235: loss: 1.8803772 pos_err: 76704.0312500 vel_err: 62963.7929688 val_loss: 1.4981282 val_pos_err: 73101.3593750 val_vel_err: 93026.8046875
+[INFO] Epoch 240: loss: 1.6545663 pos_err: 86054.4218750 vel_err: 68622.5312500 val_loss: 1.4969702 val_pos_err: 73490.3203125 val_vel_err: 86445.8125000
+[INFO] Epoch 245: loss: 1.4135696 pos_err: 79389.9687500 vel_err: 62322.6250000 val_loss: 1.4897140 val_pos_err: 72879.2031250 val_vel_err: 88872.7187500
+[INFO] Epoch 250: loss: 2.1714568 pos_err: 88191.1718750 vel_err: 56480.3476562 val_loss: 1.4929163 val_pos_err: 72520.5156250 val_vel_err: 85964.6484375
+[INFO] Epoch 255: loss: 1.9880289 pos_err: 83163.7500000 vel_err: 70781.9609375 val_loss: 1.4961398 val_pos_err: 75069.7265625 val_vel_err: 89895.7734375
+[INFO] Epoch 260: loss: 1.8551688 pos_err: 71724.1484375 vel_err: 69001.8125000 val_loss: 1.4881421 val_pos_err: 71871.1328125 val_vel_err: 87821.1953125
+[INFO] Epoch 265: loss: 1.3145332 pos_err: 76539.2187500 vel_err: 63401.8437500 val_loss: 1.4865676 val_pos_err: 72641.6093750 val_vel_err: 87559.4453125
+[INFO] Epoch 270: loss: 1.5322835 pos_err: 75261.7031250 vel_err: 57529.1210938 val_loss: 1.4871637 val_pos_err: 73024.4062500 val_vel_err: 91996.4375000
+[INFO] Epoch 275: loss: 1.6929914 pos_err: 77277.5625000 vel_err: 83187.1562500 val_loss: 1.4875336 val_pos_err: 73835.5156250 val_vel_err: 89408.5781250
+[INFO] Epoch 280: loss: 1.6510092 pos_err: 78737.8906250 vel_err: 70518.9531250 val_loss: 1.4840889 val_pos_err: 71921.2187500 val_vel_err: 89983.0390625
+[INFO] Epoch 285: loss: 1.4941387 pos_err: 79939.8046875 vel_err: 73419.4687500 val_loss: 1.4886276 val_pos_err: 71641.5937500 val_vel_err: 92342.6875000
+[INFO] Epoch 290: loss: 2.0672758 pos_err: 79271.5703125 vel_err: 78489.3125000 val_loss: 1.4810023 val_pos_err: 71183.2968750 val_vel_err: 89190.9140625
+[INFO] Epoch 295: loss: 1.5815294 pos_err: 80128.2265625 vel_err: 61076.5039062 val_loss: 1.4806050 val_pos_err: 70962.7421875 val_vel_err: 86908.8593750
+[INFO] Epoch 300: loss: 2.2224271 pos_err: 77011.1328125 vel_err: 61340.1875000 val_loss: 1.4800434 val_pos_err: 71963.0703125 val_vel_err: 89781.6640625
+[INFO] Epoch 305: loss: 1.7501520 pos_err: 80279.5156250 vel_err: 63233.9062500 val_loss: 1.4818496 val_pos_err: 72532.9062500 val_vel_err: 90768.0703125
+[INFO] Epoch 310: loss: 1.7886566 pos_err: 83534.5937500 vel_err: 57378.5234375 val_loss: 1.4777679 val_pos_err: 70839.3515625 val_vel_err: 90109.9687500
+[INFO] Epoch 315: loss: 1.6505424 pos_err: 78141.2343750 vel_err: 68678.6328125 val_loss: 1.4828042 val_pos_err: 71537.6953125 val_vel_err: 92216.5234375
+[INFO] Epoch 320: loss: 1.4608935 pos_err: 75808.1796875 vel_err: 72042.6718750 val_loss: 1.4784154 val_pos_err: 72634.2265625 val_vel_err: 91328.3046875
+[INFO] Epoch 325: loss: 1.9805331 pos_err: 81711.7890625 vel_err: 72163.8515625 val_loss: 1.4773692 val_pos_err: 71161.5312500 val_vel_err: 91248.1250000
+[INFO] Epoch 330: loss: 1.5014911 pos_err: 77299.4140625 vel_err: 72814.5156250 val_loss: 1.4746975 val_pos_err: 71223.6093750 val_vel_err: 88686.2578125
+[INFO] Epoch 335: loss: 1.7823560 pos_err: 70444.6093750 vel_err: 55990.1718750 val_loss: 1.4723195 val_pos_err: 70736.5156250 val_vel_err: 88336.5937500
+[INFO] Epoch 340: loss: 2.5371795 pos_err: 82699.9843750 vel_err: 60057.6992188 val_loss: 1.4769847 val_pos_err: 72858.5625000 val_vel_err: 90975.9609375
+[INFO] Epoch 345: loss: 1.3342900 pos_err: 74547.1640625 vel_err: 58779.0195312 val_loss: 1.4725451 val_pos_err: 71026.3515625 val_vel_err: 89519.9062500
+[INFO] Epoch 350: loss: 1.9654975 pos_err: 78443.8046875 vel_err: 64439.6054688 val_loss: 1.4706805 val_pos_err: 70083.0234375 val_vel_err: 87957.5000000
+[INFO] Epoch 355: loss: 1.9458057 pos_err: 74985.4453125 vel_err: 63174.4296875 val_loss: 1.4711583 val_pos_err: 70723.4843750 val_vel_err: 89650.5703125
+[INFO] Epoch 360: loss: 1.9138683 pos_err: 72446.2109375 vel_err: 67588.3671875 val_loss: 1.4680556 val_pos_err: 69415.8437500 val_vel_err: 87468.5781250
+[INFO] Epoch 365: loss: 1.8231804 pos_err: 76517.1171875 vel_err: 84768.3359375 val_loss: 1.4684305 val_pos_err: 69244.5156250 val_vel_err: 88296.8906250
+[INFO] Epoch 370: loss: 1.7568779 pos_err: 71856.5156250 vel_err: 88009.6093750 val_loss: 1.4675655 val_pos_err: 68729.3203125 val_vel_err: 88061.5156250
+[INFO] Epoch 375: loss: 1.8075625 pos_err: 81122.3125000 vel_err: 73291.6484375 val_loss: 1.4736577 val_pos_err: 70947.4296875 val_vel_err: 88903.7265625
+[INFO] Epoch 380: loss: 1.8784097 pos_err: 75534.4296875 vel_err: 64477.4101562 val_loss: 1.4656091 val_pos_err: 69211.2421875 val_vel_err: 88849.5156250
+[INFO] Epoch 385: loss: 1.8690623 pos_err: 74193.4921875 vel_err: 67238.4765625 val_loss: 1.4648694 val_pos_err: 68458.0937500 val_vel_err: 87436.9921875
+[INFO] Epoch 390: loss: 1.9053572 pos_err: 70067.7265625 vel_err: 78260.4453125 val_loss: 1.4657482 val_pos_err: 69537.8203125 val_vel_err: 90159.0937500
+[INFO] Epoch 395: loss: 1.7888192 pos_err: 75446.6406250 vel_err: 66963.8750000 val_loss: 1.4645507 val_pos_err: 68208.0156250 val_vel_err: 85127.9140625
+[INFO] Epoch 400: loss: 1.5291694 pos_err: 70939.2187500 vel_err: 74049.6875000 val_loss: 1.4695352 val_pos_err: 68692.9453125 val_vel_err: 91250.3828125
+[INFO] Epoch 405: loss: 1.7264128 pos_err: 73257.8671875 vel_err: 60559.9921875 val_loss: 1.4651053 val_pos_err: 68915.9609375 val_vel_err: 86451.4375000
+[INFO] Epoch 410: loss: 1.4980974 pos_err: 70722.8437500 vel_err: 80814.2968750 val_loss: 1.4697379 val_pos_err: 69761.4687500 val_vel_err: 92403.5390625
+[INFO] Epoch 415: loss: 2.0004392 pos_err: 86875.2421875 vel_err: 67766.7812500 val_loss: 1.4605503 val_pos_err: 67613.3125000 val_vel_err: 90367.5312500
+[INFO] Epoch 420: loss: 2.1118979 pos_err: 81474.1718750 vel_err: 68246.4296875 val_loss: 1.4623606 val_pos_err: 68654.9375000 val_vel_err: 89426.4843750
+[INFO] Epoch 425: loss: 1.4847733 pos_err: 74927.2656250 vel_err: 76859.1015625 val_loss: 1.4618678 val_pos_err: 68562.7500000 val_vel_err: 90664.9062500
+[INFO] Epoch 430: loss: 1.6409732 pos_err: 75039.4765625 vel_err: 63830.2929688 val_loss: 1.4673153 val_pos_err: 70848.6718750 val_vel_err: 91673.5859375
+[INFO] Epoch 435: loss: 1.3039227 pos_err: 70551.3437500 vel_err: 74359.0937500 val_loss: 1.4605137 val_pos_err: 68803.7421875 val_vel_err: 88387.9296875
+[INFO] Epoch 440: loss: 2.1685886 pos_err: 75909.8281250 vel_err: 60928.7929688 val_loss: 1.4602885 val_pos_err: 68187.4218750 val_vel_err: 90104.0000000
+[INFO] Epoch 445: loss: 1.7521034 pos_err: 75329.9921875 vel_err: 56368.4179688 val_loss: 1.4594541 val_pos_err: 67079.0312500 val_vel_err: 90981.7500000
+[INFO] Epoch 450: loss: 1.9139582 pos_err: 74151.3906250 vel_err: 65932.0546875 val_loss: 1.4576297 val_pos_err: 68647.1171875 val_vel_err: 89825.1328125
+[INFO] Epoch 455: loss: 1.9333431 pos_err: 68657.2968750 vel_err: 78824.1015625 val_loss: 1.4586275 val_pos_err: 66291.0937500 val_vel_err: 87684.1953125
+[INFO] Epoch 460: loss: 2.1892941 pos_err: 84850.0390625 vel_err: 73795.3750000 val_loss: 1.4592761 val_pos_err: 68504.6953125 val_vel_err: 90530.5859375
+[INFO] Epoch 465: loss: 1.8115542 pos_err: 71205.6328125 vel_err: 61202.9648438 val_loss: 1.4628904 val_pos_err: 68933.7265625 val_vel_err: 91711.3359375
+[INFO] Epoch 470: loss: 1.7277244 pos_err: 76529.3750000 vel_err: 45049.5195312 val_loss: 1.4571861 val_pos_err: 66854.8593750 val_vel_err: 86462.9531250
+[INFO] Epoch 475: loss: 1.5886555 pos_err: 69778.5234375 vel_err: 72147.5703125 val_loss: 1.4547985 val_pos_err: 66169.4921875 val_vel_err: 88523.0781250
+[INFO] Epoch 480: loss: 1.8117545 pos_err: 69758.5859375 vel_err: 64538.6601562 val_loss: 1.4550750 val_pos_err: 66977.0937500 val_vel_err: 88737.7265625
+[INFO] Epoch 485: loss: 1.4865903 pos_err: 67783.9921875 vel_err: 65592.1250000 val_loss: 1.4627883 val_pos_err: 68794.2031250 val_vel_err: 92400.0859375
+[INFO] Epoch 490: loss: 1.5628271 pos_err: 72790.9453125 vel_err: 60935.9023438 val_loss: 1.4541849 val_pos_err: 66016.5703125 val_vel_err: 90663.2734375
+[INFO] Epoch 495: loss: 2.0968647 pos_err: 80613.9687500 vel_err: 61471.7890625 val_loss: 1.4558247 val_pos_err: 67630.1328125 val_vel_err: 91535.6093750
+[INFO] Epoch 500: loss: 1.5824780 pos_err: 63132.9726562 vel_err: 57686.8085938 val_loss: 1.4527740 val_pos_err: 66180.7890625 val_vel_err: 90352.8671875
+[INFO] Epoch 505: loss: 1.3077989 pos_err: 64043.3945312 vel_err: 74543.5156250 val_loss: 1.4512573 val_pos_err: 65112.4921875 val_vel_err: 88545.0156250
+[INFO] Epoch 510: loss: 2.0621738 pos_err: 74053.0781250 vel_err: 69836.8281250 val_loss: 1.4497076 val_pos_err: 65211.9570312 val_vel_err: 89338.9765625
+[INFO] Epoch 515: loss: 2.0377972 pos_err: 69109.3671875 vel_err: 59413.1015625 val_loss: 1.4514010 val_pos_err: 64916.4414062 val_vel_err: 88600.3046875
+[INFO] Epoch 520: loss: 1.4639672 pos_err: 68595.7265625 vel_err: 76103.6093750 val_loss: 1.4536036 val_pos_err: 66202.5156250 val_vel_err: 87883.9609375
+[INFO] Epoch 525: loss: 1.9344656 pos_err: 77571.0468750 vel_err: 73484.3906250 val_loss: 1.4532837 val_pos_err: 66838.9296875 val_vel_err: 87862.6796875
+[INFO] Epoch 530: loss: 1.6686811 pos_err: 75842.4375000 vel_err: 49383.9179688 val_loss: 1.4504000 val_pos_err: 65607.7812500 val_vel_err: 86956.0234375
+[INFO] Epoch 535: loss: 1.7126805 pos_err: 73493.8593750 vel_err: 68977.2734375 val_loss: 1.4519305 val_pos_err: 66786.2109375 val_vel_err: 90573.7421875
+[INFO] Epoch 540: loss: 1.9452313 pos_err: 62861.9218750 vel_err: 74740.3906250 val_loss: 1.4458292 val_pos_err: 65174.2890625 val_vel_err: 88025.5703125
+[INFO] Epoch 545: loss: 1.9242059 pos_err: 72044.7031250 vel_err: 67697.9687500 val_loss: 1.4490880 val_pos_err: 65283.6718750 val_vel_err: 87485.1953125
+[INFO] Epoch 550: loss: 1.8021812 pos_err: 71125.6015625 vel_err: 71755.1796875 val_loss: 1.4577365 val_pos_err: 67092.0468750 val_vel_err: 89828.9453125
+[INFO] Epoch 555: loss: 1.8503280 pos_err: 64118.9804688 vel_err: 62064.9531250 val_loss: 1.4449141 val_pos_err: 64826.6367188 val_vel_err: 88533.3359375
+[INFO] Epoch 560: loss: 1.9246182 pos_err: 75988.6250000 vel_err: 69170.8984375 val_loss: 1.4461991 val_pos_err: 65332.2343750 val_vel_err: 89999.2890625
+[INFO] Epoch 565: loss: 2.1201308 pos_err: 76632.9375000 vel_err: 69911.7656250 val_loss: 1.4433749 val_pos_err: 64310.8437500 val_vel_err: 89920.3984375
+[INFO] Epoch 570: loss: 1.6131467 pos_err: 75816.1015625 vel_err: 73730.8828125 val_loss: 1.4433613 val_pos_err: 63992.1289062 val_vel_err: 88695.6640625
+[INFO] Epoch 575: loss: 1.8858564 pos_err: 70193.3203125 vel_err: 69118.8750000 val_loss: 1.4435681 val_pos_err: 64529.5273438 val_vel_err: 88781.1640625
+[INFO] Epoch 580: loss: 1.7696016 pos_err: 71988.7187500 vel_err: 55144.7539062 val_loss: 1.4458389 val_pos_err: 63407.7851562 val_vel_err: 92321.4765625
+[INFO] Epoch 585: loss: 1.6030420 pos_err: 66976.1718750 vel_err: 58140.6132812 val_loss: 1.4482263 val_pos_err: 65721.8593750 val_vel_err: 90812.0234375
+[INFO] Epoch 590: loss: 1.3004984 pos_err: 61859.9804688 vel_err: 82485.4609375 val_loss: 1.4401276 val_pos_err: 63093.8789062 val_vel_err: 89486.3593750
+[INFO] Epoch 595: loss: 1.4027257 pos_err: 61253.3671875 vel_err: 77575.8281250 val_loss: 1.4497740 val_pos_err: 63076.8476562 val_vel_err: 86003.5546875
+[INFO] Epoch 600: loss: 1.5038515 pos_err: 62947.1289062 vel_err: 71635.0859375 val_loss: 1.4401195 val_pos_err: 63770.6015625 val_vel_err: 88969.5703125
+[INFO] Epoch 605: loss: 1.2041336 pos_err: 60178.4531250 vel_err: 80237.3281250 val_loss: 1.4410808 val_pos_err: 62888.8320312 val_vel_err: 87798.9296875
+[INFO] Epoch 610: loss: 1.9041202 pos_err: 65777.8906250 vel_err: 73233.4687500 val_loss: 1.4420524 val_pos_err: 63088.3632812 val_vel_err: 91872.3828125
+[INFO] Epoch 615: loss: 1.4543648 pos_err: 66085.1484375 vel_err: 74236.8515625 val_loss: 1.4412328 val_pos_err: 63507.8320312 val_vel_err: 90364.0703125
+[INFO] Epoch 620: loss: 1.9458261 pos_err: 69250.8828125 vel_err: 69409.1562500 val_loss: 1.4389168 val_pos_err: 62635.9648438 val_vel_err: 91474.0156250
+[INFO] Epoch 625: loss: 1.8625813 pos_err: 74588.0546875 vel_err: 65061.7968750 val_loss: 1.4353638 val_pos_err: 62968.0703125 val_vel_err: 89262.3984375
+[INFO] Epoch 630: loss: 1.4911739 pos_err: 66235.1875000 vel_err: 63107.8359375 val_loss: 1.4371262 val_pos_err: 62161.7070312 val_vel_err: 89158.6562500
+[INFO] Epoch 635: loss: 1.6894863 pos_err: 67841.5078125 vel_err: 79764.2031250 val_loss: 1.4350874 val_pos_err: 62399.4804688 val_vel_err: 86783.4687500
+[INFO] Epoch 640: loss: 1.4537178 pos_err: 59598.5234375 vel_err: 83070.1171875 val_loss: 1.4337620 val_pos_err: 61567.3515625 val_vel_err: 88249.1796875
+[INFO] Epoch 645: loss: 1.7163763 pos_err: 69055.2968750 vel_err: 76676.4453125 val_loss: 1.4340088 val_pos_err: 61105.8398438 val_vel_err: 90278.8046875
+[INFO] Epoch 650: loss: 1.6291921 pos_err: 71454.0546875 vel_err: 63657.8164062 val_loss: 1.4458356 val_pos_err: 66052.1796875 val_vel_err: 92155.2109375
+[INFO] Epoch 655: loss: 2.2113941 pos_err: 71843.1562500 vel_err: 55214.2148438 val_loss: 1.4314938 val_pos_err: 60961.1835938 val_vel_err: 86741.2109375
+[INFO] Epoch 660: loss: 1.8839333 pos_err: 70258.6718750 vel_err: 68498.0312500 val_loss: 1.4308604 val_pos_err: 61135.7656250 val_vel_err: 87833.5156250
+[INFO] Epoch 665: loss: 2.0712056 pos_err: 69403.9375000 vel_err: 66734.0859375 val_loss: 1.4322572 val_pos_err: 61370.7343750 val_vel_err: 90100.6406250
+[INFO] Epoch 670: loss: 1.3571901 pos_err: 64832.9023438 vel_err: 90768.7421875 val_loss: 1.4295305 val_pos_err: 60817.8437500 val_vel_err: 89886.9062500
+[INFO] Epoch 675: loss: 1.7716905 pos_err: 68324.5390625 vel_err: 66297.3984375 val_loss: 1.4351965 val_pos_err: 63262.4882812 val_vel_err: 87914.6484375
+[INFO] Epoch 680: loss: 1.7336569 pos_err: 62937.2890625 vel_err: 61710.4570312 val_loss: 1.4309591 val_pos_err: 60417.9414062 val_vel_err: 90764.7734375
+[INFO] Epoch 685: loss: 1.5802697 pos_err: 62651.2500000 vel_err: 67090.4687500 val_loss: 1.4346673 val_pos_err: 63308.5078125 val_vel_err: 88798.0468750
+[INFO] Epoch 690: loss: 1.6998764 pos_err: 67652.6093750 vel_err: 67808.0000000 val_loss: 1.4264644 val_pos_err: 60703.6679688 val_vel_err: 89718.2734375
+[INFO] Epoch 695: loss: 2.3027120 pos_err: 78799.4765625 vel_err: 50479.1093750 val_loss: 1.4252992 val_pos_err: 58653.5234375 val_vel_err: 89540.1484375
+[INFO] Epoch 700: loss: 1.8255188 pos_err: 69746.4140625 vel_err: 77182.1093750 val_loss: 1.4329978 val_pos_err: 60709.1054688 val_vel_err: 90318.4531250
+[INFO] Epoch 705: loss: 1.3831304 pos_err: 61283.8476562 vel_err: 71567.3281250 val_loss: 1.4329987 val_pos_err: 59885.4492188 val_vel_err: 93136.0078125
+[INFO] Epoch 710: loss: 1.9428706 pos_err: 66154.7265625 vel_err: 83377.6015625 val_loss: 1.4299464 val_pos_err: 58342.7968750 val_vel_err: 93692.6406250
+[INFO] Epoch 715: loss: 1.4262820 pos_err: 63894.8789062 vel_err: 75419.8046875 val_loss: 1.4222316 val_pos_err: 58769.0898438 val_vel_err: 88424.3515625
+[INFO] Epoch 720: loss: 2.0540586 pos_err: 66136.1093750 vel_err: 58458.2734375 val_loss: 1.4235228 val_pos_err: 58667.4765625 val_vel_err: 89271.6171875
+[INFO] Epoch 725: loss: 1.4841363 pos_err: 58861.3515625 vel_err: 73190.4843750 val_loss: 1.4205421 val_pos_err: 57134.9140625 val_vel_err: 87849.3984375
+[INFO] Epoch 730: loss: 1.9031419 pos_err: 63613.7148438 vel_err: 55063.4140625 val_loss: 1.4217920 val_pos_err: 58127.7851562 val_vel_err: 86196.7890625
+[INFO] Epoch 735: loss: 1.5736728 pos_err: 63235.5117188 vel_err: 56027.8476562 val_loss: 1.4197778 val_pos_err: 58305.4335938 val_vel_err: 88736.7343750
+[INFO] Epoch 740: loss: 1.5886158 pos_err: 59671.6250000 vel_err: 69132.1640625 val_loss: 1.4190391 val_pos_err: 56221.5976562 val_vel_err: 89826.6484375
+[INFO] Epoch 745: loss: 1.8934950 pos_err: 64164.1367188 vel_err: 71575.3437500 val_loss: 1.4172142 val_pos_err: 56832.9531250 val_vel_err: 87961.4765625
+[INFO] Epoch 750: loss: 1.7416353 pos_err: 65479.3984375 vel_err: 60997.5351562 val_loss: 1.4152516 val_pos_err: 55708.3476562 val_vel_err: 87710.9062500
+[INFO] Epoch 755: loss: 2.2163241 pos_err: 66846.0156250 vel_err: 50295.3789062 val_loss: 1.4245687 val_pos_err: 57645.7539062 val_vel_err: 85349.7890625
+[INFO] Epoch 760: loss: 1.2547309 pos_err: 52952.5546875 vel_err: 75174.7109375 val_loss: 1.4149195 val_pos_err: 55583.8398438 val_vel_err: 87822.6640625
+[INFO] Epoch 765: loss: 1.5084553 pos_err: 60333.4570312 vel_err: 68152.0078125 val_loss: 1.4196812 val_pos_err: 57674.6679688 val_vel_err: 86747.1171875
+[INFO] Epoch 770: loss: 1.4799436 pos_err: 64406.8359375 vel_err: 80778.9843750 val_loss: 1.4122062 val_pos_err: 55996.5625000 val_vel_err: 88235.6171875
+[INFO] Epoch 775: loss: 1.4511278 pos_err: 59963.3906250 vel_err: 63358.5664062 val_loss: 1.4207197 val_pos_err: 57999.2578125 val_vel_err: 89010.3203125
+[INFO] Epoch 780: loss: 1.7062794 pos_err: 58369.0273438 vel_err: 56873.7773438 val_loss: 1.4136977 val_pos_err: 54575.6093750 val_vel_err: 88349.4921875
+[INFO] Epoch 785: loss: 1.5569474 pos_err: 64137.4882812 vel_err: 61936.5156250 val_loss: 1.4122211 val_pos_err: 55079.1718750 val_vel_err: 86252.5000000
+[INFO] Epoch 790: loss: 1.5180775 pos_err: 59362.1914062 vel_err: 53754.1445312 val_loss: 1.4142238 val_pos_err: 56884.9257812 val_vel_err: 86169.0000000
+[INFO] Epoch 795: loss: 1.5641506 pos_err: 56112.3828125 vel_err: 69085.0312500 val_loss: 1.4104477 val_pos_err: 53959.7968750 val_vel_err: 88345.9140625
+[INFO] Epoch 800: loss: 1.7550483 pos_err: 60063.3007812 vel_err: 54413.0195312 val_loss: 1.4122915 val_pos_err: 56559.6796875 val_vel_err: 89528.6328125
+[INFO] Epoch 805: loss: 2.1105127 pos_err: 61234.1601562 vel_err: 89904.0625000 val_loss: 1.4094589 val_pos_err: 52752.2617188 val_vel_err: 87094.1093750
+[INFO] Epoch 810: loss: 1.8831991 pos_err: 64729.8164062 vel_err: 63196.5351562 val_loss: 1.4137892 val_pos_err: 56366.5117188 val_vel_err: 89683.0468750
+[INFO] Epoch 815: loss: 2.2910728 pos_err: 62232.7773438 vel_err: 64615.4296875 val_loss: 1.4073251 val_pos_err: 53038.0156250 val_vel_err: 86042.5468750
+[INFO] Epoch 820: loss: 1.6827509 pos_err: 64017.0625000 vel_err: 70969.2500000 val_loss: 1.4124842 val_pos_err: 56559.1523438 val_vel_err: 87910.7031250
+[INFO] Epoch 825: loss: 1.4676174 pos_err: 55112.6406250 vel_err: 70413.4765625 val_loss: 1.4079597 val_pos_err: 53174.6484375 val_vel_err: 89043.8437500
+[INFO] Epoch 830: loss: 2.1606946 pos_err: 65392.0156250 vel_err: 62102.6562500 val_loss: 1.4065621 val_pos_err: 52559.2382812 val_vel_err: 84590.4453125
+[INFO] Epoch 835: loss: 1.6983683 pos_err: 63957.0351562 vel_err: 62936.2890625 val_loss: 1.4065273 val_pos_err: 53416.9765625 val_vel_err: 85050.0390625
+[INFO] Epoch 840: loss: 1.4364780 pos_err: 58675.7890625 vel_err: 74990.0156250 val_loss: 1.4076545 val_pos_err: 53505.4609375 val_vel_err: 85167.5937500
+[INFO] Epoch 845: loss: 1.4521630 pos_err: 63299.8203125 vel_err: 71930.4531250 val_loss: 1.4075583 val_pos_err: 52354.0976562 val_vel_err: 90173.5468750
+[INFO] Epoch 850: loss: 1.7438331 pos_err: 65127.4140625 vel_err: 65906.8515625 val_loss: 1.4116343 val_pos_err: 52102.3593750 val_vel_err: 92045.1406250
+[INFO] Epoch 855: loss: 1.8131244 pos_err: 59948.1757812 vel_err: 65068.1210938 val_loss: 1.4034103 val_pos_err: 50853.5078125 val_vel_err: 88448.8906250
+[INFO] Epoch 860: loss: 1.3336228 pos_err: 62304.6328125 vel_err: 82588.0312500 val_loss: 1.4052638 val_pos_err: 52653.1601562 val_vel_err: 85752.7031250
+[INFO] Epoch 865: loss: 1.9961526 pos_err: 63023.8671875 vel_err: 69308.0546875 val_loss: 1.4038397 val_pos_err: 50905.5625000 val_vel_err: 89552.3359375
+[INFO] Epoch 870: loss: 2.0508194 pos_err: 60873.0156250 vel_err: 58409.5898438 val_loss: 1.4041948 val_pos_err: 49652.1523438 val_vel_err: 89598.9921875
+[INFO] Epoch 875: loss: 1.5216079 pos_err: 61731.1445312 vel_err: 63050.5390625 val_loss: 1.4041328 val_pos_err: 53974.3046875 val_vel_err: 87323.7343750
+[INFO] Epoch 880: loss: 1.6980224 pos_err: 65298.7343750 vel_err: 73280.2968750 val_loss: 1.4053192 val_pos_err: 53557.0546875 val_vel_err: 89233.5781250
+[INFO] Epoch 885: loss: 1.2910202 pos_err: 50239.5468750 vel_err: 65758.8046875 val_loss: 1.4000077 val_pos_err: 51515.2460938 val_vel_err: 85019.4062500
+[INFO] Epoch 890: loss: 1.5599036 pos_err: 60468.0195312 vel_err: 66770.7031250 val_loss: 1.3995800 val_pos_err: 50916.9453125 val_vel_err: 85567.8906250
+[INFO] Epoch 895: loss: 1.4885802 pos_err: 53417.4140625 vel_err: 69453.5546875 val_loss: 1.4063609 val_pos_err: 52245.2734375 val_vel_err: 84493.5234375
+[INFO] Epoch 900: loss: 1.7733392 pos_err: 64208.7539062 vel_err: 47431.3281250 val_loss: 1.4004724 val_pos_err: 48983.6875000 val_vel_err: 86341.4218750
+[INFO] Epoch 905: loss: 1.6422195 pos_err: 61974.0859375 vel_err: 78484.6250000 val_loss: 1.4009898 val_pos_err: 52374.1171875 val_vel_err: 86880.0546875
+[INFO] Epoch 910: loss: 2.0652676 pos_err: 62931.6015625 vel_err: 68618.1406250 val_loss: 1.4006019 val_pos_err: 51453.7070312 val_vel_err: 87906.9453125
+[INFO] Epoch 915: loss: 1.2307957 pos_err: 45434.7148438 vel_err: 57920.1875000 val_loss: 1.3972876 val_pos_err: 49711.4179688 val_vel_err: 85589.7968750
+[INFO] Epoch 920: loss: 1.8221918 pos_err: 63657.0312500 vel_err: 61611.7304688 val_loss: 1.3985208 val_pos_err: 51464.9531250 val_vel_err: 86664.5000000
+[INFO] Epoch 925: loss: 1.7864866 pos_err: 57780.8789062 vel_err: 67323.1796875 val_loss: 1.3995287 val_pos_err: 48390.7343750 val_vel_err: 87366.2578125
+[INFO] Epoch 930: loss: 1.6467197 pos_err: 59314.7187500 vel_err: 51741.4062500 val_loss: 1.3969115 val_pos_err: 50523.2851562 val_vel_err: 84658.6562500
+[INFO] Epoch 935: loss: 1.8184568 pos_err: 61832.9804688 vel_err: 60979.1757812 val_loss: 1.4047948 val_pos_err: 48343.1835938 val_vel_err: 81454.7187500
+[INFO] Epoch 940: loss: 1.4835424 pos_err: 53351.9843750 vel_err: 48556.1210938 val_loss: 1.4018760 val_pos_err: 54408.1992188 val_vel_err: 88250.6250000
+[INFO] Epoch 945: loss: 1.5092933 pos_err: 54026.6914062 vel_err: 61425.3125000 val_loss: 1.3981650 val_pos_err: 51136.2500000 val_vel_err: 84166.6406250
+[INFO] Epoch 950: loss: 1.5675511 pos_err: 58800.1953125 vel_err: 60557.9960938 val_loss: 1.3976042 val_pos_err: 48984.8828125 val_vel_err: 81810.9140625
+[INFO] Epoch 955: loss: 1.5057480 pos_err: 56887.9531250 vel_err: 61221.6679688 val_loss: 1.4063118 val_pos_err: 50777.5156250 val_vel_err: 81092.3515625
+[INFO] Epoch 960: loss: 2.0432072 pos_err: 58163.2265625 vel_err: 61008.4218750 val_loss: 1.3947315 val_pos_err: 48483.9218750 val_vel_err: 85915.1093750
+[INFO] Epoch 965: loss: 1.8229284 pos_err: 53384.4882812 vel_err: 53331.5234375 val_loss: 1.3991605 val_pos_err: 50208.6835938 val_vel_err: 83718.4687500
+[INFO] Epoch 970: loss: 1.8787117 pos_err: 62110.2968750 vel_err: 54725.4101562 val_loss: 1.3968201 val_pos_err: 52336.9726562 val_vel_err: 84563.0546875
+[INFO] Epoch 975: loss: 1.4012920 pos_err: 58439.4101562 vel_err: 69378.5937500 val_loss: 1.3960537 val_pos_err: 52013.4726562 val_vel_err: 86435.8515625
+[INFO] Epoch 980: loss: 1.6146795 pos_err: 62632.5312500 vel_err: 66289.9218750 val_loss: 1.3960623 val_pos_err: 52796.2695312 val_vel_err: 87049.0625000
+[INFO] Epoch 985: loss: 1.5663520 pos_err: 50050.9531250 vel_err: 66470.3593750 val_loss: 1.3934342 val_pos_err: 48176.8906250 val_vel_err: 83682.6015625
+[INFO] Epoch 990: loss: 1.8054452 pos_err: 65511.5312500 vel_err: 71930.4375000 val_loss: 1.3931590 val_pos_err: 49716.1523438 val_vel_err: 85389.4609375
+[INFO] Epoch 995: loss: 1.9726532 pos_err: 62756.9531250 vel_err: 65046.2734375 val_loss: 1.3982645 val_pos_err: 52572.6757812 val_vel_err: 88074.1718750
+[INFO] Epoch 1000: loss: 1.6511400 pos_err: 50891.8593750 vel_err: 54617.7382812 val_loss: 1.3943815 val_pos_err: 47547.6015625 val_vel_err: 83226.5390625
+[INFO] Epoch 1005: loss: 2.0457082 pos_err: 69168.8359375 vel_err: 67357.3437500 val_loss: 1.3943429 val_pos_err: 50437.6875000 val_vel_err: 87677.7500000
+[INFO] Epoch 1010: loss: 1.8689244 pos_err: 60248.5078125 vel_err: 59749.3984375 val_loss: 1.3954091 val_pos_err: 47737.7382812 val_vel_err: 83646.1718750
+[INFO] Epoch 1015: loss: 1.7065772 pos_err: 63070.4257812 vel_err: 63946.0585938 val_loss: 1.3941286 val_pos_err: 51606.9843750 val_vel_err: 87161.2500000
+[INFO] Early stopping triggered at 1016
+running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x7f8f08e87410>, 0.0001)
+[INFO] Epoch 5: loss: 1.5776007 pos_err: 72705.7421875 vel_err: 25704.8984375 val_loss: 1.1702878 val_pos_err: 59835.0976562 val_vel_err: 33295.8125000
+[INFO] Epoch 10: loss: 1.7324047 pos_err: 82545.6953125 vel_err: 20426.6699219 val_loss: 1.1457615 val_pos_err: 62877.0898438 val_vel_err: 31915.8183594
+[INFO] Epoch 15: loss: 1.1921110 pos_err: 73088.9140625 vel_err: 25987.0332031 val_loss: 1.1322829 val_pos_err: 62497.2031250 val_vel_err: 32425.0136719
+[INFO] Epoch 20: loss: 1.5473025 pos_err: 62284.9531250 vel_err: 20661.0019531 val_loss: 1.1190126 val_pos_err: 54054.2343750 val_vel_err: 31596.7246094
+[INFO] Epoch 25: loss: 1.3813788 pos_err: 61227.5703125 vel_err: 23380.4121094 val_loss: 1.1272470 val_pos_err: 47526.0585938 val_vel_err: 31029.3925781
+[INFO] Epoch 30: loss: 1.4689279 pos_err: 60559.7148438 vel_err: 33945.8164062 val_loss: 1.1465127 val_pos_err: 52001.7968750 val_vel_err: 34366.6523438
+[INFO] Epoch 35: loss: 1.5524828 pos_err: 62896.1093750 vel_err: 19891.3652344 val_loss: 1.1282020 val_pos_err: 52225.6523438 val_vel_err: 30434.1718750
+[INFO] Epoch 40: loss: 1.3205109 pos_err: 63195.5156250 vel_err: 27463.6132812 val_loss: 1.1280651 val_pos_err: 55814.0585938 val_vel_err: 30937.5761719
+[INFO] Epoch 45: loss: 1.3791330 pos_err: 60463.1367188 vel_err: 25818.0410156 val_loss: 1.1043169 val_pos_err: 47091.5898438 val_vel_err: 32174.6074219
+[INFO] Epoch 50: loss: 1.4644092 pos_err: 47551.1328125 vel_err: 24788.0058594 val_loss: 1.1153013 val_pos_err: 44804.8984375 val_vel_err: 30013.2011719
+[INFO] Epoch 55: loss: 1.5989834 pos_err: 62487.6875000 vel_err: 24299.5195312 val_loss: 1.1257267 val_pos_err: 47681.2148438 val_vel_err: 30485.2832031
+[INFO] Epoch 60: loss: 1.3237438 pos_err: 58566.7812500 vel_err: 25906.9179688 val_loss: 1.1538470 val_pos_err: 48815.2265625 val_vel_err: 35675.7343750

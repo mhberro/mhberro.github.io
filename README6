@@ -1,6 +1,3 @@
-# Copyright 2024 Lockheed Martin Corporation
-# Lockheed Martin Proprietary Information
-
 """Euler Ordinary Differential Equation Solver for NODE implementation."""
 
 from __future__ import annotations
@@ -20,9 +17,21 @@ except ModuleNotFoundError:
 class TorchdiffeqSolver(ODESolver):
     """ODE Solver that wraps torchdiffeq"""
 
-    def __init__(self, dt=1, *, adjoint=False, method="dopri5"):
+    def __init__(self, dt=1, *, adjoint=False, method="dopri5", substeps: int = 1):
         super().__init__(dt, adjoint=False)  # torchdiffeq provides an adjoint method
         self.method = method
+        # substeps: number of internal integration steps taken PER data interval.
+        # For fixed-step methods (rk4/euler), torchdiffeq steps between the times
+        # we hand odeint, so by default the integration step equals the data
+        # spacing dt. On chaotic, maneuver-heavy trajectories that coarse step is
+        # where truncation error compounds. substeps>1 integrates on a grid that
+        # is `substeps` times finer (dt/substeps), then returns only the points
+        # aligned to the original dt -- improving accuracy with NO change to the
+        # output shape or the (steps-based) caller contract. substeps=1 exactly
+        # reproduces the original behaviour.
+        if substeps < 1:
+            raise ValueError(f"substeps must be >= 1, got {substeps}")
+        self.substeps = int(substeps)
         if tde is None:
             raise ImportError("Prediction Core is not able to use torchdiffeq. Please install torchdiffeq")
         self.odeint = tde.odeint
@@ -68,13 +77,26 @@ class TorchdiffeqSolver(ODESolver):
             raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
         # subtract epsilon from the end values because torch has inconsistent arange behavior (see torch docs)
         epsilon = 1e-10
-        times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
-        x = self.odeint(
-            func,
-            x0,
-            times,
-            method=self.method,
-        )
-        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
+        if self.substeps == 1:
+            # original behaviour: integrate directly on the data grid
+            times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
+            x = self.odeint(func, x0, times, method=self.method)
+            x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
+            return x
 
+        # sub-stepped integration: build a grid `substeps` times finer so the
+        # solver takes smaller (more accurate) internal steps, then return ONLY
+        # the points aligned to the original dt grid so the output shape and the
+        # caller contract are unchanged: (batch, steps + 1, n_features).
+        fine_dt = self.dt / self.substeps
+        n_fine = steps * self.substeps  # number of fine intervals
+        times = torch.arange(
+            0, fine_dt * n_fine + fine_dt - epsilon, fine_dt, dtype=torch.float64
+        ).to(x0.device)
+        x = self.odeint(func, x0, times, method=self.method)
+        # x: (len(times), batch, n_features). Keep every substeps-th sample,
+        # i.e. indices 0, substeps, 2*substeps, ... which land exactly on the
+        # original dt grid and number steps + 1.
+        x = x[:: self.substeps]
+        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
         return x

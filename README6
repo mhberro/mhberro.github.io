@@ -1,123 +1,80 @@
-"""
-GLIDE-PHASE ACCURACY OPTIMIZATIONS for the GRU-ODE NEXT_training script.
+# Copyright 2024 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
 
-Context from the glide training log:
-  * Training is healthy (val_loss 1.60 -> 0.238 over 170 epochs, still falling).
-  * BUT val_vel_err bottoms ~epoch 110 (~84.9k) then CLIMBS to ~100k by 170,
-    while val_pos_err keeps dropping. The unweighted/uncoupled loss is trading
-    velocity accuracy for position accuracy.
-  * Only 120 training trajectories in a SINGLE batch (batch_size=512) -> one
-    low-variance full-batch gradient step per epoch. Data-limited regime.
+"""Euler Ordinary Differential Equation Solver for NODE implementation."""
 
-These changes target accuracy (GPU throughput is NOT the bottleneck here):
+from __future__ import annotations
 
-  (1) Velocity-weighted + second-order-coupled loss   -> PhysicsSplitMSELoss
-  (2) Mini-batching with shuffling                    -> smaller batch_size
-  (3) The structural second-order constraint          -> GRUODELatentModel
-      (apply gruode_second_order_changes.py alongside this)
+from typing import Callable
 
-Apply the edits marked APPLY-> below to the GRU-ODE training script.
-"""
+import torch
+from prediction.mlearn.neural_ode.ode_solver import ODESolver
 
-# =====================================================================
-# (1) + (3)  Loss construction in train_NEXT
-# ---------------------------------------------------------------------
-# APPLY-> Replace the active `loss_func = WrappedMSELoss(...)` with this.
-#         With the second-order model (gruode_second_order_changes.py), the
-#         physics identity dpos/dt=vel holds by construction, so physics_weight
-#         is set to 0.0 (the residual would be ~0 anyway). vel_weight is raised
-#         because, under the second-order constraint, velocity bias propagates
-#         straight into position -- so velocity accuracy matters MORE in glide.
-#
-# from loss_functions import (EnergyMSELoss, PhysicsSplitMSELoss,
-#                             SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss)
-#
-# loss_func = PhysicsSplitMSELoss(
-#     height_idx=1,
-#     vel_indices=velocity_indicies,
-#     dt=trajectory_dt,
-#     pos_weight=1.0,
-#     vel_weight=3.0,        # glide: velocity is the laggard AND now feeds position
-#     physics_weight=0.0,    # second-order model makes the soft residual redundant
-#     scaler=scaler_traj if use_scalar else None,
-#     N_FEATURES=model_states,
-# )
-#
-# If you run the UNCONSTRAINED model instead (no second-order changes), use
-# physics_weight=0.1 and vel_weight=2.0 so the soft coupling does the job.
+try:
+    import torchdiffeq as tde
+
+except ModuleNotFoundError:
+    tde = None
 
 
-# =====================================================================
-# (3)  Second-order model construction in the gruode branch of train_NEXT
-# ---------------------------------------------------------------------
-# APPLY-> In the `elif model_type in ("gruode", "gruode-min"):` branch, after
-#         building gruode_func, pass the position/velocity pairing so the
-#         structural constraint is active. Pairing is frame-aware:
-#
-# if frame in ("dcu", "geodesic"):
-#     pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
-# elif frame == "grdth":
-#     pos_idx, vel_idx = [0, 1], [2, 3]      # idx 4 (VTheta) left to the network
-# else:
-#     pos_idx, vel_idx = None, None          # constraint off
-#
-# node.model = GRUODELatentModel(
-#     func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
-#     pos_idx=pos_idx, vel_idx=vel_idx,
-# ).to(node.device)
-#
-# APPLY-> And in the ONNX export block, pass the same pairing:
-# export_model = GRUODEFieldForONNX(
-#     raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
-#     pos_idx=pos_idx, vel_idx=vel_idx,
-# ).to(node.device).eval()
-# (pos_idx/vel_idx need to be in scope at export; compute them once near the top
-#  of train_NEXT next to `velocity_indicies` so both sites can use them.)
+class TorchdiffeqSolver(ODESolver):
+    """ODE Solver that wraps torchdiffeq"""
 
+    def __init__(self, dt=1, *, adjoint=False, method="dopri5"):
+        super().__init__(dt, adjoint=False)  # torchdiffeq provides an adjoint method
+        self.method = method
+        if tde is None:
+            raise ImportError("Prediction Core is not able to use torchdiffeq. Please install torchdiffeq")
+        self.odeint = tde.odeint
+        if adjoint:
+            self.odeint = tde.odeint_adjoint
 
-# =====================================================================
-# (2)  Mini-batching: the single highest-value, zero-accuracy-risk change
-# ---------------------------------------------------------------------
-# APPLY-> In main(), lower the batch size so 120 trajectories yield several
-#         shuffled gradient steps per epoch instead of one full-batch step.
-#         The gradient noise is itself a regulariser in this small-data regime.
-#
-#   batch_size = 16          # was 512 (one batch); 120/16 ~= 8 steps/epoch
-#   if HAVE_HIGH_MEMORY:
-#       batch_size = 32
-#
-# NODEPredictor.fit already shuffles (random.shuffle(pool_index)) and iterates
-# ceil(len(x)/batch_size) batches, so no other change is needed -- it simply
-# starts taking multiple steps per epoch. Validation batching is unaffected.
-#
-# NOTE: with the length-strategy curriculum, early stages train on short
-# sub-trajectories where the rollout is cheap; mini-batching there is pure win.
-# If you find very small batches make val noisy, 24-32 is a fine middle ground.
+    def integrate(
+        self,
+        func: torch.nn.Module,
+        x0: torch.Tensor,
+        steps: int = 1,
+        extra_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Solves an ODE by integrating it from the initial conditions.
 
+        Euler's Method uses the ODE evaluated at a given point and the
+        approximation that with a small step size, the function is almost
+        linear to solve the ODE. The update step can be written as follows:
 
-# =====================================================================
-# (OPTIONAL, NOT BUNDLED)  Trajectory-segment augmentation
-# ---------------------------------------------------------------------
-# Described for later, deliberately not auto-applied because it changes the
-# data pipeline and should get its own validation pass.
-#
-# From each (T, D) trajectory, emit several overlapping sub-trajectories with
-# different start offsets, multiplying effective sample count and teaching the
-# dynamics from many initial conditions rather than 120 fixed launch states:
-#
-# def augment_segments(traj, min_len=10, stride=5, max_segments=8):
-#     segs = [traj]                       # always keep the full trajectory
-#     T = traj.shape[0]
-#     for start in range(stride, T - min_len, stride):
-#         segs.append(traj[start:])
-#         if len(segs) >= max_segments:
-#             break
-#     return segs
-#
-# Then in train_NEXT, expand the training list BEFORE the length-strategy loop:
-#   scaled_traj_targets_train_posvel = [
-#       seg for traj in scaled_traj_targets_train_posvel
-#       for seg in augment_segments(traj)
-#   ]
-# Do NOT augment the validation set (keep it as held-out full trajectories so
-# val metrics stay comparable to your prior runs).
+        x_i+1 = x_i + dt*f(x_i)
+
+        where x_i is the given state, x_i+1 is the next state, dt is the step
+        size, and f(x_i) is the ODE evaluated at the given state.
+
+        Args:
+            func: Function to be integrated.
+                This should be a Callable with a single torch tensor as an
+                input. It can represent a physical system or in general be
+                anything.
+            x0: A tensor containing the initial conditions.
+                This is expected to be of shape (batch_size, n_features).
+            steps: The number of steps to integrate forward.
+            extra_feat: Optional extra features to include.
+                It is concatenated to the initial conditions and each subsequent
+                step. It can contain "scenario specific" information. It is of
+                shape (batch_size, n_extra_features).
+
+        Returns:
+            The solution to the ODE as a torch tensor.
+                The shape will be (batch_size, steps + 1, n_features).
+        """
+        if extra_feat is not None:
+            raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
+        # subtract epsilon from the end values because torch has inconsistent arange behavior (see torch docs)
+        epsilon = 1e-10
+        times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
+        x = self.odeint(
+            func,
+            x0,
+            times,
+            method=self.method,
+        )
+        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
+
+        return x

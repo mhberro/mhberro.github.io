@@ -882,7 +882,7 @@ def train_NEXT(
         #   "keep_alt"  : drop horizontal position, KEEP altitude + velocity
         #   "vel_only"  : velocity only (SME proposal)
         #   "all"       : original behaviour (full state)
-        ENCODER_INPUT_MODE = "keep_alt"   # <- switch to "vel_only" or "all" to A/B
+        ENCODER_INPUT_MODE = "all"   # "keep_alt"/"vel_only" tested WORSE than "all"
 
         if frame in ("dcu", "geodesic"):
             # state = [Down, Cross, Up(alt), dotD, dotC, dotU]
@@ -1759,6 +1759,77 @@ class GRUODEFieldForONNX(torch.nn.Module):
         return xdot
 
 
+def augment_trajectory_segments(
+    traj_list,
+    segments_per_traj: int = 5,
+    min_segment_len: int = 12,
+    keep_full: bool = True,
+):
+    """Trajectory-segment augmentation for the small-data (few-trajectory) regime.
+
+    From each (T, D) trajectory, emit several sub-trajectories that start at
+    different offsets along it. This multiplies the effective sample count and,
+    more importantly, teaches the dynamics to propagate from MANY initial
+    conditions (arbitrary mid-glide states) rather than only the handful of
+    launch states -- which is what a 96-trajectory training set otherwise
+    limits the model to.
+
+    Design choices (see conversation): SLIDING-WINDOW offsets (deterministic /
+    reproducible, even coverage -- important since the rest of the pipeline is
+    seeded and we want run-to-run comparability), the FULL trajectory always
+    kept (augmentation is purely additive, never destructive), and a minimum
+    segment length so the length-strategy curriculum (which further slices from
+    the front) can't drive a segment below the usable floor.
+
+    Segments stay in the ORIGINAL frame (NOT re-referenced to their own start):
+    a mid-trajectory segment legitimately begins at a large position offset,
+    and batch_loss uses that first point as the true IC -- exactly the
+    "propagate from an arbitrary state" signal we want, and consistent with how
+    the sim integrates.
+
+    IMPORTANT: apply to TRAINING data only. Never augment validation (keep it as
+    held-out full trajectories so val metrics remain comparable across runs).
+    Also fit the scaler on the ORIGINAL (un-augmented) data so overlapping
+    segments don't reweight the normalisation statistics.
+
+    Args:
+        traj_list: list of (T, D) tensors (training trajectories).
+        segments_per_traj: target number of segments per trajectory INCLUDING
+            the full one. ~5-6 is the sweet spot for ~100 trajectories: enough
+            new initial conditions to matter, not so much overlap that highly
+            correlated segments inflate size without diversity.
+        min_segment_len: shortest segment (in timesteps) to emit.
+        keep_full: always include the untouched full trajectory.
+
+    Returns:
+        A new, longer list of (T_i, D) tensors.
+    """
+    out = []
+    for traj in traj_list:
+        T = traj.shape[0]
+        if keep_full:
+            out.append(traj)
+        # how many ADDITIONAL offset segments to add
+        n_extra = max(0, segments_per_traj - (1 if keep_full else 0))
+        if n_extra == 0 or T <= min_segment_len:
+            continue
+        # evenly spaced start offsets across the first ~70% of the trajectory,
+        # so each segment still has a meaningful remaining horizon to learn from.
+        last_start = max(1, int(0.7 * T))
+        # guard: don't start so late the segment is shorter than the minimum
+        last_start = min(last_start, T - min_segment_len)
+        if last_start < 1:
+            continue
+        for k in range(1, n_extra + 1):
+            start = int(round(k / (n_extra + 1) * last_start))
+            if start < 1:
+                start = 1
+            seg = traj[start:]
+            if seg.shape[0] >= min_segment_len:
+                out.append(seg)
+    return out
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Training script for creating NEXT models",
@@ -2025,6 +2096,27 @@ def main():
     # plot up the distribution of each feature
 
     scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+
+    # --- Trajectory-segment augmentation (training only) --------------------
+    # Attacks the core ceiling: only ~96 training trajectories. Emits several
+    # sub-trajectories per trajectory (different start offsets) so the model
+    # learns to propagate from many initial conditions, not just launch states.
+    # Applied AFTER the scaler is fit (so overlapping segments don't reweight
+    # the normalisation stats) and NOT to validation (so val stays comparable).
+    # Set AUGMENT_SEGMENTS = 1 (or keep_full only) to disable.
+    AUGMENT_SEGMENTS = 5  # segments per trajectory incl. the full one; 1 = off
+    if AUGMENT_SEGMENTS > 1:
+        n_before = len(traj_targets_train_posvel)
+        traj_targets_train_posvel = augment_trajectory_segments(
+            traj_targets_train_posvel,
+            segments_per_traj=AUGMENT_SEGMENTS,
+            min_segment_len=12,
+            keep_full=True,
+        )
+        print(
+            f"segment augmentation: {n_before} -> {len(traj_targets_train_posvel)} "
+            f"training trajectories (val left at {len(traj_targets_test_posvel)})"
+        )
 
     # call training a model on the data
     # TODO: why does this return the model name? shouldn't that be an input?

@@ -1,25 +1,19 @@
-running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x16e423e00>, 0.0001)
-[INFO] Epoch 5: loss: 1.2552130 pos_err: 28594.5078125 vel_err: 520.2734985 val_loss: 2.4539430 val_pos_err: 77354.3828125 val_vel_err: 612.0518188
-[INFO] Epoch 10: loss: 1.4319907 pos_err: 56981.3671875 vel_err: 411.4512024 val_loss: 1.2594930 val_pos_err: 46387.2265625 val_vel_err: 538.7470703
-[INFO] Epoch 15: loss: 0.5067134 pos_err: 93975.2421875 vel_err: 550.5191650 val_loss: 0.7018403 val_pos_err: 41831.0742188 val_vel_err: 547.1375732
-[INFO] Epoch 20: loss: 0.6140144 pos_err: 83522.9453125 vel_err: 459.2184143 val_loss: 0.6042562 val_pos_err: 62854.5703125 val_vel_err: 483.8587341
-[INFO] Epoch 25: loss: 0.4042662 pos_err: 64846.5625000 vel_err: 444.7716980 val_loss: 0.4545563 val_pos_err: 35719.7539062 val_vel_err: 471.4526062
-[INFO] Epoch 30: loss: 0.6756039 pos_err: 69492.0390625 vel_err: 303.4442749 val_loss: 0.5322376 val_pos_err: 48265.8085938 val_vel_err: 473.2991943
-[INFO] Epoch 35: loss: 0.6267616 pos_err: 54703.0000000 vel_err: 326.5902405 val_loss: 0.4416879 val_pos_err: 47527.5976562 val_vel_err: 493.1577759
-[INFO] Epoch 40: loss: 0.5641260 pos_err: 25836.2500000 vel_err: 292.1369019 val_loss: 0.5274990 val_pos_err: 46115.6953125 val_vel_err: 425.4566040
-[INFO] Epoch 45: loss: 0.3058369 pos_err: 37821.6914062 vel_err: 518.0964966 val_loss: 0.5180261 val_pos_err: 50421.5507812 val_vel_err: 394.8164062
-[INFO] Epoch 50: loss: 0.4426260 pos_err: 56840.0429688 vel_err: 224.1043091 val_loss: 0.4963561 val_pos_err: 36421.2695312 val_vel_err: 379.8194885
-[INFO] Epoch 55: loss: 0.3386841 pos_err: 56040.7539062 vel_err: 366.6532288 val_loss: 0.4509390 val_pos_err: 46975.1835938 val_vel_err: 515.7890015
-[INFO] Early stopping triggered at 57
-running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x32e358a40>, 0.0001)
-[INFO] Epoch 5: loss: 0.6313041 pos_err: 22184.1308594 vel_err: 235.5215454 val_loss: 0.5183148 val_pos_err: 25010.1816406 val_vel_err: 385.8905334
-[INFO] Epoch 10: loss: 0.3902910 pos_err: 29432.1503906 vel_err: 347.2532959 val_loss: 0.5129691 val_pos_err: 28470.3437500 val_vel_err: 436.4932251
-[INFO] Epoch 15: loss: 0.4188485 pos_err: 27328.7695312 vel_err: 312.1282349 val_loss: 0.4097618 val_pos_err: 24209.8789062 val_vel_err: 502.5539551
-[INFO] Epoch 20: loss: 0.4386441 pos_err: 27313.1718750 vel_err: 440.0212097 val_loss: 0.4176263 val_pos_err: 28777.2324219 val_vel_err: 409.6363525
-[INFO] Epoch 25: loss: 0.3274710 pos_err: 15450.3505859 vel_err: 336.9441528 val_loss: 0.4289460 val_pos_err: 23540.7578125 val_vel_err: 453.9163818
-[INFO] Epoch 30: loss: 0.3821568 pos_err: 29931.0722656 vel_err: 342.5740967 val_loss: 0.3963535 val_pos_err: 23949.7207031 val_vel_err: 421.4910889
-[INFO] Epoch 35: loss: 0.3225785 pos_err: 23205.6660156 vel_err: 483.0474243 val_loss: 0.4097166 val_pos_err: 25320.4257812 val_vel_err: 491.7167358
-[INFO] Epoch 40: loss: 0.4099472 pos_err: 31389.0488281 vel_err: 219.6605988 val_loss: 0.3812938 val_pos_err: 20937.5976562 val_vel_err: 435.2492676
-[INFO] Epoch 45: loss: 0.5005329 pos_err: 28395.2089844 vel_err: 391.4654541 val_loss: 0.3359396 val_pos_err: 18676.7968750 val_vel_err: 400.0641174
-[INFO] Epoch 50: loss: 0.2598393 pos_err: 29663.2597656 vel_err: 444.1452637 val_loss: 0.3576179 val_pos_err: 25150.3984375 val_vel_err: 443.8715210
-[INFO] Early stopping triggered at 54
+           # --- per-stage LR scheduler -----------------------------------
+            # Attach a ReduceLROnPlateau ONLY to the long full-trajectory
+            # stages, where the glide log showed val_loss plateauing for ~190
+            # epochs before early-stop. Patience MUST be shorter than the
+            # early-stopper's patience, or the run stops before the LR can drop.
+            from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import (
+                ReduceLROnPlateauConfiguration,
+            )
+            if data_fraction == 1.0:
+                sched_patience = max(1, early_stopper.patience // 2)   # < early-stop patience
+                node.scheduler = ReduceLROnPlateauConfiguration(
+                    early_stop_metric_name,        # "val_loss"
+                    factor=0.5,
+                    patience=sched_patience,
+                    min_lr=1e-7,
+                    threshold=1e-4,
+                ).create_from_optimizer(node.optimizer)
+            else:
+                node.scheduler = None              # no decay on the short curriculum stages

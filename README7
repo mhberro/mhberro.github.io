@@ -1,4 +1,3 @@
-
 # Built-ins
 import argparse
 import json
@@ -24,7 +23,7 @@ from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
-# LM packages
+
 from lm_ai_torch_models.activations import Activation
 from lm_ai_torch_training.configuration import TrainingConfiguration
 from lm_ai_torch_training.hyperparameters import TrainingParam
@@ -46,7 +45,7 @@ from coordinate_transform_functions import (
 )
 from energy_functions import mechanical_energy
 from load_truth import load_single_truth
-from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+from loss_functions import EnergyMSELoss, PhysicsSplitMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
 
 # from prediction.mlearn.neural_ode.neural_ode import (
 #     DEFAULT_LOSS,
@@ -68,9 +67,15 @@ from NEXT_frames import (
     next_dcu_to_ecef,
     next_grdth_to_ecef,
 )
-from NEXT_Geodesic_Frame import (
+# Integrated ("frame trick") geodesic transform: drops absolute azimuth and
+# tracks azimuth RATE instead, yielding a 5-state [s, h, v_s, v_alpha, v_h]
+# representation. Better-conditioned than the raw 6-state [Down,Cross,Up,...]
+# geodesic frame (large down-range becomes a clean quasi-monotonic range s, and
+# the ill-defined-near-origin azimuth is replaced by a rate). Imported under a
+# _frame_trick alias so both geodesic modes coexist (see --geodesic-mode).
+from NEXT_geodesic_frame import (
     ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
-    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick
+    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
 )
 from torchdiffeq_solver import TorchdiffeqSolver
 from trajectory_helpers import (
@@ -87,23 +92,6 @@ from trajectory_helpers import (
     resample_traj_data,
 )
 
-# example command
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/train/PrSM --validation-data-path datasets/test/PrSM --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/all/simple_ballistic_trajs --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/all/simple_ballistic_trajs --sr 300000 --use-grdth --use-scalar
-# python NEXT_training.py --tgt-data-paths datasets/mini/simple_ballistic_trajs --sr 100000 --use-scalar --use-grdth  # worked with 5 trajs
-# python NEXT_training.py --tgt-data-paths datasets/mini/simple_ballistic_trajs --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200
-# python NEXT_training.py --tgt-data-paths datasets/mini/PrSM --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 200 -o model_outputs/PrSM_mini50_energy
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200 -o model_outputs/PrSM
-
-# SBI
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/DF_5 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/DF_5_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/KN_20 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/KN_20_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/KN_22 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/KN_22_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/SS_19 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/SS_19_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/SS_25 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/SS_25_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/HighE_HGV_4NEXT/GITCOMMIT_4baca132 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/HighE_HGV_v001
 
 HAVE_HIGH_MEMORY = False
 if psutil.virtual_memory().total > 64e9:
@@ -115,6 +103,22 @@ if torch.cuda.device_count() != 0:
     print("there is a gpu in this node")
     for i in range(torch.cuda.device_count()):
         print(torch.cuda.get_device_properties(i))
+
+    # --- GPU throughput defaults --------------------------------------------
+    # TF32 gives a large matmul speedup on Ampere+ (A100/P100-no, A100/H100-yes)
+    # at negligible accuracy cost for this regression task. Safe no-op on GPUs
+    # that don't support it.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Autotune the best conv/matmul algorithms for the (fixed) tensor shapes we
+    # use; the encoder/decoder/cell shapes are constant across steps so the
+    # one-time tuning cost is amortised immediately.
+    torch.backends.cudnn.benchmark = True
+    # Prefer high-throughput matmul kernels.
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
 BUCKET_SIZE = 5000  # [m]
 
@@ -163,6 +167,434 @@ class ODEfunc(torch.nn.Module):
             # return torch.cat((v, out), dim=x.ndim - 1)  # TODO: subtract a small MLP here for dissipation on the acceleration term
         else:
             return out
+
+
+# =====================================================================
+#  GRU-ODE  (De Brouwer et al., NeurIPS 2019 — GRU-ODE-Bayes)
+# ---------------------------------------------------------------------
+#  Continuous-time GRU vector field for the latent state h(t):
+#
+#       dh/dt = (1 - z(t)) ⊙ (g(t) - h(t))            (paper Eq. 3 / App. A)
+#
+#  with the continuous-time gates
+#       r(t) = σ(W_r x + U_r h + b_r)
+#       z(t) = σ(W_z x + U_z h + b_z)
+#       g(t) = tanh(W_h x + U_h (r ⊙ h) + b_h)
+#
+#  Key properties exploited here for chaotic kinematic forecasting:
+#    * Boundedness:   h(0) ∈ [-1,1]  ⇒  h(t) ∈ [-1,1] ∀t  (negative
+#      feedback term -(1-z)⊙h points inward at the boundary). This bounds
+#      long-horizon rollouts and collapses S-curve / phugoid divergence.
+#    * Lipschitz K=2: globally smooth vector field ⇒ adaptive solvers
+#      (DOPRI) stay stable and can take large steps.
+#    * Continuity prior on h(t): a smooth latent flow that regularises the
+#      forecaster, especially valuable in the low-sample regime.
+#
+#  Design note for THIS pipeline: the truth data is resampled onto a uniform
+#  grid and is fully observed (no per-feature mask), so the Bayesian filtering
+#  half of the paper (GRU-Bayes + KL post-jump loss) has nothing to filter at
+#  train time. We therefore use the GRU-ODE *cell* as a bounded latent vector
+#  field and expose the GRU-Bayes jump as an OPT-IN path (GRUODEBayesPredictor)
+#  for when genuinely sporadic/masked observations are available. The autonomous
+#  forecaster below (no continuous input x(t)) is the default — g and z then
+#  depend on h(t) only, exactly the autonomous case described in paper §2.1.
+# =====================================================================
+class FullGRUODECell(torch.nn.Module):
+    """The GRU-ODE vector field dh/dt = (1 - z) ⊙ (g - h).
+
+    Operates on a *latent* state h ∈ R^H. If a continuous control/observation
+    signal x(t) ∈ R^D is supplied it is injected into all three gates; if not,
+    the cell is autonomous (the default for forecasting).
+
+    The forward signature is (t, h) to match torchdiffeq and the existing
+    TorchdiffeqSolver / ONNX export contract used by ODEfunc.
+    """
+
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        # --- OPTIMIZED weight layout -------------------------------------
+        # The r and z gates depend on h directly; g depends on the RESET-GATED
+        # hidden state (r ⊙ h). Computing them in one packed 3H×H matmul forces
+        # the wasted product U_h·h to be computed and then subtracted out. We
+        # instead split into:
+        #   lin_hrz : (2H, H)  -> U_r, U_z      applied to h
+        #   lin_hg  : ( H, H)  -> U_h           applied to (r ⊙ h)
+        # This is two matmuls instead of three, mathematically identical to the
+        # packed-and-correct form (verified to machine precision), and removes
+        # the per-step subtraction. Fewer/larger fused GEMMs also map better to
+        # GPU tensor cores.
+        self.lin_hrz = torch.nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            # Input weights for all three gates: W_r, W_z (for r,z) and W_h (g).
+            self.lin_xrz = torch.nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            # Learnable gate biases so the autonomous field is not pinned to the
+            # origin. Registered as parameters (broadcast over batch).
+            if bias:
+                self.bias_rz = torch.nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = torch.nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        """Return dh/dt with the same trailing-dim layout as h.
+
+        h : (..., H)   latent state (any batch/sequence leading dims)
+        x : (..., D)   optional continuous input aligned on the last dim
+
+        No host-syncing side effects (no nfe counter) so the field is safe for
+        CUDA-graph capture and torch.compile.
+        """
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
+
+
+class MinimalGRUODECell(torch.nn.Module):
+    """Minimal GRU-ODE (paper App. G):
+
+        dh/dt = (1 - f) ⊙ (σ(W_h x + U_h (h ⊙ f) + b_h) - h)
+
+    Fewer parameters than the full cell; retains boundedness and the K=2
+    Lipschitz property. Useful when latent H is large or data is scarce.
+    """
+
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hf = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_f
+        self.lin_hh = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_h
+        if input_size > 0:
+            self.lin_xf = torch.nn.Linear(input_size, hidden_size, bias=bias)
+            self.lin_xh = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_f = self.lin_hf(h)
+        if self.input_size > 0:
+            pre_f = pre_f + self.lin_xf(x)
+        elif self.bias_f is not None:
+            pre_f = pre_f + self.bias_f
+        f = torch.sigmoid(pre_f)
+
+        pre_h = self.lin_hh(f * h)
+        if self.input_size > 0:
+            pre_h = pre_h + self.lin_xh(x)
+        elif self.bias_h is not None:
+            pre_h = pre_h + self.bias_h
+        g = torch.tanh(pre_h)
+
+        dh = (1.0 - f) * (g - h)
+        return dh
+
+
+class GRUODEFunc(torch.nn.Module):
+    """Drop-in replacement for ``ODEfunc`` that integrates a GRU-ODE field in a
+    BOUNDED LATENT SPACE and decodes back to the physical kinematic state.
+
+    Pipeline per integration call (single physical state, autonomous):
+
+        x_phys (..., D)
+           │  encoder (Linear→SiLU→Linear→tanh)        lift to latent
+           ▼
+        h (..., H) ∈ (-1, 1)                            boundedness precondition
+           │  ∫ FullGRUODECell  dt   (handled by the external solver)
+           ▼
+        h(t) (..., H) ∈ (-1, 1)                         stays bounded ∀t
+           │  decoder (Linear→SiLU→Linear)             project to physical
+           ▼
+        x_phys(t) (..., D)
+
+    To keep a SINGLE state vector flowing through the existing solver / ONNX
+    export (which integrate a vector field of fixed dimension), we expose the
+    *augmented* state  s = [x_phys, h]  ∈ R^{D+H}  and define its derivative:
+
+        d/dt [x_phys] = decoder_jacobian-free readout:  ẋ_phys = J·ḣ  ≈  Dec(h+εḣ) trick
+        d/dt [h]      = FullGRUODECell(h)
+
+    In practice, decoding every step is cheap and exact, so we instead carry h
+    as the integrated state and the physical readout is produced by the decoder
+    AFTER integration (see GRUODELatentModel). For ONNX/solver parity we still
+    provide a fixed-dim ``forward(t, s)`` that advances the latent block and
+    holds the physical block via its decoded velocity, supporting the
+    second-order (order_shift_slice) kinematic prior.
+
+    For the common case we recommend using ``GRUODELatentModel`` end-to-end,
+    which the trainer wires up automatically.
+    """
+
+    def __init__(
+        self,
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+    ):
+        super().__init__()
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+
+        # Encoder-input selection. The GRU-ODE dynamics should be (largely)
+        # invariant to ABSOLUTE horizontal position: how velocity evolves in a
+        # glide depends on velocity, altitude, dynamic pressure, flight-path
+        # angle -- NOT on absolute down-range/cross-range coordinate. Feeding
+        # large-magnitude, translation-variant position into the encoder both
+        # pollutes the latent and lets the model overfit position-specific
+        # dynamics (hurting val position via the integrated velocity). Under the
+        # second-order constraint this is doubly safe: position is produced by
+        # integration, so the dynamics genuinely don't need absolute position.
+        #
+        # encoder_input_idx selects which state components feed the encoder.
+        #   None                -> all components (original behaviour)
+        #   [2,3,4,5] (geodesic) -> drop Down,Cross; keep Up(alt)+velocities
+        #   [3,4,5]   (geodesic) -> velocity-only (SME's proposal)
+        # The DECODER still outputs all state_vector_len components unchanged.
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer(
+            "encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long)
+        )
+        enc_in = len(encoder_input_idx)
+
+        # Encoder: (selected) physical -> bounded latent. Final tanh guarantees
+        # h in (-1,1), satisfying the GRU-ODE boundedness precondition.
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(enc_in, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, self.latent_dim),
+            torch.nn.Tanh(),
+        )
+        # The continuous-time GRU vector field (autonomous: input_size=0).
+        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
+        # Decoder: bounded latent -> FULL physical state.
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_dim, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, state_vector_len),
+        )
+
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        """Vector field on the LATENT state h (this is what the solver integrates).
+
+        Accepts h of shape (..., latent_dim) and returns dh/dt of the same shape.
+        Boundedness is structural, so no clamping is required.
+        """
+        return self.cell(t, h)
+
+    # --- convenience maps used by the latent wrapper / ONNX model ---
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        # Select only the dynamically-relevant components before encoding.
+        # x_phys is always the FULL state (..., state_vector_len); we gather the
+        # configured subset on the last dim so every caller stays unchanged.
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+
+# Forward-mode JVP: prefer torch.func (single forward pass) over
+# torch.autograd.functional.jvp (double-backward, ~3x cost and an extra graph).
+try:  # torch >= 2.0
+    from torch.func import jvp as _func_jvp
+
+    def _decoder_jvp(decode_fn, h, dh):
+        # (output, J·dh) in one forward-mode pass — no backward graph built.
+        return _func_jvp(decode_fn, (h,), (dh,))
+except Exception:  # pragma: no cover - older torch fallback
+    def _decoder_jvp(decode_fn, h, dh):
+        return torch.autograd.functional.jvp(decode_fn, h, v=dh, create_graph=True, strict=False)
+
+
+class GRUODELatentModel(torch.nn.Module):
+    """GRU-ODE as a physical-space vector field, drop-in for ODEfunc, with an
+    optional structural second-order constraint dpos/dt = vel.
+
+    New args:
+        pos_idx, vel_idx : paired index lists. xdot[pos_idx[i]] is forced to
+                           x[vel_idx[i]]. If either is None, the constraint is
+                           OFF and the model behaves exactly as before.
+    """
+
+    def __init__(
+        self,
+        func,                 # GRUODEFunc
+        solver=None,
+        aug_dim: int = 0,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,       # StandardScaler scale_ (sigma) for the pos block
+        vel_scale=None,       # StandardScaler scale_ (sigma) for the vel block
+        vel_mean=None,        # StandardScaler mean_ (mu) for the vel block
+        so_correction_alpha: float = 0.0,  # soft-constraint correction magnitude
+        field_method: str = "central",     # "central" matches ONNX/deploy; "jvp" = exact
+        fd_eps: float = 1e-4,              # central-difference step (must match export)
+    ):
+        super().__init__()
+        self.func = func
+        self.aug_dim = aug_dim
+        # Train/deploy field parity: the ONNX export computes the physical
+        # derivative via CENTRAL FINITE DIFFERENCE through the decoder; the
+        # original training path used an exact JVP. Under the soft constraint the
+        # decoder_pos_deriv feeds a saturating tanh, so any systematic
+        # JVP-vs-FD disagreement biases the deployed position integral.
+        # "central" (default) makes the trained field identical to the deployed
+        # field; "jvp" restores the exact train-only derivative for comparison.
+        self.field_method = field_method
+        self.fd_eps = float(fd_eps)
+        # Soft second-order constraint: xdot[pos] = kinematic_term
+        #   + alpha * tanh(decoder_pos_deriv). alpha=0 => HARD constraint
+        #   (pos-deriv fully determined by velocity, original behaviour).
+        #   alpha>0 lets the network add a BOUNDED correction so it can pull
+        #   position back toward truth instead of only riding the velocity
+        #   integral (which is what makes val_pos_err plateau under the hard
+        #   constraint). tanh bounds the correction; alpha caps its magnitude.
+        self.so_correction_alpha = float(so_correction_alpha)
+        # second-order coupling (None => disabled, original behaviour)
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # CRITICAL: the model works in SCALED units, but the kinematic
+            # identity d/dt(pos)=vel holds in PHYSICAL units. With a
+            # StandardScaler (x_s=(x-mu)/sigma), the correct scaled-space
+            # position derivative is
+            #     xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + (mu_vel/sigma_pos)
+            # NOT vel_s. We precompute the per-axis ratio and offset. If no
+            # scaler stats are supplied we assume physical units (ratio=1,
+            # offset=0), recovering the naive constraint.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.so_ratio = None
+                self.so_offset = None
+                self.scaled_space = False
+        else:
+            self.pos_idx = None
+            self.vel_idx = None
+
+    def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(t, h)
+        if self.field_method == "central":
+            # Match the ONNX/deployment field EXACTLY: central finite difference
+            # of the decoder in the dh direction. Same formula and eps as
+            # GRUODEFieldForONNX so the trained field == the deployed field.
+            eps = self.fd_eps
+            x_plus = self.func.decode(h + eps * dh)
+            x_minus = self.func.decode(h - eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * eps)
+        else:
+            # exact forward-mode JVP (train-only; not reproducible in ONNX export)
+            _, xdot = _decoder_jvp(self.func.decode, h, dh)  # noqa: F821
+        if self.second_order:
+            # Kinematic term: d/dt(pos) = vel, expressed correctly in the model's
+            # units (scaled space => sigma_vel/sigma_pos * vel + mu_vel/sigma_pos).
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            if self.so_correction_alpha > 0.0:
+                # SOFT constraint: keep the kinematic term but add a bounded,
+                # learned correction taken from the decoder's own position
+                # derivative (which the hard constraint discards). tanh bounds
+                # it to (-1,1); alpha scales it.
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                correction = self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+                pos_deriv = vel_now + correction
+            else:
+                pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+        return xdot
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.func.state_vector_len:
+            x_core = x.narrow(-1, 0, self.func.state_vector_len)
+            xdot_core = self._field(t, x_core)
+            pad = torch.zeros(
+                *xdot_core.shape[:-1], self.aug_dim, dtype=xdot_core.dtype, device=xdot_core.device
+            )
+            return torch.cat((xdot_core, pad), dim=-1)
+        return self._field(t, x)
+
+
+
+class GRUBayes(torch.nn.Module):
+    """OPT-IN Bayesian jump update (paper §2.3, Eq. 4 + App. D fprep).
+
+    Only used when genuinely sporadic / masked observations are present. Given
+    the pre-jump latent h(t-), an observation y[k] and its mask m[k], it
+    produces a discrete update h(t+) = GRU(h(t-), fprep(y, m, h)). Because
+    GRU-ODE keeps h ∈ [-1,1], a standard GRUCell is range-compatible.
+
+    The trainer leaves this dormant for the current uniformly-resampled,
+    fully-observed pipeline; it is provided so the architecture is complete and
+    activates without code changes once masked inputs are wired in.
+    """
+
+    def __init__(self, latent_dim: int, obs_dim: int, prep_hidden: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.obs_dim = obs_dim
+        # fprep: per-dimension [θ (mean,logvar), y, (y-μ)/σ] -> prep_hidden, ReLU,
+        # zeroed where unobserved. Implemented as a grouped linear over dims.
+        self.obs_to_theta = torch.nn.Linear(latent_dim, 2 * obs_dim)  # fobs: μ, logσ²
+        self.prep = torch.nn.Linear(4 * obs_dim, prep_hidden * obs_dim)
+        self.gru = torch.nn.GRUCell(prep_hidden * obs_dim, latent_dim)
+
+    def fobs(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        theta = self.obs_to_theta(h)
+        mu, logvar = theta.chunk(2, dim=-1)
+        return mu, logvar
+
+    def forward(self, h_minus: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        mu, logvar = self.fobs(h_minus)
+        sigma = torch.exp(0.5 * logvar)
+        norm_err = (y - mu) / (sigma + 1e-6)
+        # Per-dim feature vector q_d = [μ, logσ², y, norm_err], masked.
+        q = torch.cat([mu, logvar, y, norm_err], dim=-1)
+        q = torch.relu(self.prep(q))
+        # Zero out contributions where there was no observation.
+        m_rep = m.repeat_interleave(self.prep.out_features // self.obs_dim, dim=-1)
+        q = q * m_rep
+        h_plus = self.gru(q, h_minus)
+        # Re-bound to the GRU-ODE operating region (defensive; GRUCell ≈ in-range).
+        return torch.tanh(h_plus)
 
 
 # wrap the sklearn StandardScalar
@@ -327,13 +759,24 @@ def train_NEXT(
     )
     # ode_solver = EulerSolver(dt=trajectory_dt)
     # ode_solver = RK4Solver(dt=trajectory_dt)
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
+    # Fixed-step RK4 with adjoint=False stores the forward graph for exact, fast
+    # gradients — appropriate here because the GRU-ODE field is K=2 Lipschitz, so
+    # a fixed step is numerically stable. Tradeoffs for GRU-ODE specifically:
+    #   * method="dopri5": adaptive step — fewer evals on smooth stretches, more
+    #     near sharp dynamics; better stability at the cost of variable runtime.
+    #   * adjoint=True: O(1) memory in the number of steps (recompute on the
+    #     backward pass) — switch this on if long horizons OOM the GPU; it trades
+    #     memory for ~2x compute and is the setting the paper uses for big latents.
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
 
     if frame == "dcu":
         velocity_indicies = (3, 4, 5)
     elif frame == "grdth":
         velocity_indicies = (2, 3, 4)
     elif frame == "geodesic":
+        # 6-state ("original") geodesic pairs like DCU; 5-state ("integrated"
+        # frame trick) [s,h,v_s,v_alpha,v_h] has GRDTH-like unbalanced layout:
+        # positions s,h at 0,1; "velocities" v_s,v_alpha,v_h at 2,3,4.
         velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
     else:
         raise ValueError("That frame is not known for what the velocity indicies are")
@@ -347,9 +790,43 @@ def train_NEXT(
     #     scaler=scaler_traj if use_scalar else None,
     #     N_FEATURES=model_states,
     # )
-    loss_func = WrappedMSELoss(
-        height_idx=1,  # This changes for GRDTH frame
-        vel_indices=velocity_indicies,  # This changes for GRDTH frame
+
+    # loss_func = WrappedMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    # )
+
+    # loss_func = PhysicsSplitMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     dt=trajectory_dt,
+    #     pos_weight=1.0,
+    #     vel_weight=2.0,
+    #     physics_weight=0,
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    # )
+
+    loss_func = PhysicsSplitMSELoss(
+        # height_idx: altitude index by frame. DCU/6-state geodesic: 'Up' at 2.
+        # 5-state "integrated" geodesic [s,h,v_s,v_alpha,v_h]: 'h' at 1.
+        # GRDTH [GR,Down,...]: 'Down' at 1. Currently inert (only EnergyMSELoss
+        # consumes it) but set correctly for any future energy term.
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        dt=trajectory_dt,
+        pos_weight=1.0,
+        vel_weight=3.0,        # glide: velocity is the laggard AND now feeds position
+        physics_weight=0.0,    # second-order model makes the soft residual redundant
+        # R2: late-weighted position term. Penalizes accumulated drift (the small
+        # velocity BIAS that integrates into large end-of-trajectory position
+        # error, invisible to flat MSE). Start late_weight~1.0, late_power=2.0
+        # (emphasize the trajectory end); set late_weight=0.0 to A/B against the
+        # current result. Sweep late_weight in {0.5, 1.0, 2.0}.
+        late_weight=1.0,
+        late_power=2.0,
         scaler=scaler_traj if use_scalar else None,
         N_FEATURES=model_states,
     )
@@ -430,6 +907,132 @@ def train_NEXT(
             aug_dim=0,
             order_shift_slice=slice(3, 6),
         ).to(node.device)
+    elif model_type in ("gruode", "gruode-min"):
+        # ------------------------------------------------------------
+        #  GRU-ODE forecaster (De Brouwer et al., 2019).
+        #  Bounded latent vector field; encode → ∫GRU-ODE → decode.
+        #  'gruode'     -> full GRU-ODE cell
+        #  'gruode-min' -> minimal GRU-ODE cell (fewer params)
+        # ------------------------------------------------------------
+        minimal = model_type == "gruode-min"
+        # Latent dimension: default to a comfortable lift above the physical
+        # state. nhidden controls the encoder/decoder MLP width.
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+
+        # --- Encoder-input selection (position-invariance experiment) --------
+        # Choose which state components feed the dynamics encoder. Absolute
+        # horizontal position is translation-variant and dynamically irrelevant;
+        # dropping it should improve generalization (and thus val position via
+        # the integrated velocity) without a pos/vel tradeoff.
+        #   "keep_alt"  : drop horizontal position, KEEP altitude + velocity
+        #   "vel_only"  : velocity only (SME proposal)
+        #   "all"       : original behaviour (full state)
+        ENCODER_INPUT_MODE = "all"   # "keep_alt"/"vel_only" tested WORSE than "all"
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            # state = [Down, Cross, Up(alt), dotD, dotC, dotU]
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [2, 3, 4, 5]        # Up + all velocities
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [3, 4, 5]           # velocities only
+            else:
+                enc_in_idx = None                # all 6
+        elif frame == "geodesic" and model_states == 5:
+            # integrated [s, h(alt), v_s, v_alpha, v_h]: keep_alt drops range s.
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        # drop s (range); keep h + rates
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           # rates only
+            else:
+                enc_in_idx = None
+        elif frame == "grdth":
+            # state = [GR, Down, dotGR, dotD, VTheta]; Down is altitude-like.
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        # drop GR (horizontal range)
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           # rates only
+            else:
+                enc_in_idx = None
+        else:
+            enc_in_idx = None
+
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=minimal,
+            encoder_input_idx=enc_in_idx,
+        ).to(node.device)
+        if frame == "dcu":
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 6:
+            # 6-state "original" geodesic pairs like DCU
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            # 5-state "integrated" frame trick [s, h, v_s, v_alpha, v_h]:
+            # s(0) integrates v_s(2); h(1) integrates v_h(4); v_alpha(3) is an
+            # azimuth RATE with no paired position -> left to the network.
+            # Note the NON-CONTIGUOUS vel pairing [2,4]; the constraint code
+            # gathers by index so this is handled correctly.
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]      # idx 4 (VTheta) left to the network
+        else:
+            pos_idx, vel_idx = None, None          # constraint off
+
+        # Scaler stats for the scaled-space second-order correction. The model
+        # operates in StandardScaler-scaled units, so d/dt(pos)=vel must be
+        # expressed as xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + mu_vel/sigma_pos.
+        # Without these, the constraint is dimensionally wrong (see _field).
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
+        # Soft-constraint correction magnitude. 0.0 = hard constraint (position
+        # is purely the velocity integral -> val_pos_err plateaus once velocity
+        # stops improving). Small positive alpha lets the network add a bounded
+        # position-derivative correction so it can pull position back toward
+        # truth. Start ~0.1 (scaled units); sweep 0.05-0.3. Set 0.0 to A/B
+        # against the current hard-constraint result.
+        SO_CORRECTION_ALPHA = 0.1
+
+        # Train/deploy field parity (reviewer R1). "central" makes the trained
+        # field identical to the ONNX/deployed field (removes the JVP-vs-FD
+        # mismatch on the position-derivative correction). "jvp" = exact,
+        # train-only. Experiment plan: A/B (alpha=0.1, "central") vs
+        # (alpha=0.0, "central") first; the latter is the pure hard constraint
+        # with guaranteed parity.
+        FIELD_METHOD = "central"
+
+        node.model = GRUODELatentModel(
+            func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
+            pos_idx=pos_idx, vel_idx=vel_idx,
+            pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
+            so_correction_alpha=SO_CORRECTION_ALPHA,
+            field_method=FIELD_METHOD,
+        ).to(node.device)
+        # Optional JIT compilation of the field for extra GPU throughput.
+        # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
+        # solver's autograd path (especially adjoint) and the forward-mode JVP;
+        # we use mode="reduce-overhead" (CUDA graphs) and fall back silently if
+        # the backend can't trace the graph on this torch/driver combo.
+        if HAVE_GPU and os.environ.get("NEXT_COMPILE", "0") == "1":
+            try:
+                node.model = torch.compile(node.model, mode="reduce-overhead", fullgraph=False)
+                print("torch.compile enabled for GRU-ODE field (reduce-overhead)")
+            except Exception as e:
+                print(f"torch.compile unavailable, running eager: {e}")
+        # The GRU-ODE forecaster outputs a physical-state trajectory directly,
+        # so the existing physical-space loss (WrappedMSELoss, already assigned
+        # to loss_func above) applies unchanged. The structural boundedness of
+        # the latent state supplies the trajectory-stabilisation prior that
+        # otherwise required an explicit boundary penalty.
+        #
+        # Optional: couple a light physical boundary / energy penalty by
+        # swapping loss_func for EnergyMSELoss above — the GRU-ODE recon is a
+        # drop-in target for any of the existing loss wrappers.
     elif model_type == "latentode":
         # ------------------------------------------------------------
         #  Latent-ODE model – a completely different object
@@ -511,16 +1114,29 @@ def train_NEXT(
             #   `fraction_of_data_val` with these lists.
 
         # length strategies is a trick from NODE literature to initialize the model on shorter time frames
+        #
+        # Early-stopper tuning for the mini-batched (noisy) regime:
+        #   * min_delta must sit ABOVE the val_loss noise floor. With ~2-6
+        #     batches/epoch the val_loss bounces ~+/-0.02-0.05; the old
+        #     min_delta=5e-6 treated a 0.000005 non-improvement as a strike, so
+        #     runs early-stopped on pure noise (the after-run died at ~57 epochs
+        #     while still improving). 1e-2 lets normal bounces pass.
+        #   * patience must be LARGE enough to (a) ride out noisy non-improving
+        #     epochs and (b) exceed the ReduceLROnPlateau patience so the LR gets
+        #     to drop and help BEFORE the stopper fires. The scheduler (applied
+        #     on the 1.0 stages) uses patience = early_stop_patience // 2, so an
+        #     early-stop patience of 60 gives the scheduler (~30) a full cycle
+        #     plus recovery room before stopping.
         length_strategies = [
-            (0.1, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.5, 3000, EarlyStopper(20, 5e-5, metric_name=early_stop_metric_name), 1e-4),
-            (0.7, 2000, EarlyStopper(20, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-3),
+            (0.1, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-3),
             # TODO: get rid of this one when the ReduceOnPlateau lr scheduler is working
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 5000, EarlyStopper(50, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-7),
         ]
 
         for len_strat in length_strategies:
@@ -605,15 +1221,60 @@ def train_NEXT(
 
     # TODO: move this conversion to a separate script
     # export the model to ONNX binary (protobuf) format
-    if isinstance(ode_solver, TorchdiffeqSolver):
+    #
+    # For GRU-ODE we export through GRUODEFieldForONNX, which exposes the induced
+    # physical-space field ẋ = f(x) WITHOUT any autograd JVP (it uses a central
+    # finite difference through the decoder). This is required because the
+    # torch.export-based ONNX exporter cannot trace autograd.functional.jvp /
+    # torch.func.jvp (it fails with "unbacked symbol" AssertionErrors). The
+    # adapter takes a single tensor and returns the physical derivative, the
+    # same contract the sim and other NODE exports use.
+    #
+    # Unwrap torch.compile (if enabled) to get the raw module before export.
+    raw_model = getattr(node.model, "_orig_mod", node.model)
+    if isinstance(raw_model, GRUODELatentModel):
+        # Pull the second-order config (and its scaled-space correction stats)
+        # off the constructed model so this works regardless of whether the
+        # model was just built or loaded from disk, and regardless of the local
+        # pos_idx/vel_idx scope.
+        if getattr(raw_model, "second_order", False):
+            _pos_idx = raw_model.pos_idx.tolist()
+            _vel_idx = raw_model.vel_idx.tolist()
+            _pos_scale = raw_model.so_ratio is not None and getattr(raw_model, "scaled_space", False)
+            if getattr(raw_model, "scaled_space", False):
+                # reconstruct the per-block sigma/mu the adapter needs from the
+                # ratio/offset buffers is lossy; instead re-derive from scaler.
+                _ps = scaler_traj.scale_[_pos_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vs = scaler_traj.scale_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vm = scaler_traj.mean_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+            else:
+                _ps = _vs = _vm = None
+        else:
+            _pos_idx = _vel_idx = None
+            _ps = _vs = _vm = None
+        # carry the soft-correction alpha off the trained model so the exported
+        # field is identical to what was trained
+        _alpha = getattr(raw_model, "so_correction_alpha", 0.0)
+        export_model = GRUODEFieldForONNX(
+            raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
+            pos_idx=_pos_idx, vel_idx=_vel_idx,
+            pos_scale=_ps, vel_scale=_vs, vel_mean=_vm,
+            so_correction_alpha=_alpha,
+        ).to(node.device).eval()
+        example_input = torch.cat(
+            (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
+        ).to(node.device)
+    elif isinstance(ode_solver, TorchdiffeqSolver):
+        export_model = node.model
         example_input = (
             None,
             torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device),
         )
     else:
+        export_model = node.model
         example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
     model_onx = torch.onnx.export(
-        node.model,
+        export_model,
         example_input,
         os.path.join(model_save_path, model_name + ".onnx"),
         export_params=True,
@@ -709,54 +1370,7 @@ def prep_trajectory(x):
     while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
         ecef_data = ecef_data[1:]
 
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # BEGIN SBI HighE HGV handling
-    # remove launch phase from SBI
-    # end_of_launch_index = 122  # SBI HighE HGV
-    end_of_launch_index = 62  # SBI LowE 3f39bfb6 HGV and for the 555063a9 too?
-
-    # write the boost out to CSV
-    # boost_ecef = ecef_data[:end_of_launch_index]
-    sbi_target_name = "LowE_555063a9_HGV"
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "boost"), exist_ok=True)
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "impact"), exist_ok=True)
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "glide"), exist_ok=True)
-    # pd.DataFrame(boost_ecef, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-    #     Path("SBI_boost-glide", sbi_target_name, "boost", traj_number), index=False
-    # )
-    # impact_slice = np.atleast_2d(ecef_data[-1])
-    # df = pd.DataFrame(impact_slice)
-    # print("baaa", df)
-    # pd.DataFrame(impact_slice, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-    #     Path("SBI_boost-glide", sbi_target_name, "impact", traj_number), index=False
-    # )
-
-    # ecef_data = ecef_data[end_of_launch_index:]
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
+   
     sr_ecef_data = np.asarray(
         tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
         # tuple(x for x in ecef_data if 2500e3 < np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
@@ -831,33 +1445,7 @@ def prep_trajectory(x):
         )
         # Prepend time and only include pos and vel
         next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
-        # SBI HighE HGV special things
-        # # limit by altitude to remove exo flight
-        # remove_exo_index = next_frame_data[:, 3] < 100e3
-        # next_frame_data = next_frame_data[remove_exo_index]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_exo_index]
-        # # limit by altitude to remove terminal flight
-        # remove_terminal_index = next_frame_data[:, 3] > 15e3
-        # next_frame_data = next_frame_data[remove_terminal_index]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_terminal_index]
-        # # check for time jumps
-        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        # # remove everything before the time jump
-        # time_jump_index = np.argmax(time_diffs) + 2
-        # next_frame_data = next_frame_data[time_jump_index:]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[time_jump_index:]
-        # # recalc for the check
-        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        # if np.any(time_diffs > trajectory_dt):
-        #     print("time diffs are weird", time_diffs)
-        #     raise ValueError("woah there! we've got a time gap")
-        # check_ecef = local_geodesic_to_ecef_vec(
-        #     np.hstack([next_frame_data, np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE])]), ref_ecef
-        # )
-        # write the glide out to a csv
-        # pd.DataFrame(resampled_sr_ecef_data, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-        #     Path("SBI_boost-glide", sbi_target_name, "glide", traj_number), index=False
-        # )
+        
     elif args.frame == "dcu":
         # convert ecef truth to the training frame
         next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
@@ -899,7 +1487,7 @@ def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
     # tempory piece of code for the phase SBI modeling
     boost_ecef = []
     glide_ecef = []
-    impact_ecef = []
+    dest_ecef = []
     target_path = Path(path)
     for phase in ["boost", "glide", "impact"]:
         phase_path = target_path / phase
@@ -928,7 +1516,7 @@ def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
         elif phase == "glide":
             glide_ecef = traj_targets
         elif phase == "impact":
-            impact_ecef = traj_targets
+            dest_ecef = traj_targets
         else:
             raise NotImplementedError("That phase is not handled yet.")
 
@@ -936,7 +1524,7 @@ def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
         # return data in ECEF frame
         return list(
             zip(
-                list(zip(boost_ecef, glide_ecef, impact_ecef)),
+                list(zip(boost_ecef, glide_ecef, dest_ecef)),
                 [x.name for x in traj_files],
             )
         )  # this return is here for the temporary SBI support
@@ -967,7 +1555,7 @@ def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
     #         )
     #         exit()
 
-    print("post-prep. how many made it though prep", len(tmp_data))
+    print("post-prep. how many made it though prep", len(traj_targets))
     return tmp_data
 
 
@@ -1018,11 +1606,6 @@ def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, da
         raise ValueError("`data` must be a 2-D array (samples x columns).")
 
     n_cols = data.shape[1]
-    labels = [f"Column {i}" for i in range(n_cols)]
-    if column_names is not None:
-        labels = list(column_names[:n_cols])
-        if len(labels) < n_cols:
-            labels.extend([f"Column {i}" for i in range(len(labels), n_cols)])
 
     # Choose a layout that keeps subplots readable.
     # Up to 5 columns → a single row, otherwise wrap to multiple rows.
@@ -1047,7 +1630,10 @@ def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, da
         # Plot histogram - `density=True` gives a probability density (area = 1)
         ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
 
-        ax.set_title(labels[idx])
+        if column_names is None:
+            ax.set_title(f"Column {idx}")
+        else:
+            ax.set_title(column_names[idx])
         ax.set_xlabel("Value")
         ax.set_ylabel("Density")
         # Each axis gets its own y-scale automatically
@@ -1100,12 +1686,9 @@ def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_name
     sns.heatmap(
         corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5
     )
-    n_cols = corr.shape[0]
-    labels = [f"Col {i}" for i in range(n_cols)]
+    labels = [f"Col {i}" for i in range(corr.shape[0])]
     if column_names is not None:
-        labels = list(column_names[:n_cols])
-        if len(labels) < n_cols:
-            labels.extend([f"Col {i}" for i in range(len(labels), n_cols)])
+        labels = column_names
     plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
     plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
     plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
@@ -1142,6 +1725,7 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
     )
 
     ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
+
     # Changing the reference frame to be at the end of the desired phase rather than impact
     if args.ref_ecef == "boost":
         ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
@@ -1162,26 +1746,30 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
         # check the inverse transform
         check_ecef = next_grdth_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading)
     elif args.frame == "geodesic":
-        # for this exmple we will use the geodesic transform
-        if args.geodesic_mode == "original":
+        # Two geodesic modes (see --geodesic-mode):
+        #   original   -> 6-state [s, az, h, v_s, v_alpha, v_h] (azimuth in state)
+        #   integrated -> 5-state [s, h, v_s, v_alpha, v_h] (azimuth dropped; the
+        #                 "frame trick": track azimuth RATE, better conditioned)
+        if getattr(args, "geodesic_mode", "original") == "original":
             timeseries_in_next_frame = ecef_to_local_geodesic_vec(
                 resampled_timeseries[:, POS_SLICE],
                 resampled_timeseries[:, VEL_SLICE],
                 np.zeros_like(
                     resampled_timeseries[:, VEL_SLICE]
                 ),  # TODO: better handling of acceleration being in the transform functions
-                ref_ecef,  # grap the impact point as the reference ecef point
+                ref_ecef,  # grab the impact point as the reference ecef point
             )
-            # Prepend time and only include pos and vel (only needed for the geodesic transform. the DCU and GRDTH functions handle time internally)
+            # Prepend time; keep pos+vel (6 cols). DCU/GRDTH handle time internally.
             timeseries_in_next_frame = np.hstack(
                 [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
             )
-        else:
+        else:  # integrated
             timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
                 resampled_timeseries[:, POS_SLICE],
                 resampled_timeseries[:, VEL_SLICE],
                 ref_ecef,
             )
+            # 5-state result [s, h, v_s, v_alpha, v_h]; prepend time.
             timeseries_in_next_frame = np.hstack(
                 [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state]
             )
@@ -1191,6 +1779,141 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
 
     # output is a 2d array with the same columns
     return timeseries_in_next_frame
+
+
+class GRUODEFieldForONNX(torch.nn.Module):
+    def __init__(
+        self,
+        func,                 # GRUODEFunc
+        state_vector_len: int,
+        aug_dim: int = 0,
+        eps: float = 1e-4,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        so_correction_alpha: float = 0.0,
+    ):
+        super().__init__()
+        self.func = func
+        self.state_vector_len = state_vector_len
+        self.aug_dim = aug_dim
+        self.eps = eps
+        self.so_correction_alpha = float(so_correction_alpha)
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # Must mirror GRUODELatentModel's scaled-space correction exactly,
+            # or the exported field disagrees with the trained field.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
+            x_phys = x.narrow(-1, 0, self.state_vector_len)
+        else:
+            x_phys = x
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(0.0, h)
+        x_plus = self.func.decode(h + self.eps * dh)
+        x_minus = self.func.decode(h - self.eps * dh)
+        xdot = (x_plus - x_minus) / (2.0 * self.eps)
+        if self.second_order:
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            if self.so_correction_alpha > 0.0:
+                # mirror GRUODELatentModel._field's soft correction exactly
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                vel_now = vel_now + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
+        return xdot
+
+
+def augment_trajectory_segments(
+    traj_list,
+    segments_per_traj: int = 5,
+    min_segment_len: int = 12,
+    keep_full: bool = True,
+):
+    """Trajectory-segment augmentation for the small-data (few-trajectory) regime.
+
+    From each (T, D) trajectory, emit several sub-trajectories that start at
+    different offsets along it. This multiplies the effective sample count and,
+    more importantly, teaches the dynamics to propagate from MANY initial
+    conditions (arbitrary mid-glide states) rather than only the handful of
+    launch states -- which is what a 96-trajectory training set otherwise
+    limits the model to.
+
+    Design choices (see conversation): SLIDING-WINDOW offsets (deterministic /
+    reproducible, even coverage -- important since the rest of the pipeline is
+    seeded and we want run-to-run comparability), the FULL trajectory always
+    kept (augmentation is purely additive, never destructive), and a minimum
+    segment length so the length-strategy curriculum (which further slices from
+    the front) can't drive a segment below the usable floor.
+
+    Segments stay in the ORIGINAL frame (NOT re-referenced to their own start):
+    a mid-trajectory segment legitimately begins at a large position offset,
+    and batch_loss uses that first point as the true IC -- exactly the
+    "propagate from an arbitrary state" signal we want, and consistent with how
+    the sim integrates.
+
+    IMPORTANT: apply to TRAINING data only. Never augment validation (keep it as
+    held-out full trajectories so val metrics remain comparable across runs).
+    Also fit the scaler on the ORIGINAL (un-augmented) data so overlapping
+    segments don't reweight the normalisation statistics.
+
+    Args:
+        traj_list: list of (T, D) tensors (training trajectories).
+        segments_per_traj: target number of segments per trajectory INCLUDING
+            the full one. ~5-6 is the sweet spot for ~100 trajectories: enough
+            new initial conditions to matter, not so much overlap that highly
+            correlated segments inflate size without diversity.
+        min_segment_len: shortest segment (in timesteps) to emit.
+        keep_full: always include the untouched full trajectory.
+
+    Returns:
+        A new, longer list of (T_i, D) tensors.
+    """
+    out = []
+    for traj in traj_list:
+        T = traj.shape[0]
+        if keep_full:
+            out.append(traj)
+        # how many ADDITIONAL offset segments to add
+        n_extra = max(0, segments_per_traj - (1 if keep_full else 0))
+        if n_extra == 0 or T <= min_segment_len:
+            continue
+        # evenly spaced start offsets across the first ~70% of the trajectory,
+        # so each segment still has a meaningful remaining horizon to learn from.
+        last_start = max(1, int(0.7 * T))
+        # guard: don't start so late the segment is shorter than the minimum
+        last_start = min(last_start, T - min_segment_len)
+        if last_start < 1:
+            continue
+        for k in range(1, n_extra + 1):
+            start = int(round(k / (n_extra + 1) * last_start))
+            if start < 1:
+                start = 1
+            seg = traj[start:]
+            if seg.shape[0] >= min_segment_len:
+                out.append(seg)
+    return out
 
 
 def main():
@@ -1203,14 +1926,14 @@ def main():
         default=[],
         type=str,
         nargs="+",
-        help="A list of directories where training data can be found. Data will be test/train split if validation data is not provided. It is suggested thet the final directory in the path be named for the target. Ex: datasets/train/PrSM",
+        help="A list of directories where training data can be found. Data will be test/train split if validation data is not provided. It is suggested thet the final directory in the path be named for the target. ",
     )
     parser.add_argument(
         "--validation-data-paths",
         default=[],
         type=str,
         nargs="+",
-        help="A list of directories where validation data can be found. Helpful for when the test/train split has already been done. Ex: datasets/test/PrSM",
+        help="A list of directories where validation data can be found. Helpful for when the test/train split has already been done. ",
     )
     # parser.add_argument("--max-epoch", default=50, type=int)
     parser.add_argument(
@@ -1236,6 +1959,16 @@ def main():
         default="dcu",
         choices=["dcu", "grdth", "geodesic"],
         help="Select which frame to put the data in for training the model",
+    )
+    parser.add_argument(
+        "--geodesic-mode",
+        default="original",
+        choices=["original", "integrated"],
+        help=(
+            "Geodesic frame mode: 'original' keeps azimuth in state (6-state "
+            "[s,az,h,v_s,v_alpha,v_h]); 'integrated' drops azimuth and tracks "
+            "azimuth rate (5-state [s,h,v_s,v_alpha,v_h], the 'frame trick')."
+        ),
     )
     parser.add_argument(
         "--sbi-phase",
@@ -1266,8 +1999,8 @@ def main():
     parser.add_argument(
         "--model-type",
         default="node",
-        choices=["node", "anode", "sonode", "latentode"],
-        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE or Latent-ODE.",
+        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"],
+        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, GRU-ODE, or minimal GRU-ODE.",
     )
     parser.add_argument(
         "--dt",
@@ -1281,19 +2014,16 @@ def main():
         choices=["boost", "glide", "impact"],
         help="The reference point for the frame transformations",
     )
-    parser.add_argument(
-        "--geodesic-mode",
-        default="original",
-        choices=["original", "integrated"],
-        help="Geodesic frame mode: original keeps azimuth in state (6-state), integrated drops azimuth and reconstructs from v_alpha (5-state).",
-    )
-
+    
     args = parser.parse_args()
 
     model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
     if args.frame == "grdth":
         model_states = 5
     elif args.frame == "geodesic" and args.geodesic_mode == "integrated":
+        # The "frame trick": integrated geodesic drops absolute azimuth and
+        # tracks azimuth rate -> 5-state [s, h, v_s, v_alpha, v_h]. (This
+        # resolves the long-standing "geodesic should also be 5" TODO.)
         model_states = 5
 
     trajectory_dt = args.dt  # [s]
@@ -1309,17 +2039,28 @@ def main():
     model_path = args.o
     model_save_path = os.path.join(model_path, model_name_target_str)
 
-    batch_size = 512  # increase the number when more RAM is available
+    # Batch size trades gradient noise (regularizing, helped escape the original
+    # single-batch plateau) against loss whipsaw (which was tripping the early
+    # stopper prematurely at ~57 epochs). With ~96 training trajectories:
+    #   16 -> ~6 batches/epoch (noisy, whipsaws val_loss)
+    #   48 -> ~2 batches/epoch (smoother, keeps a little regularizing noise)
+    #   96+ -> single full batch (smoothest/deterministic, no noise regulariser)
+    # 48 is the sweet spot for this dataset; raise toward full-batch only if the
+    # loss is still too noisy after the early-stopper change below.
+    batch_size = 48
     if HAVE_HIGH_MEMORY:
-        batch_size = 1024
+        batch_size = 48
+
+    # batch_size = 16          # previous: noisier, early-stopped on whipsaw
+    # batch_size = 512  # increase the number when more RAM is available
+    # if HAVE_HIGH_MEMORY:
+    #     batch_size = 1024
 
     # TODO: make an object to hold the data and the metadata
-
     frame_tag = args.frame
     if args.frame == "geodesic":
         frame_tag = f"geodesic-{args.geodesic_mode}"
     model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
-
     if args.use_scalar:
         model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
 
@@ -1374,7 +2115,7 @@ def main():
     ) as f:
         json.dump(split_dict, f)
 
-    # NOTE: For SBI, at this point in the script the traj_targets_train and traj_targets_test variables are a size 3 tuple. The tuple is boost_ecef, glide_ecef, and impact_ecef.
+    # NOTE: For SBI, at this point in the script the traj_targets_train and traj_targets_test variables are a size 3 tuple. The tuple is boost_ecef, glide_ecef, and dest_ecef.
     # print(traj_targets_train[0])
     phase_to_model = args.sbi_phase
     traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
@@ -1428,13 +2169,13 @@ def main():
         )
 
     stacked_posvel = np.vstack(traj_targets_train_posvel)
-    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]  # dcu default
+    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
     if args.frame == "grdth":
         column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
     elif args.frame == "geodesic":
         if args.geodesic_mode == "integrated":
             column_names = ["s", "h", "v_s", "v_alpha", "v_h"]
-        else:  # original
+        else:  # original 6-state
             column_names = ["s", "az", "h", "v_s", "v_alpha", "v_h"]
     plot_column_distributions(
         stacked_posvel,
@@ -1463,6 +2204,27 @@ def main():
 
     scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
 
+    # --- Trajectory-segment augmentation (training only) --------------------
+    # Attacks the core ceiling: only ~96 training trajectories. Emits several
+    # sub-trajectories per trajectory (different start offsets) so the model
+    # learns to propagate from many initial conditions, not just launch states.
+    # Applied AFTER the scaler is fit (so overlapping segments don't reweight
+    # the normalisation stats) and NOT to validation (so val stays comparable).
+    # Set AUGMENT_SEGMENTS = 1 (or keep_full only) to disable.
+    AUGMENT_SEGMENTS = 5  # segments per trajectory incl. the full one; 1 = off
+    if AUGMENT_SEGMENTS > 1:
+        n_before = len(traj_targets_train_posvel)
+        traj_targets_train_posvel = augment_trajectory_segments(
+            traj_targets_train_posvel,
+            segments_per_traj=AUGMENT_SEGMENTS,
+            min_segment_len=12,
+            keep_full=True,
+        )
+        print(
+            f"segment augmentation: {n_before} -> {len(traj_targets_train_posvel)} "
+            f"training trajectories (val left at {len(traj_targets_test_posvel)})"
+        )
+
     # call training a model on the data
     # TODO: why does this return the model name? shouldn't that be an input?
     # train_NEXT(traj_targets_train, traj_targets_test, max_epochs, scaler_traj)
@@ -1487,864 +2249,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    ned_data[:, 2] = grdth_data[:, GR_INDEX] * S_theta
-    # gr_dot_ortho = grdth_data[:, GR_INDEX] * grdth_data[:, THETA_DOT_INDEX]  # radius * omega
-    gr_dot_ortho = grdth_data[:, THETA_DOT_INDEX]  # V_theta
-    for i in range(grdth_data.shape[0]):
-        # velocity
-        # TODO: this needs to be a rotation about R3. use an einsum when taking away the for loop
-        ned_data[i, 4:6] = np.matmul(
-            np.array(((C_theta[i], -S_theta[i]), (S_theta[i], C_theta[i]))),
-            np.array((grdth_data[i, GR_DOT_INDEX], gr_dot_ortho[i])),
-        )
-        # gr_dot = grdth_data[i, 2]
-        # vel_north = (
-        #     C_theta[i] * gr_dot - S_theta[i] * gr_dot_ortho[i]
-        #     # + (  # ignore this correction term. there are better ways to do this
-        #     #     grdth_data[i, 0]
-        #     #     * (
-        #     #         np.gradient(grdth_data[:, 2], grdth_data[:, 0])[i]
-        #     #         - (2 * grdth_data[i, 3] * gr_dot * S_theta[i])
-        #     #         - (
-        #     #             np.gradient(grdth_data[:, 3], grdth_data[:, 0])[i]
-        #     #             * grdth_data[i, 1]
-        #     #             * S_theta[i]
-        #     #         )
-        #     #         - ((grdth_data[i, 3] ** 2) * grdth_data[i, 1] * C_theta[i])
-        #     #     )
-        #     # )
-        # )
-        # vel_east = S_theta[i] * gr_dot + C_theta[i] * gr_dot_ortho[i]
-        # ned_data[i, 4] = vel_north
-        # ned_data[i, 5] = vel_east
-
-    # NED to ECEF
-    ecef_data = np.empty_like(ned_data)
-    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]  # time
-    for i in range(ecef_data.shape[0]):
-        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
-        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
-    return ecef_data
-
-
-def ecef_to_next_grdth(ecef_data, ref_ecef):
-    # ecef_data: expected to be [time, pos x3, vel x3]
-    # get the input point as the ECEF reference point
-    # careful with the pointers
-    ref_point = deepcopy(ref_ecef)
-    ecef_data = np.atleast_2d(ecef_data)
-
-    # convert all of the ECEF data to local NED relative to the reference point
-    ned_data = deepcopy(ecef_data)
-    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    for i in range(ecef_data.shape[0]):
-        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
-        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
-        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
-        #     ecef_data[i, acc_slice], ref_point
-        # )
-    # print("please be ned", ned_data)
-
-    # TODO: throw away the velocity data and do a numpy gradient to recreate it.
-
-    # convert traj from NED to GRDTH
-    gr = np.linalg.norm(ned_data[:, 1:3], axis=1)
-    # print("gr", gr)
-    # 2d orthogonal vector. same thing as <N,E,0> cross <0,0,1>, but with fewer operations?
-    gr_orthogonal = np.array([-ned_data[:, 2], ned_data[:, 1]]).T
-    grdth_data = np.empty((ned_data.shape[0], 6))  # time plus GRDTH has 5 channels
-    # fill in the table for GRDTH frame
-    # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
-    grdth_data[:, TIME_INDEX] = ned_data[:, 0]  # time
-    grdth_data[:, GR_INDEX] = gr  # ground range
-    gr_speed = np.linalg.norm(ned_data[:, 4:6], axis=1)
-    # global theta_pre
-    theta_initial = np.arctan2(ned_data[0, 2], ned_data[0, 1])
-    # the einsums are doing the dot product of each row pair of vectors from each array
-    # C_theta = np.cos(theta_pre)
-    # S_theta = np.sin(theta_pre)
-    # for i in range(ned_data.shape[0]):
-    #     if gr[i] != 0:
-    #         grdth_data[i, 2] = np.dot(ned_data[i, 4:6], ned_data[i, 1:3]) / gr[i]
-    #         grdth_data[i, 3] = np.dot(ned_data[i, 4:6], gr_orthogonal[i]) / (gr[i] ** 2)
-    #     else:
-    #         grdth_data[i, 2] = gr_speed[i]
-    #         grdth_data[i, 3] = 0
-
-    grdth_data[:, GR_DOT_INDEX] = np.divide(
-        np.einsum("ij,ij->i", ned_data[:, 4:6], ned_data[:, 1:3]),
-        gr,
-        out=np.ones_like(gr) * gr_speed,  # force the data to come to the center
-        # where=gr != 0,
-        where=gr >= np.finfo(gr.dtype).eps,
-    ).squeeze()  # ground range dot
-    grdth_data[:, THETA_DOT_INDEX] = np.divide(
-        np.einsum("ij,ij->i", ned_data[:, 4:6], gr_orthogonal),
-        # gr**2,  # squared b/c V_orth = r*omega
-        gr,  # squared b/c V_orth = r*omega
-        # out=np.full_like(gr, np.finfo(gr.dtype).eps),
-        out=np.zeros_like(gr),  # no radial movement when close in
-        # where=gr != 0,
-        where=gr >= np.finfo(gr.dtype).eps,
-    ).squeeze()  # theta dot
-    grdth_data[:, DOWN_INDEX] = ned_data[:, 3]  # Down
-    grdth_data[:, DOWN_DOT_INDEX] = ned_data[:, 6]  # Downdot
-    # print("please be grdth", grdth_data.squeeze())
-    return grdth_data.squeeze(), theta_initial
-
-
-def ecef_to_next_dcu(ecef_data, ref_ecef):
-    # get the input point as the ECEF reference point
-    # careful with the pointers
-    ref_point = deepcopy(ref_ecef)
-    # print("ecef to next grdth ref ecef", ref_point)
-    ecef_data = np.atleast_2d(ecef_data)
-
-    # convert all of the ECEF data to local NED relative to the reference point
-    ned_data = deepcopy(ecef_data)
-    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    for i in range(ecef_data.shape[0]):
-        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
-        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
-        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
-        #     ecef_data[i, acc_slice], ref_point
-        # )
-
-    # threat anti-heading
-    # ref_heading = (np.arctan2(ned_data[0, 5], ned_data[0, 4])) % (2 * np.pi)
-    # threat position heading
-    ref_heading = (np.arctan2(ned_data[0, 2], ned_data[0, 1])) % (2 * np.pi)
-
-    # NED to DCU
-    dcu_data = np.empty_like(ned_data)
-    dcu_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
-    for i in range(ned_data.shape[0]):
-        dcu_data[i, POS_SLICE] = ned_to_dcu(ned_data[i, POS_SLICE], ref_heading)
-        dcu_data[i, VEL_SLICE] = ned_to_dcu(ned_data[i, VEL_SLICE], ref_heading)
-
-    # check for flip_c
-    do_flip_c = dcu_data[0, 2] < 0
-    if do_flip_c:
-        dcu_data = flip_c(dcu_data)
-
-    return dcu_data.squeeze(), ref_heading, do_flip_c
-
-
-def flip_c(dcu_state):
-    # change the sign of the cross range position and velocity
-    dcu_state[..., 2::3] = -dcu_state[..., 2::3]
-    return dcu_state
-
-
-def next_dcu_to_ecef(dcu_data, ref_ecef, ref_heading, do_flip_c):
-    if do_flip_c:
-        dcu_data = flip_c(dcu_data)
-
-    # DCU to NED
-    ned_data = np.empty_like(dcu_data)
-    ned_data[:, TIME_INDEX] = dcu_data[:, TIME_INDEX]
-    for i in range(dcu_data.shape[0]):
-        ned_data[i, POS_SLICE] = dcu_to_ned(dcu_data[i, POS_SLICE], ref_heading)
-        ned_data[i, VEL_SLICE] = dcu_to_ned(dcu_data[i, VEL_SLICE], ref_heading)
-
-    # NED to ECEF
-    ecef_data = np.empty_like(ned_data)
-    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
-    for i in range(ned_data.shape[0]):
-        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
-        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
-    return ecef_data.squeeze()
-
-
-# ----------------------------------------------------------------------
-# Global ellipsoid (WGS-84)
-# ----------------------------------------------------------------------
-WGS84 = Geodesic.WGS84
-a = WGS84.a  # semi-major axis (m)
-f = WGS84.f  # flattening
-b = a * (1 - f)  # semi-minor axis (m)
-
-
-# ----------------------------------------------------------------------
-# Simple helpers
-# ----------------------------------------------------------------------
-def deg2rad(x):
-    return np.deg2rad(x)
-
-
-def rad2deg(x):
-    return np.rad2deg(x)
-
-
-# ----------------------------------------------------------------------
-# 0. Geodetic ↔ ECEF (scalar - called inside vectorised loops)
-# ----------------------------------------------------------------------
-def ecef_to_geodetic(x, y, z):
-    """Scalar conversion using GeographicLib's exact algorithm."""
-    # lat, lon, h = Geodesic.WGS84._LatLonFromXYZ(x, y, z)
-    # return lat, lon, h
-    # TODO: Vermeille has a better method that Karney suggested updates to and then Vermeille updated in 2011. Update to using that rather than this Bowrank-like iterative method.
-    from coordinate_transform_functions import _ecef_to_lla
-
-    lat, lon, h, _ = _ecef_to_lla(np.hstack([x, y, z]), deg=True)
-
-    return lat, lon, h
-
-
-def geodetic_to_ecef(lat, lon, h):
-    """Scalar conversion (deg, deg, m) → (x, y, z) in metres."""
-    lat_rad = deg2rad(lat)
-    lon_rad = deg2rad(lon)
-
-    sin_phi = np.sin(lat_rad)
-    cos_phi = np.cos(lat_rad)
-    sin_lam = np.sin(lon_rad)
-    cos_lam = np.cos(lon_rad)
-
-    N = a / np.sqrt(1 - (2 * f - f**2) * sin_phi**2)
-    x = (N + h) * cos_phi * cos_lam
-    y = (N + h) * cos_phi * sin_lam
-    z = ((1 - f) ** 2 * N + h) * sin_phi
-    return x, y, z
-
-
-# ----------------------------------------------------------------------
-# 1. ENU rotation matrix (scalar - reused for a whole batch)
-# ----------------------------------------------------------------------
-def enu_rotation_matrix(lat0_rad, lon0_rad):
-    """Scalar rotation matrix from ECEF → ENU at (lat0,lon0) [radians]."""
-    sin_phi = np.sin(lat0_rad)
-    cos_phi = np.cos(lat0_rad)
-    sin_lam = np.sin(lon0_rad)
-    cos_lam = np.cos(lon0_rad)
-
-    R = np.array(
-        [
-            [-sin_lam, cos_lam, 0.0],
-            [-sin_phi * cos_lam, -sin_phi * sin_lam, cos_phi],
-            [cos_phi * cos_lam, cos_phi * sin_lam, sin_phi],
-        ]
-    )
-    return R
-
-
-# ----------------------------------------------------------------------
-# 2. Vectorised ENU conversion
-# ----------------------------------------------------------------------
-def _apply_rotation(R, vec):
-    """
-    Apply the same (3×3) rotation matrix `R` to an (N,3) array `vec`.
-    """
-    # Using @ works with both (3,3) @ (3,) and (3,3) @ (N,3).T
-    return (R @ vec.T).T
-
-
-def ecef_to_enu_vec(p_ecef, impact_ecef, lat0_deg, lon0_deg):
-    """
-    Convert an (N,3) array of ECEF positions to ENU centred at the impact point.
-    Returns an (N,3) array.
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-
-    delta = np.asarray(p_ecef) - np.asarray(impact_ecef)  # (N,3)
-    return _apply_rotation(R, delta)
-
-
-def ecef_vel_acc_to_enu_vec(v_ecef, a_ecef, lat0_deg, lon0_deg):
-    """
-    Convert (N,3) velocity and (N,3) acceleration arrays to ENU.
-    Returns two (N,3) arrays: (v_enu, a_enu).
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-
-    v_enu = _apply_rotation(R, v_ecef)
-    a_enu = _apply_rotation(R, a_ecef)
-    return v_enu, a_enu
-
-
-def enu_to_ecef_vec(p_enu, impact_ecef, lat0_deg, lon0_deg):
-    """
-    Inverse ENU → ECEF for an (N,3) array.
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-    # Inverse rotation = transpose because R is orthogonal
-    return impact_ecef + _apply_rotation(R.T, p_enu)
-
-
-# ----------------------------------------------------------------------
-# 3. Geodesic helpers (scalar)
-# ----------------------------------------------------------------------
-def inverse_geodesic(lat0, lon0, lat, lon):
-    """
-    Scalar inverse geodesic. Returns distance (m), forward azimuth (deg),
-    reverse azimuth (deg), reduced length m12 (m), geodesic scale M12 (-).
-    """
-    mask = Geodesic.DISTANCE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    inv = WGS84.Inverse(lat0, lon0, lat, lon, outmask=mask)
-    return inv["s12"], inv["azi1"], inv["azi2"], inv["m12"], inv["M12"]
-
-
-def forward_geodesic(lat0, lon0, s, azi):
-    """
-    Scalar forward geodesic. Returns destination lat, lon, reverse azimuth,
-    reduced length, geodesic scale.
-    """
-    mask = Geodesic.LATITUDE | Geodesic.LONGITUDE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    dirc = WGS84.Direct(lat0, lon0, azi, s, outmask=mask)
-    return dirc["lat2"], dirc["lon2"], dirc["azi2"], dirc["m12"], dirc["M12"]
-
-
-# ----------------------------------------------------------------------
-# 4. Vectorised geodesic-based state conversion
-# ----------------------------------------------------------------------
-def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef):
-    """
-    Vectorised conversion of whole trajectories.
-
-    Parameters
-    ----------
-    p_ecef : (N,3) array of positions (m)
-    v_ecef : (N,3) array of velocities (m/s)
-    a_ecef : (N,3) array of accelerations (m/s²)
-    impact_ecef : (3,) array - impact point in ECEF
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height above ellipsoid (m) - usually 0
-
-    Returns
-    -------
-    A dictionary where each entry is an (N,) NumPy array:
-        s   - geodesic distance from impact (m)
-        h   - relative height (m)   (trajectory h - h0)
-        az  - forward azimuth from impact (rad)
-        v_s - along-track speed (m/s)
-        v_α - azimuth rate (rad/s)
-        v_h - vertical speed (m/s)
-        a_s - along-track accel (m/s²)
-        a_α - azimuth accel (rad/s²)
-        a_h - vertical accel (m/s²)
-    """
-    N = p_ecef.shape[0]
-
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
-
-    # ------------------------------------------------------------------
-    # 1) Convert positions to lat/lon/h (scalar loop - cheap)
-    # ------------------------------------------------------------------
-    lat = np.empty(N)
-    lon = np.empty(N)
-    h = np.empty(N)
-
-    for i in range(N):
-        lat[i], lon[i], h[i] = ecef_to_geodetic(*p_ecef[i])
-
-    # ------------------------------------------------------------------
-    # 2) Inverse geodesic for each point (scalar loop - still fast)
-    # ------------------------------------------------------------------
-    s = np.empty(N)
-    az_deg = np.empty(N)  # forward azimuth (deg)
-    m12 = np.empty(N)
-    M12 = np.empty(N)
-
-    for i in range(N):
-        s[i], az_deg[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
-
-    # ------------------------------------------------------------------
-    # 3) Build ENU rotation matrix once (same for whole trajectory)
-    # ------------------------------------------------------------------
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-
-    # ------------------------------------------------------------------
-    # 4) Rotate velocities & accelerations to ENU (vectorised)
-    # ------------------------------------------------------------------
-    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
-    a_enu = _apply_rotation(R, a_ecef)  # (N,3)
-
-    # Split ENU components for readability
-    v_east, v_north, v_up = v_enu[:, 0], v_enu[:, 1], v_enu[:, 2]
-    a_east, a_north, a_up = a_enu[:, 0], a_enu[:, 1], a_enu[:, 2]
-
-    # ------------------------------------------------------------------
-    # 5) Build unit vectors that follow each geodesic direction
-    # ------------------------------------------------------------------
-    az_rad = deg2rad(az_deg)  # (N,)
-
-    # Tangent (east-north) unit vector along the geodesic
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-
-    # Lateral unit vector (perpendicular to t_hat in the ENU plane)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-
-    # Up unit vector - same for all rows
-    up_hat = np.array([0.0, 0.0, 1.0])
-
-    # ------------------------------------------------------------------
-    # 6) Velocity decomposition
-    # ------------------------------------------------------------------
-    v_s = np.einsum("ij,ij->i", t_hat, v_enu)  # dot product (N,)
-    v_l = np.einsum("ij,ij->i", l_hat, v_enu)  # lateral component
-    v_h = v_up  # vertical
-
-    # Azimuth rate (rad/s), guarding against division by zero
-    v_alpha = np.where(s > 0.0, (M12 / s) * v_l, 0.0)
-
-    # ------------------------------------------------------------------
-    # 7) Acceleration decomposition
-    # ------------------------------------------------------------------
-    a_s = np.einsum("ij,ij->i", t_hat, a_enu)
-    a_l = np.einsum("ij,ij->i", l_hat, a_enu)
-    a_h = a_up
-
-    a_alpha = np.where(s > 0.0, (M12 / s) * a_l - (v_s * v_alpha) / s, 0.0)
-
-    # ------------------------------------------------------------------
-    # 8) Assemble results
-    # ------------------------------------------------------------------
-    out = pd.DataFrame(
-        {
-            "s": s,
-            "az": az_rad,
-            "h": h - h0,
-            "v_s": v_s,
-            "v_α": v_alpha,
-            "v_h": v_h,
-            "a_s": a_s,
-            "a_α": a_alpha,
-            "a_h": a_h,
-        }
-    ).values
-    return out
-
-
-# ----------------------------------------------------------------------
-# 5. Vectorised inverse conversion (local → ECEF)
-# ----------------------------------------------------------------------
-def local_geodesic_to_ecef_vec(state, impact_ecef):
-    """
-    Convert a batch of geodesic-based states (as returned by
-    `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
-    accelerations.
-
-    Parameters
-    ----------
-    state : dict of (N,) arrays
-        ["s", "az(rad)", "h", "v_s", "v_α", "v_h", "a_s", "a_α", "a_h"]
-          0    1     2    3      4      5      6      7      8
-    impact_ecef : (3,) array
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height (m) - usually 0
-
-    Returns
-    -------
-    p_ecef, v_ecef, a_ecef : each an (N,3) array
-    """
-    N = state.shape[0]
-
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
-
-    # ------------------------------------------------------------------
-    # 1) Destination lat/lon for each sample (scalar loop)
-    # ------------------------------------------------------------------
-    lat = np.empty(N)
-    lon = np.empty(N)
-
-    for i in range(N):
-        lat[i], lon[i], _, _, _ = forward_geodesic(lat0_deg, lon0_deg, state[i, 0], rad2deg(state[i, 1]))
-
-    # ------------------------------------------------------------------
-    # 2) Build ENU rotation matrix (same for whole batch)
-    # ------------------------------------------------------------------
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-
-    # ------------------------------------------------------------------
-    # 3) Assemble ENU velocity / acceleration from geodesic components
-    # ------------------------------------------------------------------
-    az_rad = state[:, 1]
-    s = state[:, 0]
-    # Need the differential scale M12 for each point - get it with another
-    # scalar inverse geodesic call.
-    M12 = np.empty(N)
-    for i in range(N):
-        _, _, _, _, M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
-
-    # Unit vectors per sample (same definitions as in the forward routine)
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-    up_hat = np.array([0.0, 0.0, 1.0])
-
-    # ENU velocity
-    v_enu = (
-        (state[:, 3][:, None] * t_hat) + ((state[:, 4] * s / M12)[:, None] * l_hat) + (state[:, 5][:, None] * up_hat)
-    )
-
-    # ENU acceleration
-    a_enu = (
-        (state[:, 6][:, None] * t_hat) + ((state[:, 7] * s / M12)[:, None] * l_hat) + (state[:, 8][:, None] * up_hat)
-    )
-
-    # ------------------------------------------------------------------
-    # 4) Transform ENU → ECEF (vectorised) and add impact offset
-    # ------------------------------------------------------------------
-    p_ecef = np.empty((N, 3))
-    for i in range(N):
-        p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + state[i, 2])
-
-    v_ecef = _apply_rotation(R.T, v_enu)
-    a_ecef = _apply_rotation(R.T, a_enu)
-
-    # Add impact offset to positions (the geodetic conversion already gives
-    # absolute coordinates, so no extra offset is needed)
-    # (If you had stored the impact point in ECEF already you could also do:)
-    # p_ecef += impact_ecef   # <-- not required here
-
-    return np.hstack([p_ecef, v_ecef, a_ecef])
-
-
-def prep_trajectory(x):
-    # load_single_truth(x, debug=False), x.name, args.sr, path
-    ecef_data, traj_number, max_sr, trajectory_dt, use_grdth = x
-    # keep time, pos, vel. don't need the rest of the columns
-    ecef_data = ecef_data[:, 0:7]
-    # print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
-
-    # remove launch point based on near zero speed state
-    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        ecef_data = ecef_data[1:]
-
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
-    sr_ecef_data = np.asarray(
-        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-        dtype=np.float64,
-    )
-    # TODO: add a min slant range to avoid the origin discontinuity
-    # sr_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
-    #     dtype=np.float64,
-    # )
-
-    # nice idea, but it wasn't the source of the problem
-    # filter the points by only those above the horizon. Work from impact backwards.
-    # def while_gen_backward_up(data):
-    #     for x in reversed(data):
-    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
-    #             yield x
-    #         else:
-    #             break
-
-    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
-
-    # TODO: move this to a trajectory time check helper function file
-    # check the time rate of the data
-    # diff the time column, run unique, print that if there is more than 1 unique
-    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(
-            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
-        )
-
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    sr_ecef_data[:, 0],
-                    sr_ecef_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
-        )
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if use_grdth:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
-        if np.any(next_frame_data[GR_INDEX] > 1e10):
-            print(f"this ground range for traj {traj_number} seems excessive", next_frame_data[GR_INDEX].max)
-
-        # check the inverse transform
-        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
-    else:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
-    # closeness_check
-    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
-    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
-    # print(f"MSE round-trip position: {pos_err:.3e}")
-    # print(f"MSE round-trip velocity: {vel_err:.3e}")
-
-    # add column for traj number
-    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
-
-    # add columns for ECEF reference point (12, 13, 14)
-    # TODO: stop doing this to save some RAM and use a metadata attribute
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
-    #     print(next_frame_data)
-    # np.savetxt(
-    #     "grdth_" + traj_number,
-    #     next_frame_data,
-    #     delimiter=",",
-    #     # header=",".join(header_row),
-    #     comments="",
-    #     fmt="%.8f",
-    # )
-
-    return next_frame_data, traj_number
-
-
-def prep_trajectory_time(x):
-    # load_single_truth(x, debug=False), x.name, args.sr, path
-    ecef_data, traj_number, max_time, trajectory_dt, use_grdth = x
-    # keep time, pos, vel. don't need the rest of the columns
-    ecef_data = ecef_data[:, 0:7]
-    # print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
-
-    # remove launch point based on near zero speed state
-    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        # while np.any(ecef_data[0, VEL_SLICE] <= 1e-8):
-        ecef_data = ecef_data[1:]
-
-    # check that the trajectory has enough time data in it
-    traj_time_range = ecef_data[-1, TIME_INDEX] - ecef_data[0, TIME_INDEX]
-    if abs(traj_time_range) < max_time:
-        # raise ValueError(
-        #     f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
-        # )
-        print(
-            f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
-        )
-        return None, None
-
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
-    # time_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-    #     dtype=np.float64,
-    # )
-    impact_time = ecef_data[-1, TIME_INDEX]
-    start_time = impact_time - max_time
-    time_ecef_data = ecef_data[ecef_data[:, TIME_INDEX] >= start_time]
-    # now make the impact time precisely the max time
-    time_ecef_data[:, TIME_INDEX] = time_ecef_data[:, TIME_INDEX] + max_time
-    # TODO: add a min slant range to avoid the origin discontinuity
-    # sr_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
-    #     dtype=np.float64,
-    # )
-
-    # nice idea, but it wasn't the source of the problem
-    # filter the points by only those above the horizon. Work from impact backwards.
-    # def while_gen_backward_up(data):
-    #     for x in reversed(data):
-    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
-    #             yield x
-    #         else:
-    #             break
-
-    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
-
-    # TODO: move this to a trajectory time check helper function file
-    # check the time rate of the data
-    # diff the time column, run unique, print that if there is more than 1 unique
-    time_diff = np.diff(time_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(
-            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
-        )
-
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(0, max_time + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    time_ecef_data[:, 0],
-                    time_ecef_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
-        )
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if use_grdth:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(
-            resampled_sr_ecef_data,
-            ref_ecef,
-        )
-        # pass
-
-        # check the inverse transform
-        # check_ecef = next_grdth_to_ecef(
-        #     next_frame_data,
-        #     ref_ecef,
-        #     initial_point_heading,
-        # )
-    else:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_dcu(
-            resampled_sr_ecef_data,
-            ref_ecef,
-        )
-
-        # check the inverse transform
-        # check_ecef = next_dcu_to_ecef(
-        #     next_frame_data,
-        #     ref_ecef,
-        #     initial_point_heading,
-        # )
-    # closeness_check
-    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
-    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
-    # print(f"MSE round-trip position: {pos_err:.3e}")
-    # print(f"MSE round-trip velocity: {vel_err:.3e}")
-
-    # add column for traj number
-    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
-
-    # add columns for ECEF reference point (12, 13, 14)
-    # TODO: stop doing this to save some RAM and use a metadata attribute
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
-    #     print(next_frame_data)
-    # np.savetxt(
-    #     "grdth_" + traj_number,
-    #     next_frame_data,
-    #     delimiter=",",
-    #     # header=",".join(header_row),
-    #     comments="",
-    #     fmt="%.8f",
-    # )
-
-    return next_frame_data, traj_number
-
-
-def prep_many_trajs_time(traj_targets):
-    # multiprocessed trajectory prep (the output is ordered like the input)
-    # cpu_count = psutil.cpu_count(logical=False)
-    # if cpu_count is None:
-    #     cpu_count = mp.cpu_count()
-    # print(f"there are {cpu_count} cpus being used for trajectory prep")
-    # with mp.Pool(processes=cpu_count) as pool:
-    #     # time based trajectory loading
-    #     tmp_data = pool.map(prep_trajectory_time, traj_targets)
-    # single threaded, but single line
-    tmp_data = map(prep_trajectory_time, traj_targets)
-    # single threaded, but one at a time
-    # tmp_data = []
-    # for x in traj_targets[7:]:
-    #     tmp_data.append(prep_trajectory(x))
-    #     exit(0)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-
-    print("post-prep. how many made it though prep", len(traj_targets))
-    return tmp_data
-
-
-def prep_many_trajs(traj_targets):
-    # multiprocessed trajectory prep (the output is ordered like the input)
-    # cpu_count = psutil.cpu_count(logical=False)
-    # if cpu_count is None:
-    #     cpu_count = mp.cpu_count()
-    # print(f"there are {cpu_count} cpus being used for trajectory prep")
-    # with mp.Pool(processes=cpu_count) as pool:
-    #     tmp_data = pool.map(prep_trajectory, traj_targets)
-    # single threaded, but single line
-    tmp_data = map(prep_trajectory, traj_targets)
-    # single threaded, but one at a time
-    # tmp_data = []
-    # for x in traj_targets[7:]:
-    #     tmp_data.append(prep_trajectory(x))
-    #     exit(0)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-
-    # check if all of the trajectories are much shorter than the asked for bucket
-    # if not use_grdth:
-    #     if all((np.linalg.norm(x[0, POS_SLICE] - x[-1, POS_SLICE]) < args.sr - BUCKET_SIZE for x, _ in tmp_data)):
-    #         print(
-    #             f"All trajectories are shorter than the SR ({args.sr}) minus bucket size ({BUCKET_SIZE}). Skipping making this model"
-    #         )
-    #         exit()
-
-    print("post-prep. how many made it though prep", len(traj_targets))
-    return tmp_data

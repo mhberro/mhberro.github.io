@@ -1,264 +1,84 @@
 import numpy as np
 import pandas as pd
-import scipy
-from geographiclib.geodesic import Geodesic
+from NEXT_Geodesic_Frame import ecef_to_local_geodesic_vec, local_geodesic_to_ecef_vec
 
-WGS84 = Geodesic.WGS84
-a = WGS84.a  # semi-major axis (m)
-f = WGS84.f  # flattening
-b = a * (1 - f)  # semi-minor axis (m)
-# Numerical guards near the reference-point singularity (s -> 0)
-S_EPS_M = 100.0
-M12_EPS_M = 1e-3
+# ---- user inputs ----
+in_csv = r"C:/Users/e487666/iRAPTOR Projects/datasets/SBI/2026/2-Working-Data/SBI_boost-glide/HighE_HGV/boost/Albuqurque_lp2_ECEF.csv"
+out_geod_csv = r"geodesic_integrated.csv"
+out_rt_csv = r"ecef_roundtrip.csv"
+out_err_csv = r"ecef_roundtrip_error.csv"
+ref_ecef_csv = r"C:/Users/e487666/iRAPTOR Projects/datasets/SBI/2026/2-Working-Data/SBI_boost-glide/HighE_HGV/impact/Albuqurque_lp2_ECEF.csv"
+# ---------------------
 
-def ecef_to_geodetic(x, y, z):
-    """Scalar conversion using GeographicLib's exact algorithm."""
-    # lat, lon, h = Geodesic.WGS84._LatLonFromXYZ(x, y, z)
-    # return lat, lon, h
-    # TODO: Vermeille has a better method that Karney suggested updates to and then Vermeille updated in 2011. Update to using that rather than this Bowrank-like iterative method.
-    from coordinate_transform_functions import _ecef_to_lla
+df = pd.read_csv(in_csv)
+ref_df = pd.read_csv(ref_ecef_csv)
 
-    lat, lon, h, _ = _ecef_to_lla(np.hstack([x, y, z]), deg=True)
+required = ["time","x","y","z","vx","vy","vz"]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing columns: {missing}")
 
-    return lat, lon, h
+ecef = df[required].to_numpy(dtype=float)
+time = ecef[:, 0]
+pos = ecef[:, 1:4]
+vel = ecef[:, 4:7]
 
-def inverse_geodesic(lat0, lon0, lat, lon):
-    """
-    Scalar inverse geodesic. Returns distance (m), forward azimuth (deg),
-    reverse azimuth (deg), reduced length m12 (m), geodesic scale M12 (-).
-    """
-    mask = Geodesic.DISTANCE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    inv = WGS84.Inverse(lat0, lon0, lat, lon, outmask=mask)
-    return inv["s12"], inv["azi1"], inv["azi2"], inv["m12"], inv["M12"]
+ref_ecef_data = ref_df[required].to_numpy(dtype=float)
+ref_pos = ref_ecef_data[:, 1:4]
 
-def enu_rotation_matrix(lat0_rad, lon0_rad):
-    """Scalar rotation matrix from ECEF → ENU at (lat0,lon0) [radians]."""
-    sin_phi = np.sin(lat0_rad)
-    cos_phi = np.cos(lat0_rad)
-    sin_lam = np.sin(lon0_rad)
-    cos_lam = np.cos(lon0_rad)
+if np.any(np.diff(time) < 0):
+    raise ValueError("Time must be monotonic non-decreasing for integrated azimuth reconstruction.")
 
-    R = np.array(
-        [
-            [-sin_lam, cos_lam, 0.0],
-            [-sin_phi * cos_lam, -sin_phi * sin_lam, cos_phi],
-            [cos_phi * cos_lam, cos_phi * sin_lam, sin_phi],
-        ]
-    )
-    return R
+# Typical reference: impact at last state position
+ref_ecef = ref_pos[-1, :]
 
-def _apply_rotation(R, vec):
-    """
-    Apply the same (3×3) rotation matrix `R` to an (N,3) array `vec`.
-    """
-    # Using @ works with both (3,3) @ (3,) and (3,3) @ (N,3).T
-    return (R @ vec.T).T
+# ECEF -> geodesic integrated
+geod_state, az0 = ecef_to_local_geodesic_vec(pos, vel, ref_ecef)
+# geod_state columns: [s, h, v_s, v_alpha, v_h]
+geod_with_time = np.hstack([time[:, None], geod_state])
 
-def deg2rad(x):
-    return np.deg2rad(x)
+# geodesic integrated -> ECEF
+ecef_rt_no_time = local_geodesic_to_ecef_vec(geod_with_time, ref_ecef, az0)
+ecef_rt = np.hstack([time[:, None], ecef_rt_no_time])
 
-def ecef_to_local_geodesic_vec(p_ecef, v_ecef, impact_ecef):
-    """
-    Vectorised conversion of whole trajectories.
+# Save transformed and reconstructed CSVs
+pd.DataFrame(
+    geod_with_time,
+    columns=["time", "s", "h", "v_s", "v_alpha", "v_h"]
+).to_csv(out_geod_csv, index=False)
 
-    Parameters
-    ----------
-    p_ecef : (N,3) array of positions (m)
-    v_ecef : (N,3) array of velocities (m/s)
-    a_ecef : (N,3) array of accelerations (m/s²)
-    impact_ecef : (3,) array - impact point in ECEF
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height above ellipsoid (m) - usually 0
+pd.DataFrame(
+    ecef_rt,
+    columns=["time","x","y","z","vx","vy","vz"]
+).to_csv(out_rt_csv, index=False)
 
-    Returns
-    -------
-    A dictionary where each entry is an (N,) NumPy array:
-        s   - geodesic distance from impact (m)
-        h   - relative height (m)   (trajectory h - h0)
-        az  - forward azimuth from impact (deg)
-        v_s - along-track speed (m/s)
-        v_α - azimuth rate (rad/s)
-        v_h - vertical speed (m/s)
-    """
-    N = p_ecef.shape[0]
+# Error metrics
+err = ecef_rt[:, 1:7] - ecef[:, 1:7]
+pos_err = err[:, 0:3]
+vel_err = err[:, 3:6]
 
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
+pos_rmse = np.sqrt(np.mean(pos_err**2, axis=0))
+vel_rmse = np.sqrt(np.mean(vel_err**2, axis=0))
+pos_norm_rmse = np.sqrt(np.mean(np.sum(pos_err**2, axis=1)))
+vel_norm_rmse = np.sqrt(np.mean(np.sum(vel_err**2, axis=1)))
 
-    # ------------------------------------------------------------------
-    # 1) Convert positions to lat/lon/h (scalar loop - cheap)
-    # ------------------------------------------------------------------
-    lat = np.empty(N)
-    lon = np.empty(N)
-    h = np.empty(N)
+print("Azimuth initial (rad):", az0)
+print("Position RMSE [m] by axis (x,y,z):", pos_rmse)
+print("Velocity RMSE [m/s] by axis (vx,vy,vz):", vel_rmse)
+print("Position RMSE norm [m]:", pos_norm_rmse)
+print("Velocity RMSE norm [m/s]:", vel_norm_rmse)
+print("Max |position error| [m]:", np.max(np.abs(pos_err)))
+print("Max |velocity error| [m/s]:", np.max(np.abs(vel_err)))
 
-    for i in range(N):
-        lat[i], lon[i], h[i] = ecef_to_geodetic(*p_ecef[i])
+pd.DataFrame(
+    np.hstack([
+        time[:, None],
+        pos_err,
+        vel_err,
+        np.linalg.norm(pos_err, axis=1)[:, None],
+        np.linalg.norm(vel_err, axis=1)[:, None],
+    ]),
+    columns=["time","dx","dy","dz","dvx","dvy","dvz","pos_err_norm","vel_err_norm"]
+).to_csv(out_err_csv, index=False)
 
-    # ------------------------------------------------------------------
-    # 2) Inverse geodesic for each point (scalar loop - still fast)
-    # ------------------------------------------------------------------
-    s = np.empty(N)
-    az_deg = np.empty(N)  # forward azimuth (deg)
-    m12 = np.empty(N)
-    M12 = np.empty(N)
-
-    for i in range(N):
-        s[i], az_deg[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
-
-    az_rad = np.deg2rad(az_deg)
-    # ------------------------------------------------------------------
-    # 3) Build ENU rotation matrix once (same for whole trajectory)
-    # ------------------------------------------------------------------
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-
-    # ------------------------------------------------------------------
-    # 4) Rotate velocities to ENU (vectorised)
-    # ------------------------------------------------------------------
-    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
-
-    # ------------------------------------------------------------------
-    # 5) Build unit vectors that follow each geodesic direction
-    # ------------------------------------------------------------------
-
-    # Tangent (east-north) unit vector along the geodesic
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-
-    # Lateral unit vector (perpendicular to t_hat in the ENU plane)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-
-    # ------------------------------------------------------------------
-    # 6) Velocity decomposition
-    # ------------------------------------------------------------------
-    v_s = np.einsum("ij,ij->i", t_hat, v_enu)  # dot product (N,)
-    v_l = np.einsum("ij,ij->i", l_hat, v_enu)  # lateral component
-    v_h = v_enu[:, 2]  # vertical
-
-    # Azimuth rate (rad/s), stable near s=0
-    v_alpha = np.divide(
-        v_l,
-        m12,
-        out=np.zeros_like(v_l),
-        where=np.abs(m12) > M12_EPS_M,
-    )
-    v_alpha[np.abs(s) <= S_EPS_M] = 0.0
-
-    # ------------------------------------------------------------------
-    # 8) Assemble results
-    # ------------------------------------------------------------------
-    state = np.column_stack((s, h - h0, v_s, v_alpha, v_h))
-    az_initial_rad = float(az_rad[0]) if N > 0 else 0.0
-
-    return state, az_initial_rad
-
-def geodetic_to_ecef(lat, lon, h):
-    """Scalar conversion (deg, deg, m) → (x, y, z) in metres."""
-    lat_rad = deg2rad(lat)
-    lon_rad = deg2rad(lon)
-
-    sin_phi = np.sin(lat_rad)
-    cos_phi = np.cos(lat_rad)
-    sin_lam = np.sin(lon_rad)
-    cos_lam = np.cos(lon_rad)
-
-    N = a / np.sqrt(1 - (2 * f - f**2) * sin_phi**2)
-    x = (N + h) * cos_phi * cos_lam
-    y = (N + h) * cos_phi * sin_lam
-    z = ((1 - f) ** 2 * N + h) * sin_phi
-    return x, y, z
-
-def forward_geodesic(lat0, lon0, s, azi):
-    """
-    Scalar forward geodesic. Returns destination lat, lon, reverse azimuth,
-    reduced length, geodesic scale.
-    """
-    mask = Geodesic.LATITUDE | Geodesic.LONGITUDE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    dirc = WGS84.Direct(lat0, lon0, azi, s, outmask=mask)
-    return dirc["lat2"], dirc["lon2"], dirc["azi2"], dirc["m12"], dirc["M12"]
-
-def _integrate_azimuth_from_rate(v_alpha, time_s, az_initial_rad):
-    """Integrate azimuth rate (rad/s) over explicit time vector."""
-    v_alpha = np.asarray(v_alpha, dtype=float).reshape(-1)
-    time_s = np.asarray(time_s, dtype=float).reshape(-1)
-
-    if v_alpha.shape[0] != time_s.shape[0]:
-        raise ValueError("v_alpha and time_s must have the same length")
-    if v_alpha.shape[0] == 0:
-        return np.asarray([], dtype=float)
-    if np.any(np.diff(time_s) < 0):
-        raise ValueError("time_s must be monotonic non-decreasing")
-
-    if v_alpha.shape[0] == 1:
-        return np.asarray([float(az_initial_rad)], dtype=float)
-    if v_alpha.shape[0] == 2:
-        return scipy.integrate.cumulative_trapezoid(v_alpha, time_s, initial=0.0) + float(az_initial_rad)
-    
-    return scipy.integrate.cumulative_simpson(v_alpha, x=time_s, initial=float(az_initial_rad))
-    
-def local_geodesic_to_ecef_vec(state, impact_ecef, az_initial_rad):
-    """
-    Convert a batch of geodesic-based states (as returned by
-    `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
-    accelerations.
-
-    Parameters
-    ----------
-    state : dict of (N,) arrays
-        ["s", "az", "h", "v_s", "v_α", "v_h", "a_s", "a_α", "a_h"]
-          0    1     2    3      4      5      6      7      8
-    impact_ecef : (3,) array
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height (m) - usually 0
-
-    Returns
-    -------
-    p_ecef, v_ecef, a_ecef : each an (N,3) array
-    """
-    time_s = np.asarray(state[:, 0], dtype=float)
-    state = state[:, 1:]
-
-    N = state.shape[0]
-
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
-
-    s = state[:, 0]
-    h_rel = state[:, 1]
-    v_s = state[:, 2]
-    v_alpha = state[:, 3]
-    v_h = state[:, 4]
-
-    az_rad = _integrate_azimuth_from_rate(v_alpha, time_s, az_initial_rad)
-
-    lat = np.empty(N)
-    lon = np.empty(N)
-
-    m12 = np.empty(N)
-    for i in range(N):
-        lat[i], lon[i], _, m12[i], _ = forward_geodesic(
-            lat0_deg, lon0_deg, s[i], np.rad2deg(az_rad[i])
-        )
-
-    v_l = v_alpha * m12
-    v_l[np.abs(m12) <= M12_EPS_M] = 0.0
-
-    # Unit vectors per sample (same definitions as in the forward routine)
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-    up_hat = np.array([0.0, 0.0, 1.0])
-
-    v_l = v_alpha * m12
-    v_l[np.abs(s) <= S_EPS_M] = 0.0
-    v_enu = (v_s[:, None] * t_hat) + (v_l[:, None] * l_hat) + (v_h[:, None] * up_hat)    
-    
-    p_ecef = np.empty((N, 3))
-    for i in range(N):
-        p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + h_rel[i])
-    
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-    v_ecef = _apply_rotation(R.T, v_enu)
-
-    # Add impact offset to positions (the geodetic conversion already gives
-    # absolute coordinates, so no extra offset is needed)
-    # (If you had stored the impact point in ECEF already you could also do:)
-    # p_ecef += impact_ecef   # <-- not required here
-
-    return np.hstack([p_ecef, v_ecef])
+print(f"Wrote: {out_geod_csv}, {out_rt_csv}, {out_err_csv}")

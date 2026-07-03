@@ -192,15 +192,6 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         self.pos_weight = pos_weight
         self.vel_weight = vel_weight
         self.physics_weight = physics_weight
-        # Velocity DC-bias penalty (aero review item C). Position drift on an
-        # axis is ~ sigma_p * T * dt * mean_t(v_residual): a small CONSTANT
-        # velocity offset integrates into large end-of-trajectory position
-        # error while being nearly invisible to MSE (which penalizes variance).
-        # This term penalizes the time-mean signed velocity residual squared --
-        # exactly the DC offset -- and leaves zero-mean maneuver noise alone.
-        # Computed on scaled velocities so it's O(1) alongside the other terms.
-        # Start vel_bias_weight ~= pos_weight; 0.0 disables it.
-        self.vel_bias_weight = vel_bias_weight
         # Late-weighted position term (reviewer R2). Ordinary per-timestep MSE
         # penalizes variance but is BLIND to accumulated drift: a small constant
         # velocity bias (~0.05%) integrates into a large end-of-trajectory
@@ -213,6 +204,23 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         #                 1.0 = linear ramp, 2.0 = quadratic (emphasize the very end).
         self.late_weight = late_weight
         self.late_power = late_power
+        # Cumulative velocity-bias (drift) term (reviewer R2, second pass).
+        # Under the structural second-order constraint, terminal position error
+        # is (up to the bounded correction) the TIME-INTEGRAL of the velocity
+        # error. Pointwise velocity MSE charges variance but is nearly blind to
+        # a small constant BIAS in velocity — the exact quantity that integrates
+        # into the dominant end-of-trajectory position error. This term
+        # penalizes the RUNNING MEAN of the velocity residual, so zero-mean
+        # noise is (asymptotically) free and only systematic bias is charged.
+        # It is strictly sharper than the late-weighted POSITION ramp: the ramp
+        # penalizes the symptom (late position error, which the model can also
+        # satisfy through the bounded alpha-correction channel); this charges
+        # the generator (velocity bias) directly.
+        #   vel_bias_weight : strength (0 = off). Residuals are small in scaled
+        #   space, so useful weights are LARGER than the other terms — sweep
+        #   {1, 5, 25}. When enabling, consider reducing late_weight ~2x since
+        #   the two terms partially overlap.
+        self.vel_bias_weight = vel_bias_weight
         self.scaler = scaler
         self.N_FEATURES = N_FEATURES
         # Position block is everything before the first velocity index. For the
@@ -309,15 +317,19 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             late_loss = torch.mean(w * per_t)
             total_loss = total_loss + self.late_weight * late_loss
 
-        # --- velocity DC-bias penalty (aero review item C): penalize the
-        #     time-mean signed velocity residual per axis, i.e. the constant
-        #     offset that integrates into position drift. mean over time gives
-        #     the DC component; squaring + averaging over batch/axes gives a
-        #     scalar. Zero-mean maneuver noise averages out and is not penalized.
+        # --- cumulative velocity-bias (drift) term: charge the running mean of
+        #     the velocity residual. cum_mean[:, t] = (1/T) * sum_{k<=t} resid[k]
+        #     * the final element is the trajectory time-mean residual — the
+        #       accumulated drift per unit horizon, in scaled velocity units;
+        #     * intermediate elements catch bias that cancels over the full
+        #       horizon but not mid-trajectory (e.g. one-sided error during a
+        #       maneuver that later reverses).
+        #     Computed in scaled space (same as vel_loss) on the SAME velocity
+        #     block, so vel_bias_weight composes with vel_weight predictably.
         if self.vel_bias_weight > 0.0 and n_timesteps >= 2:
-            r = vel_pred - vel_target                        # (B, T, n_vel), scaled
-            bias = r.mean(dim=1)                             # (B, n_vel): DC offset
-            bias_loss = torch.mean(bias**2)
+            vel_resid = vel_pred - vel_target                      # (B, T, n_vel)
+            cum_mean = torch.cumsum(vel_resid, dim=1) / n_timesteps
+            bias_loss = torch.mean(cum_mean**2)
             total_loss = total_loss + self.vel_bias_weight * bias_loss
 
         return {

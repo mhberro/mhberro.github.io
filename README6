@@ -1,24 +1,41 @@
-Traceback (most recent call last):
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth.py", line 1127, in <module>
-    main()
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth.py", line 1119, in main
-    train_NEXT(
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth.py", line 801, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 201, in fit
-    metrics = self.batch_loss(x=x_batch.to(self.device))
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 352, in batch_loss
-    return self.criterion(x_pred, x)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth.py", line 318, in forward
-    return base_loss + self.bias_weight * bias_penalty
-           ~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-TypeError: unsupported operand type(s) for +: 'dict' and 'Tensor'
+class BiasAlignedPhysicsLoss(torch.nn.Module):
+    """
+    Sobolev-style wrapper minimizing the first-moment velocity bias across sequences.
+    Prevents localized velocity errors from integrating into large position drift[cite: 2, 4].
+    Handles both scalar tensor and metric dictionary outputs from base criteria gracefully.
+    """
+    def __init__(self, base_loss_func, vel_indices: list[int], bias_weight: float = 15.0):
+        super().__init__()
+        self.base_loss_func = base_loss_func
+        self.vel_indices = list(vel_indices)
+        self.bias_weight = bias_weight
+
+    def forward(self, pred: torch.Tensor, true: torch.Tensor):
+        # 1. Compute base loss components (returns a metric dict or scalar tensor)
+        base_loss = self.base_loss_func(pred, true)
+        
+        # 2. Isolate velocity features along the sequence dimension
+        pred_vel = pred[..., self.vel_indices]
+        true_vel = true[..., self.vel_indices]
+        
+        # 3. Calculate the systematic first-moment velocity bias vector[cite: 4]
+        velocity_bias = torch.mean(pred_vel - true_vel, dim=1)
+        bias_penalty = torch.mean(torch.sum(velocity_bias ** 2, dim=-1))
+        total_bias_loss = self.bias_weight * bias_penalty
+        
+        # 4. Check if base loss is a metric dictionary or a direct scalar tensor
+        if isinstance(base_loss, dict):
+            out_dict = base_loss.copy()
+            if "loss" in out_dict:
+                out_dict["loss"] = out_dict["loss"] + total_bias_loss
+            else:
+                # Dynamic fallback if the framework uses an unconventional primary loss key
+                for k, v in out_dict.items():
+                    if isinstance(v, torch.Tensor) and v.requires_grad:
+                        out_dict[k] = v + total_bias_loss
+                        break
+            # Add bias loss as an independent metric entry for log diagnostics (e.g., MLflow)
+            out_dict["bias_loss"] = total_bias_loss
+            return out_dict
+        else:
+            return base_loss + total_bias_loss

@@ -1,232 +1,358 @@
-#!/usr/bin/env python3
-"""A/B harness for the field-method experiment (targets val_pos_err).
+#mdn_trajectory_model
+"""Mixture-Density Trajectory Predictor for evasive-agent (drone-tag) forecasting.
 
-Runs the SAME training command under different FIELD_METHOD settings and
-compares them CORRECTLY -- at matched val_loss / at convergence, never at a
-matched epoch number (the runs progress at different rates). Tracks best
-val_pos_err and val_vel_err SEPARATELY with the epoch each was achieved.
+WHY THIS MODEL (see review discussion):
+    The "runner" drone is an ADVERSARIAL agent actively trying to be
+    unpredictable. For any non-trivial horizon its future is not a single path
+    but a DISTRIBUTION over paths, often MULTIMODAL (it jukes left OR right;
+    both are plausible from identical history). A single-point regressor trained
+    on such data collapses toward the mean of the modes -- i.e. it predicts the
+    physically-average "straight through the middle" path the runner never
+    actually takes. This module instead predicts K weighted future trajectories
+    plus their probabilities (a Gaussian mixture over futures), which is the
+    quantity a chaser can actually use: pursue the highest-weight / mixture-mean
+    mode while hedging against the branches.
 
-This does not re-implement training. It drives NEXT_training_mo_cl_ref_loss.py
-by overriding the three toggles (FIELD_METHOD / FD_EPS / FD_RELATIVE) via
-environment variables, parses the per-epoch metrics each run writes, and
-produces the comparison table + winner call.
+ARCHITECTURE (primary recommendation):
+    history window [x,y,z,vx,vy,vz] x H steps
+        -> GRU encoder                          (summarises "what maneuver now")
+        -> MDN head -> {logits_k, a_k(t)}       (K modes; per-mode accel sequence)
+        -> BOUNDED acceleration  a = a_max * tanh(.)   (dynamically feasible)
+        -> double kinematic integration          (a -> v -> p, known physics)
+        -> K future trajectories [x,y,z,vx,vy,vz] x T + mixture weights pi_k
 
-Wiring required in NEXT_training_mo_cl_ref_loss.py (one-time, minimal):
-    import os
-    FIELD_METHOD = os.environ.get("NEXT_FIELD_METHOD", "central")
-    FD_EPS       = float(os.environ.get("NEXT_FD_EPS", "1e-4"))
-    FD_RELATIVE  = os.environ.get("NEXT_FD_RELATIVE", "0") == "1"
-and have node.fit / the metrics logger append rows of
-    epoch,val_loss,val_pos_err,val_vel_err
-to  $NEXT_METRICS_CSV  (one file per run; the harness sets this per arm).
+    Decoding ACCELERATION and integrating it (rather than regressing position
+    directly) bakes in the second-order kinematics the same way the glide model's
+    structural constraint does: predicted velocity is the integral of predicted
+    acceleration and predicted position is the integral of predicted velocity, so
+    every sampled future is smooth and Newton-feasible by construction, and the
+    tanh cap keeps it inside the drone's real acceleration envelope -- the model
+    can never predict a physically impossible instantaneous juke.
 
-Usage:
-    python field_method_ab.py --cmd "python NEXT_training_mo_cl_ref_loss.py <args>" \
-        --arms central central64 jvp \
-        --outdir ab_runs/field_method
+SCALING:
+    The model consumes and PREDICTS in StandardScaler-scaled units (consistent
+    with the rest of the pipeline). The kinematic identities dp=v*dt, dv=a*dt
+    hold in PHYSICAL units, so integration is done with per-axis scale factors:
+        v_phys = v_s * sigma_v + mu_v ;  p_{t+1} = p_t + v_phys * dt   (phys)
+    then re-scaled back to scaled position. a_max is likewise a PHYSICAL bound
+    (m/s^2) converted to the scaled acceleration the head emits. All of this is
+    handled internally from the scaler stats passed at construction; if no
+    scaler is supplied the model assumes physical units (sigma=1, mu=0).
 
-Compare-at-convergence policy:
-    * "best": each arm's best val_pos_err over its whole run (default).
-    * "matched_val_loss": find the lowest val_loss L* reached by ALL arms, then
-      report each arm's val_pos_err at the first epoch it reaches L*. This
-      controls for arms that simply trained longer/faster.
+This module is deliberately self-contained (no torchdiffeq / ODE-solver
+coupling) because it is a windowed sequence-to-sequence predictor, not a
+stateless vector field. It is wired into the training script as
+`--model-type mdn` and exported to ONNX via MDNTrajectoryForONNX.
 """
+
 from __future__ import annotations
 
-import argparse
-import copy
-import json
-import os
-import subprocess
-import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
-@dataclass
-class RunResult:
-    arm: str
-    csv_path: str
-    epochs: list[int] = field(default_factory=list)
-    val_loss: list[float] = field(default_factory=list)
-    val_pos_err: list[float] = field(default_factory=list)
-    val_vel_err: list[float] = field(default_factory=list)
+class MDNTrajectoryPredictor(nn.Module):
+    """GRU-encoder + mixture-density head predicting K weighted future
+    trajectories by integrating bounded per-mode acceleration.
 
-    # -- convergence-aware summaries ------------------------------------
-    def best_pos(self) -> tuple[float, int]:
-        i = min(range(len(self.val_pos_err)), key=lambda k: self.val_pos_err[k])
-        return self.val_pos_err[i], self.epochs[i]
+    Args:
+        state_dim:   number of state features per timestep (6 for [x,y,z,vx,vy,vz]).
+        pos_idx:     indices of the position block within the state.
+        vel_idx:     indices of the velocity block, paired 1:1 with pos_idx
+                     (pos_idx[i] integrates vel_idx[i]).
+        horizon:     number of future steps T to predict.
+        dt:          timestep between states (seconds), PHYSICAL.
+        n_modes:     number of mixture components K.
+        enc_hidden:  GRU hidden width.
+        enc_layers:  GRU depth.
+        head_hidden: MDN head MLP width.
+        a_max:       PHYSICAL acceleration bound (m/s^2) per velocity axis. The
+                     head output is a = a_max * tanh(raw), guaranteeing feasibility.
+                     Set from the drone's known envelope; a scalar or a per-vel-axis
+                     list. Defaults to a generous 40 m/s^2 (~4 g) if unknown.
+        pos_scale, vel_scale, vel_mean: StandardScaler stats for the pos/vel
+                     blocks (sigma_p, sigma_v, mu_v). If None -> physical units.
+    """
 
-    def best_vel(self) -> tuple[float, int]:
-        i = min(range(len(self.val_vel_err)), key=lambda k: self.val_vel_err[k])
-        return self.val_vel_err[i], self.epochs[i]
+    def __init__(
+        self,
+        state_dim: int,
+        pos_idx: list[int],
+        vel_idx: list[int],
+        horizon: int,
+        dt: float,
+        n_modes: int = 5,
+        enc_hidden: int = 128,
+        enc_layers: int = 1,
+        head_hidden: int = 128,
+        a_max: float | list[float] = 40.0,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
+        self.state_dim = state_dim
+        self.horizon = int(horizon)
+        self.dt = float(dt)
+        self.n_modes = int(n_modes)
+        self.n_axes = len(pos_idx)
 
-    def best_val_loss(self) -> float:
-        return min(self.val_loss)
+        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
 
-    def pos_at_val_loss(self, target: float) -> tuple[float, int] | None:
-        """val_pos_err at the FIRST epoch this arm's val_loss <= target."""
-        for k, vl in enumerate(self.val_loss):
-            if vl <= target:
-                return self.val_pos_err[k], self.epochs[k]
-        return None
-
-    def vel_at_val_loss(self, target: float) -> tuple[float, int] | None:
-        for k, vl in enumerate(self.val_loss):
-            if vl <= target:
-                return self.val_vel_err[k], self.epochs[k]
-        return None
-
-
-ARM_ENV = {
-    # arm name -> env overrides for the training toggles
-    "central":       {"NEXT_FIELD_METHOD": "central",   "NEXT_FD_EPS": "1e-4", "NEXT_FD_RELATIVE": "0"},
-    "central64":     {"NEXT_FIELD_METHOD": "central64", "NEXT_FD_EPS": "1e-4", "NEXT_FD_RELATIVE": "0"},
-    "central_rel":   {"NEXT_FIELD_METHOD": "central",   "NEXT_FD_EPS": "1e-2", "NEXT_FD_RELATIVE": "1"},
-    "central64_rel": {"NEXT_FIELD_METHOD": "central64", "NEXT_FD_EPS": "1e-2", "NEXT_FD_RELATIVE": "1"},
-    "jvp":           {"NEXT_FIELD_METHOD": "jvp",       "NEXT_FD_EPS": "1e-4", "NEXT_FD_RELATIVE": "0"},
-}
-
-
-def run_arm(arm: str, base_cmd: str, outdir: Path) -> RunResult:
-    if arm not in ARM_ENV:
-        raise SystemExit(f"unknown arm {arm!r}; choices: {sorted(ARM_ENV)}")
-    outdir.mkdir(parents=True, exist_ok=True)
-    csv_path = outdir / f"{arm}_metrics.csv"
-    env = copy.deepcopy(os.environ)
-    env.update(ARM_ENV[arm])
-    env["NEXT_METRICS_CSV"] = str(csv_path)
-    print(f"\n=== ARM {arm} ===\n  env: {ARM_ENV[arm]}\n  metrics -> {csv_path}")
-    # Reproducibility: same seed across arms so the ONLY difference is the field.
-    env.setdefault("PYTHONHASHSEED", "0")
-    proc = subprocess.run(base_cmd, shell=True, env=env)
-    if proc.returncode != 0:
-        print(f"  WARNING: arm {arm} exited with code {proc.returncode}")
-    return parse_metrics(arm, csv_path)
-
-
-def parse_metrics(arm: str, csv_path: Path) -> RunResult:
-    r = RunResult(arm=arm, csv_path=str(csv_path))
-    if not csv_path.exists():
-        print(f"  ERROR: no metrics file for arm {arm} at {csv_path}")
-        return r
-    import csv as _csv
-
-    with open(csv_path) as fh:
-        reader = _csv.DictReader(fh)
-        for row in reader:
-            try:
-                r.epochs.append(int(float(row["epoch"])))
-                r.val_loss.append(float(row["val_loss"]))
-                r.val_pos_err.append(float(row["val_pos_err"]))
-                r.val_vel_err.append(float(row["val_vel_err"]))
-            except (KeyError, ValueError):
-                continue
-    return r
-
-
-def compare(results: list[RunResult], policy: str, vel_tol: float) -> None:
-    results = [r for r in results if r.epochs]
-    if not results:
-        raise SystemExit("no arms produced metrics; nothing to compare")
-
-    print("\n" + "=" * 72)
-    print("FIELD-METHOD A/B  (win = lower val_pos_err, val_vel_err not materially up)")
-    print("=" * 72)
-
-    # baseline is 'central' if present, else the first arm
-    base = next((r for r in results if r.arm == "central"), results[0])
-    base_pos, base_pos_ep = base.best_pos()
-    base_vel, base_vel_ep = base.best_vel()
-
-    if policy == "matched_val_loss":
-        target = max(r.best_val_loss() for r in results)  # loss ALL arms reached
-        print(f"\nComparison policy: matched val_loss <= {target:.6g} "
-              f"(the best loss every arm reached)\n")
-        header = f"{'arm':>14} {'pos@L*':>12} {'ep':>5} {'vel@L*':>12} {'ep':>5}"
-        print(header); print("-" * len(header))
-        for r in results:
-            pa = r.pos_at_val_loss(target); va = r.vel_at_val_loss(target)
-            if pa is None or va is None:
-                print(f"{r.arm:>14} {'n/a':>12} {'-':>5} {'n/a':>12} {'-':>5}")
-                continue
-            print(f"{r.arm:>14} {pa[0]:>12.4g} {pa[1]:>5} {va[0]:>12.4g} {va[1]:>5}")
-    else:
-        print("\nComparison policy: each arm's BEST val_pos_err over its full run\n")
-        header = (f"{'arm':>14} {'best_pos':>12} {'ep':>5} {'best_vel':>12} {'ep':>5} "
-                  f"{'best_vloss':>12}")
-        print(header); print("-" * len(header))
-        for r in results:
-            bp, bpe = r.best_pos(); bv, bve = r.best_vel()
-            print(f"{r.arm:>14} {bp:>12.4g} {bpe:>5} {bv:>12.4g} {bve:>5} "
-                  f"{r.best_val_loss():>12.4g}")
-
-    # winner call vs baseline ------------------------------------------
-    print("\nVerdict vs baseline "
-          f"({base.arm}: pos={base_pos:.4g}@{base_pos_ep}, vel={base_vel:.4g}@{base_vel_ep}):")
-    for r in results:
-        if r is base:
-            continue
-        bp, _ = r.best_pos(); bv, _ = r.best_vel()
-        pos_gain = (base_pos - bp) / base_pos * 100.0
-        vel_change = (bv - base_vel) / base_vel * 100.0
-        # win: pos improved AND vel not materially worse (within vel_tol %)
-        if bp < base_pos and vel_change <= vel_tol * 100.0:
-            tag = "WIN"
-        elif abs(pos_gain) < 1.0 and abs(vel_change) < 1.0:
-            tag = "WASH"
-        elif bp < base_pos and vel_change > vel_tol * 100.0:
-            tag = "TRADEOFF (pos better, vel worse)"
+        # --- scaling stats (scaled <-> physical) ---------------------------
+        # Derivatives in scaled space: a physical accel a_phys enters the scaled
+        # velocity update as a_phys/sigma_v; a physical velocity enters the
+        # scaled position update as v_phys/sigma_p. StandardScaler's mean shift
+        # cancels in differences, but the velocity MEAN matters when converting a
+        # scaled velocity to the physical velocity that moves position.
+        if pos_scale is not None and vel_scale is not None:
+            ps = torch.as_tensor(pos_scale, dtype=torch.float32)
+            vs = torch.as_tensor(vel_scale, dtype=torch.float32)
+            vm = (
+                torch.as_tensor(vel_mean, dtype=torch.float32)
+                if vel_mean is not None
+                else torch.zeros_like(vs)
+            )
+            self.scaled_space = True
         else:
-            tag = "WORSE"
-        print(f"  {r.arm:>14}: pos {pos_gain:+6.2f}%  vel {vel_change:+6.2f}%  -> {tag}")
+            ps = torch.ones(self.n_axes)
+            vs = torch.ones(self.n_axes)
+            vm = torch.zeros(self.n_axes)
+            self.scaled_space = False
+        self.register_buffer("pos_scale", ps)  # sigma_p
+        self.register_buffer("vel_scale", vs)  # sigma_v
+        self.register_buffer("vel_mean", vm)   # mu_v
 
-    print("\nNote: 'jvp' is train-only (not ONNX-traceable). If it wins, ship "
-          "'central64' -- it reproduces J*dh to ~1e-9 and IS exportable, so the "
-          "deployed field matches. Confirm with a train-vs-ONNX field parity "
-          "check on a batch of states before export.")
-
-
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--cmd", required=True,
-                    help="full training command to run per arm (quoted)")
-    ap.add_argument("--arms", nargs="+", default=["central", "central64", "jvp"],
-                    choices=sorted(ARM_ENV))
-    ap.add_argument("--outdir", default="ab_runs/field_method")
-    ap.add_argument("--policy", default="best",
-                    choices=["best", "matched_val_loss"])
-    ap.add_argument("--vel-tol", type=float, default=0.02,
-                    help="max fractional val_vel_err increase still counted a win "
-                         "(default 0.02 = 2%%)")
-    ap.add_argument("--skip-run", action="store_true",
-                    help="don't launch training; just parse existing metrics CSVs")
-    args = ap.parse_args()
-
-    outdir = Path(args.outdir)
-    results: list[RunResult] = []
-    for arm in args.arms:
-        if args.skip_run:
-            results.append(parse_metrics(arm, outdir / f"{arm}_metrics.csv"))
+        # PHYSICAL acceleration bound -> scaled-acceleration bound the head emits.
+        # scaled_accel = a_phys / sigma_v, so a_max_scaled = a_max / sigma_v.
+        if isinstance(a_max, (int, float)):
+            a_max_vec = torch.full((self.n_axes,), float(a_max))
         else:
-            results.append(run_arm(arm, args.cmd, outdir))
+            a_max_vec = torch.as_tensor(a_max, dtype=torch.float32)
+            assert a_max_vec.numel() == self.n_axes, "a_max list must match n vel axes"
+        self.register_buffer("a_max_phys", a_max_vec)
+        self.register_buffer("a_max_scaled", a_max_vec / vs)
 
-    compare(results, args.policy, args.vel_tol)
+        # --- encoder: history window -> context vector ---------------------
+        self.encoder = nn.GRU(
+            input_size=state_dim,
+            hidden_size=enc_hidden,
+            num_layers=enc_layers,
+            batch_first=True,
+        )
 
-    summary = {
-        r.arm: {
-            "best_pos": r.best_pos()[0] if r.epochs else None,
-            "best_pos_epoch": r.best_pos()[1] if r.epochs else None,
-            "best_vel": r.best_vel()[0] if r.epochs else None,
-            "best_vel_epoch": r.best_vel()[1] if r.epochs else None,
-            "best_val_loss": r.best_val_loss() if r.epochs else None,
-            "csv": r.csv_path,
-        }
-        for r in results
-    }
-    (outdir / "summary.json").write_text(json.dumps(summary, indent=2))
-    print(f"\nwrote {outdir/'summary.json'}")
+        # --- MDN head: context -> {mode logits, per-mode accel sequence} ----
+        # Each mode emits an acceleration for every future step and every vel
+        # axis: T * n_axes raw values, squashed by tanh and scaled by a_max.
+        self.mode_logits = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes),
+        )
+        self.accel_head = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes * self.horizon * self.n_axes),
+        )
+        # Optional per-mode, per-axis log-sigma for the mixture likelihood
+        # (aleatoric spread of each mode around its integrated mean path).
+        self.logsig_head = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes * self.n_axes),
+        )
+
+    # ------------------------------------------------------------------
+    def _integrate(self, accel_scaled: torch.Tensor, x_last: torch.Tensor) -> torch.Tensor:
+        """Integrate bounded scaled acceleration into full scaled state paths.
+
+        accel_scaled : (B, K, T, n_axes)  scaled acceleration per mode/step/axis
+        x_last       : (B, state_dim)     last observed (scaled) state = IC
+
+        Returns states : (B, K, T, state_dim) scaled [.,pos,.,vel,.] filled on the
+        paired pos/vel indices; any unpaired state channels (e.g. an azimuth-rate)
+        are held at their last observed value (the kinematic head does not model
+        them -- extend here if a frame needs it).
+        """
+        B, K, T, A = accel_scaled.shape
+        dt = self.dt
+        sig_p = self.pos_scale.view(1, 1, A)
+        sig_v = self.vel_scale.view(1, 1, A)
+        mu_v = self.vel_mean.view(1, 1, A)
+
+        # initial conditions gathered from the last observed state, per axis
+        p0 = x_last.index_select(-1, self.pos_idx).unsqueeze(1).expand(B, K, A)  # scaled pos
+        v0 = x_last.index_select(-1, self.vel_idx).unsqueeze(1).expand(B, K, A)  # scaled vel
+
+        p = p0
+        v = v0
+        pos_steps = []
+        vel_steps = []
+        for t in range(T):
+            a_s = accel_scaled[:, :, t, :]              # (B,K,A) scaled accel
+            # velocity update in scaled space: dv_scaled = (a_phys/sigma_v)*dt,
+            # and a_s already equals a_phys/sigma_v, so:
+            v = v + a_s * dt
+            # position update uses PHYSICAL velocity: v_phys = v_scaled*sigma_v + mu_v
+            v_phys = v * sig_v + mu_v
+            # dp_scaled = (v_phys/sigma_p)*dt
+            p = p + (v_phys / sig_p) * dt
+            pos_steps.append(p)
+            vel_steps.append(v)
+        pos = torch.stack(pos_steps, dim=2)  # (B,K,T,A)
+        vel = torch.stack(vel_steps, dim=2)  # (B,K,T,A)
+
+        # assemble full state paths; hold any non-pos/vel channels at last value
+        states = x_last.view(B, 1, 1, self.state_dim).expand(B, K, T, self.state_dim).clone()
+        pidx = self.pos_idx.view(1, 1, 1, A).expand(B, K, T, A)
+        vidx = self.vel_idx.view(1, 1, 1, A).expand(B, K, T, A)
+        states = states.scatter(-1, pidx, pos)
+        states = states.scatter(-1, vidx, vel)
+        return states
+
+    # ------------------------------------------------------------------
+    def forward(self, obs_window: torch.Tensor):
+        """
+        obs_window : (B, H, state_dim)  scaled history window.
+
+        Returns dict:
+            traj    : (B, K, T, state_dim)  K integrated future state paths (scaled)
+            log_pi  : (B, K)                mode log-probabilities (log-softmax)
+            log_sig : (B, K, n_axes)        per-mode log-sigma (position spread)
+            mean    : (B, T, state_dim)     mixture-mean path (weighted by pi) --
+                                            convenience single-trajectory output
+        """
+        B = obs_window.shape[0]
+        _, h_n = self.encoder(obs_window)     # h_n: (layers, B, enc_hidden)
+        ctx = h_n[-1]                         # (B, enc_hidden) last-layer hidden
+        x_last = obs_window[:, -1, :]         # (B, state_dim) IC for integration
+
+        log_pi = F.log_softmax(self.mode_logits(ctx), dim=-1)   # (B,K)
+        raw = self.accel_head(ctx).view(B, self.n_modes, self.horizon, self.n_axes)
+        a_max = self.a_max_scaled.view(1, 1, 1, self.n_axes)
+        accel = a_max * torch.tanh(raw)                          # bounded, feasible
+        log_sig = self.logsig_head(ctx).view(B, self.n_modes, self.n_axes)
+
+        traj = self._integrate(accel, x_last)                    # (B,K,T,state_dim)
+
+        pi = log_pi.exp().view(B, self.n_modes, 1, 1)
+        mean = (pi * traj).sum(dim=1)                            # (B,T,state_dim)
+
+        return {"traj": traj, "log_pi": log_pi, "log_sig": log_sig, "mean": mean}
 
 
-if __name__ == "__main__":
-    main()
+class MDNTrajectoryLoss(nn.Module):
+    """Mixture negative log-likelihood over future POSITION+VELOCITY, plus
+    convenience physical-unit L1 metrics matching the rest of the pipeline.
+
+    The NLL is the standard MDN objective: -log sum_k pi_k N(y | mu_k, sig_k).
+    Using the best-matching mode's likelihood (rather than only the mean path)
+    is what lets the model represent both branches of a juke without being
+    penalised for not averaging them -- the crucial property for an evasive
+    target. We also report minADE-style pos/vel error (error of the CLOSEST of
+    the K modes) as the metric, since that is how multimodal predictors are
+    actually scored and what the early stopper should track.
+    """
+
+    def __init__(
+        self,
+        pos_idx: list[int],
+        vel_idx: list[int],
+        scaler=None,
+        vel_weight: float = 1.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+        self.scaler = scaler
+        self.vel_weight = float(vel_weight)
+        self.eps = float(eps)
+        if scaler is not None:
+            self.register_buffer(
+                "pos_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(pos_idx)]
+            )
+            self.register_buffer(
+                "vel_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(vel_idx)]
+            )
+        else:
+            self.pos_sigma = None
+            self.vel_sigma = None
+
+    def forward(self, pred: dict, target: torch.Tensor):
+        """
+        pred   : output dict of MDNTrajectoryPredictor
+        target : (B, T, state_dim)  ground-truth future path (scaled)
+        """
+        traj = pred["traj"]          # (B,K,T,D)
+        log_pi = pred["log_pi"]      # (B,K)
+        log_sig = pred["log_sig"]    # (B,K,A)
+        B, K, T, D = traj.shape
+
+        tgt_pos = target.index_select(-1, self.pos_idx)      # (B,T,A)
+        tgt_vel = target.index_select(-1, self.vel_idx)      # (B,T,A)
+        mode_pos = traj.index_select(-1, self.pos_idx)       # (B,K,T,A)
+        mode_vel = traj.index_select(-1, self.vel_idx)       # (B,K,T,A)
+
+        # --- mixture NLL on position (time- and axis-summed Gaussian) -------
+        sig = log_sig.exp().clamp_min(self.eps).view(B, K, 1, -1)  # (B,K,1,A)
+        # per-mode, per-step Gaussian log-prob of the target position
+        diff = (mode_pos - tgt_pos.unsqueeze(1))                   # (B,K,T,A)
+        log_prob_axis = -0.5 * (diff / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
+        # sum over axes and time -> per-mode trajectory log-likelihood
+        log_prob_mode = log_prob_axis.sum(dim=(2, 3))             # (B,K)
+        # mixture: logsumexp_k (log_pi_k + log_prob_mode_k)
+        log_mix = torch.logsumexp(log_pi + log_prob_mode, dim=1)  # (B,)
+        nll = -log_mix.mean()
+
+        # small velocity consistency term: penalise the best mode's velocity
+        # error so modes stay kinematically honest (position NLL alone underuses
+        # the velocity channel).
+        with torch.no_grad():
+            per_mode_pos_err = (mode_pos - tgt_pos.unsqueeze(1)).pow(2).mean(dim=(2, 3))  # (B,K)
+            best = per_mode_pos_err.argmin(dim=1)                                          # (B,)
+        b = torch.arange(B, device=traj.device)
+        vel_best = mode_vel[b, best]                              # (B,T,A)
+        vel_mse = F.mse_loss(vel_best, tgt_vel)
+        loss = nll + self.vel_weight * vel_mse
+
+        # --- metrics: minADE-style physical-unit L1 of the closest mode -----
+        with torch.no_grad():
+            if self.pos_sigma is not None:
+                pos_err = (mode_pos - tgt_pos.unsqueeze(1)).abs() * self.pos_sigma.view(1, 1, 1, -1)
+                vel_err = (mode_vel - tgt_vel.unsqueeze(1)).abs() * self.vel_sigma.view(1, 1, 1, -1)
+            else:
+                pos_err = (mode_pos - tgt_pos.unsqueeze(1)).abs()
+                vel_err = (mode_vel - tgt_vel.unsqueeze(1)).abs()
+            # closest mode per sample (by pos), then mean over T,A and batch
+            pos_err_mode = pos_err.mean(dim=(2, 3))              # (B,K)
+            min_idx = pos_err_mode.argmin(dim=1)                 # (B,)
+            pos_err_min = pos_err_mode[b, min_idx].mean()
+            vel_err_min = vel_err.mean(dim=(2, 3))[b, min_idx].mean()
+
+        return {"loss": loss, "pos_err": pos_err_min, "vel_err": vel_err_min}
+
+
+class MDNTrajectoryForONNX(nn.Module):
+    """ONNX export adapter. Takes the scaled history window (B,H,D) and returns
+    a flat, tracker-friendly tuple:
+        traj   : (B, K, T, D)  the K candidate future paths (scaled)
+        pi     : (B, K)        mixture weights (probabilities, softmaxed)
+        mean   : (B, T, D)     mixture-mean path (single-trajectory convenience)
+    The chaser can consume the full weighted set (pursue-and-hedge) or just the
+    mean / highest-weight mode. All outputs are in scaled units; apply the
+    exported StandardScaler inverse exactly as for the other models.
+    """
+
+    def __init__(self, model: MDNTrajectoryPredictor):
+        super().__init__()
+        self.model = model
+
+    def forward(self, obs_window: torch.Tensor):
+        out = self.model(obs_window)
+        return out["traj"], out["log_pi"].exp(), out["mean"]

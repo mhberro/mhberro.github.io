@@ -1,3 +1,4 @@
+#NEXT_training_mo_cl_ref_loss
 # Built-ins
 import argparse
 import json
@@ -46,6 +47,11 @@ from coordinate_transform_functions import (
 from energy_functions import mechanical_energy
 from load_truth import load_single_truth
 from loss_functions import EnergyMSELoss, PhysicsSplitMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+from mdn_trajectory_model import (
+    MDNTrajectoryForONNX,
+    MDNTrajectoryLoss,
+    MDNTrajectoryPredictor,
+)
 
 # from prediction.mlearn.neural_ode.neural_ode import (
 #     DEFAULT_LOSS,
@@ -451,24 +457,13 @@ class GRUODELatentModel(torch.nn.Module):
         vel_scale=None,       # StandardScaler scale_ (sigma) for the vel block
         vel_mean=None,        # StandardScaler mean_ (mu) for the vel block
         so_correction_alpha: float = 0.0,  # soft-constraint correction magnitude
-        field_method: str = "central",     # "central"/"central64"/"jvp" (see _field)
+        so_correction_mode: str = "multiplicative",  # "multiplicative" | "additive" (legacy)
+        field_method: str = "central",     # "central" matches ONNX/deploy; "jvp" = exact
         fd_eps: float = 1e-4,              # central-difference step (must match export)
-        fd_relative: bool = False,         # fixed-length probe eps*dh/||dh|| (see _field)
-        dt: float = 0.1,                   # DEPLOYMENT step (seconds) for the Heun term
-        heun_correction: bool = False,     # add the structural 1/2*dt*a position term
     ):
         super().__init__()
         self.func = func
         self.aug_dim = aug_dim
-        # Deployment timestep and the Heun/midpoint position correction (item A
-        # from the aero review). Single-step Euler on the position channel drops
-        # the 1/2*a*dt^2 curvature term EVERY step, producing a biased,
-        # horizon-accumulating position error. The model already computes the
-        # (scaled) acceleration as xdot[vel_idx]; folding 1/2*dt*a into the
-        # position derivative makes the deployed Euler step second-order accurate
-        # on position, statelessly. See _field for the scaled-space derivation.
-        self.dt = float(dt)
-        self.heun_correction = bool(heun_correction)
         # Train/deploy field parity: the ONNX export computes the physical
         # derivative via CENTRAL FINITE DIFFERENCE through the decoder; the
         # original training path used an exact JVP. Under the soft constraint the
@@ -477,12 +472,7 @@ class GRUODELatentModel(torch.nn.Module):
         # "central" (default) makes the trained field identical to the deployed
         # field; "jvp" restores the exact train-only derivative for comparison.
         self.field_method = field_method
-        if field_method not in ("central", "central64", "jvp"):
-            raise ValueError(
-                f"field_method must be 'central', 'central64', or 'jvp', got {field_method!r}"
-            )
         self.fd_eps = float(fd_eps)
-        self.fd_relative = bool(fd_relative)
         # Soft second-order constraint: xdot[pos] = kinematic_term
         #   + alpha * tanh(decoder_pos_deriv). alpha=0 => HARD constraint
         #   (pos-deriv fully determined by velocity, original behaviour).
@@ -491,6 +481,23 @@ class GRUODELatentModel(torch.nn.Module):
         #   integral (which is what makes val_pos_err plateau under the hard
         #   constraint). tanh bounds the correction; alpha caps its magnitude.
         self.so_correction_alpha = float(so_correction_alpha)
+        # Correction FORM (reviewer R2, second pass). The additive form
+        #   pos_deriv = kinematic + alpha*tanh(...)
+        # bounds the correction at alpha in SCALED-position units/s, i.e.
+        # alpha*sigma_pos m/s in PHYSICAL units. For glide-scale data
+        # (sigma_pos ~ tens of km) that ceiling can EXCEED the kinematic term
+        # itself (~v_phys/sigma_pos scaled/s): the "small bounded nudge" becomes
+        # an unbounded-in-relative-terms drift channel the network can use to
+        # memorize position fits on ~96 trajectories instead of routing them
+        # through velocity. The multiplicative form
+        #   pos_deriv = kinematic * (1 + alpha*tanh(...))
+        # bounds the correction at alpha RELATIVE to the kinematic term —
+        # scale-free per axis, so alpha~0.1 really means "<=10% kinematic
+        # correction" in every frame and every unit system. Set mode="additive"
+        # to reproduce the legacy behaviour for A/B.
+        if so_correction_mode not in ("multiplicative", "additive"):
+            raise ValueError(f"unknown so_correction_mode: {so_correction_mode}")
+        self.so_correction_mode = so_correction_mode
         # second-order coupling (None => disabled, original behaviour)
         self.second_order = pos_idx is not None and vel_idx is not None
         if self.second_order:
@@ -529,45 +536,14 @@ class GRUODELatentModel(torch.nn.Module):
     def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
         h = self.func.encode(x_phys)
         dh = self.func.cell(t, h)
-        if self.field_method in ("central", "central64"):
-            # Directional finite difference of the decoder along dh: an
-            # approximation to the exact JVP  J*dh. Kept because the ONNX export
-            # cannot trace torch.func.jvp, so matching it here preserves
-            # train/deploy parity.
-            #
-            # NUMERICAL NOTE (validated offline): in float32 with a fixed
-            # eps=1e-4 the relative error of this estimate scales like 1/||dh||.
-            # The GRU-ODE cell output (1-z)*(g-h) is SMALL on smooth glide
-            # stretches (z->1 near equilibrium) -- exactly the long,
-            # horizon-dominating segments where any systematic field error
-            # integrates worst into position drift. Measured rel-err there was
-            # ~7e-2 (float32) with a nonzero MEAN (bias) component ~2.6e-5.
-            #   * "central"   : original float32 FD (parity with current ONNX).
-            #   * "central64" : same formula in float64, cast back. Recovers the
-            #                   exact JVP to ~1e-9 rel-err REGARDLESS of ||dh||
-            #                   (bias ~5e-14) and is ONNX-exportable.
-            #
-            # fd_relative: use a fixed-LENGTH probe step of size eps along the dh
-            # direction, then rescale by ||dh|| to recover J*dh. This keeps the
-            # probe out of the float-resolution floor when ||dh|| is tiny.
-            #   step = eps * dh/||dh||   (length eps)
-            #   J*dh = [decode(h+step) - decode(h-step)] / (2*eps) * ||dh||
-            # Absolute mode is the plain two-sided difference: step = eps*dh,
-            #   J*dh = [decode(h+step) - decode(h-step)] / (2*eps).
+        if self.field_method == "central":
+            # Match the ONNX/deployment field EXACTLY: central finite difference
+            # of the decoder in the dh direction. Same formula and eps as
+            # GRUODEFieldForONNX so the trained field == the deployed field.
             eps = self.fd_eps
-            work_dtype = torch.float64 if self.field_method == "central64" else h.dtype
-            h_w = h.to(work_dtype)
-            dh_w = dh.to(work_dtype)
-            if self.fd_relative:
-                nrm = dh_w.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-                step = eps * dh_w / nrm
-                scale = nrm / (2.0 * eps)          # multiply back by ||dh||
-            else:
-                step = eps * dh_w
-                scale = 1.0 / (2.0 * eps)
-            x_plus = self.func.decode(h_w + step)
-            x_minus = self.func.decode(h_w - step)
-            xdot = ((x_plus - x_minus) * scale).to(x_phys.dtype)
+            x_plus = self.func.decode(h + eps * dh)
+            x_minus = self.func.decode(h - eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * eps)
         else:
             # exact forward-mode JVP (train-only; not reproducible in ONNX export)
             _, xdot = _decoder_jvp(self.func.decode, h, dh)  # noqa: F821
@@ -577,32 +553,21 @@ class GRUODELatentModel(torch.nn.Module):
             vel_now = x_phys.index_select(-1, self.vel_idx)
             if getattr(self, "scaled_space", False):
                 vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-
-            if self.heun_correction:
-                # Heun/midpoint position term (aero review item A). The exact
-                # one-step position increment is v*dt + 1/2*a*dt^2 + O(dt^3);
-                # single-step Euler deployment keeps only v*dt, dropping the
-                # curvature term every step -> accumulating position bias.
-                # The model's own scaled acceleration is xdot[vel_idx]. In scaled
-                # position units the missing contribution to the DERIVATIVE is
-                # 1/2*dt*(sigma_vel/sigma_pos)*accel_s = 1/2*dt*so_ratio*accel_s,
-                # so that Euler advances pos by 1/2*dt^2*a as required. This is
-                # gathered at the SAME (possibly non-contiguous) vel_idx so it
-                # aligns axis-for-axis with pos_idx.
-                accel_s = xdot.index_select(-1, self.vel_idx)
-                if getattr(self, "scaled_space", False):
-                    accel_term = 0.5 * self.dt * self.so_ratio * accel_s
-                else:
-                    accel_term = 0.5 * self.dt * accel_s
-                pos_deriv = pos_deriv + accel_term
-
             if self.so_correction_alpha > 0.0:
-                # Optional additional BOUNDED learned residual on top of the
-                # kinematic (+ Heun) term. tanh bounds it; alpha caps magnitude.
+                # SOFT constraint: keep the kinematic term but allow a bounded,
+                # learned correction taken from the decoder's own position
+                # derivative (which the hard constraint discards). tanh bounds
+                # the gate to (-1,1); alpha scales it. See __init__ for why
+                # "multiplicative" (relative, scale-free) is the default and
+                # "additive" (absolute, scaled units) is legacy-only.
                 decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
-                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
-
+                gate = torch.tanh(decoder_pos_deriv)
+                if self.so_correction_mode == "multiplicative":
+                    pos_deriv = vel_now * (1.0 + self.so_correction_alpha * gate)
+                else:  # "additive" legacy
+                    pos_deriv = vel_now + self.so_correction_alpha * gate
+            else:
+                pos_deriv = vel_now
             xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
         return xdot
 
@@ -796,86 +761,43 @@ def _make_obs_target(
     return obs_window, target
 
 
-# Metric-key spellings we accept from neural_ode_mod.py's fit() output, in
-# priority order. First hit wins per field.
-_AB_KEY_ALIASES = {
-    "val_loss":    ("val_loss", "validation_loss", "val_loss_weighted"),
-    "val_pos_err": ("val_pos_err", "val_position_error", "val_pos_error", "pos_err_val"),
-    "val_vel_err": ("val_vel_err", "val_velocity_error", "val_vel_error", "vel_err_val"),
-}
+def _make_mdn_windows(
+    traj_list: list[torch.Tensor],
+    history: int,
+    horizon: int,
+    stride: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build (history, future) supervised pairs by sliding a window over each
+    trajectory.
 
+    For a trajectory of length L, every index i with i >= history and
+    i + horizon <= L yields:
+        X = traj[i-history : i]        (history, D)   the observed past
+        Y = traj[i : i+horizon]        (horizon, D)   the future to predict
 
-def _extract_series(metrics, node):
-    """Return dict field -> list[float] of per-epoch values, from whatever the
-    fit() metrics object / node.training_metrics happens to expose.
+    This is the natural supervision for a windowed predictor AND doubles as
+    strong augmentation: one 200-step flight yields ~200 training pairs, each a
+    different mid-flight initial condition -- exactly the "predict from an
+    arbitrary state mid-maneuver" signal the chaser needs, and a large multiplier
+    on an otherwise small trajectory count.
 
-    Handles: (a) dict-of-lists {'val_loss': [...], ...}; (b) list-of-dicts
-    [{'val_loss':..,'val_pos_err':..}, ...]; (c) node.training_metrics fallback.
+    Returns stacked tensors X:(N, history, D), Y:(N, horizon, D).
     """
-    def pick(d, field):
-        for k in _AB_KEY_ALIASES[field]:
-            if k in d:
-                return d[k]
-        return None
-
-    sources = []
-    if isinstance(metrics, dict):
-        sources.append(metrics)
-    if hasattr(node, "training_metrics") and isinstance(node.training_metrics, dict):
-        sources.append(node.training_metrics)
-
-    # (a) dict-of-lists
-    for src in sources:
-        cols = {f: pick(src, f) for f in _AB_KEY_ALIASES}
-        if any(isinstance(v, (list, tuple)) for v in cols.values()):
-            n = max((len(v) for v in cols.values() if isinstance(v, (list, tuple))), default=0)
-            out = {}
-            for f, v in cols.items():
-                if isinstance(v, (list, tuple)):
-                    out[f] = [float(x) for x in v]
-                else:
-                    out[f] = [float("nan")] * n
-            return out
-
-    # (b) list-of-dicts
-    seq = metrics if isinstance(metrics, (list, tuple)) else None
-    if seq and all(isinstance(e, dict) for e in seq):
-        out = {f: [] for f in _AB_KEY_ALIASES}
-        for e in seq:
-            for f in _AB_KEY_ALIASES:
-                val = pick(e, f)
-                out[f].append(float(val) if val is not None else float("nan"))
-        return out
-
-    return None
-
-
-def _log_ab_metrics(csv_path, metrics, node):
-    """Append per-epoch rows to csv_path. Epoch numbering is CONTINUOUS across
-    length-strategy stages (so 'convergence' is well defined for the whole run),
-    tracked via a counter stashed on the node."""
-    import csv as _csv
-
-    series = _extract_series(metrics, node)
-    if not series:
-        print("[ab-metrics] no recognizable per-epoch metrics; skipping")
-        return
-
-    n = max(len(v) for v in series.values())
-    start = getattr(node, "_ab_epoch_offset", 0)
-    path = Path(csv_path)
-    new_file = not path.exists()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", newline="") as fh:
-        w = _csv.writer(fh)
-        if new_file:
-            w.writerow(["epoch", "val_loss", "val_pos_err", "val_vel_err"])
-        for i in range(n):
-            def get(f):
-                v = series.get(f, [])
-                return v[i] if i < len(v) else float("nan")
-            w.writerow([start + i, get("val_loss"), get("val_pos_err"), get("val_vel_err")])
-    node._ab_epoch_offset = start + n
+    Xs, Ys = [], []
+    need = history + horizon
+    for traj in traj_list:
+        L = traj.shape[0]
+        if L < need:
+            continue
+        for i in range(history, L - horizon + 1, stride):
+            Xs.append(traj[i - history : i])
+            Ys.append(traj[i : i + horizon])
+    if not Xs:
+        raise ValueError(
+            f"No MDN windows produced: every trajectory shorter than "
+            f"history+horizon = {need}. Lower --mdn-history/--mdn-horizon."
+        )
+    return torch.stack(Xs, dim=0), torch.stack(Ys, dim=0)
 
 
 def train_NEXT(
@@ -893,6 +815,14 @@ def train_NEXT(
     gpu_index,
     model_type: str = "node",
     frame: str = "dcu",
+    train_integrator: str = "rk4",
+    train_substeps: int = 4,
+    export_field: str = "rk4-increment",
+    deploy_dt: float | None = None,
+    mdn_horizon: int = 20,
+    mdn_history: int = 10,
+    mdn_modes: int = 5,
+    mdn_a_max: float = 40.0,
 ):
     # define initial training configuration
     training_configuration = TrainingConfiguration(
@@ -913,7 +843,30 @@ def train_NEXT(
     #   * adjoint=True: O(1) memory in the number of steps (recompute on the
     #     backward pass) — switch this on if long horizons OOM the GPU; it trades
     #     memory for ~2x compute and is the setting the paper uses for big latents.
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
+    # --- integrator selection (reviewer R2, second pass) --------------------
+    # "rk4" (substeps=4): legacy — learns the CONTINUOUS derivative accurately;
+    #   pair with export_field="rk4-increment" so the deployed Euler step
+    #   reproduces the training-time flow exactly (see
+    #   GRUODEEulerIncrementFieldForONNX).
+    # "euler" (substeps=1) at the DEPLOYMENT dt: Euler-consistent training —
+    #   the rollout loss (training already integrates from the IC across the
+    #   whole trajectory) then teaches f to be the DISCRETE increment field
+    #   f*(x) ~ (Phi_dt(x)-x)/dt, which is exactly what single-step Euler
+    #   deployment consumes; f absorbs the modified-equation correction
+    #   (dt/2)*xdd itself. For exact parity, resample data at the deployment
+    #   dt (--dt). Coarse Euler gives noisier gradients early in training; the
+    #   length-strategy curriculum below mitigates this.
+    ode_solver = TorchdiffeqSolver(
+        dt=trajectory_dt, method=train_integrator, adjoint=False, substeps=train_substeps
+    )
+    if train_integrator == "euler" and export_field == "rk4-increment":
+        # An Euler-trained field already approximates the discrete increment;
+        # wrapping it in another RK4 step would apply the integrator twice.
+        print(
+            "train_integrator='euler': trained field already approximates the "
+            "discrete increment — overriding export_field to 'derivative'"
+        )
+        export_field = "derivative"
 
     if frame == "dcu":
         velocity_indicies = (3, 4, 5)
@@ -971,18 +924,19 @@ def train_NEXT(
         # error, invisible to flat MSE). Start late_weight~1.0, late_power=2.0
         # (emphasize the trajectory end); set late_weight=0.0 to A/B against the
         # current result. Sweep late_weight in {0.5, 1.0, 2.0}.
-        # A/B PROTOCOL: R2 late-weight OFF for the isolated cell (was 1.0). It is
-        # a third, independent attack on drift; leaving it on contaminates the
-        # attribution of A and of C. Re-enable (sweep {0.5,1.0,2.0}) only as its
-        # own labeled cell.
-        late_weight=0.0,
+        # R2 second pass: reduced 1.0 -> 0.5 now that vel_bias_weight charges
+        # the drift GENERATOR (velocity bias) directly — the two terms overlap.
+        # (late_weight=1.0, vel_bias_weight=0.0) reproduces the previous run.
+        late_weight=0.5,
         late_power=2.0,
-        # C: velocity DC-bias penalty. Targets the constant velocity offset that
-        # integrates into position drift. A/B PROTOCOL: OFF for the isolated cell
-        # (was 1.0) so the first run is the clean baseline / "A alone". Turn on
-        # (~= pos_weight) ONLY for the dedicated A+C cell, after A is understood
-        # in isolation.
-        vel_bias_weight=0.0,
+        # R2 second pass: cumulative velocity-bias term — penalizes the running
+        # time-mean of the velocity residual, i.e. exactly the systematic bias
+        # that integrates into terminal position error, while leaving zero-mean
+        # velocity noise uncharged (unlike the position ramp, which the model
+        # can also satisfy through the bounded alpha-correction channel).
+        # Residuals are small in scaled space so the useful range is larger
+        # than the other weights: sweep {1, 5, 25}.
+        vel_bias_weight=5.0,
         scaler=scaler_traj if use_scalar else None,
         N_FEATURES=model_states,
     )
@@ -1152,84 +1106,34 @@ def train_NEXT(
         # position-derivative correction so it can pull position back toward
         # truth. Start ~0.1 (scaled units); sweep 0.05-0.3. Set 0.0 to A/B
         # against the current hard-constraint result.
-        #
-        # A/B PROTOCOL (clean attribution): the queued experiment is "Heun ALONE"
-        # -> alpha MUST be 0.0 here so the only active position-derivative term is
-        # the item-A Heun correction. Restore to 0.1 only when deliberately
-        # re-enabling the soft tanh nudge (e.g. a later A+alpha cell) AFTER A is
-        # understood in isolation. Was 0.1 (combined with C/late).
-        SO_CORRECTION_ALPHA = 0.0
+        SO_CORRECTION_ALPHA = 0.1
+        # R2 second pass: correction FORM. "multiplicative" bounds the learned
+        # correction at alpha RELATIVE to the kinematic term (a true <=10%
+        # correction at alpha=0.1); the legacy "additive" form bounds it at
+        # alpha*sigma_pos m/s PHYSICAL — for glide-scale sigma_pos that ceiling
+        # can exceed the kinematic term itself, turning the "small nudge" into
+        # a drift channel that memorizes position fits on ~96 trajectories.
+        # Sanity-check on your scaler: compare alpha*sigma_pos[i] to mean
+        # |v_phys[i]|; if O(1) or larger, additive was the shortcut suspect in
+        # the ambiguous late-epoch position A/B. Use "additive" only to
+        # reproduce the legacy run.
+        SO_CORRECTION_MODE = "multiplicative"
 
         # Train/deploy field parity (reviewer R1). "central" makes the trained
         # field identical to the ONNX/deployed field (removes the JVP-vs-FD
         # mismatch on the position-derivative correction). "jvp" = exact,
         # train-only. Experiment plan: A/B (alpha=0.1, "central") vs
-        # --- Field method A/B (targets integrated-velocity bias -> val_pos_err)
-        # The physical derivative xdot = J*dh is computed one of three ways:
-        #   "central"   : float32 two-sided FD of the decoder (current default;
-        #                 identical to the ONNX export => train/deploy parity).
-        #   "central64" : same FD in float64, cast back. Recovers exact J*dh to
-        #                 ~1e-9 rel-err regardless of ||dh|| (float32 FD is ~7e-2
-        #                 on smooth glide stretches where ||dh|| is small, with a
-        #                 ~2.6e-5 systematic MEAN component that integrates into
-        #                 position drift). ONNX-exportable, so it can also become
-        #                 the deployed field -> parity preserved at higher
-        #                 accuracy. RECOMMENDED first A/B arm.
-        #   "jvp"       : exact forward-mode JVP (train-only; NOT ONNX-traceable,
-        #                 so it BREAKS parity if shipped -- use only to measure
-        #                 the ceiling, then match it with central64 in export).
-        # A/B protocol: hold everything else fixed (alpha=0.0, heun off, C off),
-        # run central vs central64 vs jvp, compare val_vel_err and val_pos_err at
-        # matched val_loss / convergence. If central64 ~= jvp and both beat
-        # central, the float32 FD was injecting the bias -> ship central64 in
-        # export. Start with "central" for the baseline row.
-        FIELD_METHOD = os.environ.get("NEXT_FIELD_METHOD", "central")
-        FD_EPS = float(os.environ.get("NEXT_FD_EPS", "1e-4"))          # probe step; export must use the SAME value
-        FD_RELATIVE = os.environ.get("NEXT_FD_RELATIVE", "0") == "1"   # True => fixed-length step eps*dh/||dh|| (see _field)
-
-        # Heun/midpoint position correction (aero review item A). When True, the
-        # position derivative gets the structural +1/2*dt*a term. This ONLY
-        # corrects an error when the deployment integrator is SINGLE-STEP EXPLICIT
-        # EULER, whose per-step position increment drops exactly the 1/2*a*dt^2
-        # curvature term. In that case DEPLOY_DT must equal the tracker's Euler
-        # step and the term cancels the drift exactly.
-        #
-        # *** CONTRACT CHECK (verified against Simple_Sim.py, not assumed) ***
-        # Simple_Sim.NEXT_extrapolation routes GRU-ODE models (is_gruode: the
-        # '--gruode' flag OR a '_gruode_' token in the model filename) to RK4 with
-        # sub-stepping at ~trajectory_dt (sub_dt from the '_{dt}sec_' filename
-        # token), taking round(extrapolation_dt/sub_dt) sub-steps per output dt.
-        # extrapolation_dt = 1.0 there is the OUTPUT cadence, NOT the integration
-        # step. Under that RK4 path the curvature term is NOT dropped, so the Heun
-        # term injects a spurious +1/2*dt*a bias into the field (verified
-        # numerically: it ADDS error, and larger DEPLOY_DT makes it worse).
-        #   -> If deployed via the RK4/substep path: set HEUN_CORRECTION=False.
-        #   -> Only if this model is genuinely deployed under a SINGLE 1.0s Euler
-        #      step (untagged filename AND no --gruode) does item A apply, and
-        #      then DEPLOY_DT must be 1.0 (== that Euler step), not trajectory_dt.
-        # Because the correct value is contract-dependent and the two contracts
-        # want OPPOSITE things, do NOT hard-wire it. Confirm how the sim is
-        # actually invoked for this model, then set the two knobs below to match.
-        #
-        # Default here is the SAFE choice for the RK4/substep deployment path
-        # (item A off), which is the sim's built-in routing for GRU-ODE models.
-        HEUN_CORRECTION = False   # True ONLY if deployed under single-step Euler
-        # Deployment integration step for the Heun term. IGNORED when
-        # HEUN_CORRECTION is False. If you enable Heun for a single-step-Euler
-        # deployment, set this to that Euler step (the sim's extrapolation_dt,
-        # 1.0s), NOT trajectory_dt.
-        DEPLOY_DT = trajectory_dt
+        # (alpha=0.0, "central") first; the latter is the pure hard constraint
+        # with guaranteed parity.
+        FIELD_METHOD = "central"
 
         node.model = GRUODELatentModel(
             func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
             pos_idx=pos_idx, vel_idx=vel_idx,
             pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
             so_correction_alpha=SO_CORRECTION_ALPHA,
+            so_correction_mode=SO_CORRECTION_MODE,
             field_method=FIELD_METHOD,
-            fd_eps=FD_EPS,
-            fd_relative=FD_RELATIVE,
-            dt=DEPLOY_DT,
-            heun_correction=HEUN_CORRECTION,
         ).to(node.device)
         # Optional JIT compilation of the field for extra GPU throughput.
         # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
@@ -1281,6 +1185,69 @@ def train_NEXT(
         # NOTE: NODEPredictor expects a callable that takes (pred, true).
         # We therefore bind the extra arguments via a lambda.
         node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    elif model_type == "mdn":
+        # ------------------------------------------------------------
+        #  Mixture-Density Trajectory Predictor (evasive-agent forecasting)
+        # ------------------------------------------------------------
+        # A GRU encoder over a HISTORY WINDOW feeds a mixture-density head that
+        # emits K weighted future trajectories, each produced by integrating a
+        # BOUNDED per-mode acceleration through the known kinematics. This is a
+        # windowed sequence-to-sequence predictor, NOT a stateless ODE field, so
+        # it does not use the ode_solver / torchdiffeq path at all; it trains and
+        # exports as its own object (see mdn_trajectory_model.py).
+        #
+        # Position/velocity index pairing per frame (same convention the
+        # second-order constraint uses):
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            mdn_pos_idx, mdn_vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            mdn_pos_idx, mdn_vel_idx = [0, 1], [2, 4]   # s<-v_s, h<-v_h (v_alpha unpaired)
+        elif frame == "grdth":
+            mdn_pos_idx, mdn_vel_idx = [0, 1], [2, 3]
+        else:
+            mdn_pos_idx, mdn_vel_idx = [0, 1, 2], [3, 4, 5]
+
+        # Scaler stats so integration and a_max live in the right (scaled) units.
+        mdn_pos_scale = mdn_vel_scale = mdn_vel_mean = None
+        if use_scalar and isinstance(scaler_traj, StandardScaler):
+            mdn_pos_scale = scaler_traj.scale_[mdn_pos_idx]
+            mdn_vel_scale = scaler_traj.scale_[mdn_vel_idx]
+            mdn_vel_mean = scaler_traj.mean_[mdn_vel_idx]
+
+        # Prediction horizon (# future steps) and history length (# past steps).
+        # Kept as locals here; promote to CLI flags if you want to sweep them.
+        MDN_HORIZON = mdn_horizon
+        MDN_HISTORY = mdn_history
+        MDN_MODES = mdn_modes
+        # Physical acceleration envelope of the runner drone (m/s^2). Set from
+        # the platform's real limit; a_max caps every predicted juke so no mode
+        # is ever dynamically infeasible. Default ~4 g.
+        MDN_A_MAX = mdn_a_max
+
+        node.model = MDNTrajectoryPredictor(
+            state_dim=model_states,
+            pos_idx=mdn_pos_idx,
+            vel_idx=mdn_vel_idx,
+            horizon=MDN_HORIZON,
+            dt=trajectory_dt,
+            n_modes=MDN_MODES,
+            enc_hidden=nhidden,
+            head_hidden=nhidden,
+            a_max=MDN_A_MAX,
+            pos_scale=mdn_pos_scale,
+            vel_scale=mdn_vel_scale,
+            vel_mean=mdn_vel_mean,
+        ).to(node.device)
+
+        mdn_criterion = MDNTrajectoryLoss(
+            pos_idx=mdn_pos_idx,
+            vel_idx=mdn_vel_idx,
+            scaler=scaler_traj if use_scalar else None,
+            vel_weight=1.0,
+        ).to(node.device)
+        # NODEPredictor calls loss_func(pred, true); pred is the model's dict
+        # output and true is the (B,T,D) future-target window.
+        node.loss_func = lambda pred, true: mdn_criterion(pred, true)
     else:
         raise ValueError(f"Unsupported model_type: {model_type}")
 
@@ -1314,10 +1281,126 @@ def train_NEXT(
         # except Exception as e:
         #     print("failed to compile the nn due to", e)
 
+        if model_type == "mdn":
+            # ----------------------------------------------------------------
+            #  MDN training path (windowed seq2seq; bypasses the ODE curriculum)
+            # ----------------------------------------------------------------
+            # The length-strategy curriculum below trains on progressively longer
+            # trajectory PREFIXES -- meaningful only for an ODE integrated from a
+            # single IC. The MDN instead trains on fixed-size sliding windows, so
+            # it has its own simple fit here and returns before that curriculum.
+            X_tr, Y_tr = _make_mdn_windows(
+                scaled_traj_targets_train_posvel, mdn_history, mdn_horizon
+            )
+            X_val, Y_val = _make_mdn_windows(
+                scaled_traj_targets_test_posvel, mdn_history, mdn_horizon
+            )
+            print(
+                f"MDN windows: {X_tr.shape[0]} train / {X_val.shape[0]} val "
+                f"(history={mdn_history}, horizon={mdn_horizon}, "
+                f"modes={mdn_modes}, a_max={mdn_a_max} m/s^2)"
+            )
+
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=3000,
+                optimizer=AdamOptimizer(learning_rate=1e-3),
+                batch_size=batch_size,
+                num_workers=2,
+                verbose=True,
+            )
+
+            # Self-contained training loop. The MDN's (history -> future-dict)
+            # signature and dict-valued loss don't match the ODE fit() contract
+            # (which supervises an integrated trajectory against itself), so we
+            # run a plain, explicit loop here rather than routing through
+            # NODEPredictor.fit. This keeps the MDN decoupled from the ODE
+            # trainer internals and makes its objective/early-stopping obvious.
+            device = node.device
+            model = node.model
+            X_tr, Y_tr = X_tr.to(device), Y_tr.to(device)
+            X_val, Y_val = X_val.to(device), Y_val.to(device)
+            opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+            sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="min", factor=0.5, patience=20
+            )
+
+            n = X_tr.shape[0]
+            best_val = float("inf")
+            best_state = deepcopy(model.state_dict())
+            patience, bad_epochs, max_epochs = 80, 0, 3000
+            ckpt_path = os.path.join(model_save_path, model_name + ".pt")
+
+            for epoch in range(max_epochs):
+                model.train()
+                perm = torch.randperm(n, device=device)
+                epoch_loss = 0.0
+                n_batches = 0
+                for s in range(0, n, batch_size):
+                    idx = perm[s : s + batch_size]
+                    xb, yb = X_tr[idx], Y_tr[idx]
+                    opt.zero_grad()
+                    out = model(xb)
+                    ld = mdn_criterion(out, yb)
+                    ld["loss"].backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                    opt.step()
+                    epoch_loss += float(ld["loss"].detach())
+                    n_batches += 1
+
+                model.eval()
+                with torch.no_grad():
+                    vout = model(X_val)
+                    vld = mdn_criterion(vout, Y_val)
+                    val_loss = float(vld["loss"])
+                    val_pos = float(vld["pos_err"])
+                    val_vel = float(vld["vel_err"])
+                sched.step(val_loss)
+
+                if epoch % 25 == 0 or epoch == max_epochs - 1:
+                    print(
+                        f"[mdn] epoch {epoch:4d}  train {epoch_loss / max(n_batches,1):.4f}  "
+                        f"val_loss {val_loss:.4f}  val_pos_err {val_pos:.2f}  "
+                        f"val_vel_err {val_vel:.2f}"
+                    )
+
+                if val_loss < best_val - 5e-3:
+                    best_val = val_loss
+                    best_state = deepcopy(model.state_dict())
+                    torch.save(model.state_dict(), ckpt_path)
+                    bad_epochs = 0
+                else:
+                    bad_epochs += 1
+                    if bad_epochs >= patience:
+                        print(f"[mdn] early stop at epoch {epoch} (best val {best_val:.4f})")
+                        break
+
+            model.load_state_dict(best_state)
+            model.train(False)
+            model.eval()
+
+            # ONNX export of the windowed predictor (own adapter; no ODE field).
+            raw_mdn = getattr(model, "_orig_mod", model)
+            export_model = MDNTrajectoryForONNX(raw_mdn).to(device).eval()
+            example_input = X_tr[:1].to(device)  # (1, history, D)
+            torch.onnx.export(
+                export_model,
+                example_input,
+                os.path.join(model_save_path, model_name + ".onnx"),
+                export_params=True,
+                opset_version=18,
+                input_names=["history_window"],
+                output_names=["traj", "pi", "mean"],
+                dynamic_axes={
+                    "history_window": {0: "batch"},
+                    "traj": {0: "batch"},
+                    "pi": {0: "batch"},
+                    "mean": {0: "batch"},
+                },
+            )
+            print(f"MDN model + ONNX written for {model_name}")
+            return node, model_name
+
         if model_type == "latentode":
-            # Choose a short window (e.g. 10 time-steps).  You can expose this
-            # as another CLI argument if you wish.
-            OBS_WINDOW = 10
 
             train_data = [
                 _make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel
@@ -1427,18 +1510,6 @@ def train_NEXT(
                 # validation_data=fraction_of_data,
                 enable_checkpoints=True if data_fraction == 1.0 else False,
             )
-            # --- A/B metrics logging (opt-in via NEXT_METRICS_CSV) -------------
-            # Append per-epoch (epoch, val_loss, val_pos_err, val_vel_err) so the
-            # field_method_ab.py harness can compare arms at matched val_loss /
-            # convergence. Defensive about key spelling because the metric dict
-            # is produced in neural_ode_mod.py; we probe a few common spellings
-            # and skip silently if unavailable (never breaks a training run).
-            _csv_path = os.environ.get("NEXT_METRICS_CSV")
-            if _csv_path:
-                try:
-                    _log_ab_metrics(_csv_path, metrics, node)
-                except Exception as _e:  # logging must never kill training
-                    print(f"[ab-metrics] skipped ({_e})")
         p = Path(model_save_path, model_name + ".checkpoint.pt")
         p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
 
@@ -1470,7 +1541,6 @@ def train_NEXT(
         if getattr(raw_model, "second_order", False):
             _pos_idx = raw_model.pos_idx.tolist()
             _vel_idx = raw_model.vel_idx.tolist()
-            _pos_scale = raw_model.so_ratio is not None and getattr(raw_model, "scaled_space", False)
             if getattr(raw_model, "scaled_space", False):
                 # reconstruct the per-block sigma/mu the adapter needs from the
                 # ratio/offset buffers is lossy; instead re-derive from scaler.
@@ -1482,37 +1552,39 @@ def train_NEXT(
         else:
             _pos_idx = _vel_idx = None
             _ps = _vs = _vm = None
-        # carry the soft-correction alpha, deployment dt, and Heun flag off the
-        # trained model so the exported field is identical to what was trained
+        # carry the soft-correction alpha AND mode off the trained model so the
+        # exported field is identical to what was trained
         _alpha = getattr(raw_model, "so_correction_alpha", 0.0)
-        _dt = getattr(raw_model, "dt", trajectory_dt)
-        _heun = getattr(raw_model, "heun_correction", False)
-        # Carry the field-derivative method so the exported field is bit-for-bit
-        # the trained field. "jvp" CANNOT be exported (autograd not traceable);
-        # fall back to central64, which reproduces exact J*dh to ~1e-9 and IS
-        # traceable, and warn so the parity break is explicit rather than silent.
-        _field_method = getattr(raw_model, "field_method", "central")
-        _fd_eps = getattr(raw_model, "fd_eps", 1e-4)
-        _fd_relative = getattr(raw_model, "fd_relative", False)
-        if _field_method == "jvp":
-            print(
-                "WARNING: model trained with field_method='jvp', which is not "
-                "ONNX-traceable. Exporting with 'central64' (exact J*dh to ~1e-9) "
-                "instead. Deployed field will match the JVP field to ~1e-9 but "
-                "NOT bit-exactly. To guarantee parity, train with 'central64'."
-            )
-            _field_method = "central64"
+        _mode = getattr(raw_model, "so_correction_mode", "additive")
         export_model = GRUODEFieldForONNX(
             raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
             pos_idx=_pos_idx, vel_idx=_vel_idx,
             pos_scale=_ps, vel_scale=_vs, vel_mean=_vm,
             so_correction_alpha=_alpha,
-            field_method=_field_method,
-            fd_eps=_fd_eps,
-            fd_relative=_fd_relative,
-            dt=_dt,
-            heun_correction=_heun,
+            so_correction_mode=_mode,
         ).to(node.device).eval()
+        # --- integrator-in-the-field export (reviewer R2, second pass) -------
+        # The model was optimised so that RK4(substeps) o f matches truth; the
+        # tracker runs single-step Euler at a coarser fixed dt. Exporting the
+        # RK4 INCREMENT function makes the tracker's Euler update bit-for-bit
+        # one RK4 step of the trained field — see GRUODEEulerIncrementFieldForONNX.
+        # export_field="derivative" exports the raw field (legacy; also forced
+        # automatically when train_integrator="euler").
+        if export_field == "rk4-increment":
+            _deploy_dt = float(deploy_dt) if deploy_dt is not None else float(trajectory_dt)
+            export_model = GRUODEEulerIncrementFieldForONNX(
+                export_model,
+                dt=_deploy_dt,
+                # match the TRAINING solver's internal step for exact flow parity
+                substeps=(train_substeps if train_integrator == "rk4" else 1),
+            ).to(node.device).eval()
+            print(
+                f"exporting RK4 increment field: deploy dt={_deploy_dt}, "
+                f"substeps={export_model.substeps} "
+                f"({4 * export_model.substeps} field evals per deployed Euler step)"
+            )
+        elif export_field != "derivative":
+            raise ValueError(f"unknown export_field: {export_field}")
         example_input = torch.cat(
             (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
         ).to(node.device)
@@ -2046,30 +2118,17 @@ class GRUODEFieldForONNX(torch.nn.Module):
         vel_scale=None,
         vel_mean=None,
         so_correction_alpha: float = 0.0,
-        field_method: str = "central",
-        fd_eps: float | None = None,
-        fd_relative: bool = False,
-        dt: float = 0.1,
-        heun_correction: bool = False,
+        so_correction_mode: str = "multiplicative",
     ):
         super().__init__()
         self.func = func
         self.state_vector_len = state_vector_len
         self.aug_dim = aug_dim
-        # fd_eps (if given) overrides the legacy `eps` arg; keep both so old
-        # call sites that pass eps=... still work.
-        self.eps = float(fd_eps) if fd_eps is not None else float(eps)
-        # "jvp" is not ONNX-traceable; the export path rewrites it to "central64"
-        # before constructing this module, so we only ever see central/central64.
-        if field_method not in ("central", "central64"):
-            raise ValueError(
-                f"ONNX field_method must be 'central' or 'central64', got {field_method!r}"
-            )
-        self.field_method = field_method
-        self.fd_relative = bool(fd_relative)
+        self.eps = eps
         self.so_correction_alpha = float(so_correction_alpha)
-        self.dt = float(dt)
-        self.heun_correction = bool(heun_correction)
+        # Must mirror GRUODELatentModel exactly (see its __init__ for the
+        # multiplicative-vs-additive rationale) or trained != deployed field.
+        self.so_correction_mode = so_correction_mode
         self.second_order = pos_idx is not None and vel_idx is not None
         if self.second_order:
             self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
@@ -2099,39 +2158,116 @@ class GRUODEFieldForONNX(torch.nn.Module):
             x_phys = x
         h = self.func.encode(x_phys)
         dh = self.func.cell(0.0, h)
-        # Mirror GRUODELatentModel._field EXACTLY (see its NUMERICAL NOTE).
-        eps = self.eps
-        work_dtype = torch.float64 if self.field_method == "central64" else h.dtype
-        h_w = h.to(work_dtype)
-        dh_w = dh.to(work_dtype)
-        if self.fd_relative:
-            nrm = dh_w.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-            step = eps * dh_w / nrm
-            scale = nrm / (2.0 * eps)
-        else:
-            step = eps * dh_w
-            scale = 1.0 / (2.0 * eps)
-        x_plus = self.func.decode(h_w + step)
-        x_minus = self.func.decode(h_w - step)
-        xdot = ((x_plus - x_minus) * scale).to(x_phys.dtype)
+        x_plus = self.func.decode(h + self.eps * dh)
+        x_minus = self.func.decode(h - self.eps * dh)
+        xdot = (x_plus - x_minus) / (2.0 * self.eps)
         if self.second_order:
             vel_now = x_phys.index_select(-1, self.vel_idx)
             if getattr(self, "scaled_space", False):
                 vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            if self.heun_correction:
-                # mirror GRUODELatentModel._field's Heun term exactly
-                accel_s = xdot.index_select(-1, self.vel_idx)
-                if getattr(self, "scaled_space", False):
-                    pos_deriv = pos_deriv + 0.5 * self.dt * self.so_ratio * accel_s
-                else:
-                    pos_deriv = pos_deriv + 0.5 * self.dt * accel_s
             if self.so_correction_alpha > 0.0:
-                # mirror the soft correction exactly
+                # mirror GRUODELatentModel._field's soft correction exactly
                 decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
-                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+                gate = torch.tanh(decoder_pos_deriv)
+                if self.so_correction_mode == "multiplicative":
+                    vel_now = vel_now * (1.0 + self.so_correction_alpha * gate)
+                else:  # "additive" legacy
+                    vel_now = vel_now + self.so_correction_alpha * gate
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
         return xdot
+
+
+class GRUODEEulerIncrementFieldForONNX(torch.nn.Module):
+    """Integrator-in-the-field export: closes the train/deploy integrator gap.
+
+    THE GAP: the model is trained so that RK4(substeps) o f reproduces truth
+    (TorchdiffeqSolver, method="rk4"), but the deployed tracker runs
+    single-step explicit EULER at a fixed dt. Even with perfect field parity,
+    the discrete flows differ by Euler's local truncation error ~(dt^2/2)*xdd
+    per step — and on a curved glide arc xdd keeps a consistent sign over long
+    stretches, so this is a SYSTEMATIC, integrating position bias introduced
+    entirely at deployment, after training.
+
+    THE FIX: export the RK4 *increment function* instead of the raw derivative:
+
+        f_tilde(x) = (RK4_step(f, x, dt_deploy) - x) / dt_deploy
+
+    Then the tracker's contract-mandated update  x + dt*f_tilde(x)  is
+    bit-for-bit one RK4 step of the trained field f. The deployment contract
+    fixes the CALL SIGNATURE (stateless xdot = f(x), single Euler step, fixed
+    dt) — not the internal structure of f — and dt is fixed and known at
+    export, so the increment function is a legitimate stateless field.
+
+    substeps: match the TRAINING solver's substeps for exact train/deploy flow
+    parity (training integrates at dt/substeps internally). substeps=1 is
+    already O(dt^4)-accurate vs Euler's O(dt) and costs 4 field evals/step;
+    substeps=S costs 4*S evals/step.
+
+    IMPORTANT: only export this wrapper when the field was trained with an
+    RK4 (derivative-approximating) solver. If training itself ran Euler at the
+    deployment dt (see --train-integrator), the trained f already IS the
+    discrete increment and must be exported raw (the caller guards this).
+    """
+
+    def __init__(self, base_field: torch.nn.Module, dt: float, substeps: int = 1):
+        super().__init__()
+        if dt <= 0:
+            raise ValueError(f"dt must be positive, got {dt}")
+        if substeps < 1:
+            raise ValueError(f"substeps must be >= 1, got {substeps}")
+        self.base = base_field
+        self.dt = float(dt)
+        self.substeps = int(substeps)
+
+    def _rk4_step(self, x: torch.Tensor, h: float) -> torch.Tensor:
+        k1 = self.base(x)
+        k2 = self.base(x + (0.5 * h) * k1)
+        k3 = self.base(x + (0.5 * h) * k2)
+        k4 = self.base(x + h * k3)
+        return x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.dt / self.substeps
+        y = x
+        for _ in range(self.substeps):  # fixed trip count -> unrolls in ONNX
+            y = self._rk4_step(y, h)
+        return (y - x) / self.dt
+
+
+class EnsembleFieldForONNX(torch.nn.Module):
+    """Mean-field deep ensemble, exported as ONE stateless ONNX field.
+
+    With ~96 effective training trajectories, seed-to-seed variance of the
+    learned field is a large fraction of the error budget. Averaging the
+    FIELDS (not the trajectories) of M independently-seeded runs reduces the
+    variance component of the xdot error ~1/M, which integrates into reduced
+    position drift. Contract-compatible: still a single stateless f(x), just
+    M-times the compute.
+
+    Recipe:
+      1. Train M runs varying --seed (and ideally the train/test split seed).
+      2. For each run, build its export module exactly as train_NEXT does
+         (GRUODEFieldForONNX, optionally wrapped in
+         GRUODEEulerIncrementFieldForONNX) with that run's loaded weights.
+      3. export_model = EnsembleFieldForONNX([field_1, ..., field_M])
+      4. torch.onnx.export(export_model, ...) as usual.
+
+    Members must share state_vector_len/aug_dim and correction configuration.
+    Averaging the increment-wrapped members averages the discrete flows, which
+    is the quantity the tracker consumes — prefer wrapping THEN averaging.
+    """
+
+    def __init__(self, member_fields: list[torch.nn.Module]):
+        super().__init__()
+        if len(member_fields) < 1:
+            raise ValueError("EnsembleFieldForONNX needs at least one member")
+        self.members = torch.nn.ModuleList(member_fields)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.members[0](x)
+        for m in list(self.members)[1:]:
+            out = out + m(x)
+        return out / float(len(self.members))
 
 
 def augment_trajectory_segments(
@@ -2288,8 +2424,8 @@ def main():
     parser.add_argument(
         "--model-type",
         default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"],
-        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, GRU-ODE, or minimal GRU-ODE.",
+        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min", "mdn"],
+        help="Which architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, GRU-ODE, minimal GRU-ODE, or MDN (mixture-density windowed trajectory predictor for evasive-agent / drone-tag forecasting).",
     )
     parser.add_argument(
         "--dt",
@@ -2303,7 +2439,96 @@ def main():
         choices=["boost", "glide", "impact"],
         help="The reference point for the frame transformations",
     )
-    
+    parser.add_argument(
+        "--seed",
+        default=47,
+        type=int,
+        help=(
+            "Random seed for numpy/torch. Vary this across otherwise-identical "
+            "runs to (a) measure the seed-variance floor against which model "
+            "changes must be judged and (b) build a deep-ensemble export via "
+            "EnsembleFieldForONNX (mean field of M seeded runs, exported as "
+            "one stateless ONNX)."
+        ),
+    )
+    parser.add_argument(
+        "--train-integrator",
+        default="rk4",
+        choices=["rk4", "euler"],
+        help=(
+            "Training-time solver. 'rk4' (legacy) learns the continuous "
+            "derivative and should be paired with --export-field rk4-increment. "
+            "'euler' trains through the DEPLOYED integrator (Euler-consistent "
+            "training): the rollout loss teaches f the discrete increment "
+            "directly; use with --train-substeps 1 and --dt at the deployment "
+            "timestep."
+        ),
+    )
+    parser.add_argument(
+        "--train-substeps",
+        default=4,
+        type=int,
+        help="Internal solver substeps per data interval during training.",
+    )
+    parser.add_argument(
+        "--export-field",
+        default="rk4-increment",
+        choices=["rk4-increment", "derivative"],
+        help=(
+            "What the ONNX field computes. 'rk4-increment' exports "
+            "f_tilde(x)=(RK4_step(f,x,dt_deploy)-x)/dt_deploy so the tracker's "
+            "single Euler step reproduces one RK4 step of the trained field "
+            "exactly (closes the train/deploy integrator gap; ~4*substeps field "
+            "evals per deployed step). 'derivative' exports the raw field "
+            "(legacy behaviour; forced automatically when "
+            "--train-integrator euler)."
+        ),
+    )
+    parser.add_argument(
+        "--deploy-dt",
+        default=None,
+        type=float,
+        help=(
+            "The FIXED timestep the deployed tracker/sim uses for its "
+            "single-step Euler update. Consumed by --export-field "
+            "rk4-increment. Defaults to --dt; set it to the tracker's actual "
+            "(coarser) step for exact deployment parity."
+        ),
+    )
+    parser.add_argument(
+        "--mdn-horizon",
+        default=20,
+        type=int,
+        help="(model-type mdn) Number of future timesteps to predict per window.",
+    )
+    parser.add_argument(
+        "--mdn-history",
+        default=10,
+        type=int,
+        help="(model-type mdn) Number of past timesteps in the input history window.",
+    )
+    parser.add_argument(
+        "--mdn-modes",
+        default=5,
+        type=int,
+        help=(
+            "(model-type mdn) Number of mixture components K (distinct candidate "
+            "futures). More modes capture more branch options (e.g. juke "
+            "left/right/straight) at more parameters; 3-6 is typical."
+        ),
+    )
+    parser.add_argument(
+        "--mdn-a-max",
+        default=40.0,
+        type=float,
+        help=(
+            "(model-type mdn) PHYSICAL acceleration bound of the runner drone "
+            "(m/s^2). Every predicted acceleration is capped at this via tanh, so "
+            "no predicted juke is dynamically infeasible. Set from the platform's "
+            "real envelope; default ~4 g."
+        ),
+    )
+
     args = parser.parse_args()
 
     model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
@@ -2317,7 +2542,7 @@ def main():
 
     trajectory_dt = args.dt  # [s]
 
-    seed = 47
+    seed = args.seed
     # random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -2352,6 +2577,10 @@ def main():
     model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
     if args.use_scalar:
         model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
+    if args.seed != 47:
+        # keep legacy names for the default seed; tag others so ensemble-member
+        # runs (varying --seed) don't overwrite each other's checkpoints/ONNX
+        model_name_wo_epochs = model_name_wo_epochs + f"_seed{args.seed}"
 
     # TODO: Move the epoch name string to somewhere else after the callbacks thing
     model_name = f"{model_name_wo_epochs}"
@@ -2532,6 +2761,14 @@ def main():
         args.gpu_index,
         args.model_type,
         args.frame,
+        train_integrator=args.train_integrator,
+        train_substeps=args.train_substeps,
+        export_field=args.export_field,
+        deploy_dt=args.deploy_dt,
+        mdn_horizon=args.mdn_horizon,
+        mdn_history=args.mdn_history,
+        mdn_modes=args.mdn_modes,
+        mdn_a_max=args.mdn_a_max,
     )
     # NOTE: After this was the whole chain of evaluation functions. Skipping adding that to this unclass side for now. It really should be a separate script.
 

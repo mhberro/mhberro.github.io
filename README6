@@ -1,358 +1,631 @@
-#mdn_trajectory_model
-"""Mixture-Density Trajectory Predictor for evasive-agent (drone-tag) forecasting.
-
-WHY THIS MODEL (see review discussion):
-    The "runner" drone is an ADVERSARIAL agent actively trying to be
-    unpredictable. For any non-trivial horizon its future is not a single path
-    but a DISTRIBUTION over paths, often MULTIMODAL (it jukes left OR right;
-    both are plausible from identical history). A single-point regressor trained
-    on such data collapses toward the mean of the modes -- i.e. it predicts the
-    physically-average "straight through the middle" path the runner never
-    actually takes. This module instead predicts K weighted future trajectories
-    plus their probabilities (a Gaussian mixture over futures), which is the
-    quantity a chaser can actually use: pursue the highest-weight / mixture-mean
-    mode while hedging against the branches.
-
-ARCHITECTURE (primary recommendation):
-    history window [x,y,z,vx,vy,vz] x H steps
-        -> GRU encoder                          (summarises "what maneuver now")
-        -> MDN head -> {logits_k, a_k(t)}       (K modes; per-mode accel sequence)
-        -> BOUNDED acceleration  a = a_max * tanh(.)   (dynamically feasible)
-        -> double kinematic integration          (a -> v -> p, known physics)
-        -> K future trajectories [x,y,z,vx,vy,vz] x T + mixture weights pi_k
-
-    Decoding ACCELERATION and integrating it (rather than regressing position
-    directly) bakes in the second-order kinematics the same way the glide model's
-    structural constraint does: predicted velocity is the integral of predicted
-    acceleration and predicted position is the integral of predicted velocity, so
-    every sampled future is smooth and Newton-feasible by construction, and the
-    tanh cap keeps it inside the drone's real acceleration envelope -- the model
-    can never predict a physically impossible instantaneous juke.
-
-SCALING:
-    The model consumes and PREDICTS in StandardScaler-scaled units (consistent
-    with the rest of the pipeline). The kinematic identities dp=v*dt, dv=a*dt
-    hold in PHYSICAL units, so integration is done with per-axis scale factors:
-        v_phys = v_s * sigma_v + mu_v ;  p_{t+1} = p_t + v_phys * dt   (phys)
-    then re-scaled back to scaled position. a_max is likewise a PHYSICAL bound
-    (m/s^2) converted to the scaled acceleration the head emits. All of this is
-    handled internally from the scaler stats passed at construction; if no
-    scaler is supplied the model assumes physical units (sigma=1, mu=0).
-
-This module is deliberately self-contained (no torchdiffeq / ODE-solver
-coupling) because it is a windowed sequence-to-sequence predictor, not a
-stateless vector field. It is wired into the training script as
-`--model-type mdn` and exported to ONNX via MDNTrajectoryForONNX.
-"""
+#loss_functions
+"""Loss functions for a Neural Ordinary Differential Equation model."""
 
 from __future__ import annotations
 
-import math
+from typing import Callable
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from sklearn.preprocessing import MinMaxScaler
+from torch import Tensor
+from torch.nn import MSELoss
+from tslearn.metrics import SoftDTWLossPyTorch
 
 
-class MDNTrajectoryPredictor(nn.Module):
-    """GRU-encoder + mixture-density head predicting K weighted future
-    trajectories by integrating bounded per-mode acceleration.
-
-    Args:
-        state_dim:   number of state features per timestep (6 for [x,y,z,vx,vy,vz]).
-        pos_idx:     indices of the position block within the state.
-        vel_idx:     indices of the velocity block, paired 1:1 with pos_idx
-                     (pos_idx[i] integrates vel_idx[i]).
-        horizon:     number of future steps T to predict.
-        dt:          timestep between states (seconds), PHYSICAL.
-        n_modes:     number of mixture components K.
-        enc_hidden:  GRU hidden width.
-        enc_layers:  GRU depth.
-        head_hidden: MDN head MLP width.
-        a_max:       PHYSICAL acceleration bound (m/s^2) per velocity axis. The
-                     head output is a = a_max * tanh(raw), guaranteeing feasibility.
-                     Set from the drone's known envelope; a scalar or a per-vel-axis
-                     list. Defaults to a generous 40 m/s^2 (~4 g) if unknown.
-        pos_scale, vel_scale, vel_mean: StandardScaler stats for the pos/vel
-                     blocks (sigma_p, sigma_v, mu_v). If None -> physical units.
-    """
-
+class WrappedMSELoss(MSELoss):
     def __init__(
         self,
-        state_dim: int,
-        pos_idx: list[int],
-        vel_idx: list[int],
-        horizon: int,
-        dt: float,
-        n_modes: int = 5,
-        enc_hidden: int = 128,
-        enc_layers: int = 1,
-        head_hidden: int = 128,
-        a_max: float | list[float] = 40.0,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
-    ):
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes WrappedMSELoss."""
         super().__init__()
-        assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
-        self.state_dim = state_dim
-        self.horizon = int(horizon)
-        self.dt = float(dt)
-        self.n_modes = int(n_modes)
-        self.n_axes = len(pos_idx)
-
-        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-
-        # --- scaling stats (scaled <-> physical) ---------------------------
-        # Derivatives in scaled space: a physical accel a_phys enters the scaled
-        # velocity update as a_phys/sigma_v; a physical velocity enters the
-        # scaled position update as v_phys/sigma_p. StandardScaler's mean shift
-        # cancels in differences, but the velocity MEAN matters when converting a
-        # scaled velocity to the physical velocity that moves position.
-        if pos_scale is not None and vel_scale is not None:
-            ps = torch.as_tensor(pos_scale, dtype=torch.float32)
-            vs = torch.as_tensor(vel_scale, dtype=torch.float32)
-            vm = (
-                torch.as_tensor(vel_mean, dtype=torch.float32)
-                if vel_mean is not None
-                else torch.zeros_like(vs)
-            )
-            self.scaled_space = True
-        else:
-            ps = torch.ones(self.n_axes)
-            vs = torch.ones(self.n_axes)
-            vm = torch.zeros(self.n_axes)
-            self.scaled_space = False
-        self.register_buffer("pos_scale", ps)  # sigma_p
-        self.register_buffer("vel_scale", vs)  # sigma_v
-        self.register_buffer("vel_mean", vm)   # mu_v
-
-        # PHYSICAL acceleration bound -> scaled-acceleration bound the head emits.
-        # scaled_accel = a_phys / sigma_v, so a_max_scaled = a_max / sigma_v.
-        if isinstance(a_max, (int, float)):
-            a_max_vec = torch.full((self.n_axes,), float(a_max))
-        else:
-            a_max_vec = torch.as_tensor(a_max, dtype=torch.float32)
-            assert a_max_vec.numel() == self.n_axes, "a_max list must match n vel axes"
-        self.register_buffer("a_max_phys", a_max_vec)
-        self.register_buffer("a_max_scaled", a_max_vec / vs)
-
-        # --- encoder: history window -> context vector ---------------------
-        self.encoder = nn.GRU(
-            input_size=state_dim,
-            hidden_size=enc_hidden,
-            num_layers=enc_layers,
-            batch_first=True,
-        )
-
-        # --- MDN head: context -> {mode logits, per-mode accel sequence} ----
-        # Each mode emits an acceleration for every future step and every vel
-        # axis: T * n_axes raw values, squashed by tanh and scaled by a_max.
-        self.mode_logits = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes),
-        )
-        self.accel_head = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes * self.horizon * self.n_axes),
-        )
-        # Optional per-mode, per-axis log-sigma for the mixture likelihood
-        # (aleatoric spread of each mode around its integrated mean path).
-        self.logsig_head = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes * self.n_axes),
-        )
-
-    # ------------------------------------------------------------------
-    def _integrate(self, accel_scaled: torch.Tensor, x_last: torch.Tensor) -> torch.Tensor:
-        """Integrate bounded scaled acceleration into full scaled state paths.
-
-        accel_scaled : (B, K, T, n_axes)  scaled acceleration per mode/step/axis
-        x_last       : (B, state_dim)     last observed (scaled) state = IC
-
-        Returns states : (B, K, T, state_dim) scaled [.,pos,.,vel,.] filled on the
-        paired pos/vel indices; any unpaired state channels (e.g. an azimuth-rate)
-        are held at their last observed value (the kinematic head does not model
-        them -- extend here if a frame needs it).
-        """
-        B, K, T, A = accel_scaled.shape
-        dt = self.dt
-        sig_p = self.pos_scale.view(1, 1, A)
-        sig_v = self.vel_scale.view(1, 1, A)
-        mu_v = self.vel_mean.view(1, 1, A)
-
-        # initial conditions gathered from the last observed state, per axis
-        p0 = x_last.index_select(-1, self.pos_idx).unsqueeze(1).expand(B, K, A)  # scaled pos
-        v0 = x_last.index_select(-1, self.vel_idx).unsqueeze(1).expand(B, K, A)  # scaled vel
-
-        p = p0
-        v = v0
-        pos_steps = []
-        vel_steps = []
-        for t in range(T):
-            a_s = accel_scaled[:, :, t, :]              # (B,K,A) scaled accel
-            # velocity update in scaled space: dv_scaled = (a_phys/sigma_v)*dt,
-            # and a_s already equals a_phys/sigma_v, so:
-            v = v + a_s * dt
-            # position update uses PHYSICAL velocity: v_phys = v_scaled*sigma_v + mu_v
-            v_phys = v * sig_v + mu_v
-            # dp_scaled = (v_phys/sigma_p)*dt
-            p = p + (v_phys / sig_p) * dt
-            pos_steps.append(p)
-            vel_steps.append(v)
-        pos = torch.stack(pos_steps, dim=2)  # (B,K,T,A)
-        vel = torch.stack(vel_steps, dim=2)  # (B,K,T,A)
-
-        # assemble full state paths; hold any non-pos/vel channels at last value
-        states = x_last.view(B, 1, 1, self.state_dim).expand(B, K, T, self.state_dim).clone()
-        pidx = self.pos_idx.view(1, 1, 1, A).expand(B, K, T, A)
-        vidx = self.vel_idx.view(1, 1, 1, A).expand(B, K, T, A)
-        states = states.scatter(-1, pidx, pos)
-        states = states.scatter(-1, vidx, vel)
-        return states
-
-    # ------------------------------------------------------------------
-    def forward(self, obs_window: torch.Tensor):
-        """
-        obs_window : (B, H, state_dim)  scaled history window.
-
-        Returns dict:
-            traj    : (B, K, T, state_dim)  K integrated future state paths (scaled)
-            log_pi  : (B, K)                mode log-probabilities (log-softmax)
-            log_sig : (B, K, n_axes)        per-mode log-sigma (position spread)
-            mean    : (B, T, state_dim)     mixture-mean path (weighted by pi) --
-                                            convenience single-trajectory output
-        """
-        B = obs_window.shape[0]
-        _, h_n = self.encoder(obs_window)     # h_n: (layers, B, enc_hidden)
-        ctx = h_n[-1]                         # (B, enc_hidden) last-layer hidden
-        x_last = obs_window[:, -1, :]         # (B, state_dim) IC for integration
-
-        log_pi = F.log_softmax(self.mode_logits(ctx), dim=-1)   # (B,K)
-        raw = self.accel_head(ctx).view(B, self.n_modes, self.horizon, self.n_axes)
-        a_max = self.a_max_scaled.view(1, 1, 1, self.n_axes)
-        accel = a_max * torch.tanh(raw)                          # bounded, feasible
-        log_sig = self.logsig_head(ctx).view(B, self.n_modes, self.n_axes)
-
-        traj = self._integrate(accel, x_last)                    # (B,K,T,state_dim)
-
-        pi = log_pi.exp().view(B, self.n_modes, 1, 1)
-        mean = (pi * traj).sum(dim=1)                            # (B,T,state_dim)
-
-        return {"traj": traj, "log_pi": log_pi, "log_sig": log_sig, "mean": mean}
-
-
-class MDNTrajectoryLoss(nn.Module):
-    """Mixture negative log-likelihood over future POSITION+VELOCITY, plus
-    convenience physical-unit L1 metrics matching the rest of the pipeline.
-
-    The NLL is the standard MDN objective: -log sum_k pi_k N(y | mu_k, sig_k).
-    Using the best-matching mode's likelihood (rather than only the mean path)
-    is what lets the model represent both branches of a juke without being
-    penalised for not averaging them -- the crucial property for an evasive
-    target. We also report minADE-style pos/vel error (error of the CLOSEST of
-    the K modes) as the metric, since that is how multimodal predictors are
-    actually scored and what the early stopper should track.
-    """
-
-    def __init__(
-        self,
-        pos_idx: list[int],
-        vel_idx: list[int],
-        scaler=None,
-        vel_weight: float = 1.0,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
         self.scaler = scaler
-        self.vel_weight = float(vel_weight)
-        self.eps = float(eps)
-        if scaler is not None:
-            self.register_buffer(
-                "pos_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(pos_idx)]
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }
+
+
+# TODO: with a bit of re-work, this could be changed to any-order loss
+# change vel_indices to order_split_indices
+# TODO: What about HuberLoss so that more attention is paid to the order that is above the needed value?
+class SecondOrderSplitMSELoss(torch.nn.Module):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        vel_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        pos_expect: float = "inf",
+        vel_expect: float = "inf",
+    ) -> None:
+        """Initializes SecondOrderSplitMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.vel_weight = vel_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.pos_expect = pos_expect
+        self.vel_expect = vel_expect
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+
+        # Compute metrics.
+        # with torch.no_grad():
+        if self.scaler is not None:
+            pred_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
             )
-            self.register_buffer(
-                "vel_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(vel_idx)]
+            target_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
             )
         else:
-            self.pos_sigma = None
-            self.vel_sigma = None
+            pred_unscaled = pred.detach()
+            target_unscaled = target.detach()
 
-    def forward(self, pred: dict, target: torch.Tensor):
-        """
-        pred   : output dict of MDNTrajectoryPredictor
-        target : (B, T, state_dim)  ground-truth future path (scaled)
-        """
-        traj = pred["traj"]          # (B,K,T,D)
-        log_pi = pred["log_pi"]      # (B,K)
-        log_sig = pred["log_sig"]    # (B,K,A)
-        B, K, T, D = traj.shape
+        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
+        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
+        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
+        vel_target_unscaled = target_unscaled[..., self.vel_indices]
 
-        tgt_pos = target.index_select(-1, self.pos_idx)      # (B,T,A)
-        tgt_vel = target.index_select(-1, self.vel_idx)      # (B,T,A)
-        mode_pos = traj.index_select(-1, self.pos_idx)       # (B,K,T,A)
-        mode_vel = traj.index_select(-1, self.vel_idx)       # (B,K,T,A)
+        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
+        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
 
-        # --- mixture NLL on position (time- and axis-summed Gaussian) -------
-        sig = log_sig.exp().clamp_min(self.eps).view(B, K, 1, -1)  # (B,K,1,A)
-        # per-mode, per-step Gaussian log-prob of the target position
-        diff = (mode_pos - tgt_pos.unsqueeze(1))                   # (B,K,T,A)
-        log_prob_axis = -0.5 * (diff / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
-        # sum over axes and time -> per-mode trajectory log-likelihood
-        log_prob_mode = log_prob_axis.sum(dim=(2, 3))             # (B,K)
-        # mixture: logsumexp_k (log_pi_k + log_prob_mode_k)
-        log_mix = torch.logsumexp(log_pi + log_prob_mode, dim=1)  # (B,)
-        nll = -log_mix.mean()
+        pos_pred = pred[..., : self.vel_indices[0]]
+        pos_target = target[..., : self.vel_indices[0]]
+        vel_pred = pred[..., self.vel_indices]
+        vel_target = target[..., self.vel_indices]
 
-        # small velocity consistency term: penalise the best mode's velocity
-        # error so modes stay kinematically honest (position NLL alone underuses
-        # the velocity channel).
-        with torch.no_grad():
-            per_mode_pos_err = (mode_pos - tgt_pos.unsqueeze(1)).pow(2).mean(dim=(2, 3))  # (B,K)
-            best = per_mode_pos_err.argmin(dim=1)                                          # (B,)
-        b = torch.arange(B, device=traj.device)
-        vel_best = mode_vel[b, best]                              # (B,T,A)
-        vel_mse = F.mse_loss(vel_best, tgt_vel)
-        loss = nll + self.vel_weight * vel_mse
+        # calculate vel weight based on how far above the expectation each error is
+        # piecewise above expect ratio
+        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
+        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
 
-        # --- metrics: minADE-style physical-unit L1 of the closest mode -----
-        with torch.no_grad():
-            if self.pos_sigma is not None:
-                pos_err = (mode_pos - tgt_pos.unsqueeze(1)).abs() * self.pos_sigma.view(1, 1, 1, -1)
-                vel_err = (mode_vel - tgt_vel.unsqueeze(1)).abs() * self.vel_sigma.view(1, 1, 1, -1)
-            else:
-                pos_err = (mode_pos - tgt_pos.unsqueeze(1)).abs()
-                vel_err = (mode_vel - tgt_vel.unsqueeze(1)).abs()
-            # closest mode per sample (by pos), then mean over T,A and batch
-            pos_err_mode = pos_err.mean(dim=(2, 3))              # (B,K)
-            min_idx = pos_err_mode.argmin(dim=1)                 # (B,)
-            pos_err_min = pos_err_mode[b, min_idx].mean()
-            vel_err_min = vel_err.mean(dim=(2, 3))[b, min_idx].mean()
+        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
+        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
+        total_loss = pos_loss + vel_loss
 
-        return {"loss": loss, "pos_err": pos_err_min, "vel_err": vel_err_min}
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }
 
 
-class MDNTrajectoryForONNX(nn.Module):
-    """ONNX export adapter. Takes the scaled history window (B,H,D) and returns
-    a flat, tracker-friendly tuple:
-        traj   : (B, K, T, D)  the K candidate future paths (scaled)
-        pi     : (B, K)        mixture weights (probabilities, softmaxed)
-        mean   : (B, T, D)     mixture-mean path (single-trajectory convenience)
-    The chaser can consume the full weighted set (pursue-and-hedge) or just the
-    mean / highest-weight mode. All outputs are in scaled units; apply the
-    exported StandardScaler inverse exactly as for the other models.
+class PhysicsSplitMSELoss(torch.nn.Module):
+    """Position/velocity-weighted MSE with an optional physics-residual coupling.
+
+    Combines the two requested GRU-ODE improvements in one loss, each behind a
+    weight that defaults to recovering plain summed MSE:
+
+      total = w_pos * MSE(pos) + w_vel * MSE(vel) + w_phys * MSE(d/dt pos - vel)
+
+    1. Velocity weighting (w_vel): the laggard in the training logs was velocity
+       (val_vel_err ~58 while position kept improving). w_vel lets you up- or
+       down-weight the velocity MSE relative to position. (The old
+       SecondOrderSplitMSELoss declared a vel_weight but never applied it; here
+       it is actually used.)
+
+    2. Physics residual (w_phys): the geodesic `gruode` path sets no
+       order_shift_slice, so predicted position and velocity are untied — the
+       model can output a position trajectory inconsistent with its own
+       velocity, which compounds into long-horizon drift. This term penalises
+       the violation of the kinematic identity d/dt(position) = velocity,
+       directly coupling the two and damping that drift.
+
+    CRITICAL — scaling: the loss sees the StandardScaler-scaled state, in which
+    dx = v*dt does NOT hold (position and velocity have different scale factors).
+    The residual is therefore computed in PHYSICAL units by multiplying each
+    block by its scaler scale_ factor before finite-differencing. The forward
+    difference uses dt (seconds) between consecutive timesteps. With w_phys=0
+    this term and its unscaling are skipped entirely.
+
+    Returns the {"loss", "pos_err", "vel_err"} dict the early stopper expects
+    (early_stop_metric_name="val_loss"). pos_err/vel_err remain physical-unit
+    L1 metrics, identical in meaning to the other losses, so curves stay
+    comparable across runs.
     """
 
-    def __init__(self, model: MDNTrajectoryPredictor):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        dt: float,
+        pos_weight: float = 1.0,
+        vel_weight: float = 1.0,
+        physics_weight: float = 0.0,
+        late_weight: float = 0.0,
+        late_power: float = 1.0,
+        vel_bias_weight: float = 0.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
         super().__init__()
-        self.model = model
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        # Late-weighted position term (reviewer R2). Ordinary per-timestep MSE
+        # penalizes variance but is BLIND to accumulated drift: a small constant
+        # velocity bias (~0.05%) integrates into a large end-of-trajectory
+        # position error while contributing almost nothing to pointwise MSE.
+        # Weighting the position error by a ramp that grows toward the
+        # trajectory end makes that drift expensive (its cost scales with
+        # horizon), so the optimizer finally "sees" and suppresses the bias.
+        #   late_weight : strength of the extra late-weighted position term (0=off)
+        #   late_power  : ramp steepness; weight_k = (k/(T-1))**late_power.
+        #                 1.0 = linear ramp, 2.0 = quadratic (emphasize the very end).
+        self.late_weight = late_weight
+        self.late_power = late_power
+        # Cumulative velocity-bias (drift) term (reviewer R2, second pass).
+        # Under the structural second-order constraint, terminal position error
+        # is (up to the bounded correction) the TIME-INTEGRAL of the velocity
+        # error. Pointwise velocity MSE charges variance but is nearly blind to
+        # a small constant BIAS in velocity — the exact quantity that integrates
+        # into the dominant end-of-trajectory position error. This term
+        # penalizes the RUNNING MEAN of the velocity residual, so zero-mean
+        # noise is (asymptotically) free and only systematic bias is charged.
+        # It is strictly sharper than the late-weighted POSITION ramp: the ramp
+        # penalizes the symptom (late position error, which the model can also
+        # satisfy through the bounded alpha-correction channel); this charges
+        # the generator (velocity bias) directly.
+        #   vel_bias_weight : strength (0 = off). Residuals are small in scaled
+        #   space, so useful weights are LARGER than the other terms — sweep
+        #   {1, 5, 25}. When enabling, consider reducing late_weight ~2x since
+        #   the two terms partially overlap.
+        self.vel_bias_weight = vel_bias_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        # Position block is everything before the first velocity index. For the
+        # balanced 6-state geodesic/DCU layout (vel_indices=[3,4,5]) this gives
+        # position indices [0,1,2], so pos component i pairs with vel component i.
+        self.n_pos = self.vel_indices[0]
+        # Pre-extract per-block physical scale factors (std dev for StandardScaler)
+        # so the physics residual can be evaluated in physical units. Registered
+        # as buffers so they ride along to the correct device.
+        if scaler is not None and physics_weight > 0.0:
+            scale = torch.as_tensor(getattr(scaler, "scale_"), dtype=torch.float32)
+            self.register_buffer("pos_scale", scale[: self.n_pos].clone())
+            self.register_buffer("vel_scale", scale[self.vel_indices].clone())
+        else:
+            self.pos_scale = None
+            self.vel_scale = None
 
-    def forward(self, obs_window: torch.Tensor):
-        out = self.model(obs_window)
-        return out["traj"], out["log_pi"].exp(), out["mean"]
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+
+        # --- physical-unit L1 metrics (no grad), matching the other losses ---
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(
+                        pred.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
+                    ).reshape(-1, n_timesteps, self.N_FEATURES)
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(
+                        target.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
+                    ).reshape(-1, n_timesteps, self.N_FEATURES)
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred_u = pred_unscaled[..., : self.n_pos]
+            pos_target_u = target_unscaled[..., : self.n_pos]
+            vel_pred_u = pred_unscaled[..., self.vel_indices]
+            vel_target_u = target_unscaled[..., self.vel_indices]
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_target_u)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_target_u)
+
+        # --- differentiable position / velocity MSE (scaled space) ---
+        pos_pred = pred[..., : self.n_pos]
+        pos_target = target[..., : self.n_pos]
+        vel_pred = pred[..., self.vel_indices]
+        vel_target = target[..., self.vel_indices]
+
+        pos_loss = torch.nn.functional.mse_loss(pos_pred, pos_target)
+        vel_loss = torch.nn.functional.mse_loss(vel_pred, vel_target)
+        total_loss = self.pos_weight * pos_loss + self.vel_weight * vel_loss
+
+        # --- optional physics-residual coupling: d/dt(pos) ?= vel ---
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            # Convert the predicted blocks to physical units. With a scaler we
+            # multiply by the per-component std; without one we assume the data
+            # is already physical (scale = 1).
+            if self.pos_scale is not None:
+                pos_phys = pos_pred * self.pos_scale.to(pos_pred.device)
+                vel_phys = vel_pred * self.vel_scale.to(vel_pred.device)
+            else:
+                pos_phys = pos_pred
+                vel_phys = vel_pred
+            # forward finite difference along time: (x[t+1]-x[t])/dt vs v[t]
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_mid = vel_phys[:, :-1, :]
+            # normalise the residual back by pos_scale so its magnitude is
+            # comparable to the scaled MSE terms (keeps physics_weight ~O(1)).
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pos_pred.device)
+            else:
+                resid = dpos_dt - vel_mid
+            physics_loss = torch.mean(resid**2)
+            total_loss = total_loss + self.physics_weight * physics_loss
+
+        # --- late-weighted position term (reviewer R2): penalize accumulated
+        #     drift by weighting per-timestep position error toward the end of
+        #     the trajectory. A constant velocity bias produces position error
+        #     that grows with k, so a ramp weight makes it expensive where a
+        #     flat MSE does not. Computed in scaled space (same as pos_loss) so
+        #     late_weight stays O(1) relative to the other terms.
+        if self.late_weight > 0.0 and n_timesteps >= 2:
+            # per-timestep squared position error, averaged over batch & axes
+            se = (pos_pred - pos_target) ** 2               # (B, T, n_pos)
+            per_t = se.mean(dim=(0, 2))                      # (T,)
+            # ramp weight in [0,1], growing toward the trajectory end
+            k = torch.arange(n_timesteps, device=pos_pred.device, dtype=pos_pred.dtype)
+            w = (k / (n_timesteps - 1)) ** self.late_power   # (T,)
+            # normalize so the ramp has unit mean -> late_weight is comparable
+            # in scale to pos_weight regardless of trajectory length / power
+            w = w / (w.mean() + 1e-8)
+            late_loss = torch.mean(w * per_t)
+            total_loss = total_loss + self.late_weight * late_loss
+
+        # --- cumulative velocity-bias (drift) term: charge the running mean of
+        #     the velocity residual. cum_mean[:, t] = (1/T) * sum_{k<=t} resid[k]
+        #     * the final element is the trajectory time-mean residual — the
+        #       accumulated drift per unit horizon, in scaled velocity units;
+        #     * intermediate elements catch bias that cancels over the full
+        #       horizon but not mid-trajectory (e.g. one-sided error during a
+        #       maneuver that later reverses).
+        #     Computed in scaled space (same as vel_loss) on the SAME velocity
+        #     block, so vel_bias_weight composes with vel_weight predictably.
+        if self.vel_bias_weight > 0.0 and n_timesteps >= 2:
+            vel_resid = vel_pred - vel_target                      # (B, T, n_vel)
+            cum_mean = torch.cumsum(vel_resid, dim=1) / n_timesteps
+            bias_loss = torch.mean(cum_mean**2)
+            total_loss = total_loss + self.vel_bias_weight * bias_loss
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class EnergyMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
+        energy_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes EnergyMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.energy_fn = energy_fn
+        self.energy_weight = energy_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
+        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
+        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
+
+        total_loss = loss_data + loss_energy
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "energy_loss": loss_energy,
+        }
+
+
+class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
+    """Reverse Linear Weighting Loss function.
+
+    The Reverse Linear Weighting Loss function calculates a linearly weighted
+    Mean Absolute Error (MAE) where the last points in the time series data are
+    weighted more than the first points. The weights are calculated linearly,
+    monotonically increasing in weight.
+
+    This loss function helps the NODE model learn the end of the time series
+    target data better by increasing the importance of these points through the
+    weighting scheme.
+
+    Example:
+        If pred = [100 200 300 400 500] and target = [105 205 305 405 505]:
+
+        absolute error = [5 5 5 5 5]
+        reverse_linear_weights = [0 0.1 0.2 0.3 0.4] * 100
+        weighted absolute errors = [0 50 100 150 200]
+        mean weighted absolute error = 100
+    """
+
+    def __init__(self) -> None:
+        """Initializes ReverseLinearWeightingLoss."""
+        super().__init__()
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Calculates the reverse linear weighting loss.
+
+        Args:
+            pred: The prediction from the model.
+            target: The target data the model should predict.
+
+        Returns:
+            A tensor containing the reverse linear weighting loss.
+        """
+        batch_size, time_steps, n_features = pred.shape
+
+        # Calculate reverse linear weights.
+        # Create a tensor of shape (batch_size, time_steps) row counts up from 0
+        # to time_steps-1.
+        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
+
+        # Normalize accross the rows.
+        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
+
+        # Duplicate in the feature dimension. Final result is tensor of shape
+        # (batch_size, time_steps, n_features) to match pred and target shapes.
+        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
+
+        # Calculate Weighted Mean Absolute Error according to the weight tensor.
+        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
+
+
+class SoftDTWLossWrapper(SoftDTWLossPyTorch):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        gamma=1,
+        normalize=False,
+        dist_func=None,
+    ):
+        super().__init__(gamma, normalize, dist_func)
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }
+
+
+class WeightedHuberLoss(torch.nn.Module):
+    """
+    δp, δv are the *normalised* thresholds (already divided by the
+    corresponding std-dev).  wp, wv are optional scalar weights.
+    """
+
+    def __init__(
+        self,
+        delta_pos,
+        delta_vel,
+        vel_indices: list[int],
+        weight_pos=1.0,
+        weight_vel=1.0,
+        scaler=None,
+        N_FEATURES: int = 6,
+    ):
+        super().__init__()
+        self.delta_pos = delta_pos
+        self.delta_vel = delta_vel
+        self.delta_pos_unsacled = delta_pos
+        self.delta_vel_unsacled = delta_vel
+        self.vel_indices = vel_indices
+        self.wp = weight_pos
+        self.wv = weight_vel
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        if scaler is not None:
+            # self.compute_normalised_deltas(scaler, delta_pos, delta_vel)
+            sigma = scaler.scale_
+            # simple average, or keep per‑axis
+            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
+            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
+
+    # def compute_normalised_deltas(
+    #     self,
+    #     scaler,
+    #     delta_pos_phys,  # metres
+    #     delta_vel_phys,
+    # ):  # metres / sec
+    #     # scaler.scale_ is an array of length 6: [σ_px, σ_py, σ_pz, σ_vx, σ_vy, σ_vz]
+
+    #     # return delta_pos_norm, delta_vel_norm
+
+    # def huber(self, r, delta):
+    #     """Element-wise Huber for a tensor of residuals."""
+    #     abs_r = torch.abs(r)
+    #     quadratic = 0.5 * r**2
+    #     linear = delta * (abs_r - 0.5 * delta)
+    #     return torch.where(abs_r <= delta, quadratic, linear)
+
+    def forward(self, pred, target):
+        """
+        pred_norm / target_norm : (T,6) tensors in normalised space
+        Returns a scalar loss (mean over all time steps and components)
+        """
+        n_timesteps = pred.size(1)
+
+        pos_pred_scaled = pred[..., : self.vel_indices[0]]
+        pos_target_scaled = target[..., : self.vel_indices[0]]
+        vel_pred_scaled = pred[..., self.vel_indices]
+        vel_target_scaled = target[..., self.vel_indices]
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)  # TODO: What about RMSE?
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+            # TODO: What about RMSE?
+            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
+            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
+
+        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
+        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
+
+        # sum over dimensions, then mean over time steps
+        # total_loss = (self.wp * loss_pos.sum(dim=1) + self.wv * loss_vel.sum(dim=1)).mean()
+        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
+        total_loss_unweighted = loss_pos + loss_vel
+        return {
+            "loss": total_loss,
+            "loss_unweighted": total_loss_unweighted,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "pos_err_scaled": avg_pos_diff_scaled,
+            "vel_err_scaled": avg_vel_diff_scaled,
+        }
+
+
+# Latent ODE
+# TODO: finish wrapping this
+def loss_function(recon, target, mu, logvar):
+    # recon & target are still in normalised space
+    mse = torch.mean((recon - target) ** 2)
+
+    # KL divergence between q(z|x) and standard normal p(z)
+    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return mse + 0.5 * kl  # weight KL by 0.5 (tune as needed)

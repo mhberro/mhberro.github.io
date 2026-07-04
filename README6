@@ -203,8 +203,7 @@ class MinimalGRUODECell(torch.nn.Module):
             pre_h = pre_h + self.bias_h
         g = torch.tanh(pre_h)
 
-        dh = (1.0 - f) * (g - h)
-        return dh
+        return (1.0 - f) * (g - h)
 
 
 class GRUODEFunc(torch.nn.Module):
@@ -262,12 +261,12 @@ except Exception:
 
 
 class GRUODELatentModel(torch.nn.Module):
-    """GRU-ODE physical vector wrapper augmented with a float64 central-difference arm.
-    Safeguards tracking math from catastrophic cancellation along steady glide regimes[cite: 6].
+    """GRU-ODE physical vector wrapper augmented with a float64 central-difference arm[cite: 6].
+    Safeguards tracking math from catastrophic cancellation along steady glide stretches[cite: 6].
     """
     def __init__(
         self,
-        func,                 # GRUODEFunc
+        func,
         solver=None,
         aug_dim: int = 0,
         pos_idx: list[int] | None = None,
@@ -276,7 +275,7 @@ class GRUODELatentModel(torch.nn.Module):
         vel_scale=None,
         vel_mean=None,
         so_correction_alpha: float = 0.0,
-        field_method: str = "central_f64",  # Updated default fix arm[cite: 6]
+        field_method: str = "central_f64",  # High-fidelity fix arm[cite: 6]
         fd_eps: float = 1e-4,
         dt: float = 0.1,
         heun_correction: bool = False,
@@ -324,7 +323,6 @@ class GRUODELatentModel(torch.nn.Module):
             h_64 = h.to(torch.float64)
             dh_64 = dh.to(torch.float64)
             
-            # High-fidelity functional decoder pass mapping custom activation states
             def decode_f64(h_val):
                 out = h_val
                 for layer in self.func.decoder:
@@ -484,6 +482,42 @@ def _make_obs_target(traj: torch.Tensor, obs_len: int = 10):
     return traj[:obs_len].unsqueeze(0), traj.unsqueeze(0)
 
 
+class BiasAlignedPhysicsLoss(torch.nn.Module):
+    """
+    Dictionary-aware Sobolev-style wrapper minimizing the first-moment velocity bias[cite: 4, 6].
+    Safely unpacks baseline metric mappings to integrate penalty terms seamlessly[cite: 4].
+    """
+    def __init__(self, base_loss_func, vel_indices: list[int], bias_weight: float = 15.0):
+        super().__init__()
+        self.base_loss_func = base_loss_func
+        self.vel_indices = list(vel_indices)
+        self.bias_weight = bias_weight
+
+    def forward(self, pred: torch.Tensor, true: torch.Tensor):
+        base_loss = self.base_loss_func(pred, true)
+        
+        pred_vel = pred[..., self.vel_indices]
+        true_vel = true[..., self.vel_indices]
+        
+        velocity_bias = torch.mean(pred_vel - true_vel, dim=1)
+        bias_penalty = torch.mean(torch.sum(velocity_bias ** 2, dim=-1))
+        total_bias_loss = self.bias_weight * bias_penalty
+        
+        if isinstance(base_loss, dict):
+            out_dict = base_loss.copy()
+            if "loss" in out_dict:
+                out_dict["loss"] = out_dict["loss"] + total_bias_loss
+            else:
+                for k, v in out_dict.items():
+                    if isinstance(v, torch.Tensor) and v.requires_grad:
+                        out_dict[k] = v + total_bias_loss
+                        break
+            out_dict["bias_loss"] = total_bias_loss
+            return out_dict
+        else:
+            return base_loss + total_bias_loss
+
+
 def train_NEXT(
     model_name,
     traj_targets_train,
@@ -534,6 +568,12 @@ def train_NEXT(
         N_FEATURES=model_states,
     )
 
+    loss_wrapper = BiasAlignedPhysicsLoss(
+        base_loss_func=loss_func,
+        vel_indices=velocity_indicies,
+        bias_weight=15.0
+    )
+
     node = NODEPredictor(
         architecture=FFNNArchitecture(
             layer_channels=[5, 5],
@@ -542,7 +582,7 @@ def train_NEXT(
         training_configuration=training_configuration,
         solver=ode_solver,
         logging_interval=5,
-        loss_func=loss_func,
+        loss_func=loss_wrapper,
         early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
         checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
         aug_dim=aug_dim,
@@ -599,7 +639,7 @@ def train_NEXT(
             so_vel_mean = scaler_traj.mean_[vel_idx]
 
         SO_CORRECTION_ALPHA = 0.1
-        FIELD_METHOD = "central_f64"  # Default fix applied globally[cite: 6]
+        FIELD_METHOD = "central_f64"  
         HEUN_CORRECTION = True
         DEPLOY_DT = trajectory_dt
 
@@ -742,9 +782,6 @@ def train_NEXT(
 
 
 class GRUODEFieldForONNX(torch.nn.Module):
-    """Overhauled ONNX production graph carrying double-precision central-difference routing.
-    Accepts float32 tracking parameters, converts internally to double, and downcasts safely back[cite: 4, 6].
-    """
     def __init__(
         self,
         func,
@@ -901,6 +938,34 @@ def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
 
     tmp_data = [x for x in tmp_data if x[0] is not None]
     return tmp_data
+
+
+def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
+    """SBI space conversion utility mapping raw coordinate matrices across tracking phases[cite: 4]."""
+    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
+    if timeseries_to_transform.shape[0] < 10:
+        return None
+    new_times = np.arange(timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt)
+    resampled_timeseries = np.hstack([np.atleast_2d(new_times).T] + [make_interp_spline(timeseries_to_transform[:, TIME_INDEX], timeseries_to_transform[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)])
+
+    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
+    if args.ref_ecef == "boost": ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
+    elif args.ref_ecef == "glide": ref_ecef = ecef_data_traj[1][-1, POS_SLICE]
+
+    if args.frame == "dcu":
+        timeseries_in_next_frame, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
+    elif args.frame == "grdth":
+        timeseries_in_next_frame, initial_point_heading = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
+    elif args.frame == "geodesic":
+        if getattr(args, "geodesic_mode", "original") == "original":
+            timeseries_in_next_frame = ecef_to_local_geodesic_vec(resampled_timeseries[:, POS_SLICE], resampled_timeseries[:, VEL_SLICE], np.zeros_like(resampled_timeseries[:, VEL_SLICE]), ref_ecef)
+            timeseries_in_next_frame = np.hstack([resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]])
+        else:
+            timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(resampled_timeseries[:, POS_SLICE], resampled_timeseries[:, VEL_SLICE], ref_ecef)
+            timeseries_in_next_frame = np.hstack([resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state])
+    else:
+        raise NotImplementedError("Frame transformation not recognized for SBI.")
+    return timeseries_in_next_frame
 
 
 def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):

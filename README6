@@ -1,1 +1,1057 @@
-python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000 --use-scalar --aug 0 --nhidden 100 -o model_outputs/SBI/GRUODE_mo_cl_ref_loss_NoAug_Bsize16_SO.1_pos3_LateW0_new_agent_grdth/GEODESIC/boost --frame geodesic --geodesic-mode integrated --model-type gruode --ref-ecef glide --sbi-phase glide
+# =====================================================================
+# SYSTEM "NeXT" TRAJECTORY PREDICTION SUBSYSTEM OVERHAUL
+# Target Integration: Space-Based Interceptor (SBI) Fire Control System
+# Operational Drop Deadline: July 17th, 2026
+# Precision Fix: Double-Precision Central Finite Difference (central_f64)
+# =====================================================================
+
+# Built-ins
+import argparse
+import json
+import math
+import multiprocessing as mp
+import os
+import pickle
+from copy import deepcopy
+from pathlib import Path
+
+# 3rd party
+import matplotlib.pyplot as plt
+import numpy as np
+import onnx
+import pandas as pd
+import psutil
+import scipy
+import seaborn as sns
+import torch
+from scipy.interpolate import make_interp_spline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
+
+from lm_ai_torch_models.activations import Activation
+from lm_ai_torch_training.configuration import TrainingConfiguration
+from lm_ai_torch_training.hyperparameters import TrainingParam
+from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
+from lm_ai_torch_training.optimizers.adam import AdamOptimizer
+from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
+from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
+
+# Local
+from coordinate_transform_functions import (
+    dcu_to_ned,
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    frd_to_dcu,
+    ned_to_dcu,
+    ned_to_ecef,
+    ned_to_ecef_velocity,
+)
+from energy_functions import mechanical_energy
+from load_truth import load_single_truth
+from loss_functions import EnergyMSELoss, PhysicsSplitMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+
+from neural_ode_mod import (
+    DEFAULT_LOSS,
+    EarlyStopper,
+    ModelCheckpoint,
+    NODEPredictor,
+)
+from NEXT_frames import (
+    ecef_to_local_geodesic_vec,
+    ecef_to_next_dcu,
+    ecef_to_next_grdth,
+    local_geodesic_to_ecef_vec,
+    next_dcu_to_ecef,
+    next_grdth_to_ecef,
+)
+from NEXT_geodesic_frame import (
+    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
+    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
+)
+from torchdiffeq_solver import TorchdiffeqSolver
+from trajectory_helpers import (
+    ACC_SLICE,
+    DOWN_DOT_INDEX,
+    DOWN_INDEX,
+    GR_DOT_INDEX,
+    GR_INDEX,
+    POS_SLICE,
+    THETA_DOT_INDEX,
+    TIME_INDEX,
+    VEL_SLICE,
+    check_time_series,
+    resample_traj_data,
+)
+
+HAVE_HIGH_MEMORY = False
+if psutil.virtual_memory().total > 64e9:
+    HAVE_HIGH_MEMORY = True
+
+HAVE_GPU = False
+if torch.cuda.device_count() != 0:
+    HAVE_GPU = True
+    print("there is a gpu in this node")
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i))
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+BUCKET_SIZE = 5000  # [m]
+
+
+class ODEfunc(torch.nn.Module):
+    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
+        super(ODEfunc, self).__init__()
+        self.order_shift_slice = order_shift_slice
+        self.len_of_order_shift_slice = 0
+        if self.order_shift_slice is not None:
+            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
+            self.len_of_order_shift_slice = len(order_indicies)
+        self.act1 = torch.nn.SiLU(inplace=False)
+        self.act2 = torch.nn.SiLU(inplace=False)
+        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
+        self.fc2 = torch.nn.Linear(nhidden, nhidden)
+        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
+        self.nfe = 0
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.order_shift_slice is not None:
+            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
+        self.nfe += 1
+        out = self.fc1(x)
+        out = self.act1(out)
+        out = self.fc2(out)
+        out = self.act2(out)
+        out = self.fc4(out)
+        if self.order_shift_slice is not None:
+            return torch.cat((v, out), dim=x.ndim - 1)
+        else:
+            return out
+
+
+class FullGRUODECell(torch.nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hrz = torch.nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xrz = torch.nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            if bias:
+                self.bias_rz = torch.nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = torch.nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
+
+
+class MinimalGRUODECell(torch.nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hf = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        self.lin_hh = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xf = torch.nn.Linear(input_size, hidden_size, bias=bias)
+            self.lin_xh = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_f = self.lin_hf(h)
+        if self.input_size > 0:
+            pre_f = pre_f + self.lin_xf(x)
+        elif self.bias_f is not None:
+            pre_f = pre_f + self.bias_f
+        f = torch.sigmoid(pre_f)
+
+        pre_h = self.lin_hh(f * h)
+        if self.input_size > 0:
+            pre_h = pre_h + self.lin_xh(x)
+        elif self.bias_h is not None:
+            pre_h = pre_h + self.bias_h
+        g = torch.tanh(pre_h)
+
+        dh = (1.0 - f) * (g - h)
+        return dh
+
+
+class GRUODEFunc(torch.nn.Module):
+    def __init__(
+        self,
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+    ):
+        super().__init__()
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
+        enc_in = len(encoder_input_idx)
+
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(enc_in, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, self.latent_dim),
+            torch.nn.Tanh(),
+        )
+        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_dim, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, state_vector_len),
+        )
+
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        return self.cell(t, h)
+
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+
+try:
+    from torch.func import jvp as _func_jvp
+    def _decoder_jvp(decode_fn, h, dh):
+        return _func_jvp(decode_fn, (h,), (dh,))
+except Exception:
+    def _decoder_jvp(decode_fn, h, dh):
+        return torch.autograd.functional.jvp(decode_fn, h, v=dh, create_graph=True, strict=False)
+
+
+class GRUODELatentModel(torch.nn.Module):
+    """GRU-ODE physical vector wrapper augmented with a float64 central-difference arm.
+    Safeguards tracking math from catastrophic cancellation along steady glide regimes[cite: 6].
+    """
+    def __init__(
+        self,
+        func,                 # GRUODEFunc
+        solver=None,
+        aug_dim: int = 0,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        so_correction_alpha: float = 0.0,
+        field_method: str = "central_f64",  # Updated default fix arm[cite: 6]
+        fd_eps: float = 1e-4,
+        dt: float = 0.1,
+        heun_correction: bool = False,
+    ):
+        super().__init__()
+        self.func = func
+        self.aug_dim = aug_dim
+        self.dt = float(dt)
+        self.heun_correction = bool(heun_correction)
+        self.field_method = field_method
+        self.fd_eps = float(fd_eps)
+        self.so_correction_alpha = float(so_correction_alpha)
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                offset = torch.as_tensor(vel_mean, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.so_ratio = None
+                self.so_offset = None
+                self.scaled_space = False
+        else:
+            self.pos_idx = None
+            self.vel_idx = None
+
+    def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(t, h)
+        
+        if self.field_method == "central":
+            eps = self.fd_eps
+            x_plus = self.func.decode(h + eps * dh)
+            x_minus = self.func.decode(h - eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * eps)
+            
+        elif self.field_method == "central_f64":
+            # Cast representations into double precision to capture minuscule perturbations[cite: 6]
+            eps = self.fd_eps
+            h_64 = h.to(torch.float64)
+            dh_64 = dh.to(torch.float64)
+            
+            # High-fidelity functional decoder pass mapping custom activation states
+            def decode_f64(h_val):
+                out = h_val
+                for layer in self.func.decoder:
+                    if isinstance(layer, torch.nn.Linear):
+                        out = torch.nn.functional.linear(
+                            out, layer.weight.to(torch.float64), 
+                            layer.bias.to(torch.float64) if layer.bias is not None else None
+                        )
+                    elif isinstance(layer, torch.nn.SiLU):
+                        out = torch.nn.functional.silu(out)
+                    elif isinstance(layer, torch.nn.ReLU):
+                        out = torch.nn.functional.relu(out)
+                    elif isinstance(layer, torch.nn.Tanh):
+                        out = torch.tanh(out)
+                    elif isinstance(layer, torch.nn.ELU):
+                        out = torch.nn.functional.elu(out)
+                return out
+                
+            x_plus_64 = decode_f64(h_64 + eps * dh_64)
+            x_minus_64 = decode_f64(h_64 - eps * dh_64)
+            xdot = ((x_plus_64 - x_minus_64) / (2.0 * eps)).to(torch.float32)
+            
+        else:
+            _, xdot = _decoder_jvp(self.func.decode, h, dh)
+            
+        if self.second_order:
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+
+            if self.heun_correction:
+                accel_s = xdot.index_select(-1, self.vel_idx)
+                if getattr(self, "scaled_space", False):
+                    accel_term = 0.5 * self.dt * self.so_ratio * accel_s
+                else:
+                    accel_term = 0.5 * self.dt * accel_s
+                pos_deriv = pos_deriv + accel_term
+
+            if self.so_correction_alpha > 0.0:
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+        return xdot
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.func.state_vector_len:
+            x_core = x.narrow(-1, 0, self.func.state_vector_len)
+            xdot_core = self._field(t, x_core)
+            pad = torch.zeros(*xdot_core.shape[:-1], self.aug_dim, dtype=xdot_core.dtype, device=xdot_core.device)
+            return torch.cat((xdot_core, pad), dim=-1)
+        return self._field(t, x)
+
+
+class GRUBayes(torch.nn.Module):
+    def __init__(self, latent_dim: int, obs_dim: int, prep_hidden: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.obs_dim = obs_dim
+        self.obs_to_theta = torch.nn.Linear(latent_dim, 2 * obs_dim)
+        self.prep = torch.nn.Linear(4 * obs_dim, prep_hidden * obs_dim)
+        self.gru = torch.nn.GRUCell(prep_hidden * obs_dim, latent_dim)
+
+    def fobs(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        theta = self.obs_to_theta(h)
+        mu, logvar = theta.chunk(2, dim=-1)
+        return mu, logvar
+
+    def forward(self, h_minus: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        mu, logvar = self.fobs(h_minus)
+        sigma = torch.exp(0.5 * logvar)
+        norm_err = (y - mu) / (sigma + 1e-6)
+        q = torch.cat([mu, logvar, y, norm_err], dim=-1)
+        q = torch.relu(self.prep(q))
+        m_rep = m.repeat_interleave(self.prep.out_features // self.obs_dim, dim=-1)
+        q = q * m_rep
+        h_plus = self.gru(q, h_minus)
+        return torch.tanh(h_plus)
+
+
+class Normaliser(torch.nn.Module):
+    def __init__(self, scaler):
+        super().__init__()
+        self.mean = torch.nn.Parameter(torch.tensor(scaler.mean_, dtype=torch.float32), requires_grad=False)
+        self.scale = torch.nn.Parameter(torch.tensor(scaler.scale_, dtype=torch.float32), requires_grad=False)
+
+    def forward(self, x): return (x - self.mean) / self.scale
+    def inverse(self, z): return z * self.scale + self.mean
+
+
+class Encoder(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.rnn = torch.nn.GRU(input_size=6, hidden_size=hidden, batch_first=True, num_layers=1)
+        self.mu_head = torch.nn.Linear(hidden, latent_dim)
+        self.logvar_head = torch.nn.Linear(hidden, latent_dim)
+
+    def forward(self, x):
+        _, h_n = self.rnn(x)
+        h = h_n.squeeze(0)
+        return self.mu_head(h), self.logvar_head(h)
+
+
+class LatentODEFunc(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, latent_dim),
+        )
+
+    def forward(self, t, z): return self.net(z)
+
+
+class Decoder(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 6),
+        )
+
+    def forward(self, z): return self.net(z)
+
+
+from torchdiffeq import odeint_adjoint
+
+class LatentNODE(torch.nn.Module):
+    def __init__(self, latent_dim=8):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.odefunc = LatentODEFunc(latent_dim)
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, obs_window_and_times: tuple[torch.Tensor, torch.Tensor]):
+        obs_window, t_eval = obs_window_and_times
+        mu, logvar = self.encoder(obs_window)
+        std = torch.exp(0.5 * logvar)
+        z0 = mu + torch.randn_like(std) * std
+        z_t = odeint_adjoint(self.odefunc, z0, t_eval, atol=1e-5, rtol=1e-5)
+        return self.decoder(z_t.permute(1, 0, 2)), mu, logvar
+
+
+def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    return 0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar), dim=1))
+
+
+def _make_obs_target(traj: torch.Tensor, obs_len: int = 10):
+    assert traj.shape[0] > obs_len
+    return traj[:obs_len].unsqueeze(0), traj.unsqueeze(0)
+
+
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+):
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=100,
+        verbose=True,
+    )
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
+
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame == "grdth":
+        velocity_indicies = (2, 3, 4)
+    elif frame == "geodesic":
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("That frame is not known for what the velocity indicies are")
+        
+    early_stop_metric_name = "val_loss"
+
+    loss_func = PhysicsSplitMSELoss(
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        dt=trajectory_dt,
+        pos_weight=1.0,
+        vel_weight=3.0,
+        physics_weight=0.0,
+        late_weight=1.0,
+        late_power=2.0,
+        vel_bias_weight=1.0,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+    )
+
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(
+            layer_channels=[5, 5],
+            layer_activation=Activation.SILU,
+        ),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    if model_type == "node":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=0, order_shift_slice=None).to(node.device)
+    elif model_type == "anode":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=aug_dim, order_shift_slice=None).to(node.device)
+    elif model_type == "sonode":
+        node.model = ODEfunc(state_vector_len=model_states, nhidden=nhidden, aug_dim=0, order_shift_slice=slice(3, 6)).to(node.device)
+    elif model_type in ("gruode", "gruode-min"):
+        minimal = model_type == "gruode-min"
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+        ENCODER_INPUT_MODE = "all"
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            enc_in_idx = [2, 3, 4, 5] if ENCODER_INPUT_MODE == "keep_alt" else ([3, 4, 5] if ENCODER_INPUT_MODE == "vel_only" else None)
+        elif frame == "geodesic" and model_states == 5:
+            enc_in_idx = [1, 2, 3, 4] if ENCODER_INPUT_MODE == "keep_alt" else ([2, 3, 4] if ENCODER_INPUT_MODE == "vel_only" else None)
+        elif frame == "grdth":
+            enc_in_idx = [1, 2, 3, 4] if ENCODER_INPUT_MODE == "keep_alt" else ([2, 3, 4] if ENCODER_INPUT_MODE == "vel_only" else None)
+        else:
+            enc_in_idx = None
+
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=minimal,
+            encoder_input_idx=enc_in_idx,
+        ).to(node.device)
+        
+        if frame == "dcu":
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 6:
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
+        else:
+            pos_idx, vel_idx = None, None
+
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
+        SO_CORRECTION_ALPHA = 0.1
+        FIELD_METHOD = "central_f64"  # Default fix applied globally[cite: 6]
+        HEUN_CORRECTION = True
+        DEPLOY_DT = trajectory_dt
+
+        node.model = GRUODELatentModel(
+            func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
+            pos_idx=pos_idx, vel_idx=vel_idx,
+            pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
+            so_correction_alpha=SO_CORRECTION_ALPHA,
+            field_method=FIELD_METHOD,
+            dt=DEPLOY_DT,
+            heun_correction=HEUN_CORRECTION,
+        ).to(node.device)
+        
+        if HAVE_GPU and os.environ.get("NEXT_COMPILE", "0") == "1":
+            try:
+                node.model = torch.compile(node.model, mode="reduce-overhead", fullgraph=False)
+                print("torch.compile enabled for GRU-ODE field (reduce-overhead)")
+            except Exception as e:
+                print(f"torch.compile unavailable, running eager: {e}")
+    elif model_type == "latentode":
+        latent_dim = nhidden // 2 if nhidden >= 20 else 8
+        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
+        recon_criterion = WrappedMSELoss(height_idx=1, vel_indices=[3, 4, 5], scaler=scaler_traj if use_scalar else None, N_FEATURES=model_states)
+        node.loss_func = lambda pred, true: recon_criterion(pred[0], true) + 0.1 * _kl_divergence(pred[1], pred[2])
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+        
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
+
+    if gen_model:
+        if model_type == "latentode":
+            OBS_WINDOW = 10
+            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]
+            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
+
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-3),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+        for len_strat in length_strategies:
+            print("running length strategy", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+            node.training_configuration = TrainingConfiguration(n_epochs=epochs, optimizer=AdamOptimizer(learning_rate=learning_rate), batch_size=batch_size, num_workers=2, verbose=True)
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
+
+            min_states = 5
+            if model_type == "latentode":
+                fraction_of_data = [(obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)]) for (obs, tgt) in train_data]
+                fraction_of_data_val = [(obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)]) for (obs, tgt) in test_data]
+            else:
+                fraction_of_data = [x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :] for x in scaled_traj_targets_train_posvel]
+                fraction_of_data_val = [x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :] for x in scaled_traj_targets_test_posvel]
+
+            metrics = node.fit(x=fraction_of_data, validation_data=fraction_of_data_val, enable_checkpoints=True if data_fraction == 1.0 else False)
+            
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
+
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.train(False)
+    node.model.eval()
+
+    raw_model = getattr(node.model, "_orig_mod", node.model)
+    if isinstance(raw_model, GRUODELatentModel):
+        if getattr(raw_model, "second_order", False):
+            _pos_idx = raw_model.pos_idx.tolist()
+            _vel_idx = raw_model.vel_idx.tolist()
+            if getattr(raw_model, "scaled_space", False):
+                _ps = scaler_traj.scale_[_pos_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vs = scaler_traj.scale_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vm = scaler_traj.mean_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+            else:
+                _ps = _vs = _vm = None
+        else:
+            _pos_idx = _vel_idx = None
+            _ps = _vs = _vm = None
+            
+        _alpha = getattr(raw_model, "so_correction_alpha", 0.0)
+        _dt = getattr(raw_model, "dt", trajectory_dt)
+        _heun = getattr(raw_model, "heun_correction", False)
+        _field_method = getattr(raw_model, "field_method", "central_f64")
+        
+        export_model = GRUODEFieldForONNX(
+            raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
+            pos_idx=_pos_idx, vel_idx=_vel_idx,
+            pos_scale=_ps, vel_scale=_vs, vel_mean=_vm,
+            so_correction_alpha=_alpha,
+            dt=_dt,
+            heun_correction=_heun,
+            field_method=_field_method,
+        ).to(node.device).eval()
+        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    elif isinstance(ode_solver, TorchdiffeqSolver):
+        export_model = node.model
+        example_input = (None, torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device))
+    else:
+        export_model = node.model
+        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+        
+    model_onx = torch.onnx.export(
+        export_model, example_input, os.path.join(model_save_path, model_name + ".onnx"),
+        export_params=True, opset_version=18, external_data=False,
+        input_names=["input"], output_names=["output"],
+    )
+
+    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
+        f.write(onnx.printer.to_text(model_onx.model_proto))
+
+    if isinstance(scaler_traj, MinMaxScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
+                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
+    elif isinstance(scaler_traj, StandardScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
+                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
+    return node, model_name
+
+
+class GRUODEFieldForONNX(torch.nn.Module):
+    """Overhauled ONNX production graph carrying double-precision central-difference routing.
+    Accepts float32 tracking parameters, converts internally to double, and downcasts safely back[cite: 4, 6].
+    """
+    def __init__(
+        self,
+        func,
+        state_vector_len: int,
+        aug_dim: int = 0,
+        eps: float = 1e-4,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        so_correction_alpha: float = 0.0,
+        dt: float = 0.1,
+        heun_correction: bool = False,
+        field_method: str = "central_f64",
+    ):
+        super().__init__()
+        self.func = func
+        self.state_vector_len = state_vector_len
+        self.aug_dim = aug_dim
+        self.eps = eps
+        self.so_correction_alpha = float(so_correction_alpha)
+        self.dt = float(dt)
+        self.heun_correction = bool(heun_correction)
+        self.field_method = field_method
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                offset = torch.as_tensor(vel_mean, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
+            x_phys = x.narrow(-1, 0, self.state_vector_len)
+        else:
+            x_phys = x
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(0.0, h)
+        
+        if self.field_method == "central":
+            x_plus = self.func.decode(h + self.eps * dh)
+            x_minus = self.func.decode(h - self.eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * self.eps)
+            
+        elif self.field_method == "central_f64":
+            h_64 = h.to(torch.float64)
+            dh_64 = dh.to(torch.float64)
+            eps_val = self.eps
+            
+            def decode_f64(h_val):
+                out = h_val
+                for layer in self.func.decoder:
+                    if isinstance(layer, torch.nn.Linear):
+                        out = torch.nn.functional.linear(
+                            out, layer.weight.to(torch.float64), 
+                            layer.bias.to(torch.float64) if layer.bias is not None else None
+                        )
+                    elif isinstance(layer, torch.nn.SiLU):
+                        out = torch.nn.functional.silu(out)
+                    elif isinstance(layer, torch.nn.ReLU):
+                        out = torch.nn.functional.relu(out)
+                    elif isinstance(layer, torch.nn.Tanh):
+                        out = torch.tanh(out)
+                    elif isinstance(layer, torch.nn.ELU):
+                        out = torch.nn.functional.elu(out)
+                return out
+                
+            x_plus_64 = decode_f64(h_64 + eps_val * dh_64)
+            x_minus_64 = decode_f64(h_64 - eps_val * dh_64)
+            xdot = ((x_plus_64 - x_minus_64) / (2.0 * eps_val)).to(torch.float32)
+            
+        if self.second_order:
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            if self.heun_correction:
+                accel_s = xdot.index_select(-1, self.vel_idx)
+                if getattr(self, "scaled_space", False):
+                    pos_deriv = pos_deriv + 0.5 * self.dt * self.so_ratio * accel_s
+                else:
+                    pos_deriv = pos_deriv + 0.5 * self.dt * accel_s
+            if self.so_correction_alpha > 0.0:
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+        return xdot
+
+
+def prep_trajectory(x):
+    ecef_data, traj_number, max_sr, trajectory_dt, args = x
+    ecef_data = ecef_data[:, 0:7]
+    print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        ecef_data = ecef_data[1:]
+   
+    sr_ecef_data = np.asarray(tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr), dtype=np.float64)
+
+    if sr_ecef_data.shape[-1] < 5:
+        print(f"{traj_number} does not have enough time stamps for this slant range")
+        return None, None
+    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
+    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
+    if np.any(time_diff < 0): raise ValueError(f"warning: {traj_number} has backward time.")
+
+    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
+
+    try:
+        resampled_sr_ecef_data = np.hstack([np.atleast_2d(new_times).T] + [make_interp_spline(sr_ecef_data[:, 0], sr_ecef_data[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)])
+    except Exception as e:
+        print(f"warning: {traj_number} had the error with interpolation")
+        raise e
+
+    if args.frame == "grdth": next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
+    elif args.frame == "geodesic":
+        next_frame_data = ecef_to_local_geodesic_vec(resampled_sr_ecef_data[:, POS_SLICE], resampled_sr_ecef_data[:, VEL_SLICE], np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE]), ref_ecef)
+        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
+    elif args.frame == "dcu": next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
+    else: raise NotImplementedError("That frame is not supported yet")
+
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
+
+    return next_frame_data, traj_number
+
+
+def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
+    boost_ecef, glide_ecef, dest_ecef = [], [], []
+    target_path = Path(path)
+    for phase in ["boost", "glide", "impact"]:
+        phase_path = target_path / phase
+        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
+        if len(traj_files) == 0: raise ValueError("bad target path", path)
+        traj_targets = [load_single_truth(x, debug=False, low_memory=not HAVE_HIGH_MEMORY, memory_map=HAVE_HIGH_MEMORY, min_state_vector_size=7) for x in traj_files]
+        if phase == "boost": boost_ecef = traj_targets
+        elif phase == "glide": glide_ecef = traj_targets
+        elif phase == "impact": dest_ecef = traj_targets
+
+    if not do_prep: return list(zip(list(zip(boost_ecef, glide_ecef, dest_ecef)), [x.name for x in traj_files]))
+
+    cpu_count = psutil.cpu_count(logical=False) or mp.cpu_count()
+    print(f"there are {cpu_count} cpus being used for trajectory prep")
+    with mp.Pool(processes=cpu_count) as pool: tmp_data = pool.map(prep_trajectory, traj_targets)
+
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+    return tmp_data
+
+
+def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
+    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
+    scaler_traj = StandardScaler().fit(stacked_posvel)
+    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
+    with open(pickle_scalar_name, "wb") as o: pickle.dump(scaler_traj, o)
+    return scaler_traj
+
+
+def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
+    if data.ndim != 2: raise ValueError("`data` must be a 2-D array.")
+    n_cols = data.shape[1]
+    max_per_row = 5
+    n_rows = int(np.ceil(n_cols / max_per_row))
+    n_cols_plot = min(n_cols, max_per_row)
+    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
+    if n_rows == 1: axes = np.expand_dims(axes, axis=0)
+    colors = plt.get_cmap(cmap).colors
+    for idx in range(data.shape[1]):
+        row, col = idx // max_per_row, idx % max_per_row
+        ax = axes[row, col]
+        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
+        ax.set_title(f"Column {idx}" if column_names is None else column_names[idx])
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Density")
+    for empty_idx in range(data.shape[1], n_rows * n_cols_plot):
+        fig.delaxes(axes[empty_idx // max_per_row, empty_idx % max_per_row])
+    plt.suptitle("Column-wise Distributions", fontsize=16, y=1.02)
+    plt.savefig(data_path + "_feature_distribution.png")
+
+
+def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
+    if data.ndim != 2: raise ValueError("`data` must be a 2-D array.")
+    corr = np.corrcoef(data, rowvar=False) if method == "pearson" else scipy.stats.spearmanr(data, axis=0)[0]
+    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
+    sns.heatmap(corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5)
+    labels = [f"Col {i}" for i in range(corr.shape[0])] if column_names is None else column_names
+    plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
+    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.tight_layout()
+    plt.savefig(data_path + "_correlation_matrix.png")
+
+
+def augment_trajectory_segments(traj_list, segments_per_traj: int = 5, min_segment_len: int = 12, keep_full: bool = True):
+    out = []
+    for traj in traj_list:
+        T = traj.shape[0]
+        if keep_full: out.append(traj)
+        n_extra = max(0, segments_per_traj - (1 if keep_full else 0))
+        if n_extra == 0 or T <= min_segment_len: continue
+        last_start = min(max(1, int(0.7 * T)), T - min_segment_len)
+        if last_start < 1: continue
+        for k in range(1, n_extra + 1):
+            start = max(1, int(round(k / (n_extra + 1) * last_start)))
+            seg = traj[start:]
+            if seg.shape[0] >= min_segment_len: out.append(seg)
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Training script for creating NEXT models", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--tgt-data-paths", default=[], type=str, nargs="+")
+    parser.add_argument("--validation-data-paths", default=[], type=str, nargs="+")
+    parser.add_argument("--sr", default=100000, type=int)
+    parser.add_argument("-o", default="model_outputs", type=str)
+    parser.add_argument("--use-scalar", default=False, action="store_true")
+    parser.add_argument("--frame", default="dcu", choices=["dcu", "grdth", "geodesic"])
+    parser.add_argument("--geodesic-mode", default="original", choices=["original", "integrated"])
+    parser.add_argument("--sbi-phase", default="boost", choices=["boost", "glide"])
+    parser.add_argument("--nhidden", default=200, type=int)
+    parser.add_argument("--aug", default=0, type=int, dest="aug_dim")
+    parser.add_argument("--gpuidx", default=0, type=int, dest="gpu_index")
+    parser.add_argument("--model-type", default="node", choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"])
+    parser.add_argument("--dt", default=0.1, type=float)
+    parser.add_argument("--ref-ecef", default="impact", choices=["boost", "glide", "impact"])
+    args = parser.parse_args()
+
+    model_states = 6
+    if args.frame == "grdth": model_states = 5
+    elif args.frame == "geodesic" and args.geodesic_mode == "integrated": model_states = 5
+
+    trajectory_dt = args.dt
+    seed = 47
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    target_strs = [Path(x).name for x in args.tgt_data_paths]
+    model_name_target_str = "+".join(target_strs)
+    model_save_path = os.path.join(args.o, model_name_target_str)
+    batch_size = 48
+
+    frame_tag = f"geodesic-{args.geodesic_mode}" if args.frame == "geodesic" else args.frame
+    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    if args.use_scalar: model_name_wo_epochs += "_scalarOn"
+    model_name = f"{model_name_wo_epochs}"
+
+    traj_targets_train, traj_targets_test = [], []
+    if len(args.validation_data_paths) == 0:
+        for tgt_data_path in args.tgt_data_paths:
+            traj_targets = load_data_dir(tgt_data_path, trajectory_dt, args, do_prep=False)
+            t_train, t_test = train_test_split(traj_targets, test_size=0.2, random_state=26525)
+            traj_targets_train.extend(t_train)
+            traj_targets_test.extend(t_test)
+    else:
+        for tgt_data_path in args.tgt_data_paths: traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+        for tgt_data_path in args.validation_data_paths: traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+
+    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
+    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
+    split_dict = {"train": traj_targets_train_traj_numbers, "test": traj_targets_test_traj_numbers}
+    os.makedirs(model_save_path, exist_ok=True)
+    with open(os.path.join(model_save_path, f"{model_name_wo_epochs}_train_test_split.json"), "w", encoding="utf-8") as f: json.dump(split_dict, f)
+
+    traj_targets_train = [sbi_trajectory_prep(x, args.sbi_phase, trajectory_dt, args) for x in traj_targets_train]
+    traj_targets_test = [sbi_trajectory_prep(x, args.sbi_phase, trajectory_dt, args) for x in traj_targets_test]
+    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
+    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
+
+    if any(x.shape[0] < 10 for x in [x for x in traj_targets_train + traj_targets_test]):
+        raise ValueError("Some tracking inputs possess less than 10 sequential points.")
+
+    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
+    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
+
+    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any([torch.isnan(x).any() for x in traj_targets_test_posvel]):
+        raise ValueError("NaN variables detected across target trajectory tracking lines.")
+
+    stacked_posvel = np.vstack(traj_targets_train_posvel)
+    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
+    if args.frame == "grdth": column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
+    elif args.frame == "geodesic": column_names = ["s", "h", "v_s", "v_alpha", "v_h"] if args.geodesic_mode == "integrated" else ["s", "az", "h", "v_s", "v_alpha", "v_h"]
+    plot_column_distributions(stacked_posvel, column_names=column_names, data_path=str(Path(model_save_path, model_name_wo_epochs)))
+    plot_correlation_matrix(stacked_posvel, column_names=column_names, data_path=str(Path(model_save_path, model_name_wo_epochs)))
+
+    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+
+    AUGMENT_SEGMENTS = 5
+    if BUCKET_SIZE and AUGMENT_SEGMENTS > 1:
+        n_before = len(traj_targets_train_posvel)
+        traj_targets_train_posvel = augment_trajectory_segments(traj_targets_train_posvel, segments_per_traj=AUGMENT_SEGMENTS, min_segment_len=12, keep_full=True)
+        print(f"segment augmentation: {n_before} -> {len(traj_targets_train_posvel)} training paths.")
+
+    train_NEXT(
+        model_name, traj_targets_train_posvel, traj_targets_test_posvel, scaler_traj, model_save_path,
+        trajectory_dt, batch_size, args.use_scalar, model_states, args.aug_dim, args.nhidden,
+        args.gpu_index, args.model_type, args.frame
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,15 +1,372 @@
-((.venv) ) 1010670000@magenta-gorilla-0:~/lm_cm_repos/next$ python NEXT_training_mo_cl_mdn.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/MDN_mo_cl/GEODESIC/boost --frame geodesic --geodesic-mode integrated --model-type mdn --ref-ecef glide --sbi-phase glide 
-there is a gpu in this node
-_CudaDeviceProperties(name='NVIDIA A100-SXM4-80GB', major=8, minor=0, total_memory=81152MB, multi_processor_count=108, uuid=78c6e557-8c9e-39eb-078b-37a803194bd9, pci_bus_id=78, pci_device_id=0, pci_domain_id=0, L2_cache_size=40MB)
-There are 120 training trajs and 30 validation trajs. There will be 3 batch(es) for training and 1 for validation
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
-segment augmentation: 117 -> 585 training trajectories (val left at 30)
-[INFO] MDN windows: 1347356 train / 88967 val (history=10, horizon=20, modes=5, a_max=40.0 m/s^2)
-[INFO] Epoch 5: loss: -240.0868521 pos_err: 354.8217451 vel_err: 32.0799420 val_loss: -227.0214233 val_pos_err: 419.9773560 val_vel_err: 32.7183189
-[INFO] Epoch 10: loss: -240.7677987 pos_err: 354.7942247 vel_err: 32.0696501 val_loss: -223.3714294 val_pos_err: 419.9996643 val_vel_err: 32.7406845
-[INFO] Epoch 15: loss: -241.0089460 pos_err: 354.7854350 vel_err: 32.0691175 val_loss: -219.5459900 val_pos_err: 420.0318909 val_vel_err: 32.7135620
+"""Mixture-Density Trajectory Predictor for evasive-agent (drone-tag) forecasting.
+
+WHY THIS MODEL (see review discussion):
+    The "runner" drone is an ADVERSARIAL agent actively trying to be
+    unpredictable. For any non-trivial horizon its future is not a single path
+    but a DISTRIBUTION over paths, often MULTIMODAL (it jukes left OR right;
+    both are plausible from identical history). A single-point regressor trained
+    on such data collapses toward the mean of the modes -- i.e. it predicts the
+    physically-average "straight through the middle" path the runner never
+    actually takes. This module instead predicts K weighted future trajectories
+    plus their probabilities (a Gaussian mixture over futures), which is the
+    quantity a chaser can actually use: pursue the highest-weight / mixture-mean
+    mode while hedging against the branches.
+
+ARCHITECTURE (primary recommendation):
+    history window [x,y,z,vx,vy,vz] x H steps
+        -> GRU encoder                          (summarises "what maneuver now")
+        -> MDN head -> {logits_k, a_k(t)}       (K modes; per-mode accel sequence)
+        -> BOUNDED acceleration  a = a_max * tanh(.)   (dynamically feasible)
+        -> double kinematic integration          (a -> v -> p, known physics)
+        -> K future trajectories [x,y,z,vx,vy,vz] x T + mixture weights pi_k
+
+    Decoding ACCELERATION and integrating it (rather than regressing position
+    directly) bakes in the second-order kinematics the same way the glide model's
+    structural constraint does: predicted velocity is the integral of predicted
+    acceleration and predicted position is the integral of predicted velocity, so
+    every sampled future is smooth and Newton-feasible by construction, and the
+    tanh cap keeps it inside the drone's real acceleration envelope -- the model
+    can never predict a physically impossible instantaneous juke.
+
+SCALING:
+    The model consumes and PREDICTS in StandardScaler-scaled units (consistent
+    with the rest of the pipeline). The kinematic identities dp=v*dt, dv=a*dt
+    hold in PHYSICAL units, so integration is done with per-axis scale factors:
+        v_phys = v_s * sigma_v + mu_v ;  p_{t+1} = p_t + v_phys * dt   (phys)
+    then re-scaled back to scaled position. a_max is likewise a PHYSICAL bound
+    (m/s^2) converted to the scaled acceleration the head emits. All of this is
+    handled internally from the scaler stats passed at construction; if no
+    scaler is supplied the model assumes physical units (sigma=1, mu=0).
+
+This module is deliberately self-contained (no torchdiffeq / ODE-solver
+coupling) because it is a windowed sequence-to-sequence predictor, not a
+stateless vector field. It is wired into the training script as
+`--model-type mdn` and exported to ONNX via MDNTrajectoryForONNX.
+"""
+
+from __future__ import annotations
+
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MDNTrajectoryPredictor(nn.Module):
+    """GRU-encoder + mixture-density head predicting K weighted future
+    trajectories by integrating bounded per-mode acceleration.
+
+    Args:
+        state_dim:   number of state features per timestep (6 for [x,y,z,vx,vy,vz]).
+        pos_idx:     indices of the position block within the state.
+        vel_idx:     indices of the velocity block, paired 1:1 with pos_idx
+                     (pos_idx[i] integrates vel_idx[i]).
+        horizon:     number of future steps T to predict.
+        dt:          timestep between states (seconds), PHYSICAL.
+        n_modes:     number of mixture components K.
+        enc_hidden:  GRU hidden width.
+        enc_layers:  GRU depth.
+        head_hidden: MDN head MLP width.
+        a_max:       PHYSICAL acceleration bound (m/s^2) per velocity axis. The
+                     head output is a = a_max * tanh(raw), guaranteeing feasibility.
+                     Set from the drone's known envelope; a scalar or a per-vel-axis
+                     list. Defaults to a generous 40 m/s^2 (~4 g) if unknown.
+        pos_scale, vel_scale, vel_mean: StandardScaler stats for the pos/vel
+                     blocks (sigma_p, sigma_v, mu_v). If None -> physical units.
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        pos_idx: list[int],
+        vel_idx: list[int],
+        horizon: int,
+        dt: float,
+        n_modes: int = 5,
+        enc_hidden: int = 128,
+        enc_layers: int = 1,
+        head_hidden: int = 128,
+        a_max: float | list[float] = 40.0,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
+        self.state_dim = state_dim
+        self.horizon = int(horizon)
+        self.dt = float(dt)
+        self.n_modes = int(n_modes)
+        self.n_axes = len(pos_idx)
+
+        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+
+        # --- scaling stats (scaled <-> physical) ---------------------------
+        # Derivatives in scaled space: a physical accel a_phys enters the scaled
+        # velocity update as a_phys/sigma_v; a physical velocity enters the
+        # scaled position update as v_phys/sigma_p. StandardScaler's mean shift
+        # cancels in differences, but the velocity MEAN matters when converting a
+        # scaled velocity to the physical velocity that moves position.
+        if pos_scale is not None and vel_scale is not None:
+            ps = torch.as_tensor(pos_scale, dtype=torch.float32)
+            vs = torch.as_tensor(vel_scale, dtype=torch.float32)
+            vm = (
+                torch.as_tensor(vel_mean, dtype=torch.float32)
+                if vel_mean is not None
+                else torch.zeros_like(vs)
+            )
+            self.scaled_space = True
+        else:
+            ps = torch.ones(self.n_axes)
+            vs = torch.ones(self.n_axes)
+            vm = torch.zeros(self.n_axes)
+            self.scaled_space = False
+        self.register_buffer("pos_scale", ps)  # sigma_p
+        self.register_buffer("vel_scale", vs)  # sigma_v
+        self.register_buffer("vel_mean", vm)   # mu_v
+
+        # PHYSICAL acceleration bound -> scaled-acceleration bound the head emits.
+        # scaled_accel = a_phys / sigma_v, so a_max_scaled = a_max / sigma_v.
+        if isinstance(a_max, (int, float)):
+            a_max_vec = torch.full((self.n_axes,), float(a_max))
+        else:
+            a_max_vec = torch.as_tensor(a_max, dtype=torch.float32)
+            assert a_max_vec.numel() == self.n_axes, "a_max list must match n vel axes"
+        self.register_buffer("a_max_phys", a_max_vec)
+        self.register_buffer("a_max_scaled", a_max_vec / vs)
+
+        # --- encoder: history window -> context vector ---------------------
+        self.encoder = nn.GRU(
+            input_size=state_dim,
+            hidden_size=enc_hidden,
+            num_layers=enc_layers,
+            batch_first=True,
+        )
+
+        # --- MDN head: context -> {mode logits, per-mode accel sequence} ----
+        # Each mode emits an acceleration for every future step and every vel
+        # axis: T * n_axes raw values, squashed by tanh and scaled by a_max.
+        self.mode_logits = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes),
+        )
+        self.accel_head = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes * self.horizon * self.n_axes),
+        )
+        # Optional per-mode, per-axis log-sigma for the mixture likelihood
+        # (aleatoric spread of each mode around its integrated mean path).
+        self.logsig_head = nn.Sequential(
+            nn.Linear(enc_hidden, head_hidden),
+            nn.SiLU(),
+            nn.Linear(head_hidden, self.n_modes * self.n_axes),
+        )
+
+    # ------------------------------------------------------------------
+    def _integrate(self, accel_scaled: torch.Tensor, x_last: torch.Tensor) -> torch.Tensor:
+        """Integrate bounded scaled acceleration into full scaled state paths.
+
+        accel_scaled : (B, K, T, n_axes)  scaled acceleration per mode/step/axis
+        x_last       : (B, state_dim)     last observed (scaled) state = IC
+
+        Returns states : (B, K, T, state_dim) scaled [.,pos,.,vel,.] filled on the
+        paired pos/vel indices; any unpaired state channels (e.g. an azimuth-rate)
+        are held at their last observed value (the kinematic head does not model
+        them -- extend here if a frame needs it).
+        """
+        B, K, T, A = accel_scaled.shape
+        dt = self.dt
+        sig_p = self.pos_scale.view(1, 1, A)
+        sig_v = self.vel_scale.view(1, 1, A)
+        mu_v = self.vel_mean.view(1, 1, A)
+
+        # initial conditions gathered from the last observed state, per axis
+        p0 = x_last.index_select(-1, self.pos_idx).unsqueeze(1).expand(B, K, A)  # scaled pos
+        v0 = x_last.index_select(-1, self.vel_idx).unsqueeze(1).expand(B, K, A)  # scaled vel
+
+        p = p0
+        v = v0
+        pos_steps = []
+        vel_steps = []
+        for t in range(T):
+            a_s = accel_scaled[:, :, t, :]              # (B,K,A) scaled accel
+            # velocity update in scaled space: dv_scaled = (a_phys/sigma_v)*dt,
+            # and a_s already equals a_phys/sigma_v, so:
+            v = v + a_s * dt
+            # position update uses PHYSICAL velocity: v_phys = v_scaled*sigma_v + mu_v
+            v_phys = v * sig_v + mu_v
+            # dp_scaled = (v_phys/sigma_p)*dt
+            p = p + (v_phys / sig_p) * dt
+            pos_steps.append(p)
+            vel_steps.append(v)
+        pos = torch.stack(pos_steps, dim=2)  # (B,K,T,A)
+        vel = torch.stack(vel_steps, dim=2)  # (B,K,T,A)
+
+        # assemble full state paths; hold any non-pos/vel channels at last value
+        states = x_last.view(B, 1, 1, self.state_dim).expand(B, K, T, self.state_dim).clone()
+        pidx = self.pos_idx.view(1, 1, 1, A).expand(B, K, T, A)
+        vidx = self.vel_idx.view(1, 1, 1, A).expand(B, K, T, A)
+        states = states.scatter(-1, pidx, pos)
+        states = states.scatter(-1, vidx, vel)
+        return states
+
+    # ------------------------------------------------------------------
+    def forward(self, obs_window: torch.Tensor):
+        """
+        obs_window : (B, H, state_dim)  scaled history window.
+
+        Returns dict:
+            traj    : (B, K, T, state_dim)  K integrated future state paths (scaled)
+            log_pi  : (B, K)                mode log-probabilities (log-softmax)
+            log_sig : (B, K, n_axes)        per-mode log-sigma (position spread)
+            mean    : (B, T, state_dim)     mixture-mean path (weighted by pi) --
+                                            convenience single-trajectory output
+        """
+        B = obs_window.shape[0]
+        _, h_n = self.encoder(obs_window)     # h_n: (layers, B, enc_hidden)
+        ctx = h_n[-1]                         # (B, enc_hidden) last-layer hidden
+        x_last = obs_window[:, -1, :]         # (B, state_dim) IC for integration
+
+        log_pi = F.log_softmax(self.mode_logits(ctx), dim=-1)   # (B,K)
+        raw = self.accel_head(ctx).view(B, self.n_modes, self.horizon, self.n_axes)
+        a_max = self.a_max_scaled.view(1, 1, 1, self.n_axes)
+        accel = a_max * torch.tanh(raw)                          # bounded, feasible
+        log_sig = self.logsig_head(ctx).view(B, self.n_modes, self.n_axes)
+
+        traj = self._integrate(accel, x_last)                    # (B,K,T,state_dim)
+
+        pi = log_pi.exp().view(B, self.n_modes, 1, 1)
+        mean = (pi * traj).sum(dim=1)                            # (B,T,state_dim)
+
+        return {"traj": traj, "log_pi": log_pi, "log_sig": log_sig, "mean": mean}
+
+
+class MDNTrajectoryLoss(nn.Module):
+    """Mixture negative log-likelihood over future POSITION+VELOCITY, plus
+    physical-unit L1 metrics that match the original pipeline's losses exactly.
+
+    The NLL is the standard MDN objective: -log sum_k pi_k N(y | mu_k, sig_k).
+    Scoring the mixture likelihood (rather than only the mean path) is what lets
+    the model represent both branches of a juke without being penalised for not
+    averaging them -- the crucial property for an evasive target.
+
+    The REPORTED metrics (pos_err, vel_err), however, are computed exactly as the
+    ODE models compute them: mean absolute error, in physical units, of the
+    SINGLE predicted path against the target -- where the single path is the
+    mixture-mean (the probability-weighted average of the K modes). This makes
+    pos_err / vel_err directly comparable to the other model types' metrics
+    (same name, same units, same plain-mean reduction over batch x time x axes).
+    """
+
+    def __init__(
+        self,
+        pos_idx: list[int],
+        vel_idx: list[int],
+        scaler=None,
+        vel_weight: float = 1.0,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+        self.scaler = scaler
+        self.vel_weight = float(vel_weight)
+        self.eps = float(eps)
+        if scaler is not None:
+            self.register_buffer(
+                "pos_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(pos_idx)]
+            )
+            self.register_buffer(
+                "vel_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(vel_idx)]
+            )
+        else:
+            self.pos_sigma = None
+            self.vel_sigma = None
+
+    def forward(self, pred: dict, target: torch.Tensor):
+        """
+        pred   : output dict of MDNTrajectoryPredictor
+        target : (B, T, state_dim)  ground-truth future path (scaled)
+        """
+        traj = pred["traj"]          # (B,K,T,D)
+        log_pi = pred["log_pi"]      # (B,K)
+        log_sig = pred["log_sig"]    # (B,K,A)
+        B, K, T, D = traj.shape
+
+        tgt_pos = target.index_select(-1, self.pos_idx)      # (B,T,A)
+        tgt_vel = target.index_select(-1, self.vel_idx)      # (B,T,A)
+        mode_pos = traj.index_select(-1, self.pos_idx)       # (B,K,T,A)
+        mode_vel = traj.index_select(-1, self.vel_idx)       # (B,K,T,A)
+
+        # --- mixture NLL on position (time- and axis-summed Gaussian) -------
+        sig = log_sig.exp().clamp_min(self.eps).view(B, K, 1, -1)  # (B,K,1,A)
+        # per-mode, per-step Gaussian log-prob of the target position
+        diff = (mode_pos - tgt_pos.unsqueeze(1))                   # (B,K,T,A)
+        log_prob_axis = -0.5 * (diff / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
+        # sum over axes and time -> per-mode trajectory log-likelihood
+        log_prob_mode = log_prob_axis.sum(dim=(2, 3))             # (B,K)
+        # mixture: logsumexp_k (log_pi_k + log_prob_mode_k)
+        log_mix = torch.logsumexp(log_pi + log_prob_mode, dim=1)  # (B,)
+        nll = -log_mix.mean()
+
+        # small velocity consistency term: penalise the best mode's velocity
+        # error so modes stay kinematically honest (position NLL alone underuses
+        # the velocity channel).
+        with torch.no_grad():
+            per_mode_pos_err = (mode_pos - tgt_pos.unsqueeze(1)).pow(2).mean(dim=(2, 3))  # (B,K)
+            best = per_mode_pos_err.argmin(dim=1)                                          # (B,)
+        b = torch.arange(B, device=traj.device)
+        vel_best = mode_vel[b, best]                              # (B,T,A)
+        vel_mse = F.mse_loss(vel_best, tgt_vel)
+        loss = nll + self.vel_weight * vel_mse
+
+        # --- metrics: physical-unit L1 of the MIXTURE-MEAN path -------------
+        # Matches the original single-trajectory losses (PhysicsSplitMSELoss etc.)
+        # EXACTLY: mean absolute error between the (single) predicted path and the
+        # target, in PHYSICAL units, reduced by a plain mean over batch x time x
+        # axes (torch.nn.L1Loss default). The "single predicted path" for a
+        # mixture is its probability-weighted mean (pred["mean"]), so pos_err /
+        # vel_err are directly comparable to the ODE models' pos_err / vel_err --
+        # same name, same units, same reduction. (Physical units via scale_,
+        # i.e. StandardScaler's per-feature std; mean offset cancels in a
+        # difference so only scale_ is needed, identical to the original.)
+        with torch.no_grad():
+            mean_path = pred["mean"]                              # (B,T,D)
+            mean_pos = mean_path.index_select(-1, self.pos_idx)  # (B,T,A)
+            mean_vel = mean_path.index_select(-1, self.vel_idx)  # (B,T,A)
+            if self.pos_sigma is not None:
+                pos_pred_u = mean_pos * self.pos_sigma.view(1, 1, -1)
+                pos_tgt_u = tgt_pos * self.pos_sigma.view(1, 1, -1)
+                vel_pred_u = mean_vel * self.vel_sigma.view(1, 1, -1)
+                vel_tgt_u = tgt_vel * self.vel_sigma.view(1, 1, -1)
+            else:
+                pos_pred_u, pos_tgt_u = mean_pos, tgt_pos
+                vel_pred_u, vel_tgt_u = mean_vel, tgt_vel
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_tgt_u)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_tgt_u)
+
+        return {"loss": loss, "pos_err": avg_pos_diff, "vel_err": avg_vel_diff}
+
+
+class MDNTrajectoryForONNX(nn.Module):
+    """ONNX export adapter. Takes the scaled history window (B,H,D) and returns
+    a flat, tracker-friendly tuple:
+        traj   : (B, K, T, D)  the K candidate future paths (scaled)
+        pi     : (B, K)        mixture weights (probabilities, softmaxed)
+        mean   : (B, T, D)     mixture-mean path (single-trajectory convenience)
+    The chaser can consume the full weighted set (pursue-and-hedge) or just the
+    mean / highest-weight mode. All outputs are in scaled units; apply the
+    exported StandardScaler inverse exactly as for the other models.
+    """
+
+    def __init__(self, model: MDNTrajectoryPredictor):
+        super().__init__()
+        self.model = model
+
+    def forward(self, obs_window: torch.Tensor):
+        out = self.model(obs_window)
+        return out["traj"], out["log_pi"].exp(), out["mean"]

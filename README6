@@ -1,372 +1,565 @@
-"""Mixture-Density Trajectory Predictor for evasive-agent (drone-tag) forecasting.
-
-WHY THIS MODEL (see review discussion):
-    The "runner" drone is an ADVERSARIAL agent actively trying to be
-    unpredictable. For any non-trivial horizon its future is not a single path
-    but a DISTRIBUTION over paths, often MULTIMODAL (it jukes left OR right;
-    both are plausible from identical history). A single-point regressor trained
-    on such data collapses toward the mean of the modes -- i.e. it predicts the
-    physically-average "straight through the middle" path the runner never
-    actually takes. This module instead predicts K weighted future trajectories
-    plus their probabilities (a Gaussian mixture over futures), which is the
-    quantity a chaser can actually use: pursue the highest-weight / mixture-mean
-    mode while hedging against the branches.
-
-ARCHITECTURE (primary recommendation):
-    history window [x,y,z,vx,vy,vz] x H steps
-        -> GRU encoder                          (summarises "what maneuver now")
-        -> MDN head -> {logits_k, a_k(t)}       (K modes; per-mode accel sequence)
-        -> BOUNDED acceleration  a = a_max * tanh(.)   (dynamically feasible)
-        -> double kinematic integration          (a -> v -> p, known physics)
-        -> K future trajectories [x,y,z,vx,vy,vz] x T + mixture weights pi_k
-
-    Decoding ACCELERATION and integrating it (rather than regressing position
-    directly) bakes in the second-order kinematics the same way the glide model's
-    structural constraint does: predicted velocity is the integral of predicted
-    acceleration and predicted position is the integral of predicted velocity, so
-    every sampled future is smooth and Newton-feasible by construction, and the
-    tanh cap keeps it inside the drone's real acceleration envelope -- the model
-    can never predict a physically impossible instantaneous juke.
-
-SCALING:
-    The model consumes and PREDICTS in StandardScaler-scaled units (consistent
-    with the rest of the pipeline). The kinematic identities dp=v*dt, dv=a*dt
-    hold in PHYSICAL units, so integration is done with per-axis scale factors:
-        v_phys = v_s * sigma_v + mu_v ;  p_{t+1} = p_t + v_phys * dt   (phys)
-    then re-scaled back to scaled position. a_max is likewise a PHYSICAL bound
-    (m/s^2) converted to the scaled acceleration the head emits. All of this is
-    handled internally from the scaler stats passed at construction; if no
-    scaler is supplied the model assumes physical units (sigma=1, mu=0).
-
-This module is deliberately self-contained (no torchdiffeq / ODE-solver
-coupling) because it is a windowed sequence-to-sequence predictor, not a
-stateless vector field. It is wired into the training script as
-`--model-type mdn` and exported to ONNX via MDNTrajectoryForONNX.
-"""
+"""Base training class for a Neural Ordinary Differential Equation model."""
 
 from __future__ import annotations
 
 import math
+import random
+from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+
+from cm_utilities.logger import logger
+from lm_ai_torch_training.device_type import DeviceType
+from lm_ai_torch_training.hyperparameters import TrainingParam
+from lm_ai_torch_training.model_management import (
+    TorchModelLoader,
+    TorchModelSaver,
+)
+from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
+from prediction.mlearn.neural_ode.loss_functions import (
+    ReverseLinearWeightingLoss,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    from lm_ai_torch_training.configuration import TrainingConfiguration
+    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
+    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
+        OptimizerWithLossFunction,
+    )
+    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+    from prediction.mlearn.ffnn.model import FFNNModel
+    from prediction.mlearn.neural_ode.ode_solver import ODESolver
+
+DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
 
 
-class MDNTrajectoryPredictor(nn.Module):
-    """GRU-encoder + mixture-density head predicting K weighted future
-    trajectories by integrating bounded per-mode acceleration.
+# TODO: This needs to move somewhere that is more useful to PCM
+class EarlyStopper:
+    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
+        # TODO: What about a percent rise stopper rather and a absolute value? Both?
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float("inf")
+        self.previous_validation_loss = float("inf")
+        self.metric_name = metric_name
 
-    Args:
-        state_dim:   number of state features per timestep (6 for [x,y,z,vx,vy,vz]).
-        pos_idx:     indices of the position block within the state.
-        vel_idx:     indices of the velocity block, paired 1:1 with pos_idx
-                     (pos_idx[i] integrates vel_idx[i]).
-        horizon:     number of future steps T to predict.
-        dt:          timestep between states (seconds), PHYSICAL.
-        n_modes:     number of mixture components K.
-        enc_hidden:  GRU hidden width.
-        enc_layers:  GRU depth.
-        head_hidden: MDN head MLP width.
-        a_max:       PHYSICAL acceleration bound (m/s^2) per velocity axis. The
-                     head output is a = a_max * tanh(raw), guaranteeing feasibility.
-                     Set from the drone's known envelope; a scalar or a per-vel-axis
-                     list. Defaults to a generous 40 m/s^2 (~4 g) if unknown.
-        pos_scale, vel_scale, vel_mean: StandardScaler stats for the pos/vel
-                     blocks (sigma_p, sigma_v, mu_v). If None -> physical units.
+    def early_stop(self, validation_loss: float):
+        # Improvement must beat best by at least min_delta
+        if validation_loss < (self.min_validation_loss - self.min_delta):
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        else:
+            # No meaningful improvement (same, tiny change, or worse)
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        self.previous_validation_loss = validation_loss
+        return False
+
+
+class ModelCheckpoint:
+    def __init__(self, min_epochs: int, directory: str, model_name: str):
+        self.min_epochs = min_epochs
+        self.directory = directory
+        self.model_name = model_name
+        self.min_metric = float("inf")
+
+    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
+        if epoch > self.min_epochs and metric < self.min_metric:
+            self.min_metric = metric
+            model.save(
+                directory=self.directory,
+                model_name=self.model_name,
+            )
+            return True
+        return False
+
+
+class NODEPredictor(nn.Module):
+    """Neural Ordinary Differential Equation (NODE) Prediction Model.
+
+    The Neural Ordinary Differential Equation (NODE) is a neural network that
+    parameterizes the derivative of the hidden state instead of specifying a
+    discrete sequence of hidden layers. Essentially, it extends a residual
+    network model [EQ 1], adding more layers and decreasing the step size to the
+    limit to yield an ODE [EQ 2]. This is shown by the equations below:
+
+            h_t+1 = h_t + f(h_t,Θ_t)          [EQ 1]
+            dh(t)/dt = f(h(t),t,Θ)            [EQ 2]
+
+    f is a feed-forward neural network. Then, with some given initial
+    conditions, an ODE solver can be used to integrate forward the dynamics
+    captured by the network.
+
+    For more information, refer to the original paper given below
+    (https://arxiv.org/pdf/1806.07366.pdf)
     """
 
     def __init__(
         self,
-        state_dim: int,
-        pos_idx: list[int],
-        vel_idx: list[int],
-        horizon: int,
-        dt: float,
-        n_modes: int = 5,
-        enc_hidden: int = 128,
-        enc_layers: int = 1,
-        head_hidden: int = 128,
-        a_max: float | list[float] = 40.0,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
-    ):
+        architecture: FFNNArchitecture,
+        training_configuration: TrainingConfiguration,
+        solver: ODESolver,
+        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
+        logging_interval: int = 1,  # Default to log every epoch/iteration.
+        early_stopper: EarlyStopper | None = None,
+        checkpoint: ModelCheckpoint | None = None,
+        aug_dim: int = 0,
+        euler_rollout_weight: float = 0.0,
+        euler_rollout_dt: float | None = None,
+        euler_rollout_window: int = 6,
+        euler_rollout_warmup_epochs: int = 0,
+    ) -> None:
+        """Initializes a NODE from an input configuration.
+
+        Args:
+            architecture: A configuration defining the underlying node model.
+            training_configuration: The model training hyperparameters.
+            logging_interval: How often to log training epochs or iterations.
+                This is used if verbose is True in the training configuration.
+                Logging statements will be printed to the console every
+                logging_interval epochs or optimizer iterations.
+            solver: The ODESolver used in the NODE.
+            loss_func: The loss function optimized for training the node model.
+            euler_rollout_weight: weight of the deployment-integrator consistency
+                loss (review item 1.2). 0.0 disables it (original behaviour). This
+                rolls the model's OWN physical-space field forward with single-step
+                explicit Euler at ``euler_rollout_dt`` over short windows and
+                penalizes divergence from truth -- i.e. it optimizes the object the
+                tracker actually deploys, so truncation error the single Euler step
+                makes on this field is absorbed into the learned field, statelessly.
+                Fully compatible with the stateless-Euler deployment contract.
+            euler_rollout_dt: the DEPLOYMENT timestep (seconds). Defaults to the
+                solver dt. MUST match the tracker's extrapolation dt to be
+                meaningful.
+            euler_rollout_window: number of Euler steps per rolled window (K). Keep
+                small (4-8) to avoid exposure-bias / exploding-gradient issues.
+            euler_rollout_warmup_epochs: ramp the rollout weight linearly over the
+                first N epochs (curriculum) so the supervised RK4 loss establishes a
+                sane field before the rollout term bites. 0 = full weight from
+                epoch 1.
+        """
         super().__init__()
-        assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
-        self.state_dim = state_dim
-        self.horizon = int(horizon)
-        self.dt = float(dt)
-        self.n_modes = int(n_modes)
-        self.n_axes = len(pos_idx)
+        self.architecture: FFNNArchitecture = architecture
+        self.training_configuration: TrainingConfiguration = training_configuration
+        self.logging_interval: int = logging_interval
+        self.solver = solver
+        self.early_stopper = early_stopper
+        self.checkpoint = checkpoint
+        self.aug_dim = aug_dim
+        # --- deployment-integrator (Euler) rollout consistency (review 1.2) ---
+        self.euler_rollout_weight = float(euler_rollout_weight)
+        self.euler_rollout_dt = euler_rollout_dt
+        self.euler_rollout_window = int(euler_rollout_window)
+        self.euler_rollout_warmup_epochs = int(euler_rollout_warmup_epochs)
+        self._current_epoch = 1  # updated by fit(); used for the warmup ramp
 
-        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+        # Parse parameters from the training configuration.
+        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
+        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
+        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
+        self.verbose: bool = self.training_configuration.verbose
 
-        # --- scaling stats (scaled <-> physical) ---------------------------
-        # Derivatives in scaled space: a physical accel a_phys enters the scaled
-        # velocity update as a_phys/sigma_v; a physical velocity enters the
-        # scaled position update as v_phys/sigma_p. StandardScaler's mean shift
-        # cancels in differences, but the velocity MEAN matters when converting a
-        # scaled velocity to the physical velocity that moves position.
-        if pos_scale is not None and vel_scale is not None:
-            ps = torch.as_tensor(pos_scale, dtype=torch.float32)
-            vs = torch.as_tensor(vel_scale, dtype=torch.float32)
-            vm = (
-                torch.as_tensor(vel_mean, dtype=torch.float32)
-                if vel_mean is not None
-                else torch.zeros_like(vs)
-            )
-            self.scaled_space = True
-        else:
-            ps = torch.ones(self.n_axes)
-            vs = torch.ones(self.n_axes)
-            vm = torch.zeros(self.n_axes)
-            self.scaled_space = False
-        self.register_buffer("pos_scale", ps)  # sigma_p
-        self.register_buffer("vel_scale", vs)  # sigma_v
-        self.register_buffer("vel_mean", vm)   # mu_v
+        # Set the iteration parameter for required optimizers.
+        self.training_metrics: dict[str, list[float]] = {}
 
-        # PHYSICAL acceleration bound -> scaled-acceleration bound the head emits.
-        # scaled_accel = a_phys / sigma_v, so a_max_scaled = a_max / sigma_v.
-        if isinstance(a_max, (int, float)):
-            a_max_vec = torch.full((self.n_axes,), float(a_max))
-        else:
-            a_max_vec = torch.as_tensor(a_max, dtype=torch.float32)
-            assert a_max_vec.numel() == self.n_axes, "a_max list must match n vel axes"
-        self.register_buffer("a_max_phys", a_max_vec)
-        self.register_buffer("a_max_scaled", a_max_vec / vs)
+        # Setup the model for training and inference.
+        self._initialize_device()
+        self._initialize_losses(loss_func=loss_func)
+        self._initialize_model()
+        self._initialize_optimizer()
 
-        # --- encoder: history window -> context vector ---------------------
-        self.encoder = nn.GRU(
-            input_size=state_dim,
-            hidden_size=enc_hidden,
-            num_layers=enc_layers,
-            batch_first=True,
-        )
-
-        # --- MDN head: context -> {mode logits, per-mode accel sequence} ----
-        # Each mode emits an acceleration for every future step and every vel
-        # axis: T * n_axes raw values, squashed by tanh and scaled by a_max.
-        self.mode_logits = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes),
-        )
-        self.accel_head = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes * self.horizon * self.n_axes),
-        )
-        # Optional per-mode, per-axis log-sigma for the mixture likelihood
-        # (aleatoric spread of each mode around its integrated mean path).
-        self.logsig_head = nn.Sequential(
-            nn.Linear(enc_hidden, head_hidden),
-            nn.SiLU(),
-            nn.Linear(head_hidden, self.n_modes * self.n_axes),
-        )
-
-    # ------------------------------------------------------------------
-    def _integrate(self, accel_scaled: torch.Tensor, x_last: torch.Tensor) -> torch.Tensor:
-        """Integrate bounded scaled acceleration into full scaled state paths.
-
-        accel_scaled : (B, K, T, n_axes)  scaled acceleration per mode/step/axis
-        x_last       : (B, state_dim)     last observed (scaled) state = IC
-
-        Returns states : (B, K, T, state_dim) scaled [.,pos,.,vel,.] filled on the
-        paired pos/vel indices; any unpaired state channels (e.g. an azimuth-rate)
-        are held at their last observed value (the kinematic head does not model
-        them -- extend here if a frame needs it).
-        """
-        B, K, T, A = accel_scaled.shape
-        dt = self.dt
-        sig_p = self.pos_scale.view(1, 1, A)
-        sig_v = self.vel_scale.view(1, 1, A)
-        mu_v = self.vel_mean.view(1, 1, A)
-
-        # initial conditions gathered from the last observed state, per axis
-        p0 = x_last.index_select(-1, self.pos_idx).unsqueeze(1).expand(B, K, A)  # scaled pos
-        v0 = x_last.index_select(-1, self.vel_idx).unsqueeze(1).expand(B, K, A)  # scaled vel
-
-        p = p0
-        v = v0
-        pos_steps = []
-        vel_steps = []
-        for t in range(T):
-            a_s = accel_scaled[:, :, t, :]              # (B,K,A) scaled accel
-            # velocity update in scaled space: dv_scaled = (a_phys/sigma_v)*dt,
-            # and a_s already equals a_phys/sigma_v, so:
-            v = v + a_s * dt
-            # position update uses PHYSICAL velocity: v_phys = v_scaled*sigma_v + mu_v
-            v_phys = v * sig_v + mu_v
-            # dp_scaled = (v_phys/sigma_p)*dt
-            p = p + (v_phys / sig_p) * dt
-            pos_steps.append(p)
-            vel_steps.append(v)
-        pos = torch.stack(pos_steps, dim=2)  # (B,K,T,A)
-        vel = torch.stack(vel_steps, dim=2)  # (B,K,T,A)
-
-        # assemble full state paths; hold any non-pos/vel channels at last value
-        states = x_last.view(B, 1, 1, self.state_dim).expand(B, K, T, self.state_dim).clone()
-        pidx = self.pos_idx.view(1, 1, 1, A).expand(B, K, T, A)
-        vidx = self.vel_idx.view(1, 1, 1, A).expand(B, K, T, A)
-        states = states.scatter(-1, pidx, pos)
-        states = states.scatter(-1, vidx, vel)
-        return states
-
-    # ------------------------------------------------------------------
-    def forward(self, obs_window: torch.Tensor):
-        """
-        obs_window : (B, H, state_dim)  scaled history window.
-
-        Returns dict:
-            traj    : (B, K, T, state_dim)  K integrated future state paths (scaled)
-            log_pi  : (B, K)                mode log-probabilities (log-softmax)
-            log_sig : (B, K, n_axes)        per-mode log-sigma (position spread)
-            mean    : (B, T, state_dim)     mixture-mean path (weighted by pi) --
-                                            convenience single-trajectory output
-        """
-        B = obs_window.shape[0]
-        _, h_n = self.encoder(obs_window)     # h_n: (layers, B, enc_hidden)
-        ctx = h_n[-1]                         # (B, enc_hidden) last-layer hidden
-        x_last = obs_window[:, -1, :]         # (B, state_dim) IC for integration
-
-        log_pi = F.log_softmax(self.mode_logits(ctx), dim=-1)   # (B,K)
-        raw = self.accel_head(ctx).view(B, self.n_modes, self.horizon, self.n_axes)
-        a_max = self.a_max_scaled.view(1, 1, 1, self.n_axes)
-        accel = a_max * torch.tanh(raw)                          # bounded, feasible
-        log_sig = self.logsig_head(ctx).view(B, self.n_modes, self.n_axes)
-
-        traj = self._integrate(accel, x_last)                    # (B,K,T,state_dim)
-
-        pi = log_pi.exp().view(B, self.n_modes, 1, 1)
-        mean = (pi * traj).sum(dim=1)                            # (B,T,state_dim)
-
-        return {"traj": traj, "log_pi": log_pi, "log_sig": log_sig, "mean": mean}
-
-
-class MDNTrajectoryLoss(nn.Module):
-    """Mixture negative log-likelihood over future POSITION+VELOCITY, plus
-    physical-unit L1 metrics that match the original pipeline's losses exactly.
-
-    The NLL is the standard MDN objective: -log sum_k pi_k N(y | mu_k, sig_k).
-    Scoring the mixture likelihood (rather than only the mean path) is what lets
-    the model represent both branches of a juke without being penalised for not
-    averaging them -- the crucial property for an evasive target.
-
-    The REPORTED metrics (pos_err, vel_err), however, are computed exactly as the
-    ODE models compute them: mean absolute error, in physical units, of the
-    SINGLE predicted path against the target -- where the single path is the
-    mixture-mean (the probability-weighted average of the K modes). This makes
-    pos_err / vel_err directly comparable to the other model types' metrics
-    (same name, same units, same plain-mean reduction over batch x time x axes).
-    """
-
-    def __init__(
+    def fit(
         self,
-        pos_idx: list[int],
-        vel_idx: list[int],
-        scaler=None,
-        vel_weight: float = 1.0,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-        self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-        self.scaler = scaler
-        self.vel_weight = float(vel_weight)
-        self.eps = float(eps)
-        if scaler is not None:
-            self.register_buffer(
-                "pos_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(pos_idx)]
-            )
-            self.register_buffer(
-                "vel_sigma", torch.as_tensor(scaler.scale_, dtype=torch.float32)[list(vel_idx)]
-            )
+        x: list[torch.Tensor],
+        extra_feat: torch.Tensor | None = None,
+        *,
+        shuffle: bool = True,
+        validation_data: list[torch.Tensor] | None = None,
+        enable_checkpoints: bool = False,
+    ) -> dict[str, list[float]]:
+        """Fits a model to a dataset.
+
+        Args:
+            x: List of tensors that contain the time series targets.
+                Each tensor should be of shape (n_time_steps, n_features), where
+                the first point is the initial condition for the ODE solver.
+            extra_feat: Extra features used in training.
+                This will be passed to the extra features of the Neural ODE. It
+                should be of shape (len(x), n_extra_features).
+            shuffle: Flag to shuffle the data for batching.
+                The data will not be shuffled when set to False.
+            validation_data: List of tensors that contain the time series targets.
+                Each tensor should be of shape (n_time_steps, n_features), where
+                the first point is the initial condition for the ODE solver.
+
+        Returns:
+            A dictionary of training losses and metrics.
+        """
+        if extra_feat is not None:
+            extra_feat = extra_feat.to(self.device)
+
+        for epoch in range(1, self.n_epochs + 1):
+            self._current_epoch = epoch  # drives the Euler-rollout warmup ramp
+            pool_index = list(range(len(x)))
+            if shuffle:
+                random.shuffle(pool_index)
+            for _ in range(math.ceil(len(x) / self.batch_size)):
+                batch_idx = [
+                    pool_index.pop(0)
+                    for _ in range(
+                        min(
+                            len(pool_index),
+                            self.batch_size,
+                        )
+                    )
+                ]
+                x_batch_list = [x[i] for i in batch_idx]
+                max_len = max([i.size(dim=0) for i in x_batch_list])
+                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
+                for i in range(len(x_batch_list)):
+                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
+
+                if extra_feat is None:
+                    metrics = self.batch_loss(x=x_batch.to(self.device))
+                else:
+                    metrics = self.batch_loss(
+                        x=x_batch.to(self.device),
+                        extra_feat=extra_feat[batch_idx],
+                    )
+
+                self.optimizer.zero_grad()
+                metrics["loss"].backward()
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
+                    norm_type=2.0,
+                )
+                # # (optional) log the pre‑clip norm so you can monitor it
+                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
+                self.optimizer.step()
+
+            if validation_data is not None:
+                with torch.no_grad():
+                    # repeating the above...it should be another function
+                    pool_index_val = list(range(len(validation_data)))
+                    if shuffle:
+                        random.shuffle(pool_index_val)
+
+                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
+                        batch_idx_val = [
+                            pool_index_val.pop(0)
+                            for _ in range(
+                                min(
+                                    len(pool_index_val),
+                                    self.batch_size,
+                                )
+                            )
+                        ]
+                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
+                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
+                        x_batch_val = float("nan") * torch.ones(
+                            (
+                                len(batch_idx_val),
+                                max_len_val,
+                                x_batch_list_val[0].size(dim=1),
+                            )
+                        )
+                        for i in range(len(x_batch_list_val)):
+                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
+
+                        if extra_feat is None:
+                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
+                        else:
+                            metrics_val = self.batch_loss(
+                                x=x_batch_val.to(self.device),
+                                extra_feat=extra_feat[batch_idx_val],
+                            )
+
+                    for key in metrics_val:
+                        metrics[f"val_{key}"] = metrics_val[key]
+
+                    # update the position and velocity weights only for the loss functions that support this
+                    # and only when looking at the full trajectory
+                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
+                    if hasattr(self.criterion, "wp") and enable_checkpoints:
+                        if epoch % 50 == 0:
+                            if (
+                                metrics["pos_err_scaled"] > self.criterion.delta_pos
+                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
+                            ):
+                                pass
+                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
+                                self.criterion.wp *= 1.2  # amplify position focus
+                                logger.info(
+                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
+                                )
+                                # self.early_stopper.counter = self.early_stopper.counter // 2
+                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
+                                self.criterion.wv *= 1.2
+                                logger.info(
+                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
+                                )
+                                # self.early_stopper.counter = self.early_stopper.counter // 2
+
+            self._add_metrics_to_global_metrics(metrics)
+            self._log_metrics(metrics, iteration=epoch)
+
+            if (
+                enable_checkpoints
+                and validation_data is not None
+                and self.checkpoint is not None
+                and self.checkpoint.save_on_min(
+                    self,
+                    epoch,
+                    metrics[self.early_stopper.metric_name],
+                )
+            ):
+                logger.info(f"Saved checkpoint at {epoch}")
+            if (
+                self.early_stopper is not None
+                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
+                # and metrics["pos_err"] < 5000
+            ):
+                logger.info(f"Early stopping triggered at {epoch}")
+                break
+
+        return self.training_metrics
+
+    def batch_loss(
+        self,
+        x: torch.Tensor,
+        extra_feat: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Calculates the loss of the batch.
+
+        Args:
+            x: Batch targets time series data.
+                This should be of shape (batch_size, series_length, n_features).
+                The first column x(:,0,:) is used as the initial condition for
+                the ODE solver integration.
+            extra_feat: Batch extra features.
+                This is used as the extra features in the ODE solver
+                integration. It should be of shape (batch_size,
+                n_extra_features).
+
+        Returns:
+            The loss of the batch.
+        """
+        if self.aug_dim == 0:
+            x0 = x[:, 0]
         else:
-            self.pos_sigma = None
-            self.vel_sigma = None
+            zeros = torch.zeros((x.shape[0], self.aug_dim)).to(self.device)
+            x0 = torch.cat((x[:, 0, :], zeros), dim=1)
+        batch_size, time_steps, n_features = x.shape
+        if self.solver.adjoint:
+            x_pred = AdjointMethod.apply(
+                self.solver,
+                self.model,
+                x0,
+                time_steps - 1,
+                extra_feat,
+                *tuple(self.model.parameters()),
+            )[:, :, : x.shape[2]]
+        else:
+            x_pred = self.solver.integrate(
+                func=self.model,
+                x0=x0,
+                steps=time_steps - 1,
+                extra_feat=extra_feat,
+            )[:, :, : x.shape[2]]
 
-    def forward(self, pred: dict, target: torch.Tensor):
+        x_pred = torch.nan_to_num(x_pred, nan=0)
+        x = torch.nan_to_num(x, nan=0)
+
+        metrics = self.criterion(x_pred, x)
+
+        # --- deployment-integrator consistency (review item 1.2) -------------
+        # Optimize the object we actually deploy: roll the model's OWN physical
+        # field forward with single-step explicit Euler at the DEPLOYMENT dt over
+        # short windows from truth ICs, and penalize divergence from truth. The
+        # RK4-with-substeps training solver above is far more accurate than the
+        # single Euler step the tracker uses, so without this the model is never
+        # asked to be accurate under its deployed integrator. This term makes the
+        # single-step truncation error visible to the optimizer, which folds a
+        # correction into the learned field -- statelessly, preserving the
+        # ẋ = f(x) single-Euler contract. Covers ALL axes (including any unpaired
+        # rate the analytic Heun term misses).
+        if self.euler_rollout_weight > 0.0 and time_steps >= 2:
+            w = self._euler_rollout_current_weight()
+            if w > 0.0:
+                euler_loss = self._euler_rollout_loss(x)
+                metrics["euler_rollout"] = euler_loss.detach()
+                metrics["loss"] = metrics["loss"] + w * euler_loss
+
+        return metrics
+
+    def _euler_rollout_current_weight(self) -> float:
+        """Linear warmup ramp for the rollout weight (curriculum)."""
+        if self.euler_rollout_warmup_epochs <= 0:
+            return self.euler_rollout_weight
+        frac = min(1.0, self._current_epoch / float(self.euler_rollout_warmup_epochs))
+        return self.euler_rollout_weight * frac
+
+    def _euler_rollout_loss(self, x: torch.Tensor) -> torch.Tensor:
+        """Short-window single-step-Euler rollout consistency loss (scaled space).
+
+        x : (batch, T, n_features) truth trajectory in scaled units.
+
+        For each start index we take K = euler_rollout_window explicit Euler steps
+        at the deployment dt using the model's physical-space field, and compare to
+        truth at the matching timesteps. Truth ICs (not carried predictions) start
+        every window, so this is a *local* consistency term -- bounded gradient
+        paths, no full-trajectory unroll -- which is what keeps it stable at short K.
+
+        CAVEAT (shared with the existing supervised criterion): variable-length
+        trajectories are NaN->0 padded in fit(), so windows whose target lands in a
+        shorter trajectory's zero-pad tail compare an Euler prediction against a
+        zero "truth". The main loss already lives with this; length-bucketed
+        batching (enabled upstream) keeps within-batch length spread small, so the
+        pad contamination is bounded. If it ever bites, thread per-sample lengths
+        into batch_loss and mask windows past each trajectory's true end.
         """
-        pred   : output dict of MDNTrajectoryPredictor
-        target : (B, T, state_dim)  ground-truth future path (scaled)
+        dt = self.euler_rollout_dt if self.euler_rollout_dt is not None else self.solver.dt
+        K = max(1, min(self.euler_rollout_window, x.shape[1] - 1))
+        n_feat = x.shape[2]
+
+        # Start every window at a truth state (teacher-forced ICs). Using ALL
+        # valid starts maximizes coverage of mid-glide initial conditions, which
+        # is exactly what the small-trajectory regime is short on.
+        starts = x[:, : x.shape[1] - K, :]                 # (B, S, n_feat)
+        B, S, _ = starts.shape
+        state = starts.reshape(B * S, n_feat)              # (B*S, n_feat)
+
+        if self.aug_dim > 0:
+            pad = torch.zeros((state.shape[0], self.aug_dim), device=state.device, dtype=state.dtype)
+            state = torch.cat((state, pad), dim=1)
+
+        total = torch.zeros((), device=x.device, dtype=x.dtype)
+        for k in range(1, K + 1):
+            # model(t, state) is the physical-space derivative ẋ = f(x): the exact
+            # contract the sim integrates. t is unused by the autonomous field.
+            deriv = self.model(0.0, state)
+            state = state + dt * deriv                     # single explicit Euler step
+            pred_k = state[:, :n_feat].reshape(B, S, n_feat)
+            truth_k = x[:, k : k + S, :]                    # truth at the same offset
+            total = total + torch.mean((pred_k - truth_k) ** 2)
+        return total / K
+
+    def infer(
+        self,
+        x0: torch.Tensor,
+        steps: int = 1,
+        extra_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Infers on a trained model with a predefined dataset.
+
+        Args:
+            x0: An input tensor with the initial conditions for the ODE Solver.
+                This is a shape (batch_size, n_features).
+            extra_feat: A tensor with the extra features of the NODE.
+                This is of shape (batch_size, n_extra_features).
+            steps: Number of steps the ODE Solver will take.
+
+        Returns:
+            A tensor containing the predicted data from the trained model.
         """
-        traj = pred["traj"]          # (B,K,T,D)
-        log_pi = pred["log_pi"]      # (B,K)
-        log_sig = pred["log_sig"]    # (B,K,A)
-        B, K, T, D = traj.shape
-
-        tgt_pos = target.index_select(-1, self.pos_idx)      # (B,T,A)
-        tgt_vel = target.index_select(-1, self.vel_idx)      # (B,T,A)
-        mode_pos = traj.index_select(-1, self.pos_idx)       # (B,K,T,A)
-        mode_vel = traj.index_select(-1, self.vel_idx)       # (B,K,T,A)
-
-        # --- mixture NLL on position (time- and axis-summed Gaussian) -------
-        sig = log_sig.exp().clamp_min(self.eps).view(B, K, 1, -1)  # (B,K,1,A)
-        # per-mode, per-step Gaussian log-prob of the target position
-        diff = (mode_pos - tgt_pos.unsqueeze(1))                   # (B,K,T,A)
-        log_prob_axis = -0.5 * (diff / sig) ** 2 - torch.log(sig) - 0.5 * math.log(2 * math.pi)
-        # sum over axes and time -> per-mode trajectory log-likelihood
-        log_prob_mode = log_prob_axis.sum(dim=(2, 3))             # (B,K)
-        # mixture: logsumexp_k (log_pi_k + log_prob_mode_k)
-        log_mix = torch.logsumexp(log_pi + log_prob_mode, dim=1)  # (B,)
-        nll = -log_mix.mean()
-
-        # small velocity consistency term: penalise the best mode's velocity
-        # error so modes stay kinematically honest (position NLL alone underuses
-        # the velocity channel).
         with torch.no_grad():
-            per_mode_pos_err = (mode_pos - tgt_pos.unsqueeze(1)).pow(2).mean(dim=(2, 3))  # (B,K)
-            best = per_mode_pos_err.argmin(dim=1)                                          # (B,)
-        b = torch.arange(B, device=traj.device)
-        vel_best = mode_vel[b, best]                              # (B,T,A)
-        vel_mse = F.mse_loss(vel_best, tgt_vel)
-        loss = nll + self.vel_weight * vel_mse
+            if self.aug_dim != 0:
+                x0 = torch.cat((x0[:, 0], torch.zeros(self.aug_dim)), dim=1)
+            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
 
-        # --- metrics: physical-unit L1 of the MIXTURE-MEAN path -------------
-        # Matches the original single-trajectory losses (PhysicsSplitMSELoss etc.)
-        # EXACTLY: mean absolute error between the (single) predicted path and the
-        # target, in PHYSICAL units, reduced by a plain mean over batch x time x
-        # axes (torch.nn.L1Loss default). The "single predicted path" for a
-        # mixture is its probability-weighted mean (pred["mean"]), so pos_err /
-        # vel_err are directly comparable to the ODE models' pos_err / vel_err --
-        # same name, same units, same reduction. (Physical units via scale_,
-        # i.e. StandardScaler's per-feature std; mean offset cancels in a
-        # difference so only scale_ is needed, identical to the original.)
+    def load(
+        self,
+        directory: str,
+        model_name: str,
+        device_type: DeviceType = DeviceType.CPU,
+    ) -> None:
+        """Loads a model from file.
+
+        Args:
+            directory: The directory to load the model from.
+            model_name: The name of the model without extensions.
+                The torch model loading utilities will automatically apply
+                a suffix of `.pt` to the input model_name when searching
+                for the model file.
+            device_type: The hardware device to use for model loading.
+        """
+        loader = TorchModelLoader(directory, model_name, device_type)
+        loader.load(name="model", component=self.model)
+
+    def save(self, directory: str, model_name: str) -> None:
+        """Saves a model to one torch file.
+
+        Args:
+            directory: The directory to save the model to.
+            model_name: The name of the model without extensions.
+                The torch model loading utilities will automatically apply
+                a suffix of `.pt` to the input model_name when creating
+                the model file.
+        """
+        model_saver = TorchModelSaver()
+        model_saver.add_component(name="model", component=self.model)
+        model_saver.save(directory, model_name)
+
+    def _initialize_device(self) -> None:
+        """Sets torch device based on whether GPU is available or not."""
+        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
+        self.to(device=self.device)
+
+    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
+        """Initializes the losses for the NODE.
+
+        Args:
+            loss_func: The loss function optimized for training the node model.
+        """
+        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
+
+    def _initialize_model(self) -> None:
+        """Initialize the NODE."""
+        self.model: FFNNModel = self.architecture.get_model().to(self.device)
+
+    def _initialize_optimizer(self) -> None:
+        """Initialize the optimizer for the NODE from the model parameters."""
+        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
+            self.model
+        )
+
+    def _add_metrics_to_global_metrics(
+        self,
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        """Adds metrics generated from training to the global metrics.
+
+        Args:
+            metrics: A dictionary containing the metrics generated this epoch.
+        """
+        # Add losses and metrics to global metrics.
+        for metric, value in metrics.items():
+            if metric not in self.training_metrics:
+                self.training_metrics[metric] = []
+            self.training_metrics[metric].append(value.detach().cpu().numpy())
+
+    def _log_metrics(
+        self,
+        metrics: dict[str, torch.Tensor],
+        iteration: int,
+        prefix: str = "Epoch",
+    ) -> None:
+        """Logs metrics generated during a training epoch or iteration.
+
+        Args:
+            metrics: A dictionary containing the metrics generated this epoch.
+            iteration: The current epoch or optimizer iteration.
+            prefix: The prefix for the logging statement reported to console.
+        """
         with torch.no_grad():
-            mean_path = pred["mean"]                              # (B,T,D)
-            mean_pos = mean_path.index_select(-1, self.pos_idx)  # (B,T,A)
-            mean_vel = mean_path.index_select(-1, self.vel_idx)  # (B,T,A)
-            if self.pos_sigma is not None:
-                pos_pred_u = mean_pos * self.pos_sigma.view(1, 1, -1)
-                pos_tgt_u = tgt_pos * self.pos_sigma.view(1, 1, -1)
-                vel_pred_u = mean_vel * self.vel_sigma.view(1, 1, -1)
-                vel_tgt_u = tgt_vel * self.vel_sigma.view(1, 1, -1)
-            else:
-                pos_pred_u, pos_tgt_u = mean_pos, tgt_pos
-                vel_pred_u, vel_tgt_u = mean_vel, tgt_vel
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_tgt_u)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_tgt_u)
+            if self.verbose and iteration % self.logging_interval == 0:
+                metric_comps: list[str] = []
+                for metric, value in metrics.items():
+                    metric_comps.append(f"{metric}: {value.item():.7f}")
 
-        return {"loss": loss, "pos_err": avg_pos_diff, "vel_err": avg_vel_diff}
-
-
-class MDNTrajectoryForONNX(nn.Module):
-    """ONNX export adapter. Takes the scaled history window (B,H,D) and returns
-    a flat, tracker-friendly tuple:
-        traj   : (B, K, T, D)  the K candidate future paths (scaled)
-        pi     : (B, K)        mixture weights (probabilities, softmaxed)
-        mean   : (B, T, D)     mixture-mean path (single-trajectory convenience)
-    The chaser can consume the full weighted set (pursue-and-hedge) or just the
-    mean / highest-weight mode. All outputs are in scaled units; apply the
-    exported StandardScaler inverse exactly as for the other models.
-    """
-
-    def __init__(self, model: MDNTrajectoryPredictor):
-        super().__init__()
-        self.model = model
-
-    def forward(self, obs_window: torch.Tensor):
-        out = self.model(obs_window)
-        return out["traj"], out["log_pi"].exp(), out["mean"]
+                metric_str: str = " ".join(metric_comps)
+                logger.info(f"{prefix} {iteration}: {metric_str}")

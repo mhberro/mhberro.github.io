@@ -434,6 +434,46 @@ class GRUODEFunc(torch.nn.Module):
     def decode(self, h: torch.Tensor) -> torch.Tensor:
         return self.decoder(h)
 
+    def decode_jvp(self, h: torch.Tensor, dh: torch.Tensor) -> torch.Tensor:
+        """Exact decoder Jacobian-vector product  J_dec(h) . dh  (review A1).
+
+        The decoder is Linear -> SiLU -> Linear, so its directional derivative
+        along dh has a CLOSED FORM built only from matmuls and an elementwise
+        SiLU-derivative:
+
+            z1   = W1 h + b1                 (pre-activation)
+            a1   = SiLU(z1)                  (decode's hidden, unused here)
+            dz1  = W1 dh                     (linear layer is its own Jacobian)
+            da1  = SiLU'(z1) * dz1           (chain rule through SiLU)
+            J.dh = W2 da1                    (second linear layer)
+
+        with  SiLU(z)=z*sigmoid(z)  =>  SiLU'(z)=sigmoid(z)*(1+z*(1-sigmoid(z))).
+
+        This REPLACES the central finite difference
+            (Dec(h+eps*dh) - Dec(h-eps*dh)) / (2 eps)
+        used previously for train/deploy parity. That FD had O(eps^2) truncation
+        AND ~O(machine_eps/eps) float32 cancellation noise injected straight into
+        xdot (hence into every deployed Euler position step). The JVP is exact to
+        float precision, and -- crucially -- every op here (index into the
+        Sequential's Linear submodules, a sigmoid, elementwise mul, two matmuls)
+        traces cleanly to ONNX, so the deployed field can use the SAME closed
+        form. Parity is preserved WITHOUT the numerical error.
+
+        Works transparently under spectral_norm: layer.weight returns the
+        reparametrized (normalized) weight, so W1/W2 are the effective weights.
+        """
+        lin1, act, lin2 = self.decoder[0], self.decoder[1], self.decoder[2]
+        # pre-activation of the first decoder layer
+        z1 = torch.nn.functional.linear(h, lin1.weight, lin1.bias)
+        # directional derivative through the first (linear) layer: no bias term
+        dz1 = torch.nn.functional.linear(dh, lin1.weight, None)
+        # SiLU'(z) = sigmoid(z) * (1 + z * (1 - sigmoid(z)))
+        s = torch.sigmoid(z1)
+        silu_prime = s * (1.0 + z1 * (1.0 - s))
+        da1 = silu_prime * dz1
+        # second (linear) layer, again no bias on the derivative
+        return torch.nn.functional.linear(da1, lin2.weight, None)
+
 
 # Forward-mode JVP: prefer torch.func (single forward pass) over
 # torch.autograd.functional.jvp (double-backward, ~3x cost and an extra graph).
@@ -558,16 +598,27 @@ class GRUODELatentModel(torch.nn.Module):
     def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
         h = self.func.encode(x_phys)
         dh = self.func.cell(t, h)
-        if self.field_method == "central":
-            # Match the ONNX/deployment field EXACTLY: central finite difference
-            # of the decoder in the dh direction. Same formula and eps as
-            # GRUODEFieldForONNX so the trained field == the deployed field.
+        if self.field_method == "analytic":
+            # Review A1: EXACT decoder Jacobian-vector product, closed form.
+            # Replaces the central finite difference below. Same mathematical
+            # object (J_dec(h).dh) but with no truncation / cancellation noise,
+            # and -- because it is built only from matmuls + an elementwise SiLU'
+            # -- it EXPORTS to ONNX, so the deployed field uses the identical
+            # closed form. This is the new default: exact AND parity-preserving.
+            xdot = self.func.decode_jvp(h, dh)
+        elif self.field_method == "central":
+            # LEGACY parity path (A/B only): central finite difference of the
+            # decoder in the dh direction. Same formula and eps as the old
+            # GRUODEFieldForONNX. Kept so the analytic field can be compared
+            # against the previous behaviour; carries FD truncation + float32
+            # cancellation error that the analytic path removes.
             eps = self.fd_eps
             x_plus = self.func.decode(h + eps * dh)
             x_minus = self.func.decode(h - eps * dh)
             xdot = (x_plus - x_minus) / (2.0 * eps)
         else:
-            # exact forward-mode JVP (train-only; not reproducible in ONNX export)
+            # exact forward-mode JVP via autograd (train-only; historically not
+            # reproducible in ONNX export -- prefer "analytic" which is).
             _, xdot = _decoder_jvp(self.func.decode, h, dh)  # noqa: F821
         if self.second_order:
             # Kinematic term: d/dt(pos) = vel, expressed correctly in the model's
@@ -922,23 +973,27 @@ def train_NEXT(
         pos_weight=1.0,
         vel_weight=3.0,        # glide: velocity is the laggard AND now feeds position
         physics_weight=0.0,    # second-order model makes the soft residual redundant
-        # R2: late-weighted position term. Penalizes accumulated drift (the small
-        # velocity BIAS that integrates into large end-of-trajectory position
-        # error, invisible to flat MSE). Start late_weight~1.0, late_power=2.0
-        # (emphasize the trajectory end); set late_weight=0.0 to A/B against the
-        # current result. Sweep late_weight in {0.5, 1.0, 2.0}.
-        late_weight=1.0,
+        # --- DE-BLOAT (review section 4) -------------------------------------
+        # late_weight, vel_bias_weight and sobolev_weight are NOT independent
+        # regularizers: they are three projections of ONE error mode (a slow /
+        # DC velocity residual integrating into position drift). vel_bias
+        # penalizes its DC (time-mean) component; late_weight penalizes its
+        # accumulated (horizon-weighted) form; sobolev penalizes the position-rate
+        # error whose integral IS that drift. Stacking all three made the loss
+        # non-orthogonal (they fight over the same signal) and blew up the sweep.
+        # We keep the single STRONGEST and most general one -- sobolev -- and let
+        # the A2 Euler rollout carry the structural drift suppression. Re-enable
+        # the others only to A/B one at a time.
+        #   R2 late-weighted position term (DISABLED; subsumed by sobolev+rollout)
+        late_weight=0.0,
         late_power=2.0,
-        # C: velocity DC-bias penalty. Targets the constant velocity offset that
-        # integrates into position drift (same bias the Heun term attacks, from
-        # the loss side). Start ~= pos_weight; set 0.0 to disable. Now weighted
-        # per-axis by physical drift contribution (review item 3.3).
-        vel_bias_weight=1.0,
-        # Review item 3.1: Sobolev derivative-matching term. Penalizes the time
-        # derivative of the position error (physical units), suppressing the
-        # slowly-varying position-rate error that integrates into long-horizon
-        # drift -- a stronger attack on val_pos_err than the DC-only bias term.
-        # Start ~0.5-1.0; sweep {0.25, 0.5, 1.0}. 0.0 to A/B against current.
+        #   C velocity DC-bias penalty (DISABLED; DC is a strict subset of what
+        #   the sobolev term already covers)
+        vel_bias_weight=0.0,
+        # Sobolev derivative-matching term (KEPT). Penalizes the time derivative
+        # of the position error (physical units), suppressing the slowly-varying
+        # position-rate error that integrates into long-horizon drift -- the
+        # broadest single attack on val_pos_err. Sweep {0.25, 0.5, 1.0}.
         sobolev_weight=0.5,
         scaler=scaler_traj if use_scalar else None,
         N_FEATURES=model_states,
@@ -1127,22 +1182,34 @@ def train_NEXT(
         # cannot behave like a DC offset. Exported identically (parity preserved).
         PHYSICAL_GATE = True
 
-        # Train/deploy field parity (reviewer R1). "central" makes the trained
-        # field identical to the ONNX/deployed field (removes the JVP-vs-FD
-        # mismatch on the position-derivative correction). "jvp" = exact,
-        # train-only. Experiment plan: A/B (alpha=0.1, "central") vs
-        # (alpha=0.0, "central") first; the latter is the pure hard constraint
-        # with guaranteed parity.
-        FIELD_METHOD = "central"
+        # Train/deploy field parity (reviewer R1 + review A1). "analytic" is the
+        # EXACT decoder Jacobian-vector product in closed form: it removes the
+        # finite-difference truncation/cancellation noise the old "central" path
+        # injected into xdot every step, AND it exports to ONNX, so the trained
+        # field == the deployed field with NO numerical mismatch. This is the new
+        # default. "central" is retained for A/B against the previous behaviour;
+        # "jvp" is the autograd forward-mode JVP (train-only, not exportable).
+        # A/B plan: ("analytic") [current] vs ("central") to isolate the FD-noise
+        # contribution to val_pos_err.
+        FIELD_METHOD = "analytic"
 
         # Heun/midpoint position correction (aero review item A). When True, the
         # position derivative gets the structural +1/2*dt*a term so the deployed
         # single-step Euler is second-order accurate on position (kills the
-        # 1/2*a*dt^2 curvature bias that accumulates over the horizon). This is
-        # the principled replacement for the generic alpha*tanh nudge. Experiment
-        # plan: A/B (heun=True, alpha=0.0) vs your current (heun=False,
-        # alpha=0.1). dt here MUST be the DEPLOYMENT step used by the tracker.
-        HEUN_CORRECTION = True
+        # 1/2*a*dt^2 curvature bias that accumulates over the horizon).
+        #
+        # DE-BLOAT (review section 4): the Heun term and the A2 Euler-rollout loss
+        # BOTH make single-step Euler position-accurate -- one analytically per
+        # step, one by optimizing the actual rollout. Running both double-counts:
+        # the rollout will fold in a correction the Heun term has already partly
+        # supplied, and neither knows about the other, so they can cancel or
+        # over-correct. The rollout is the more complete mechanism (it also covers
+        # the unpaired v_alpha axis, which the paired Heun term cannot) and is now
+        # the principal position lever, so we turn Heun OFF and let the rollout own
+        # position accuracy cleanly. A/B: (heun=False, rollout on) [current] vs
+        # (heun=True, rollout off) to see them in isolation, as the review advises;
+        # do NOT run both on together as the first experiment.
+        HEUN_CORRECTION = False
         DEPLOY_DT = trajectory_dt  # set to the tracker's extrapolation dt if it differs
 
         node.model = GRUODELatentModel(
@@ -1170,10 +1237,27 @@ def train_NEXT(
         # axis. Keep the window short (K~6) and warm it up so the supervised RK4
         # loss establishes a sane field first. Set weight 0.0 to A/B against the
         # current result. DEPLOY_DT MUST equal the tracker's extrapolation step.
+        #
+        # Review A2: the rollout is now the PRINCIPAL attack on val_pos_err via a
+        # two-part curriculum on top of the warmup ramp:
+        #   * scheduled sampling: re-inject-truth probability decays 1.0 -> 0.0
+        #     over euler_rollout_ss_epochs, so the term starts as the stable
+        #     teacher-forced consistency loss and ends as the fully free-running
+        #     deployed rollout -- training the model to be accurate on the states
+        #     IT produces (the exposure-bias fix; drift is a deploy-integrator
+        #     phenomenon, so this is the highest-leverage POSITION lever).
+        #   * window growth: K grows 6 -> euler_rollout_max_window over the same
+        #     schedule, so long free-running horizons only appear once p is low.
+        # Grad-clipping in fit() (norm 1.0) bounds the multi-step gradient this
+        # introduces. Fully stateless-Euler-contract compatible. A/B: set
+        # euler_rollout_ss_epochs=0 (and max_window=None) to recover the old
+        # always-teacher-forced K=6 term.
         node.euler_rollout_weight = 1.0
         node.euler_rollout_dt = DEPLOY_DT
         node.euler_rollout_window = 6
         node.euler_rollout_warmup_epochs = 10
+        node.euler_rollout_max_window = 16
+        node.euler_rollout_ss_epochs = 40
         # Optional JIT compilation of the field for extra GPU throughput.
         # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
         # solver's autograd path (especially adjoint) and the forward-mode JVP;
@@ -2025,9 +2109,20 @@ class GRUODEFieldForONNX(torch.nn.Module):
             x_phys = x
         h = self.func.encode(x_phys)
         dh = self.func.cell(0.0, h)
-        x_plus = self.func.decode(h + self.eps * dh)
-        x_minus = self.func.decode(h - self.eps * dh)
-        xdot = (x_plus - x_minus) / (2.0 * self.eps)
+        # Review A1: use the EXACT decoder Jacobian-vector product (closed form,
+        # matmuls + elementwise SiLU') instead of the central finite difference.
+        # This is what GRUODELatentModel._field now trains with (field_method=
+        # "analytic"), so the exported field is bit-parity with the trained field
+        # WITHOUT the FD truncation/cancellation noise. Every op here traces to
+        # ONNX. If you exported a legacy central-diff model, set USE_ANALYTIC_ONNX
+        # = False below to reproduce it exactly instead.
+        USE_ANALYTIC_ONNX = True
+        if USE_ANALYTIC_ONNX:
+            xdot = self.func.decode_jvp(h, dh)
+        else:
+            x_plus = self.func.decode(h + self.eps * dh)
+            x_minus = self.func.decode(h - self.eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * self.eps)
         if self.second_order:
             vel_now = x_phys.index_select(-1, self.vel_idx)
             if getattr(self, "scaled_space", False):

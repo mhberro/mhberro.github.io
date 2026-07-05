@@ -1,929 +1,430 @@
-#NEXT_frames
-# Built-ins
-from copy import deepcopy
-
-# 3rd party
-import numpy as np
-import pandas as pd
-import scipy
-from geographiclib.geodesic import Geodesic
-from scipy.interpolate import make_interp_spline  # TODO: cubic hermite spline?
-
-from coordinate_transform_functions import (
-    dcu_to_ned,
-    ecef_to_ned,
-    ecef_to_ned_velocity,
-    frd_to_dcu,
-    ned_to_dcu,
-    ned_to_ecef,
-    ned_to_ecef_velocity,
-)
-from trajectory_helpers import (
-    DOWN_DOT_INDEX,
-    DOWN_INDEX,
-    GR_DOT_INDEX,
-    GR_INDEX,
-    POS_SLICE,
-    THETA_DOT_INDEX,
-    TIME_INDEX,
-    VEL_SLICE,
-)
-
-
-def next_grdth_to_ecef(grdth_data, ref_ecef, ref_heading):
-    """Convert from grdth frame to ECEF.
-
-    grdth_data: array of size (n_states,5),
-    ref_ecef: the impact point in ecef,
-    ref_heading: target initial point heading from impact
-    """
-    # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
-    # get theta from thetadot
-    # TODO: What about cumulative_simpson? only in scipy>=1.12.0
-    theta = (
-        scipy.integrate.cumulative_trapezoid(
-            np.divide(grdth_data[:, THETA_DOT_INDEX], grdth_data[:, GR_INDEX]),
-            grdth_data[:, TIME_INDEX],
-            initial=0,
-        )
-        + ref_heading
-    )
-
-    theta = scipy.integrate.cumulative_simpson(
-        np.divide(grdth_data[:, THETA_DOT_INDEX], grdth_data[:, GR_INDEX]),  # omega = V_theta / rho
-        x=grdth_data[:, TIME_INDEX],
-        initial=ref_heading,
-    )
-
-    # now from grdth to NED
-    ned_data = np.empty((grdth_data.shape[0], 7))
-    # take care of time, down, and downdot in single lines
-    ned_data[:, TIME_INDEX] = grdth_data[:, TIME_INDEX]
-    ned_data[:, 3] = grdth_data[:, DOWN_INDEX]
-    ned_data[:, 6] = grdth_data[:, DOWN_DOT_INDEX]
-    # now the math from cylindrical to cartesian
-    # position
-    C_theta = np.cos(theta)
-    S_theta = np.sin(theta)
-    ned_data[:, 1] = grdth_data[:, GR_INDEX] * C_theta
-    ned_data[:, 2] = grdth_data[:, GR_INDEX] * S_theta
-    # gr_dot_ortho = grdth_data[:, GR_INDEX] * grdth_data[:, THETA_DOT_INDEX]  # radius * omega
-    gr_dot_ortho = grdth_data[:, THETA_DOT_INDEX]  # V_theta
-    for i in range(grdth_data.shape[0]):
-        # velocity
-        # TODO: this needs to be a rotation about R3. use an einsum when taking away the for loop
-        ned_data[i, 4:6] = np.matmul(
-            np.array(((C_theta[i], -S_theta[i]), (S_theta[i], C_theta[i]))),
-            np.array((grdth_data[i, GR_DOT_INDEX], gr_dot_ortho[i])),
-        )
-        # gr_dot = grdth_data[i, 2]
-        # vel_north = (
-        #     C_theta[i] * gr_dot - S_theta[i] * gr_dot_ortho[i]
-        #     # + (  # ignore this correction term. there are better ways to do this
-        #     #     grdth_data[i, 0]
-        #     #     * (
-        #     #         np.gradient(grdth_data[:, 2], grdth_data[:, 0])[i]
-        #     #         - (2 * grdth_data[i, 3] * gr_dot * S_theta[i])
-        #     #         - (
-        #     #             np.gradient(grdth_data[:, 3], grdth_data[:, 0])[i]
-        #     #             * grdth_data[i, 1]
-        #     #             * S_theta[i]
-        #     #         )
-        #     #         - ((grdth_data[i, 3] ** 2) * grdth_data[i, 1] * C_theta[i])
-        #     #     )
-        #     # )
-        # )
-        # vel_east = S_theta[i] * gr_dot + C_theta[i] * gr_dot_ortho[i]
-        # ned_data[i, 4] = vel_north
-        # ned_data[i, 5] = vel_east
-
-    # NED to ECEF
-    ecef_data = np.empty_like(ned_data)
-    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]  # time
-    for i in range(ecef_data.shape[0]):
-        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
-        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
-    return ecef_data
-
-
-def ecef_to_next_grdth(ecef_data, ref_ecef):
-    # ecef_data: expected to be [time, pos x3, vel x3]
-    # get the input point as the ECEF reference point
-    # careful with the pointers
-    ref_point = deepcopy(ref_ecef)
-    ecef_data = np.atleast_2d(ecef_data)
-
-    # convert all of the ECEF data to local NED relative to the reference point
-    ned_data = deepcopy(ecef_data)
-    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    for i in range(ecef_data.shape[0]):
-        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
-        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
-        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
-        #     ecef_data[i, acc_slice], ref_point
-        # )
-    # print("please be ned", ned_data)
-
-    # TODO: throw away the velocity data and do a numpy gradient to recreate it.
-
-    # convert traj from NED to GRDTH
-    gr = np.linalg.norm(ned_data[:, 1:3], axis=1)
-    # print("gr", gr)
-    # 2d orthogonal vector. same thing as <N,E,0> cross <0,0,1>, but with fewer operations?
-    gr_orthogonal = np.array([-ned_data[:, 2], ned_data[:, 1]]).T
-    grdth_data = np.empty((ned_data.shape[0], 6))  # time plus GRDTH has 5 channels
-    # fill in the table for GRDTH frame
-    # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
-    grdth_data[:, TIME_INDEX] = ned_data[:, 0]  # time
-    grdth_data[:, GR_INDEX] = gr  # ground range
-    gr_speed = np.linalg.norm(ned_data[:, 4:6], axis=1)
-    # global theta_pre
-    theta_initial = np.arctan2(ned_data[0, 2], ned_data[0, 1])
-    # the einsums are doing the dot product of each row pair of vectors from each array
-    # C_theta = np.cos(theta_pre)
-    # S_theta = np.sin(theta_pre)
-    # for i in range(ned_data.shape[0]):
-    #     if gr[i] != 0:
-    #         grdth_data[i, 2] = np.dot(ned_data[i, 4:6], ned_data[i, 1:3]) / gr[i]
-    #         grdth_data[i, 3] = np.dot(ned_data[i, 4:6], gr_orthogonal[i]) / (gr[i] ** 2)
-    #     else:
-    #         grdth_data[i, 2] = gr_speed[i]
-    #         grdth_data[i, 3] = 0
-
-    grdth_data[:, GR_DOT_INDEX] = np.divide(
-        np.einsum("ij,ij->i", ned_data[:, 4:6], ned_data[:, 1:3]),
-        gr,
-        out=np.ones_like(gr) * gr_speed,  # force the data to come to the center
-        # where=gr != 0,
-        where=gr >= np.finfo(gr.dtype).eps,
-    ).squeeze()  # ground range dot
-    grdth_data[:, THETA_DOT_INDEX] = np.divide(
-        np.einsum("ij,ij->i", ned_data[:, 4:6], gr_orthogonal),
-        # gr**2,  # squared b/c V_orth = r*omega
-        gr,  # squared b/c V_orth = r*omega
-        # out=np.full_like(gr, np.finfo(gr.dtype).eps),
-        out=np.zeros_like(gr),  # no radial movement when close in
-        # where=gr != 0,
-        where=gr >= np.finfo(gr.dtype).eps,
-    ).squeeze()  # theta dot
-    grdth_data[:, DOWN_INDEX] = ned_data[:, 3]  # Down
-    grdth_data[:, DOWN_DOT_INDEX] = ned_data[:, 6]  # Downdot
-    # print("please be grdth", grdth_data.squeeze())
-    return grdth_data.squeeze(), theta_initial
-
-
-def ecef_to_next_dcu(ecef_data, ref_ecef):
-    # get the input point as the ECEF reference point
-    # careful with the pointers
-    ref_point = deepcopy(ref_ecef)
-    # print("ecef to next grdth ref ecef", ref_point)
-    ecef_data = np.atleast_2d(ecef_data)
-
-    # convert all of the ECEF data to local NED relative to the reference point
-    ned_data = deepcopy(ecef_data)
-    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    for i in range(ecef_data.shape[0]):
-        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
-        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
-        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
-        #     ecef_data[i, acc_slice], ref_point
-        # )
-
-    # threat anti-heading
-    # ref_heading = (np.arctan2(ned_data[0, 5], ned_data[0, 4])) % (2 * np.pi)
-    # threat position heading
-    ref_heading = (np.arctan2(ned_data[0, 2], ned_data[0, 1])) % (2 * np.pi)
-
-    # NED to DCU
-    dcu_data = np.empty_like(ned_data)
-    dcu_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
-    for i in range(ned_data.shape[0]):
-        dcu_data[i, POS_SLICE] = ned_to_dcu(ned_data[i, POS_SLICE], ref_heading)
-        dcu_data[i, VEL_SLICE] = ned_to_dcu(ned_data[i, VEL_SLICE], ref_heading)
-
-    # check for flip_c
-    do_flip_c = dcu_data[0, 2] < 0
-    if do_flip_c:
-        dcu_data = flip_c(dcu_data)
-
-    return dcu_data.squeeze(), ref_heading, do_flip_c
-
-
-def flip_c(dcu_state):
-    # change the sign of the cross range position and velocity
-    dcu_state[..., 2::3] = -dcu_state[..., 2::3]
-    return dcu_state
-
-
-def next_dcu_to_ecef(dcu_data, ref_ecef, ref_heading, do_flip_c):
-    if do_flip_c:
-        dcu_data = flip_c(dcu_data)
-
-    # DCU to NED
-    ned_data = np.empty_like(dcu_data)
-    ned_data[:, TIME_INDEX] = dcu_data[:, TIME_INDEX]
-    for i in range(dcu_data.shape[0]):
-        ned_data[i, POS_SLICE] = dcu_to_ned(dcu_data[i, POS_SLICE], ref_heading)
-        ned_data[i, VEL_SLICE] = dcu_to_ned(dcu_data[i, VEL_SLICE], ref_heading)
-
-    # NED to ECEF
-    ecef_data = np.empty_like(ned_data)
-    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
-    for i in range(ned_data.shape[0]):
-        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
-        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
-    return ecef_data.squeeze()
-
-
-# ----------------------------------------------------------------------
-# Global ellipsoid (WGS-84)
-# ----------------------------------------------------------------------
-WGS84 = Geodesic.WGS84
-a = WGS84.a  # semi-major axis (m)
-f = WGS84.f  # flattening
-b = a * (1 - f)  # semi-minor axis (m)
-
-
-# ----------------------------------------------------------------------
-# Simple helpers
-# ----------------------------------------------------------------------
-def deg2rad(x):
-    return np.deg2rad(x)
-
-
-def rad2deg(x):
-    return np.rad2deg(x)
-
-
-# ----------------------------------------------------------------------
-# 0. Geodetic ↔ ECEF (scalar - called inside vectorised loops)
-# ----------------------------------------------------------------------
-def ecef_to_geodetic(x, y, z):
-    """Scalar conversion using GeographicLib's exact algorithm."""
-    # lat, lon, h = Geodesic.WGS84._LatLonFromXYZ(x, y, z)
-    # return lat, lon, h
-    # TODO: Vermeille has a better method that Karney suggested updates to and then Vermeille updated in 2011. Update to using that rather than this Bowrank-like iterative method.
-    from coordinate_transform_functions import _ecef_to_lla
-
-    lat, lon, h, _ = _ecef_to_lla(np.hstack([x, y, z]), deg=True)
-
-    return lat, lon, h
-
-
-def geodetic_to_ecef(lat, lon, h):
-    """Scalar conversion (deg, deg, m) → (x, y, z) in metres."""
-    lat_rad = deg2rad(lat)
-    lon_rad = deg2rad(lon)
-
-    sin_phi = np.sin(lat_rad)
-    cos_phi = np.cos(lat_rad)
-    sin_lam = np.sin(lon_rad)
-    cos_lam = np.cos(lon_rad)
-
-    N = a / np.sqrt(1 - (2 * f - f**2) * sin_phi**2)
-    x = (N + h) * cos_phi * cos_lam
-    y = (N + h) * cos_phi * sin_lam
-    z = ((1 - f) ** 2 * N + h) * sin_phi
-    return x, y, z
-
-
-# ----------------------------------------------------------------------
-# 1. ENU rotation matrix (scalar - reused for a whole batch)
-# ----------------------------------------------------------------------
-def enu_rotation_matrix(lat0_rad, lon0_rad):
-    """Scalar rotation matrix from ECEF → ENU at (lat0,lon0) [radians]."""
-    sin_phi = np.sin(lat0_rad)
-    cos_phi = np.cos(lat0_rad)
-    sin_lam = np.sin(lon0_rad)
-    cos_lam = np.cos(lon0_rad)
-
-    R = np.array(
-        [
-            [-sin_lam, cos_lam, 0.0],
-            [-sin_phi * cos_lam, -sin_phi * sin_lam, cos_phi],
-            [cos_phi * cos_lam, cos_phi * sin_lam, sin_phi],
-        ]
-    )
-    return R
-
-
-# ----------------------------------------------------------------------
-# 2. Vectorised ENU conversion
-# ----------------------------------------------------------------------
-def _apply_rotation(R, vec):
-    """
-    Apply the same (3×3) rotation matrix `R` to an (N,3) array `vec`.
-    """
-    # Using @ works with both (3,3) @ (3,) and (3,3) @ (N,3).T
-    return (R @ vec.T).T
-
-
-def ecef_to_enu_vec(p_ecef, impact_ecef, lat0_deg, lon0_deg):
-    """
-    Convert an (N,3) array of ECEF positions to ENU centred at the impact point.
-    Returns an (N,3) array.
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-
-    delta = np.asarray(p_ecef) - np.asarray(impact_ecef)  # (N,3)
-    return _apply_rotation(R, delta)
-
-
-def ecef_vel_acc_to_enu_vec(v_ecef, a_ecef, lat0_deg, lon0_deg):
-    """
-    Convert (N,3) velocity and (N,3) acceleration arrays to ENU.
-    Returns two (N,3) arrays: (v_enu, a_enu).
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-
-    v_enu = _apply_rotation(R, v_ecef)
-    a_enu = _apply_rotation(R, a_ecef)
-    return v_enu, a_enu
-
-
-def enu_to_ecef_vec(p_enu, impact_ecef, lat0_deg, lon0_deg):
-    """
-    Inverse ENU → ECEF for an (N,3) array.
-    """
-    lat0 = deg2rad(lat0_deg)
-    lon0 = deg2rad(lon0_deg)
-    R = enu_rotation_matrix(lat0, lon0)
-    # Inverse rotation = transpose because R is orthogonal
-    return impact_ecef + _apply_rotation(R.T, p_enu)
-
-
-# ----------------------------------------------------------------------
-# 3. Geodesic helpers (scalar)
-# ----------------------------------------------------------------------
-def inverse_geodesic(lat0, lon0, lat, lon):
-    """
-    Scalar inverse geodesic. Returns distance (m), forward azimuth (deg),
-    reverse azimuth (deg), reduced length m12 (m), geodesic scale M12 (-).
-    """
-    mask = Geodesic.DISTANCE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    inv = WGS84.Inverse(lat0, lon0, lat, lon, outmask=mask)
-    return inv["s12"], inv["azi1"], inv["azi2"], inv["m12"], inv["M12"]
-
-
-def forward_geodesic(lat0, lon0, s, azi):
-    """
-    Scalar forward geodesic. Returns destination lat, lon, reverse azimuth,
-    reduced length, geodesic scale.
-    """
-    mask = Geodesic.LATITUDE | Geodesic.LONGITUDE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
-    dirc = WGS84.Direct(lat0, lon0, azi, s, outmask=mask)
-    return dirc["lat2"], dirc["lon2"], dirc["azi2"], dirc["m12"], dirc["M12"]
-
-
-# ----------------------------------------------------------------------
-# 4. Vectorised geodesic-based state conversion
-# ----------------------------------------------------------------------
-def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef):
-    """
-    Vectorised conversion of whole trajectories.
-
-    Parameters
-    ----------
-    p_ecef : (N,3) array of positions (m)
-    v_ecef : (N,3) array of velocities (m/s)
-    a_ecef : (N,3) array of accelerations (m/s²)
-    impact_ecef : (3,) array - impact point in ECEF
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height above ellipsoid (m) - usually 0
-
-    Returns
-    -------
-    A dictionary where each entry is an (N,) NumPy array:
-        s   - geodesic distance from impact (m)
-        h   - relative height (m)   (trajectory h - h0)
-        az  - forward azimuth from impact (deg)
-        v_s - along-track speed (m/s)
-        v_α - azimuth rate (rad/s)
-        v_h - vertical speed (m/s)
-        a_s - along-track accel (m/s²)
-        a_α - azimuth accel (rad/s²)
-        a_h - vertical accel (m/s²)
-    """
-    N = p_ecef.shape[0]
-
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
-
-    # ------------------------------------------------------------------
-    # 1) Convert positions to lat/lon/h (scalar loop - cheap)
-    # ------------------------------------------------------------------
-    lat = np.empty(N)
-    lon = np.empty(N)
-    h = np.empty(N)
-
-    for i in range(N):
-        lat[i], lon[i], h[i] = ecef_to_geodetic(*p_ecef[i])
-
-    # ------------------------------------------------------------------
-    # 2) Inverse geodesic for each point (scalar loop - still fast)
-    # ------------------------------------------------------------------
-    s = np.empty(N)
-    az = np.empty(N)  # forward azimuth (deg)
-    m12 = np.empty(N)
-    M12 = np.empty(N)
-
-    for i in range(N):
-        s[i], az[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
-
-    # ------------------------------------------------------------------
-    # 3) Build ENU rotation matrix once (same for whole trajectory)
-    # ------------------------------------------------------------------
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-
-    # ------------------------------------------------------------------
-    # 4) Rotate velocities & accelerations to ENU (vectorised)
-    # ------------------------------------------------------------------
-    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
-    a_enu = _apply_rotation(R, a_ecef)  # (N,3)
-
-    # Split ENU components for readability
-    v_east, v_north, v_up = v_enu[:, 0], v_enu[:, 1], v_enu[:, 2]
-    a_east, a_north, a_up = a_enu[:, 0], a_enu[:, 1], a_enu[:, 2]
-
-    # ------------------------------------------------------------------
-    # 5) Build unit vectors that follow each geodesic direction
-    # ------------------------------------------------------------------
-    az_rad = deg2rad(az)  # (N,)
-
-    # Tangent (east-north) unit vector along the geodesic
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-
-    # Lateral unit vector (perpendicular to t_hat in the ENU plane)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-
-    # Up unit vector - same for all rows
-    up_hat = np.array([0.0, 0.0, 1.0])
-
-    # ------------------------------------------------------------------
-    # 6) Velocity decomposition
-    # ------------------------------------------------------------------
-    v_s = np.einsum("ij,ij->i", t_hat, v_enu)  # dot product (N,)
-    v_l = np.einsum("ij,ij->i", l_hat, v_enu)  # lateral component
-    v_h = v_up  # vertical
-
-    # Azimuth rate (rad/s), guarding against division by zero
-    v_alpha = np.where(s > 0.0, (M12 / s) * v_l, 0.0)
-
-    # ------------------------------------------------------------------
-    # 7) Acceleration decomposition
-    # ------------------------------------------------------------------
-    a_s = np.einsum("ij,ij->i", t_hat, a_enu)
-    a_l = np.einsum("ij,ij->i", l_hat, a_enu)
-    a_h = a_up
-
-    a_alpha = np.where(s > 0.0, (M12 / s) * a_l - (v_s * v_alpha) / s, 0.0)
-
-    # ------------------------------------------------------------------
-    # 8) Assemble results
-    # ------------------------------------------------------------------
-    out = pd.DataFrame(
-        {
-            "s": s,
-            "az": az,
-            "h": h - h0,
-            "v_s": v_s,
-            "v_α": v_alpha,
-            "v_h": v_h,
-            "a_s": a_s,
-            "a_α": a_alpha,
-            "a_h": a_h,
+#loss_functions.py
+
+"""Loss functions for a Neural Ordinary Differential Equation model."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from torch import Tensor
+from torch.nn import MSELoss
+from tslearn.metrics import SoftDTWLossPyTorch
+
+
+class WrappedMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes WrappedMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
         }
-    ).values
-    return out
 
 
-# ----------------------------------------------------------------------
-# 5. Vectorised inverse conversion (local → ECEF)
-# ----------------------------------------------------------------------
-def local_geodesic_to_ecef_vec(state, impact_ecef):
+# TODO: with a bit of re-work, this could be changed to any-order loss
+# change vel_indices to order_split_indices
+# TODO: What about HuberLoss so that more attention is paid to the order that is above the needed value?
+class SecondOrderSplitMSELoss(torch.nn.Module):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        vel_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        pos_expect: float = "inf",
+        vel_expect: float = "inf",
+    ) -> None:
+        """Initializes SecondOrderSplitMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.vel_weight = vel_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.pos_expect = pos_expect
+        self.vel_expect = vel_expect
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+
+        # Compute metrics.
+        # with torch.no_grad():
+        if self.scaler is not None:
+            pred_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+            target_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+        else:
+            pred_unscaled = pred.detach()
+            target_unscaled = target.detach()
+
+        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
+        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
+        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
+        vel_target_unscaled = target_unscaled[..., self.vel_indices]
+
+        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
+        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
+
+        pos_pred = pred[..., : self.vel_indices[0]]
+        pos_target = target[..., : self.vel_indices[0]]
+        vel_pred = pred[..., self.vel_indices]
+        vel_target = target[..., self.vel_indices]
+
+        # calculate vel weight based on how far above the expectation each error is
+        # piecewise above expect ratio
+        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
+        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
+
+        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
+        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
+        total_loss = pos_loss + vel_loss
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }
+
+
+class EnergyMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
+        energy_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes EnergyMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.energy_fn = energy_fn
+        self.energy_weight = energy_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
+        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
+        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
+
+        total_loss = loss_data + loss_energy
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "energy_loss": loss_energy,
+        }
+
+
+class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
+    """Reverse Linear Weighting Loss function.
+
+    The Reverse Linear Weighting Loss function calculates a linearly weighted
+    Mean Absolute Error (MAE) where the last points in the time series data are
+    weighted more than the first points. The weights are calculated linearly,
+    monotonically increasing in weight.
+
+    This loss function helps the NODE model learn the end of the time series
+    target data better by increasing the importance of these points through the
+    weighting scheme.
+
+    Example:
+        If pred = [100 200 300 400 500] and target = [105 205 305 405 505]:
+
+        absolute error = [5 5 5 5 5]
+        reverse_linear_weights = [0 0.1 0.2 0.3 0.4] * 100
+        weighted absolute errors = [0 50 100 150 200]
+        mean weighted absolute error = 100
     """
-    Convert a batch of geodesic-based states (as returned by
-    `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
-    accelerations.
 
-    Parameters
-    ----------
-    state : dict of (N,) arrays
-        ["s", "az", "h", "v_s", "v_α", "v_h", "a_s", "a_α", "a_h"]
-          0    1     2    3      4      5      6      7      8
-    impact_ecef : (3,) array
-    lat0_deg, lon0_deg : impact latitude/longitude (deg)
-    h0 : impact height (m) - usually 0
+    def __init__(self) -> None:
+        """Initializes ReverseLinearWeightingLoss."""
+        super().__init__()
 
-    Returns
-    -------
-    p_ecef, v_ecef, a_ecef : each an (N,3) array
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        """Calculates the reverse linear weighting loss.
+
+        Args:
+            pred: The prediction from the model.
+            target: The target data the model should predict.
+
+        Returns:
+            A tensor containing the reverse linear weighting loss.
+        """
+        batch_size, time_steps, n_features = pred.shape
+
+        # Calculate reverse linear weights.
+        # Create a tensor of shape (batch_size, time_steps) row counts up from 0
+        # to time_steps-1.
+        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
+
+        # Normalize accross the rows.
+        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
+
+        # Duplicate in the feature dimension. Final result is tensor of shape
+        # (batch_size, time_steps, n_features) to match pred and target shapes.
+        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
+
+        # Calculate Weighted Mean Absolute Error according to the weight tensor.
+        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
+
+
+class SoftDTWLossWrapper(SoftDTWLossPyTorch):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        gamma=1,
+        normalize=False,
+        dist_func=None,
+    ):
+        super().__init__(gamma, normalize, dist_func)
+        self.height_idx = height_idx
+        self.vel_indices = vel_indices
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            # "energy_loss": loss_energy,
+        }
+
+
+class WeightedHuberLoss(torch.nn.Module):
     """
-    N = state.shape[0]
+    δp, δv are the *normalised* thresholds (already divided by the
+    corresponding std-dev).  wp, wv are optional scalar weights.
+    """
 
-    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
+    def __init__(
+        self,
+        delta_pos,
+        delta_vel,
+        vel_indices: list[int],
+        weight_pos=1.0,
+        weight_vel=1.0,
+        scaler=None,
+        N_FEATURES: int = 6,
+    ):
+        super().__init__()
+        self.delta_pos = delta_pos
+        self.delta_vel = delta_vel
+        self.delta_pos_unsacled = delta_pos
+        self.delta_vel_unsacled = delta_vel
+        self.vel_indices = vel_indices
+        self.wp = weight_pos
+        self.wv = weight_vel
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        if scaler is not None:
+            # self.compute_normalised_deltas(scaler, delta_pos, delta_vel)
+            sigma = scaler.scale_
+            # simple average, or keep per‑axis
+            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
+            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
 
-    # ------------------------------------------------------------------
-    # 1) Destination lat/lon for each sample (scalar loop)
-    # ------------------------------------------------------------------
-    lat = np.empty(N)
-    lon = np.empty(N)
+    # def compute_normalised_deltas(
+    #     self,
+    #     scaler,
+    #     delta_pos_phys,  # metres
+    #     delta_vel_phys,
+    # ):  # metres / sec
+    #     # scaler.scale_ is an array of length 6: [σ_px, σ_py, σ_pz, σ_vx, σ_vy, σ_vz]
 
-    for i in range(N):
-        lat[i], lon[i], _, _, _ = forward_geodesic(lat0_deg, lon0_deg, state[i, 0], state[i, 1])
+    #     # return delta_pos_norm, delta_vel_norm
 
-    # ------------------------------------------------------------------
-    # 2) Build ENU rotation matrix (same for whole batch)
-    # ------------------------------------------------------------------
-    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+    # def huber(self, r, delta):
+    #     """Element-wise Huber for a tensor of residuals."""
+    #     abs_r = torch.abs(r)
+    #     quadratic = 0.5 * r**2
+    #     linear = delta * (abs_r - 0.5 * delta)
+    #     return torch.where(abs_r <= delta, quadratic, linear)
 
-    # ------------------------------------------------------------------
-    # 3) Assemble ENU velocity / acceleration from geodesic components
-    # ------------------------------------------------------------------
-    az_rad = deg2rad(state[:, 1])
-    s = state[:, 0]
-    # Need the differential scale M12 for each point - get it with another
-    # scalar inverse geodesic call.
-    M12 = np.empty(N)
-    for i in range(N):
-        _, _, _, _, M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
+    def forward(self, pred, target):
+        """
+        pred_norm / target_norm : (T,6) tensors in normalised space
+        Returns a scalar loss (mean over all time steps and components)
+        """
+        n_timesteps = pred.size(1)
 
-    # Unit vectors per sample (same definitions as in the forward routine)
-    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
-    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
-    up_hat = np.array([0.0, 0.0, 1.0])
+        pos_pred_scaled = pred[..., : self.vel_indices[0]]
+        pos_target_scaled = target[..., : self.vel_indices[0]]
+        vel_pred_scaled = pred[..., self.vel_indices]
+        vel_target_scaled = target[..., self.vel_indices]
 
-    # ENU velocity
-    v_enu = (
-        (state[:, 3][:, None] * t_hat) + ((state[:, 4] * s / M12)[:, None] * l_hat) + (state[:, 5][:, None] * up_hat)
-    )
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
 
-    # ENU acceleration
-    a_enu = (
-        (state[:, 6][:, None] * t_hat) + ((state[:, 7] * s / M12)[:, None] * l_hat) + (state[:, 8][:, None] * up_hat)
-    )
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
 
-    # ------------------------------------------------------------------
-    # 4) Transform ENU → ECEF (vectorised) and add impact offset
-    # ------------------------------------------------------------------
-    p_ecef = np.empty((N, 3))
-    for i in range(N):
-        p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + state[i, 2])
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)  # TODO: What about RMSE?
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
 
-    v_ecef = _apply_rotation(R.T, v_enu)
-    a_ecef = _apply_rotation(R.T, a_enu)
+            # TODO: What about RMSE?
+            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
+            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
 
-    # Add impact offset to positions (the geodetic conversion already gives
-    # absolute coordinates, so no extra offset is needed)
-    # (If you had stored the impact point in ECEF already you could also do:)
-    # p_ecef += impact_ecef   # <-- not required here
+        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
+        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
 
-    return np.hstack([p_ecef, v_ecef, a_ecef])
-
-
-def prep_trajectory(x):
-    # load_single_truth(x, debug=False), x.name, args.sr, path
-    ecef_data, traj_number, max_sr, trajectory_dt, use_grdth = x
-    # keep time, pos, vel. don't need the rest of the columns
-    ecef_data = ecef_data[:, 0:7]
-    # print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
-
-    # remove launch point based on near zero speed state
-    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        ecef_data = ecef_data[1:]
-
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
-    sr_ecef_data = np.asarray(
-        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-        dtype=np.float64,
-    )
-    # TODO: add a min slant range to avoid the origin discontinuity
-    # sr_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
-    #     dtype=np.float64,
-    # )
-
-    # nice idea, but it wasn't the source of the problem
-    # filter the points by only those above the horizon. Work from impact backwards.
-    # def while_gen_backward_up(data):
-    #     for x in reversed(data):
-    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
-    #             yield x
-    #         else:
-    #             break
-
-    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
-
-    # TODO: move this to a trajectory time check helper function file
-    # check the time rate of the data
-    # diff the time column, run unique, print that if there is more than 1 unique
-    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(
-            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
-        )
-
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    sr_ecef_data[:, 0],
-                    sr_ecef_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
-        )
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if use_grdth:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
-        if np.any(next_frame_data[GR_INDEX] > 1e10):
-            print(f"this ground range for traj {traj_number} seems excessive", next_frame_data[GR_INDEX].max)
-
-        # check the inverse transform
-        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
-    else:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
-    # closeness_check
-    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
-    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
-    # print(f"MSE round-trip position: {pos_err:.3e}")
-    # print(f"MSE round-trip velocity: {vel_err:.3e}")
-
-    # add column for traj number
-    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
-
-    # add columns for ECEF reference point (12, 13, 14)
-    # TODO: stop doing this to save some RAM and use a metadata attribute
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
-    #     print(next_frame_data)
-    # np.savetxt(
-    #     "grdth_" + traj_number,
-    #     next_frame_data,
-    #     delimiter=",",
-    #     # header=",".join(header_row),
-    #     comments="",
-    #     fmt="%.8f",
-    # )
-
-    return next_frame_data, traj_number
+        # sum over dimensions, then mean over time steps
+        # total_loss = (self.wp * loss_pos.sum(dim=1) + self.wv * loss_vel.sum(dim=1)).mean()
+        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
+        total_loss_unweighted = loss_pos + loss_vel
+        return {
+            "loss": total_loss,
+            "loss_unweighted": total_loss_unweighted,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "pos_err_scaled": avg_pos_diff_scaled,
+            "vel_err_scaled": avg_vel_diff_scaled,
+        }
 
 
-def prep_trajectory_time(x):
-    # load_single_truth(x, debug=False), x.name, args.sr, path
-    ecef_data, traj_number, max_time, trajectory_dt, use_grdth = x
-    # keep time, pos, vel. don't need the rest of the columns
-    ecef_data = ecef_data[:, 0:7]
-    # print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+# Latent ODE
+# TODO: finish wrapping this
+def loss_function(recon, target, mu, logvar):
+    # recon & target are still in normalised space
+    mse = torch.mean((recon - target) ** 2)
 
-    # remove launch point based on near zero speed state
-    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        # while np.any(ecef_data[0, VEL_SLICE] <= 1e-8):
-        ecef_data = ecef_data[1:]
-
-    # check that the trajectory has enough time data in it
-    traj_time_range = ecef_data[-1, TIME_INDEX] - ecef_data[0, TIME_INDEX]
-    if abs(traj_time_range) < max_time:
-        # raise ValueError(
-        #     f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
-        # )
-        print(
-            f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
-        )
-        return None, None
-
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
-    # time_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-    #     dtype=np.float64,
-    # )
-    impact_time = ecef_data[-1, TIME_INDEX]
-    start_time = impact_time - max_time
-    time_ecef_data = ecef_data[ecef_data[:, TIME_INDEX] >= start_time]
-    # now make the impact time precisely the max time
-    time_ecef_data[:, TIME_INDEX] = time_ecef_data[:, TIME_INDEX] + max_time
-    # TODO: add a min slant range to avoid the origin discontinuity
-    # sr_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
-    #     dtype=np.float64,
-    # )
-
-    # nice idea, but it wasn't the source of the problem
-    # filter the points by only those above the horizon. Work from impact backwards.
-    # def while_gen_backward_up(data):
-    #     for x in reversed(data):
-    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
-    #             yield x
-    #         else:
-    #             break
-
-    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
-
-    # TODO: move this to a trajectory time check helper function file
-    # check the time rate of the data
-    # diff the time column, run unique, print that if there is more than 1 unique
-    time_diff = np.diff(time_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(
-            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
-        )
-
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(0, max_time + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    time_ecef_data[:, 0],
-                    time_ecef_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
-        )
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if use_grdth:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(
-            resampled_sr_ecef_data,
-            ref_ecef,
-        )
-        # pass
-
-        # check the inverse transform
-        # check_ecef = next_grdth_to_ecef(
-        #     next_frame_data,
-        #     ref_ecef,
-        #     initial_point_heading,
-        # )
-    else:
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_dcu(
-            resampled_sr_ecef_data,
-            ref_ecef,
-        )
-
-        # check the inverse transform
-        # check_ecef = next_dcu_to_ecef(
-        #     next_frame_data,
-        #     ref_ecef,
-        #     initial_point_heading,
-        # )
-    # closeness_check
-    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
-    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
-    # print(f"MSE round-trip position: {pos_err:.3e}")
-    # print(f"MSE round-trip velocity: {vel_err:.3e}")
-
-    # add column for traj number
-    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
-
-    # add columns for ECEF reference point (12, 13, 14)
-    # TODO: stop doing this to save some RAM and use a metadata attribute
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
-    #     print(next_frame_data)
-    # np.savetxt(
-    #     "grdth_" + traj_number,
-    #     next_frame_data,
-    #     delimiter=",",
-    #     # header=",".join(header_row),
-    #     comments="",
-    #     fmt="%.8f",
-    # )
-
-    return next_frame_data, traj_number
-
-
-def prep_many_trajs_time(traj_targets):
-    # multiprocessed trajectory prep (the output is ordered like the input)
-    # cpu_count = psutil.cpu_count(logical=False)
-    # if cpu_count is None:
-    #     cpu_count = mp.cpu_count()
-    # print(f"there are {cpu_count} cpus being used for trajectory prep")
-    # with mp.Pool(processes=cpu_count) as pool:
-    #     # time based trajectory loading
-    #     tmp_data = pool.map(prep_trajectory_time, traj_targets)
-    # single threaded, but single line
-    tmp_data = map(prep_trajectory_time, traj_targets)
-    # single threaded, but one at a time
-    # tmp_data = []
-    # for x in traj_targets[7:]:
-    #     tmp_data.append(prep_trajectory(x))
-    #     exit(0)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-
-    print("post-prep. how many made it though prep", len(traj_targets))
-    return tmp_data
-
-
-def prep_many_trajs(traj_targets):
-    # multiprocessed trajectory prep (the output is ordered like the input)
-    # cpu_count = psutil.cpu_count(logical=False)
-    # if cpu_count is None:
-    #     cpu_count = mp.cpu_count()
-    # print(f"there are {cpu_count} cpus being used for trajectory prep")
-    # with mp.Pool(processes=cpu_count) as pool:
-    #     tmp_data = pool.map(prep_trajectory, traj_targets)
-    # single threaded, but single line
-    tmp_data = map(prep_trajectory, traj_targets)
-    # single threaded, but one at a time
-    # tmp_data = []
-    # for x in traj_targets[7:]:
-    #     tmp_data.append(prep_trajectory(x))
-    #     exit(0)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-
-    # check if all of the trajectories are much shorter than the asked for bucket
-    # if not use_grdth:
-    #     if all((np.linalg.norm(x[0, POS_SLICE] - x[-1, POS_SLICE]) < args.sr - BUCKET_SIZE for x, _ in tmp_data)):
-    #         print(
-    #             f"All trajectories are shorter than the SR ({args.sr}) minus bucket size ({BUCKET_SIZE}). Skipping making this model"
-    #         )
-    #         exit()
-
-    print("post-prep. how many made it though prep", len(traj_targets))
-    return tmp_data
+    # KL divergence between q(z|x) and standard normal p(z)
+    kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    return mse + 0.5 * kl  # weight KL by 0.5 (tune as needed)

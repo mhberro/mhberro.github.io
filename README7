@@ -812,6 +812,77 @@ def _make_mdn_windows(
     return torch.stack(Xs, dim=0), torch.stack(Ys, dim=0)
 
 
+def _mdn_full_rollout_error(
+    model,
+    traj_list,
+    history: int,
+    horizon: int,
+    pos_idx: list[int],
+    vel_idx: list[int],
+    scaler,
+    device,
+) -> tuple[float, float]:
+    """Physical-unit L1 error of the MDN rolled out over ENTIRE trajectories.
+
+    Mirrors how the ODE models are scored (integrate the whole trajectory, error
+    over all steps) so the MDN gets an apples-to-apples number. Because the MDN
+    predicts `horizon` steps per call, we chain it autoregressively: seed with
+    the first `history` observed states, predict the mixture-MEAN `horizon` steps
+    ahead, append them, slide the window, and repeat until the trajectory end.
+    Error is the mean absolute deviation of the rolled-out states from truth over
+    all predicted steps and all trajectories, in physical units (scaler.scale_).
+
+    Returns (pos_err_full, vel_err_full) as python floats.
+    """
+    model.eval()
+    pos_idx_t = torch.tensor(pos_idx, dtype=torch.long, device=device)
+    vel_idx_t = torch.tensor(vel_idx, dtype=torch.long, device=device)
+    if scaler is not None:
+        scale = torch.as_tensor(scaler.scale_, dtype=torch.float32, device=device)
+        pos_sigma = scale[pos_idx_t]
+        vel_sigma = scale[vel_idx_t]
+    else:
+        pos_sigma = torch.ones(len(pos_idx), device=device)
+        vel_sigma = torch.ones(len(vel_idx), device=device)
+
+    tot_pos = 0.0
+    tot_vel = 0.0
+    n_pos = 0
+    n_vel = 0
+    with torch.no_grad():
+        for traj in traj_list:
+            L = traj.shape[0]
+            if L < history + 1:
+                continue
+            traj = traj.to(device)
+            # rolling buffer of the most recent `history` states (scaled)
+            window = traj[:history].clone()             # (history, D)
+            preds = []                                   # predicted future states
+            t = history
+            while t < L:
+                out = model(window.unsqueeze(0))         # batch of 1
+                mean_path = out["mean"][0]               # (horizon, D) scaled
+                take = min(horizon, L - t)               # don't overrun the truth
+                step = mean_path[:take]                  # (take, D)
+                preds.append(step)
+                # advance the window with the PREDICTED states (true autoregression)
+                window = torch.cat([window, step], dim=0)[-history:]
+                t += take
+            pred_states = torch.cat(preds, dim=0)        # (L-history, D)
+            truth = traj[history:history + pred_states.shape[0]]
+
+            dp = (pred_states.index_select(-1, pos_idx_t)
+                  - truth.index_select(-1, pos_idx_t)).abs() * pos_sigma
+            dv = (pred_states.index_select(-1, vel_idx_t)
+                  - truth.index_select(-1, vel_idx_t)).abs() * vel_sigma
+            tot_pos += float(dp.sum()); n_pos += dp.numel()
+            tot_vel += float(dv.sum()); n_vel += dv.numel()
+
+    if n_pos == 0:
+        return float("nan"), float("nan")
+    return tot_pos / n_pos, tot_vel / n_vel
+
+
 def train_NEXT(
     model_name,
     traj_targets_train,
@@ -1385,10 +1456,35 @@ def train_NEXT(
                     val_loss = float(vld["loss"])
                 sched.step(val_loss)
 
+                # --- full-trajectory rollout metric (apples-to-apples w/ ODE) --
+                # The windowed val_pos_err above measures only `mdn_horizon` steps
+                # ahead from mid-flight windows, so it is NOT comparable to the
+                # ODE models' val_pos_err, which is the error of integrating an
+                # ENTIRE trajectory from its first state. To compare like-for-like
+                # we autoregressively chain the MDN's mixture-mean over each full
+                # validation trajectory (predict horizon steps, advance, repeat)
+                # and take physical-unit L1 over ALL rolled-out steps -- the same
+                # quantity the ODE path reports. Logged as val_pos_err_full /
+                # val_vel_err_full (computed every logging interval to save time).
+                if epoch % mdn_log_interval == 0:
+                    pe_full, ve_full = _mdn_full_rollout_error(
+                        model,
+                        scaled_traj_targets_test_posvel,
+                        mdn_history,
+                        mdn_horizon,
+                        mdn_pos_idx,
+                        mdn_vel_idx,
+                        scaler_traj if use_scalar else None,
+                        device,
+                    )
+                else:
+                    pe_full = ve_full = float("nan")
+
                 # Same metric dictionary shape the ODE path logs: training metrics
                 # (loss, pos_err, vel_err) plus val_-prefixed validation metrics
                 # (val_loss, val_pos_err, val_vel_err), all physical-unit and
                 # identically named so downstream parsing/plots are unchanged.
+                # val_*_err_full are the ODE-comparable full-trajectory numbers.
                 metrics = {
                     "loss": tr_loss / nb,
                     "pos_err": tr_pos / nb,
@@ -1396,6 +1492,8 @@ def train_NEXT(
                     "val_loss": val_loss,
                     "val_pos_err": float(vld["pos_err"]),
                     "val_vel_err": float(vld["vel_err"]),
+                    "val_pos_err_full": pe_full,
+                    "val_vel_err_full": ve_full,
                 }
                 _log_metrics_like_ode(metrics, iteration=epoch)
 

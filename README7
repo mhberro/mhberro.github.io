@@ -1,790 +1,114 @@
-# NEXT_training.py
-# Built-ins
-import argparse
-import json
-import math
-import multiprocessing as mp
-import os
-import pickle
-from copy import deepcopy
-from pathlib import Path
-
-# 3rd party
-import matplotlib.pyplot as plt
-import numpy as np
-import onnx
-import pandas as pd
-import psutil
-import scipy
-import seaborn as sns
-import torch
-from scipy.interpolate import make_interp_spline
-from sklearn.compose import ColumnTransformer
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
-
-# LM packages
-from lm_ai_torch_models.activations import Activation
-from lm_ai_torch_training.configuration import TrainingConfiguration
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
-from lm_ai_torch_training.optimizers.adam import AdamOptimizer
-from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
-from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
-
-# Local
-from coordinate_transform_functions import (
-    dcu_to_ned,
-    ecef_to_ned,
-    ecef_to_ned_velocity,
-    frd_to_dcu,
-    ned_to_dcu,
-    ned_to_ecef,
-    ned_to_ecef_velocity,
-)
-from energy_functions import mechanical_energy
-from gru_ode import GRUODEFunc, GRUODEPredictorModel
-from load_truth import load_single_truth
-from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
-
-from neural_ode_mod import (
-    DEFAULT_LOSS,
-    EarlyStopper,
-    ModelCheckpoint,
-    NODEPredictor,
-)
-from NEXT_frames import (
-    ecef_to_local_geodesic_vec,
-    ecef_to_next_dcu,
-    ecef_to_next_grdth,
-    local_geodesic_to_ecef_vec,
-    next_dcu_to_ecef,
-    next_grdth_to_ecef,
-)
-
-from NEXT_geodesic_frame import (
-    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
-    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
-)
-from torchdiffeq_solver import TorchdiffeqSolver
-from trajectory_helpers import (
-    ACC_SLICE,
-    DOWN_DOT_INDEX,
-    DOWN_INDEX,
-    GR_DOT_INDEX,
-    GR_INDEX,
-    POS_SLICE,
-    THETA_DOT_INDEX,
-    TIME_INDEX,
-    VEL_SLICE,
-    check_time_series,
-    resample_traj_data,
-)
-
-HAVE_HIGH_MEMORY = False
-if psutil.virtual_memory().total > 64e9:
-    HAVE_HIGH_MEMORY = True
-
-HAVE_GPU = False
-if torch.cuda.device_count() != 0:
-    HAVE_GPU = True
-    print("there is a gpu in this node")
-    for i in range(torch.cuda.device_count()):
-        print(torch.cuda.get_device_properties(i))
-
-BUCKET_SIZE = 5000
-
-
-class ODEfunc(torch.nn.Module):
-    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
-        super(ODEfunc, self).__init__()
-        self.order_shift_slice = order_shift_slice
-        self.len_of_order_shift_slice = 0
-        if self.order_shift_slice is not None:
-            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
-            self.len_of_order_shift_slice = len(order_indicies)
-        self.act1 = torch.nn.SiLU(inplace=False)
-        self.act2 = torch.nn.SiLU(inplace=False)
-        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
-        self.fc2 = torch.nn.Linear(nhidden, nhidden)
-        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
-        self.nfe = 0
-
-    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
-        if self.order_shift_slice is not None:
-            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
-        self.nfe += 1
-        out = self.fc1(x)
-        out = self.act1(out)
-        out = self.fc2(out)
-        out = self.act2(out)
-        out = self.fc4(out)
-        if self.order_shift_slice is not None:
-            return torch.cat((v, out), dim=x.ndim - 1)
-        else:
-            return out
-
-
-class Normaliser(torch.nn.Module):
-    def __init__(self, scaler):
-        super().__init__()
-        self.mean = torch.nn.Parameter(torch.tensor(scaler.mean_, dtype=torch.float32), requires_grad=False)
-        self.scale = torch.nn.Parameter(torch.tensor(scaler.scale_, dtype=torch.float32), requires_grad=False)
-
-    def forward(self, x):
-        return (x - self.mean) / self.scale
-
-    def inverse(self, z):
-        return z * self.scale + self.mean
-
-
-class Encoder(torch.nn.Module):
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        self.rnn = torch.nn.GRU(input_size=6, hidden_size=hidden, batch_first=True, num_layers=1)
-        self.mu_head = torch.nn.Linear(hidden, latent_dim)
-        self.logvar_head = torch.nn.Linear(hidden, latent_dim)
-
-    def forward(self, x):
-        _, h_n = self.rnn(x)
-        h = h_n.squeeze(0)
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
-        return mu, logvar
-
-
-class LatentODEFunc(torch.nn.Module):
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, latent_dim),
-        )
-
-    def forward(self, t, z):
-        return self.net(z)
-
-
-class Decoder(torch.nn.Module):
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, 6),
-        )
-
-    def forward(self, z):
-        return self.net(z)
-
-
-from torchdiffeq import odeint_adjoint
-
-class LatentNODE(torch.nn.Module):
-    def __init__(self, latent_dim=8):
-        super().__init__()
-        self.encoder = Encoder(latent_dim)
-        self.odefunc = LatentODEFunc(latent_dim)
-        self.decoder = Decoder(latent_dim)
-
-    def forward(self, obs_window_and_times: tuple[torch.Tensor, torch.Tensor]):
-        obs_window, t_eval = obs_window_and_times
-        mu, logvar = self.encoder(obs_window)
-
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z0 = mu + eps * std
-
-        z_t = odeint_adjoint(self.odefunc, z0, t_eval, atol=1e-5, rtol=1e-5)
-        z_t = z_t.permute(1, 0, 2)
-
-        recon = self.decoder(z_t)
-        return recon, mu, logvar
-
-
-def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    return 0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar), dim=1))
-
-
-def _make_obs_target(traj: torch.Tensor, obs_len: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
-    assert traj.shape[0] > obs_len, "trajectory shorter than observation window"
-    obs_window = traj[:obs_len].unsqueeze(0)
-    target = traj.unsqueeze(0)
-    return obs_window, target
-
-
-def train_NEXT(
-    model_name,
-    traj_targets_train,
-    traj_targets_test,
-    scaler_traj,
-    model_save_path,
-    trajectory_dt,
-    batch_size,
-    use_scalar,
-    model_states,
-    aug_dim,
-    nhidden,
-    gpu_index,
-    model_type: str = "node",
-    frame: str = "dcu",
-):
-    training_configuration = TrainingConfiguration(
-        n_epochs=1,
-        optimizer=AdamOptimizer(learning_rate=1e-3),
-        batch_size=batch_size,
-        num_workers=100,
-        verbose=True,
-    )
-    
-    GRUODE_SOLVER_METHOD = "dopri5"
-    if model_type in ("gruode", "gruode-min"):
-        ode_method = GRUODE_SOLVER_METHOD
-    else:
-        ode_method = "rk4"
-        
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method=ode_method, adjoint=False)
-    if hasattr(ode_solver, 'atol'):
-        ode_solver.atol = 1e-8
-    if hasattr(ode_solver, 'rtol'):
-        ode_solver.rtol = 1e-6
-
-    if frame == "dcu":
-        velocity_indicies = (3, 4, 5)
-    elif frame == "grdth":
-        velocity_indicies = (2, 3, 4)
-    elif frame == "geodesic":
-        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
-    else:
-        raise ValueError("That frame is not known for what the velocity indicies are")
-        
-    early_stop_metric_name = "val_loss"
-    
-    loss_func = WrappedMSELoss(
-        height_idx=1,
-        vel_indices=velocity_indicies,
-        scaler=scaler_traj if use_scalar else None,
-        N_FEATURES=model_states,
-        position_loss_weight=80.0,
-        l2_reg=1e-4,
-        temporal_weighting=True,
-    )
-
-    node = NODEPredictor(
-        architecture=FFNNArchitecture(
-            layer_channels=[5, 5],
-            layer_activation=Activation.SILU,
-        ),
-        training_configuration=training_configuration,
-        solver=ode_solver,
-        logging_interval=5,
-        loss_func=loss_func,
-        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
-        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
-        aug_dim=aug_dim,
-    )
-    if HAVE_GPU:
-        node.device = torch.device(f"cuda:{gpu_index}")
-        node._initialize_losses(node.criterion)
-        node._initialize_model()
-        node._initialize_optimizer()
-
-    if model_type == "node":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "anode":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=aug_dim,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "sonode":
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=slice(3, 6),
-        ).to(node.device)
-    elif model_type in ("gruode", "gruode-min"):
-        gru_hidden = nhidden
-        cell_kind = "minimal" if model_type == "gruode-min" else "full"
-
-        USE_KINEMATIC_IDENTITY = False
-        IDENTITY_MODE = "raw"
-        COUPLE_MODE = "non_position"
-        PAIRS_RULE = "leading_positions"
-
-        n_derivative_pairs = 0
-        if USE_KINEMATIC_IDENTITY:
-            if PAIRS_RULE == "contiguous_all":
-                n_pairs = len(velocity_indicies)
-                valid = tuple(velocity_indicies) == tuple(range(n_pairs, 2 * n_pairs))
-            elif PAIRS_RULE == "leading_positions":
-                n_pairs = velocity_indicies[0]
-                valid = tuple(velocity_indicies[:n_pairs]) == tuple(range(n_pairs, 2 * n_pairs))
-            else:
-                raise ValueError(f"unknown PAIRS_RULE {PAIRS_RULE!r}")
-
-            if valid and n_pairs > 0:
-                n_derivative_pairs = n_pairs
-            else:
-                print(f"Leaving the kinematic identity OFF for frame rule pairing matches.")
-                n_derivative_pairs = 0
-
-        if COUPLE_MODE == "all":
-            couple_state = True
-            couple_indices = tuple(range(model_states))
-        elif COUPLE_MODE == "non_position":
-            couple_state = True
-            couple_indices = tuple(range(n_derivative_pairs, model_states))
-        elif COUPLE_MODE == "none":
-            couple_state = False
-            couple_indices = None
-        else:
-            raise ValueError(f"unknown COUPLE_MODE {COUPLE_MODE!r}")
-
-        pos_scale = vel_scale = vel_mean = None
-        if USE_KINEMATIC_IDENTITY and IDENTITY_MODE == "scaled" and use_scalar and n_derivative_pairs > 0:
-            k = n_derivative_pairs
-            pos_scale = scaler_traj.scale_[0:k]
-            vel_scale = scaler_traj.scale_[k : 2 * k]
-            vel_mean = scaler_traj.mean_[k : 2 * k]
-
-        gru_func = GRUODEFunc(
-            n_features=model_states,
-            hidden_size=gru_hidden,
-            cell=cell_kind,
-            couple_state=couple_state,
-            n_derivative_pairs=n_derivative_pairs,
-            couple_indices=couple_indices,
-            identity_mode=IDENTITY_MODE,
-            pos_scale=pos_scale,
-            vel_scale=vel_scale,
-            vel_mean=vel_mean,
-            encoder_dropout=0.1,
-        )
-        node.model = GRUODEPredictorModel(gru_func).to(node.device)
-        node.aug_dim = gru_hidden
-        aug_dim = gru_hidden
-        if not isinstance(ode_solver, TorchdiffeqSolver):
-            raise ValueError("GRU-ODE requires TorchdiffeqSolver setup mapping options.")
-            
-    elif model_type == "latentode":
-        latent_dim = nhidden // 2 if nhidden >= 20 else 8
-        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
-
-        recon_criterion = WrappedMSELoss(
-            height_idx=1,
-            vel_indices=[3, 4, 5],
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-        )
-
-        def latent_ode_loss_fn(recon, target, mu, logvar):
-            recon_loss = recon_criterion(recon, target)
-            kl = _kl_divergence(mu, logvar)
-            return recon_loss + 0.1 * kl
-
-        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    if hasattr(loss_func, "set_model"):
-        loss_func.set_model(node.model)
-
-    if use_scalar:
-        scaled_traj_targets_train_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
-        ]
-        scaled_traj_targets_test_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
-        ]
-    else:
-        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
-        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
-    gen_model = False
-    try:
-        node.load(directory=model_save_path, model_name=model_name)
-    except ValueError:
-        gen_model = True
-        pass
-
-    if gen_model:
-        if model_type == "latentode":
-            OBS_WINDOW = 10
-            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]
-            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
-            fraction_of_data = [
-                (obs[: max(math.ceil(obs.shape[0] * data_fraction), 5)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), 5)])
-                for (obs, tgt) in train_data
-            ]
-            fraction_of_data_val = [
-                (obs[: max(math.ceil(obs.shape[0] * data_fraction), 5)], tgt[: max(math.ceil(tgt.shape[0] * data_fraction), 5)])
-                for (obs, tgt) in test_data
-            ]
-
-        # OPTIMIZED CURRICULUM: Smooth monotonic non-increasing learning rates & relaxed early stopping
-        length_strategies = [
-            (0.1, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 3e-5),  # Damps horizon step shock
-            (0.5, 3000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 1e-5),
-            (0.7, 2000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 5e-6),
-            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 2e-6),
-            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 5e-6),
-            (1.0, 5000, EarlyStopper(60, 5e-3, metric_name=early_stop_metric_name), 1e-7),
-        ]
-
-        for len_strat in length_strategies:
-            print("running length strategy", len_strat)
-            data_fraction, epochs, early_stopper, learning_rate = len_strat
-            node.training_configuration = TrainingConfiguration(
-                n_epochs=epochs,
-                optimizer=AdamOptimizer(learning_rate=learning_rate),
-                batch_size=batch_size,
-                num_workers=2,
-                verbose=True,
-            )
-
-            node.optimizer_config = node.training_configuration.optimizer
-            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
-            node.training_metrics = {}
-            node._initialize_optimizer()
-            node.early_stopper = early_stopper
-
-            min_states = 5
-            if model_type == "latentode":
-                pass
-            else:
-                fraction_of_data = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_train_posvel
-                ]
-                fraction_of_data_val = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_test_posvel
-                ]
-
-            metrics = node.fit(
-                x=fraction_of_data,
-                validation_data=fraction_of_data_val,
-                enable_checkpoints=True if data_fraction == 1.0 else False,
-            )
-        p = Path(model_save_path, model_name + ".checkpoint.pt")
-        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
-
-    node.load(directory=model_save_path, model_name=model_name)
-    node.model.train(False)
-    node.model.eval()
-
-    if isinstance(ode_solver, TorchdiffeqSolver):
-        example_input = (None, torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device))
-    else:
-        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
-        
-    model_onx = torch.onnx.export(
-        node.model,
-        example_input,
-        os.path.join(model_save_path, model_name + ".onnx"),
-        export_params=True,
-        opset_version=18,
-        external_data=False,
-        input_names=["input"],
-        output_names=["output"],
-    )
-
-    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
-        f.write(onnx.printer.to_text(model_onx.model_proto))
-
-    if isinstance(scaler_traj, MinMaxScaler):
-        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
-            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
-                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
-    elif isinstance(scaler_traj, StandardScaler):
-        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
-            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
-                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
-    return node, model_name
-
-
-def prep_trajectory(x):
-    ecef_data, traj_number, max_sr, trajectory_dt, args = x
-    ecef_data = ecef_data[:, 0:7]
-    print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
-
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        ecef_data = ecef_data[1:]
-
-    sr_ecef_data = np.asarray(
-        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-        dtype=np.float64,
-    )
-
-    if sr_ecef_data.shape[-1] < 5:
-        print(f"{traj_number} does not have enough time stamps for this slant range")
-        return None, None
-    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(f"warning: {traj_number} has time that goes backwards.")
-
-    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [make_interp_spline(sr_ecef_data[:, 0], sr_ecef_data[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)]
-        )
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if args.frame == "grdth":
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
-    elif args.frame == "geodesic":
-        geodesic_mode = getattr(args, "geodesic_mode", "original")
-        if geodesic_mode == "original":
-            next_frame_data = ecef_to_local_geodesic_vec(resampled_sr_ecef_data[:, POS_SLICE], resampled_sr_ecef_data[:, VEL_SLICE], np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE]), ref_ecef)
-            next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
-        else:
-            geodesic_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(resampled_sr_ecef_data[:, POS_SLICE], resampled_sr_ecef_data[:, VEL_SLICE], ref_ecef)
-            next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], geodesic_state])
-    elif args.frame == "dcu":
-        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
-    else:
-        raise NotImplementedError("That frame is not supported yet")
-
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    return next_frame_data, traj_number
-
-
-def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
-    boost_ecef = []
-    glide_ecef = []
-    impact_ecef = []
-    target_path = Path(path)
-    for phase in ["boost", "glide", "impact"]:
-        phase_path = target_path / phase
-        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
-
-        if len(traj_files) == 0:
-            raise ValueError("bad target path", path)
-
-        traj_targets = [load_single_truth(x, debug=False, low_memory=not HAVE_HIGH_MEMORY, memory_map=HAVE_HIGH_MEMORY, min_state_vector_size=7) for x in traj_files]
-        if phase == "boost":
-            boost_ecef = traj_targets
-        elif phase == "glide":
-            glide_ecef = traj_targets
-        elif phase == "impact":
-            impact_ecef = traj_targets
-
-    if not do_prep:
-        return list(zip(list(zip(boost_ecef, glide_ecef, impact_ecef)), [x.name for x in traj_files]))
-
-    cpu_count = psutil.cpu_count(logical=False)
-    if cpu_count is None:
-        cpu_count = mp.cpu_count()
-    with mp.Pool(processes=cpu_count) as pool:
-        tmp_data = pool.map(prep_trajectory, traj_targets)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-    return tmp_data
-
-
-def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
-    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
-    scaler_traj = StandardScaler().fit(stacked_posvel)
-    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
-    with open(pickle_scalar_name, "wb") as o:
-        pickle.dump(scaler_traj, o)
-    return scaler_traj
-
-
-def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
-    if data.ndim != 2:
-        raise ValueError("`data` must be a 2-D array.")
-    n_cols = data.shape[1]
-    max_per_row = 5
-    n_rows = int(np.ceil(n_cols / max_per_row))
-    n_cols_plot = min(n_cols, max_per_row)
-
-    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
-    if n_rows == 1:
-        axes = np.expand_dims(axes, axis=0)
-
-    colors = plt.get_cmap(cmap).colors
-    for idx in range(data.shape[1]):
-        row = idx // max_per_row
-        col = idx % max_per_row
-        ax = axes[row, col]
-        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
-        if column_names is None:
-            ax.set_title(f"Column {idx}")
-        else:
-            ax.set_title(column_names[idx])
-    plt.suptitle("Column-wise Distributions", fontsize=16, y=1.02)
-    plt.savefig(data_path + "_feature_distribution.png")
-
-
-def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
-    if method == "pearson":
-        corr = np.corrcoef(data, rowvar=False)
-    elif method == "spearman":
-        from scipy.stats import spearmanr
-        corr, _ = spearmanr(data, axis=0)
-    else:
-        raise ValueError("Unsupported method; choose 'pearson' or 'spearman'.")
-
-    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
-    sns.heatmap(corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5)
-    labels = column_names if column_names is not None else [f"Col {i}" for i in range(corr.shape[0])]
-    plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
-    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels)
-    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels)
-    plt.tight_layout()
-    plt.savefig(data_path + "_correlation_matrix.png")
-
-
-def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
-    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
-    if timeseries_to_transform.shape[0] < 10:
-        return None
-    new_times = np.arange(timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt)
-    resampled_timeseries = np.hstack([np.atleast_2d(new_times).T] + [make_interp_spline(timeseries_to_transform[:, TIME_INDEX], timeseries_to_transform[:, 1:], bc_type="not-a-knot")(new_times, extrapolate=True)])
-
-    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
-    if args.ref_ecef == "boost":
-        ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
-    elif args.ref_ecef == "glide":
-        ref_ecef = ecef_data_traj[1][-1, POS_SLICE]
-
-    if args.frame == "dcu":
-        timeseries_in_next_frame, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
-    elif args.frame == "grdth":
-        timeseries_in_next_frame, initial_point_heading = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
-    elif args.frame == "geodesic":
-        if args.geodesic_mode == "original":
-            timeseries_in_next_frame = ecef_to_local_geodesic_vec(resampled_timeseries[:, POS_SLICE], resampled_timeseries[:, VEL_SLICE], np.zeros_like(resampled_timeseries[:, VEL_SLICE]), ref_ecef)
-            timeseries_in_next_frame = np.hstack([resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]])
-        else:
-            timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(resampled_timeseries[:, POS_SLICE], resampled_timeseries[:, VEL_SLICE], ref_ecef)
-            timeseries_in_next_frame = np.hstack([resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state])
-    else:
-        raise NotImplementedError("Frame layout mapping not configured.")
-
-    return timeseries_in_next_frame
-
-
-def main():
-    parser = argparse.ArgumentParser(description="Training script for creating NEXT models", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--tgt-data-paths", default=[], type=str, nargs="+")
-    parser.add_argument("--validation-data-paths", default=[], type=str, nargs="+")
-    parser.add_argument("--sr", default=100000, type=int)
-    parser.add_argument("-o", default="model_outputs", type=str)
-    parser.add_argument("--use-scalar", default=False, action="store_true")
-    parser.add_argument("--frame", default="dcu", choices=["dcu", "grdth", "geodesic"])
-    parser.add_argument("--sbi-phase", default="boost", choices=["boost", "glide"])
-    parser.add_argument("--nhidden", default=200, type=int)
-    parser.add_argument("--aug", default=0, type=int, dest="aug_dim")
-    parser.add_argument("--gpuidx", default=0, type=int, dest="gpu_index")
-    parser.add_argument("--model-type", default="node", choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"])
-    parser.add_argument("--dt", default=0.1, type=float)
-    parser.add_argument("--ref-ecef", default="impact", choices=["boost", "glide", "impact"])
-    parser.add_argument("--geodesic-mode", default="original", choices=["original", "integrated"])
-
-    args = parser.parse_args()
-
-    model_states = 6
-    if args.frame == "grdth":
-        model_states = 5
-    elif args.frame == "geodesic" and args.geodesic_mode == "integrated":
-        model_states = 5
-
-    trajectory_dt = args.dt
-
-    seed = 47
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    target_strs = [Path(x).name for x in args.tgt_data_paths]
-    model_name_target_str = "+".join(target_strs)
-    model_path = args.o
-    model_save_path = os.path.join(model_path, model_name_target_str)
-
-    batch_size = 512 if not HAVE_HIGH_MEMORY else 1024
-
-    frame_tag = args.frame if args.frame != "geodesic" else f"geodesic-{args.geodesic_mode}"
-    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
-    if args.use_scalar:
-        model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
-
-    model_name = f"{model_name_wo_epochs}"
-
-    traj_targets_train = []
-    traj_targets_test = []
-    if len(args.validation_data_paths) == 0:
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets = load_data_dir(tgt_data_path, trajectory_dt, args, do_prep=False)
-            traj_train_one, traj_test_one = train_test_split(traj_targets, test_size=0.2, random_state=26525)
-            traj_targets_train.extend(traj_train_one)
-            traj_targets_test.extend(traj_test_one)
-    else:
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
-        for tgt_data_path in args.validation_data_paths:
-            traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
-
-    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
-    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
-    
-    os.makedirs(os.path.join(model_path, model_name_target_str), exist_ok=True)
-    with open(os.path.join(model_path, model_name_target_str, f"{model_name_wo_epochs}_train_test_split.json"), "w", encoding="utf-8") as f:
-        json.dump({"train": traj_targets_train_traj_numbers, "test": traj_targets_test_traj_numbers}, f)
-
-    phase_to_model = args.sbi_phase
-    traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
-    traj_targets_test = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_test]
-
-    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
-    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
-
-    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
-    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
-
-    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any([torch.isnan(x).any() for x in traj_targets_test_posvel]):
-        raise ValueError("There are NaNs in the calculated coordinate conversion arrays.")
-
-    stacked_posvel = np.vstack(traj_targets_train_posvel)
-    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"] if args.frame == "dcu" else (["GR", "Down", "dotGR", "dotD", "VTheta"] if args.frame == "grdth" else (["s", "h", "v_s", "v_alpha", "v_h"] if args.geodesic_mode == "integrated" else ["s", "az", "h", "v_s", "v_alpha", "v_h"]))
-    
-    plot_column_distributions(stacked_posvel, column_names=column_names, data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)))
-    plot_correlation_matrix(stacked_posvel, column_names=column_names, data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)))
-
-    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
-
-    node, model_name = train_NEXT(
-        model_name, traj_targets_train_posvel, traj_targets_test_posvel, scaler_traj,
-        model_save_path, trajectory_dt, batch_size, args.use_scalar, model_states,
-        args.aug_dim, args.nhidden, args.gpu_index, args.model_type, args.frame
-    )
-
-
-if __name__ == "__main__":
-    main()
+BEFORE
+
+((.venv) ) 1010670000@magenta-gorilla-0:~/lm_cm_repos/next$ python NEXT_training_cl_new.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 10000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_cl_new2/GEODESIC/glide --frame geodesic --model-type gruode --ref-ecef glide --sbi-phase glide --geodesic-mode integrated
+there is a gpu in this node
+_CudaDeviceProperties(name='NVIDIA A100-SXM4-80GB', major=8, minor=0, total_memory=81152MB, multi_processor_count=108, uuid=78c6e557-8c9e-39eb-078b-37a803194bd9, pci_bus_id=78, pci_device_id=0, pci_domain_id=0, L2_cache_size=40MB)
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f140dc7fd40>, 0.0001)
+[INFO] Epoch 5: loss: 11.5489273 pos_err: 137236.5625000 vel_err: 376.9192810 val_loss: 5.0932822 val_pos_err: 101771.4765625 val_vel_err: 292.4035645
+[INFO] Epoch 10: loss: 5.1591563 pos_err: 68769.1640625 vel_err: 381.8367920 val_loss: 3.1536002 val_pos_err: 56093.4687500 val_vel_err: 285.1954041
+[INFO] Epoch 15: loss: 2.4125919 pos_err: 44393.7226562 vel_err: 295.4090881 val_loss: 1.4953325 val_pos_err: 39591.4453125 val_vel_err: 218.1306152
+[INFO] Epoch 20: loss: 1.3434603 pos_err: 42088.8945312 vel_err: 141.8657227 val_loss: 0.9824725 val_pos_err: 29542.2070312 val_vel_err: 105.1357880
+[INFO] Epoch 25: loss: 1.2078400 pos_err: 28089.5996094 vel_err: 122.0933380 val_loss: 0.6319822 val_pos_err: 19887.0000000 val_vel_err: 112.5046234
+[INFO] Epoch 30: loss: 0.6801015 pos_err: 25082.9277344 vel_err: 115.3330231 val_loss: 0.4833917 val_pos_err: 24334.5292969 val_vel_err: 110.3056259
+[INFO] Epoch 35: loss: 0.6376612 pos_err: 22850.1542969 vel_err: 119.5080795 val_loss: 0.4218898 val_pos_err: 22182.9863281 val_vel_err: 113.7373199
+[INFO] Epoch 40: loss: 0.4603722 pos_err: 19464.4824219 vel_err: 110.7605591 val_loss: 0.2739958 val_pos_err: 17538.4160156 val_vel_err: 102.1494217
+[INFO] Epoch 45: loss: 0.3769855 pos_err: 19378.8066406 vel_err: 90.2577744 val_loss: 0.3142552 val_pos_err: 20017.0957031 val_vel_err: 78.0196991
+[INFO] Epoch 50: loss: 0.4823918 pos_err: 26629.0585938 vel_err: 91.8833160 val_loss: 0.4104284 val_pos_err: 21704.0546875 val_vel_err: 84.5254288
+[INFO] Epoch 55: loss: 0.8539124 pos_err: 37009.0781250 vel_err: 107.2493210 val_loss: 0.3204584 val_pos_err: 18934.3203125 val_vel_err: 90.8519821
+[INFO] Epoch 60: loss: 0.6595111 pos_err: 36076.2539062 vel_err: 89.4926453 val_loss: 0.6316493 val_pos_err: 19757.8769531 val_vel_err: 84.7312546
+[INFO] Early stopping triggered at 63
+running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x7f140de26000>, 0.0001)
+[INFO] Epoch 5: loss: 18.7104626 pos_err: 209166.5625000 vel_err: 200.8824768 val_loss: 8.5639429 val_pos_err: 97133.2031250 val_vel_err: 184.3262787
+[INFO] Epoch 10: loss: 11.5080814 pos_err: 119603.1171875 vel_err: 193.3850250 val_loss: 7.2276897 val_pos_err: 108704.2421875 val_vel_err: 176.7114868
+[INFO] Epoch 15: loss: 10.1042776 pos_err: 126198.6093750 vel_err: 194.2091522 val_loss: 6.2873449 val_pos_err: 110717.3593750 val_vel_err: 178.2315674
+[INFO] Epoch 20: loss: 9.8939486 pos_err: 112856.6015625 vel_err: 197.0493164 val_loss: 6.6562047 val_pos_err: 96800.7734375 val_vel_err: 188.0705566
+[INFO] Epoch 25: loss: 8.7742825 pos_err: 106595.5156250 vel_err: 178.5514069 val_loss: 5.2975554 val_pos_err: 93904.7968750 val_vel_err: 180.6483612
+[INFO] Epoch 30: loss: 7.6265407 pos_err: 103467.0000000 vel_err: 196.5759430 val_loss: 4.5221019 val_pos_err: 92416.3046875 val_vel_err: 178.4968872
+[INFO] Epoch 35: loss: 5.4664583 pos_err: 84305.4296875 vel_err: 199.8304901 val_loss: 3.2539995 val_pos_err: 66352.5859375 val_vel_err: 180.0121460
+[INFO] Epoch 40: loss: 4.6842990 pos_err: 91850.9921875 vel_err: 180.9779510 val_loss: 3.7261248 val_pos_err: 72137.2968750 val_vel_err: 168.4192963
+[INFO] Epoch 45: loss: 3.5550516 pos_err: 62748.8046875 vel_err: 187.7500000 val_loss: 2.8983402 val_pos_err: 48216.9023438 val_vel_err: 192.1906891
+[INFO] Epoch 50: loss: 2.3140249 pos_err: 47223.9179688 vel_err: 191.0465546 val_loss: 1.6536549 val_pos_err: 45791.1210938 val_vel_err: 172.6754456
+[INFO] Epoch 55: loss: 2.8471622 pos_err: 73789.0468750 vel_err: 164.4658356 val_loss: 2.0859361 val_pos_err: 71919.4453125 val_vel_err: 159.7595062
+[INFO] Epoch 60: loss: 2.4697399 pos_err: 54647.7304688 vel_err: 168.6746674 val_loss: 1.4661461 val_pos_err: 46568.2539062 val_vel_err: 158.2001190
+[INFO] Epoch 65: loss: 2.4020104 pos_err: 56769.0781250 vel_err: 156.2013550 val_loss: 1.2617975 val_pos_err: 36102.3593750 val_vel_err: 157.8933868
+[INFO] Epoch 70: loss: 1.3344622 pos_err: 37450.9179688 vel_err: 163.1627502 val_loss: 1.3241909 val_pos_err: 45868.5195312 val_vel_err: 150.5406952
+[INFO] Epoch 75: loss: 1.4555804 pos_err: 36777.9414062 vel_err: 159.5972290 val_loss: 1.1391841 val_pos_err: 37692.1601562 val_vel_err: 147.6149445
+[INFO] Epoch 80: loss: 3.0669637 pos_err: 35271.3945312 vel_err: 180.8253174 val_loss: 1.5245253 val_pos_err: 31848.5390625 val_vel_err: 163.5718079
+[INFO] Epoch 85: loss: 1.5769020 pos_err: 43975.9882812 vel_err: 165.3056030 val_loss: 1.8956692 val_pos_err: 35198.0234375 val_vel_err: 166.7084198
+[INFO] Epoch 90: loss: 1.8391699 pos_err: 45307.0351562 vel_err: 153.3103638 val_loss: 1.4709196 val_pos_err: 25594.9394531 val_vel_err: 164.6906738
+[INFO] Epoch 95: loss: 2.7323427 pos_err: 45758.6484375 vel_err: 145.3114014 val_loss: 1.2077290 val_pos_err: 30000.1425781 val_vel_err: 151.6985931
+[INFO] Early stopping triggered at 97
+running length strategy (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x7f14174aff20>, 5e-05)
+[INFO] Epoch 5: loss: 6.4812703 pos_err: 84752.3125000 vel_err: 231.9257202 val_loss: 5.6629200 val_pos_err: 94703.8437500 val_vel_err: 243.1028442
+[INFO] Epoch 10: loss: 4.1447215 pos_err: 87112.4531250 vel_err: 228.0960083 val_loss: 3.4909966 val_pos_err: 70855.3125000 val_vel_err: 240.8474426
+[INFO] Epoch 15: loss: 3.4594676 pos_err: 63491.1328125 vel_err: 217.2687836 val_loss: 3.1640222 val_pos_err: 61946.8046875 val_vel_err: 229.3823395
+[INFO] Epoch 20: loss: 2.7347682 pos_err: 53171.7773438 vel_err: 206.0656738 val_loss: 2.2635331 val_pos_err: 42172.1835938 val_vel_err: 217.7899933
+
+AFTER
+
+((.venv) ) 1010670000@magenta-gorilla-0:~/lm_cm_repos/next$ python NEXT_training_cl_new.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 10000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_cl_new2/GEODESIC/glide --frame geodesic --model-type gruode --ref-ecef glide --sbi-phase glide --geodesic-mode integrated
+there is a gpu in this node
+_CudaDeviceProperties(name='NVIDIA A100-SXM4-80GB', major=8, minor=0, total_memory=81152MB, multi_processor_count=108, uuid=78c6e557-8c9e-39eb-078b-37a803194bd9, pci_bus_id=78, pci_device_id=0, pci_domain_id=0, L2_cache_size=40MB)
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f08b3d98860>, 0.0001)
+[INFO] Epoch 5: loss: 24.5472546 pos_err: 124573.9140625 vel_err: 374.5674744 val_loss: 13.0339909 val_pos_err: 107594.9218750 val_vel_err: 290.0299683
+[INFO] Epoch 10: loss: 11.0719681 pos_err: 70004.3828125 vel_err: 378.8341675 val_loss: 6.6558690 val_pos_err: 53704.4375000 val_vel_err: 279.5674133
+[INFO] Epoch 15: loss: 5.1029892 pos_err: 47818.5195312 vel_err: 289.7875061 val_loss: 3.4784944 val_pos_err: 35915.0390625 val_vel_err: 213.8249969
+[INFO] Epoch 20: loss: 3.2244387 pos_err: 43229.5117188 vel_err: 133.7256927 val_loss: 1.8673297 val_pos_err: 24333.3378906 val_vel_err: 107.0251846
+[INFO] Epoch 25: loss: 1.9390576 pos_err: 27639.2070312 vel_err: 119.0608444 val_loss: 1.3978038 val_pos_err: 20997.4687500 val_vel_err: 103.0802231
+[INFO] Epoch 30: loss: 1.7407135 pos_err: 23231.9765625 vel_err: 125.5409012 val_loss: 1.0058165 val_pos_err: 26640.8300781 val_vel_err: 110.0589218
+[INFO] Epoch 35: loss: 1.4455872 pos_err: 23120.4296875 vel_err: 126.0045853 val_loss: 1.1173494 val_pos_err: 19357.8378906 val_vel_err: 122.6215439
+[INFO] Epoch 40: loss: 1.3056893 pos_err: 21172.8808594 vel_err: 116.8780518 val_loss: 0.8725624 val_pos_err: 20390.5019531 val_vel_err: 113.4580383
+[INFO] Epoch 45: loss: 1.1115156 pos_err: 24968.2324219 vel_err: 107.1228943 val_loss: 1.0229588 val_pos_err: 24222.7792969 val_vel_err: 93.8285446
+[INFO] Epoch 50: loss: 0.8323253 pos_err: 18937.9550781 vel_err: 96.6037979 val_loss: 0.7212502 val_pos_err: 21746.7500000 val_vel_err: 83.6485367
+[INFO] Epoch 55: loss: 0.7000778 pos_err: 20739.2285156 vel_err: 92.5079346 val_loss: 0.6456699 val_pos_err: 20644.6933594 val_vel_err: 81.8566513
+[INFO] Epoch 60: loss: 1.0010129 pos_err: 34743.1406250 vel_err: 87.7282639 val_loss: 0.8829705 val_pos_err: 30602.3945312 val_vel_err: 79.1878738
+[INFO] Epoch 65: loss: 1.0195332 pos_err: 26785.9101562 vel_err: 84.1563797 val_loss: 0.6182137 val_pos_err: 17961.4921875 val_vel_err: 77.8991089
+[INFO] Epoch 70: loss: 0.8174362 pos_err: 27660.0839844 vel_err: 84.8713837 val_loss: 0.5970414 val_pos_err: 24087.4238281 val_vel_err: 77.5663910
+[INFO] Epoch 75: loss: 0.5585769 pos_err: 17026.0878906 vel_err: 77.4446869 val_loss: 0.5837734 val_pos_err: 22568.3925781 val_vel_err: 75.8701553
+[INFO] Epoch 80: loss: 0.9834051 pos_err: 16854.0839844 vel_err: 88.0751724 val_loss: 0.6163719 val_pos_err: 13935.1562500 val_vel_err: 79.4990158
+[INFO] Epoch 85: loss: 1.5442619 pos_err: 17697.3183594 vel_err: 73.9146194 val_loss: 0.8033379 val_pos_err: 22372.2929688 val_vel_err: 69.3386154
+[INFO] Epoch 90: loss: 0.9570066 pos_err: 30340.4550781 vel_err: 72.3800964 val_loss: 0.4673294 val_pos_err: 17432.4609375 val_vel_err: 69.9572830
+[INFO] Epoch 95: loss: 1.2715846 pos_err: 28775.8574219 vel_err: 78.9435120 val_loss: 1.4000566 val_pos_err: 32980.6835938 val_vel_err: 77.2203445
+[INFO] Epoch 100: loss: 0.5341910 pos_err: 20111.0019531 vel_err: 82.7187958 val_loss: 0.4128913 val_pos_err: 15262.2783203 val_vel_err: 74.6708832
+[INFO] Epoch 105: loss: 0.4853089 pos_err: 15406.1054688 vel_err: 76.8604813 val_loss: 0.3537918 val_pos_err: 15519.4785156 val_vel_err: 76.0697098
+[INFO] Epoch 110: loss: 0.7083286 pos_err: 16319.1572266 vel_err: 75.7230301 val_loss: 0.3758854 val_pos_err: 15655.7246094 val_vel_err: 73.7567825
+[INFO] Epoch 115: loss: 0.4235264 pos_err: 16712.6386719 vel_err: 76.4183655 val_loss: 0.3421114 val_pos_err: 14883.4326172 val_vel_err: 73.3564377
+[INFO] Epoch 120: loss: 0.5652084 pos_err: 19288.6660156 vel_err: 75.8123245 val_loss: 0.3795959 val_pos_err: 15678.1240234 val_vel_err: 71.8623734
+[INFO] Epoch 125: loss: 0.4714188 pos_err: 16667.3535156 vel_err: 73.6454010 val_loss: 0.4511459 val_pos_err: 15240.8359375 val_vel_err: 73.4185410
+[INFO] Epoch 130: loss: 0.3861125 pos_err: 14930.6425781 vel_err: 72.7521515 val_loss: 0.4855535 val_pos_err: 13909.4130859 val_vel_err: 74.7664337
+[INFO] Epoch 135: loss: 0.4761601 pos_err: 14977.2666016 vel_err: 73.9906921 val_loss: 0.4572294 val_pos_err: 16108.9433594 val_vel_err: 71.4249573
+[INFO] Epoch 140: loss: 0.4316718 pos_err: 13927.9218750 vel_err: 76.4456635 val_loss: 0.3501784 val_pos_err: 15859.3339844 val_vel_err: 71.7131805
+[INFO] Epoch 145: loss: 0.4215541 pos_err: 14120.3769531 vel_err: 68.0509186 val_loss: 0.3636445 val_pos_err: 15601.4277344 val_vel_err: 68.5271606
+[INFO] Epoch 150: loss: 0.5394167 pos_err: 15133.0937500 vel_err: 66.9379349 val_loss: 0.3117991 val_pos_err: 13524.4951172 val_vel_err: 69.9673691
+[INFO] Epoch 155: loss: 0.6795877 pos_err: 25015.1738281 vel_err: 66.5210724 val_loss: 0.3596543 val_pos_err: 14697.2500000 val_vel_err: 67.3725662
+[INFO] Epoch 160: loss: 0.5449451 pos_err: 14924.8759766 vel_err: 64.6487579 val_loss: 0.5944775 val_pos_err: 21269.7851562 val_vel_err: 65.7096863
+[INFO] Epoch 165: loss: 0.4300822 pos_err: 14553.1796875 vel_err: 71.3626404 val_loss: 0.4688291 val_pos_err: 12871.4306641 val_vel_err: 64.5577698
+[INFO] Epoch 170: loss: 0.5766100 pos_err: 23747.4765625 vel_err: 67.3812332 val_loss: 0.4680797 val_pos_err: 20473.3125000 val_vel_err: 70.2283783
+[INFO] Epoch 175: loss: 0.2817225 pos_err: 12510.8134766 vel_err: 67.0262070 val_loss: 0.5737997 val_pos_err: 13484.9121094 val_vel_err: 71.5155334
+[INFO] Epoch 180: loss: 1.9460025 pos_err: 17646.7617188 vel_err: 63.0165024 val_loss: 0.8478528 val_pos_err: 13167.7187500 val_vel_err: 63.6170273
+[INFO] Epoch 185: loss: 0.5944626 pos_err: 26879.9042969 vel_err: 67.2407074 val_loss: 0.4076076 val_pos_err: 15571.1113281 val_vel_err: 64.9205399
+[INFO] Epoch 190: loss: 0.6723072 pos_err: 20737.5058594 vel_err: 64.2400055 val_loss: 0.4971430 val_pos_err: 15072.7861328 val_vel_err: 64.9399033
+[INFO] Epoch 195: loss: 0.5014592 pos_err: 14408.6796875 vel_err: 64.9212418 val_loss: 0.2578456 val_pos_err: 10929.3994141 val_vel_err: 68.5472717
+[INFO] Epoch 200: loss: 0.3318990 pos_err: 12910.2841797 vel_err: 68.0382614 val_loss: 0.3613629 val_pos_err: 14046.8867188 val_vel_err: 67.8580170
+[INFO] Epoch 205: loss: 0.3211516 pos_err: 12855.2412109 vel_err: 66.9436188 val_loss: 0.3760695 val_pos_err: 11960.7685547 val_vel_err: 65.9589386
+[INFO] Epoch 210: loss: 0.4554390 pos_err: 18378.6425781 vel_err: 64.9392776 val_loss: 0.3698859 val_pos_err: 13749.6201172 val_vel_err: 64.3358459
+[INFO] Epoch 215: loss: 0.3940905 pos_err: 15637.6328125 vel_err: 63.4982452 val_loss: 0.3134039 val_pos_err: 12285.6542969 val_vel_err: 67.5536423
+[INFO] Epoch 220: loss: 0.3764263 pos_err: 12543.9843750 vel_err: 65.6934128 val_loss: 0.3025776 val_pos_err: 9859.1230469 val_vel_err: 66.1029510
+[INFO] Epoch 225: loss: 0.3409610 pos_err: 12331.9130859 vel_err: 64.6000214 val_loss: 0.3529646 val_pos_err: 14457.4160156 val_vel_err: 62.8646164
+[INFO] Epoch 230: loss: 0.3836626 pos_err: 14892.5849609 vel_err: 63.1312828 val_loss: 0.2609029 val_pos_err: 13591.7148438 val_vel_err: 64.5614853
+[INFO] Epoch 235: loss: 0.3358183 pos_err: 12439.2656250 vel_err: 63.3394279 val_loss: 0.3177857 val_pos_err: 9710.4169922 val_vel_err: 67.2390060
+[INFO] Early stopping triggered at 238
+running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x7f08aabf2fc0>, 3e-05)
+[INFO] Epoch 5: loss: 8.9180155 pos_err: 54238.5585938 vel_err: 152.0111847 val_loss: 10.7845993 val_pos_err: 37651.0117188 val_vel_err: 157.9198608
+[INFO] Epoch 10: loss: 7.2939320 pos_err: 41062.7695312 vel_err: 133.6967316 val_loss: 4.9611402 val_pos_err: 25965.1542969 val_vel_err: 139.8751373
+[INFO] Epoch 15: loss: 6.3604603 pos_err: 44085.9726562 vel_err: 155.5002136 val_loss: 4.3162141 val_pos_err: 39080.0195312 val_vel_err: 151.3788300
+[INFO] Epoch 20: loss: 4.0632501 pos_err: 48061.6289062 vel_err: 138.1952362 val_loss: 4.5323143 val_pos_err: 46902.8320312 val_vel_err: 149.9822693
+[INFO] Epoch 25: loss: 2.9589825 pos_err: 35588.5898438 vel_err: 141.0675049 val_loss: 3.0517230 val_pos_err: 24986.2695312 val_vel_err: 151.8018799
+[INFO] Epoch 30: loss: 3.4829650 pos_err: 33135.3789062 vel_err: 139.0571594 val_loss: 2.1561370 val_pos_err: 22343.3984375 val_vel_err: 149.7116852
+[INFO] Epoch 35: loss: 2.6516013 pos_err: 33094.4531250 vel_err: 141.9166718 val_loss: 2.4544394 val_pos_err: 25452.4746094 val_vel_err: 153.3426056
+[INFO] Epoch 40: loss: 3.6716063 pos_err: 29761.4140625 vel_err: 146.4195709 val_loss: 2.5401423 val_pos_err: 26935.3554688 val_vel_err: 149.9470367
+[INFO] Epoch 45: loss: 2.3520467 pos_err: 30869.5742188 vel_err: 139.8661346 val_loss: 2.4524901 val_pos_err: 30020.7011719 val_vel_err: 148.2257385
+[INFO] Epoch 50: loss: 2.7315547 pos_err: 38260.8242188 vel_err: 140.7675171 val_loss: 2.2648363 val_pos_err: 26247.3906250 val_vel_err: 149.0194397
+[INFO] Epoch 55: loss: 2.6505704 pos_err: 30150.2226562 vel_err: 138.4886017 val_loss: 1.9102032 val_pos_err: 27392.6757812 val_vel_err: 146.5182037
+[INFO] Epoch 60: loss: 2.0542057 pos_err: 28063.4882812 vel_err: 139.5573730 val_loss: 2.1299753 val_pos_err: 24498.3300781 val_vel_err: 150.1067963
+[INFO] Epoch 65: loss: 1.8118428 pos_err: 25821.5839844 vel_err: 140.2382202 val_loss: 1.9219925 val_pos_err: 29063.0449219 val_vel_err: 148.0136261

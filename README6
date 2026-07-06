@@ -45,7 +45,6 @@ from coordinate_transform_functions import (
     ned_to_ecef_velocity,
 )
 from energy_functions import mechanical_energy
-from gru_ode import GRUODEFunc, GRUODEPredictorModel
 from load_truth import load_single_truth
 from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
 
@@ -68,21 +67,6 @@ from NEXT_frames import (
     local_geodesic_to_ecef_vec,
     next_dcu_to_ecef,
     next_grdth_to_ecef,
-)
-
-# Frame-trick geodesic transforms (Jackson's addition). The "integrated" mode
-# drops absolute azimuth from the state and instead tracks the azimuth *rate*
-# (v_alpha), reconstructing azimuth by integration on the inverse transform.
-# This is the geodesic analogue of the GRDTH theta-dot trick and yields a
-# 5-state vector [s, h, v_s, v_alpha, v_h] that removes the along-azimuth
-# degree of freedom the ODE would otherwise have to memorize.
-#
-# NOTE: the module file is NEXT_geodesic_frame.py. Jackson's draft imported it
-# as `NEXT_Geodesic_Frame`, which resolves only on case-insensitive
-# filesystems; we import the lowercase module name so it works on Linux too.
-from NEXT_geodesic_frame import (
-    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
-    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
 )
 from torchdiffeq_solver import TorchdiffeqSolver
 from trajectory_helpers import (
@@ -108,6 +92,10 @@ from trajectory_helpers import (
 # python NEXT_training.py --tgt-data-paths datasets/mini/simple_ballistic_trajs --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200
 # python NEXT_training.py --tgt-data-paths datasets/mini/PrSM --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 200 -o model_outputs/PrSM_mini50_energy
 # python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200 -o model_outputs/PrSM
+
+# GRU-ODE (De Brouwer et al. 2019). Recommended starting point:
+# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --frame dcu --model-type gruode --latent-dim 64 --nhidden 200 --recon-weight 0.1 -o model_outputs/PrSM_gruode
+# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --frame grdth --model-type gruode --latent-dim 64 --nhidden 200 --recon-weight 0.1 --boundary-weight 0.01 -o model_outputs/PrSM_gruode_grdth
 
 # SBI
 # python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/DF_5 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/DF_5_v001
@@ -175,6 +163,291 @@ class ODEfunc(torch.nn.Module):
             # return torch.cat((v, out), dim=x.ndim - 1)  # TODO: subtract a small MLP here for dissipation on the acceleration term
         else:
             return out
+
+
+# =====================================================================
+#  GRU-ODE (De Brouwer, Simm, Arany, Moreau — "GRU-ODE-Bayes", NeurIPS 2019)
+# =====================================================================
+# The classes below implement a continuous-time GRU hidden process that is
+# integrated jointly with the physical trajectory state by the existing ODE
+# solver stack (Euler / RK4 / torchdiffeq / dopri5).
+#
+# ODE state layout (last dim):   s = [ x (D physical states) | h (H latents) ]
+#
+#   dh/dt = (1 - z(x,h)) ∘ (g(x,h) - h)          (paper Eq. 3 / Appendix A)
+#   dx/dt = [ kinematic shift of velocities | MLP([x,h]) ]
+#
+# Properties inherited from the paper that matter for chaotic kinematic
+# trajectories:
+#   * h(t) is invariant on [-1, 1] (negative feedback term) → bounded latents,
+#     which damps phugoid-mode blow-up during long free-run rollouts.
+#   * The field is Lipschitz (K=2 on the latent block) → a continuity prior on
+#     the hidden process, which the paper shows is decisive in the
+#     small-sample regime (Table 2) — exactly the few-trajectories-per-target
+#     situation of this pipeline.
+#   * Purely elementwise gates + Linear layers → clean ONNX opset-18 export
+#     (Sigmoid, Tanh, MatMul/Gemm, Mul, Sub, Concat only).
+#
+# GRU-Bayes: in this pipeline the truth is resampled onto a uniform dt grid
+# and the harness forecasts from a single initial condition, so the sporadic
+# jump machinery collapses to a single Bayes update at t=0 from the empty
+# prior h(0-)=0. That update is implemented in GRUBayesInit below (discrete
+# GRU gate math, so h(0+) ∈ [-1,1] as required for the invariance property).
+# If sporadic mid-rollout measurements are introduced later, apply
+# GRUBayesInit.update(h, x_obs) at each observation time between solver
+# segments — no other change is needed.
+
+
+class GRUODECell(torch.nn.Module):
+    """Full continuous-time GRU cell: dh/dt = (1 - z) ∘ (g - h).
+
+    x(t) is the continuous input signal — here the physical trajectory state
+    riding in the same ODE state vector, giving the tight ODE/input
+    interleaving the paper argues for (vs. decoupled encoder-decoder NODEs).
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.lin_rx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
+        self.lin_rh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.lin_zx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
+        self.lin_zh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.lin_gx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
+        self.lin_gh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        r = torch.sigmoid(self.lin_rx(x) + self.lin_rh(h))
+        z = torch.sigmoid(self.lin_zx(x) + self.lin_zh(h))
+        g = torch.tanh(self.lin_gx(x) + self.lin_gh(r * h))
+        return (1.0 - z) * (g - h)
+
+
+class MinimalGRUODECell(torch.nn.Module):
+    """Minimal GRU-ODE variant (paper Appendix G): one gate, ~2/3 the params.
+
+    dh/dt = (1 - f) ∘ (tanh(W_h x + U_h (h ∘ f) + b_h) - h)
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int):
+        super().__init__()
+        self.lin_fx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
+        self.lin_fh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.lin_gx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
+        self.lin_gh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
+
+    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+        f = torch.sigmoid(self.lin_fx(x) + self.lin_fh(h))
+        g = torch.tanh(self.lin_gx(x) + self.lin_gh(h * f))
+        return (1.0 - f) * (g - h)
+
+
+class GRUBayesInit(torch.nn.Module):
+    """GRU-Bayes observation update, specialized to the t=0 initial condition.
+
+    Discrete GRU gate math applied once from the empty prior h(0-) = 0:
+        h(0+) = z ∘ h(0-) + (1 - z) ∘ g  =  (1 - z) ∘ g   ∈ [-1, 1]
+    The f_prep step of Appendix D reduces to a Linear+ReLU lift of the fully
+    observed state vector (mask ≡ 1 on this uniformly resampled data).
+    Implemented manually (not torch.nn.GRUCell) so that the standalone ONNX
+    export traces to primitive ops only.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, prep_dim: int | None = None):
+        super().__init__()
+        prep_dim = prep_dim or 2 * hidden_dim
+        self.prep = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, prep_dim),
+            torch.nn.ReLU(inplace=False),
+        )
+        self.lin_z = torch.nn.Linear(prep_dim, hidden_dim, bias=True)
+        self.lin_g = torch.nn.Linear(prep_dim, hidden_dim, bias=True)
+
+    def forward(self, x0: torch.Tensor) -> torch.Tensor:
+        q = self.prep(x0)
+        z = torch.sigmoid(self.lin_z(q))
+        g = torch.tanh(self.lin_g(q))
+        return (1.0 - z) * g  # h(0-) = 0 ⇒ z ∘ h(0-) vanishes
+
+    def update(self, h: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
+        """General GRU-Bayes jump h(t-) → h(t+) for future sporadic-obs use."""
+        q = self.prep(x_obs)
+        z = torch.sigmoid(self.lin_z(q))
+        g = torch.tanh(self.lin_g(q))
+        return z * h + (1.0 - z) * g
+
+
+class GRUODEFunc(torch.nn.Module):
+    """Joint ODE field over s = [x_phys, h_latent] for the NODE solver stack.
+
+    * Latent block: GRU-ODE (full or minimal cell) driven continuously by x(t).
+    * Physical block: second-order kinematic structure. The derivative of the
+      integrated position-like states is copied *exactly* from the velocity
+      states (with the correct affine correction when the states are
+      standardized: d x̂_p/dt = (σ_v x̂_v + μ_v)/σ_p), and only the true
+      dynamics (accelerations, heading-rate derivative) are learned by an MLP
+      conditioned on [x, h].
+
+    forward signature is (t, s) to match torchdiffeq; s: (..., D + H).
+    """
+
+    def __init__(
+        self,
+        state_dim: int,
+        latent_dim: int,
+        nhidden: int,
+        order_shift_slice: slice | None = None,
+        minimal: bool = False,
+        scaler=None,
+    ):
+        super().__init__()
+        self.state_dim = state_dim
+        self.latent_dim = latent_dim
+        self.order_shift_slice = order_shift_slice
+        self.len_of_order_shift_slice = 0
+        if order_shift_slice is not None:
+            self.len_of_order_shift_slice = len(range(*order_shift_slice.indices(state_dim)))
+
+        cell_cls = MinimalGRUODECell if minimal else GRUODECell
+        self.gru_ode = cell_cls(state_dim, latent_dim)
+        self.init_net = GRUBayesInit(state_dim, latent_dim)
+
+        dx_out = state_dim - self.len_of_order_shift_slice
+        self.act1 = torch.nn.SiLU(inplace=False)
+        self.act2 = torch.nn.SiLU(inplace=False)
+        self.fc1 = torch.nn.Linear(state_dim + latent_dim, nhidden)
+        self.fc2 = torch.nn.Linear(nhidden, nhidden)
+        self.fc3 = torch.nn.Linear(nhidden, dx_out)
+
+        # linear latent readout used as an autoencoder-style consistency head
+        # during training (not part of the exported ODE field)
+        self.latent_readout = torch.nn.Linear(latent_dim, state_dim)
+
+        # affine correction for the kinematic shift under StandardScaler
+        n_shift = max(self.len_of_order_shift_slice, 1)
+        vel_scale = torch.ones(n_shift)
+        vel_mean = torch.zeros(n_shift)
+        pos_scale = torch.ones(n_shift)
+        if scaler is not None and order_shift_slice is not None:
+            vs = order_shift_slice.start
+            length = self.len_of_order_shift_slice
+            vel_scale = torch.tensor(scaler.scale_[vs : vs + length], dtype=torch.float32)
+            vel_mean = torch.tensor(scaler.mean_[vs : vs + length], dtype=torch.float32)
+            pos_scale = torch.tensor(scaler.scale_[0:length], dtype=torch.float32)
+        self.register_buffer("shift_vel_scale", vel_scale)
+        self.register_buffer("shift_vel_mean", vel_mean)
+        self.register_buffer("shift_pos_scale", pos_scale)
+
+        self.nfe = 0
+
+    def init_hidden(self, x0: torch.Tensor) -> torch.Tensor:
+        """GRU-Bayes update at t=0 from empty prior. h(0) ∈ [-1, 1]."""
+        return self.init_net(x0)
+
+    def forward(self, t, s: torch.Tensor) -> torch.Tensor:  # torchdiffeq signature
+        self.nfe += 1
+        x = torch.narrow(s, dim=-1, start=0, length=self.state_dim)
+        h = torch.narrow(s, dim=-1, start=self.state_dim, length=self.latent_dim)
+
+        # latent flow (bounded, Lipschitz)
+        dh = self.gru_ode(x, h)
+
+        # learned physical dynamics conditioned on [x, h]
+        out = self.fc1(torch.cat((x, h), dim=-1))
+        out = self.act1(out)
+        out = self.fc2(out)
+        out = self.act2(out)
+        dx_free = self.fc3(out)
+
+        if self.order_shift_slice is not None:
+            v = torch.narrow(s, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
+            # exact d(pos)/dt = vel, corrected for standardization
+            dpos = (v * self.shift_vel_scale + self.shift_vel_mean) / self.shift_pos_scale
+            dx = torch.cat((dpos, dx_free), dim=s.ndim - 1)
+        else:
+            dx = dx_free
+        return torch.cat((dx, dh), dim=s.ndim - 1)
+
+
+class GRUODEPredictor(NODEPredictor):
+    """NODEPredictor whose ODE state is [x_phys | h_latent].
+
+    Overrides batch_loss/infer to (1) run the GRU-Bayes initial update to get
+    h(0), (2) integrate the joint state, (3) score the loss on the physical
+    slice only, plus two optional physics-informed regularizers:
+      * latent autoencoder reconstruction: readout(h_t) ≈ x_t (target), which
+        forces h to encode the full kinematic state and stabilizes long
+        rollouts,
+      * physical boundary penalty: soft hinge on the frame invariant
+        (Up ≥ 0 in DCU/geodesic, GroundRange ≥ 0 in GRDTH), evaluated in
+        unscaled physical units.
+    """
+
+    def __init__(
+        self,
+        *nargs,
+        recon_weight: float = 0.1,
+        boundary_weight: float = 0.0,
+        boundary_idx: int | None = None,
+        scaler=None,
+        **kwargs,
+    ):
+        super().__init__(*nargs, **kwargs)
+        self.recon_weight = recon_weight
+        self.boundary_weight = boundary_weight
+        self.boundary_idx = boundary_idx
+        # differentiable unscale constants for the boundary term
+        if scaler is not None and boundary_idx is not None:
+            self.register_buffer(
+                "bnd_scale", torch.tensor(float(scaler.scale_[boundary_idx]), dtype=torch.float32)
+            )
+            self.register_buffer("bnd_mean", torch.tensor(float(scaler.mean_[boundary_idx]), dtype=torch.float32))
+        else:
+            self.register_buffer("bnd_scale", torch.tensor(1.0))
+            self.register_buffer("bnd_mean", torch.tensor(0.0))
+
+    def batch_loss(self, x: torch.Tensor, extra_feat: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
+        if self.solver.adjoint:
+            raise NotImplementedError("GRUODEPredictor uses torchdiffeq's odeint_adjoint via the solver method flag")
+        batch_size, time_steps, n_features = x.shape
+        x0 = x[:, 0]
+        h0 = self.model.init_hidden(x0)  # GRU-Bayes jump from empty prior
+        s0 = torch.cat((x0, h0), dim=-1)
+
+        s_pred = self.solver.integrate(
+            func=self.model,
+            x0=s0,
+            steps=time_steps - 1,
+            extra_feat=extra_feat,
+        )
+        x_pred = s_pred[:, :, : self.model.state_dim]
+        h_pred = s_pred[:, :, self.model.state_dim :]
+
+        x_pred = torch.nan_to_num(x_pred, nan=0)
+        x_tgt = torch.nan_to_num(x, nan=0)
+        metrics = self.criterion(x_pred, x_tgt)
+
+        if self.recon_weight > 0:
+            recon = self.model.latent_readout(h_pred)
+            recon_loss = torch.nn.functional.mse_loss(recon, x_tgt)
+            metrics["latent_recon"] = recon_loss.detach()
+            metrics["loss"] = metrics["loss"] + self.recon_weight * recon_loss
+
+        if self.boundary_weight > 0 and self.boundary_idx is not None:
+            phys = x_pred[..., self.boundary_idx] * self.bnd_scale.to(x_pred.device) + self.bnd_mean.to(
+                x_pred.device
+            )
+            boundary_loss = torch.nn.functional.relu(-phys).mean()
+            metrics["boundary_pen"] = boundary_loss.detach()
+            metrics["loss"] = metrics["loss"] + self.boundary_weight * boundary_loss
+
+        return metrics
+
+    def infer(self, x0: torch.Tensor, steps: int = 1, extra_feat: torch.Tensor | None = None) -> torch.Tensor:
+        with torch.no_grad():
+            h0 = self.model.init_hidden(x0)
+            s0 = torch.cat((x0, h0), dim=-1)
+            s = self.solver.integrate(func=self.model, x0=s0, steps=steps, extra_feat=extra_feat)
+            return s[:, :, : self.model.state_dim]
 
 
 # wrap the sklearn StandardScalar
@@ -327,6 +600,10 @@ def train_NEXT(
     gpu_index,
     model_type: str = "node",
     frame: str = "dcu",
+    latent_dim: int = 64,
+    recon_weight: float = 0.1,
+    boundary_weight: float = 0.0,
+    gruode_minimal: bool = False,
 ):
     # define initial training configuration
     training_configuration = TrainingConfiguration(
@@ -339,26 +616,12 @@ def train_NEXT(
     )
     # ode_solver = EulerSolver(dt=trajectory_dt)
     # ode_solver = RK4Solver(dt=trajectory_dt)
-    # Solver choice matters for accuracy on chaotic trajectories. The GRU-ODE
-    # paper (Appendix C) shows the adaptive Dormand-Prince method (dopri5)
-    # reaches the same accuracy as fixed-step Euler/RK4 with FEWER function
-    # evaluations, concentrating steps where the dynamics are fast (near
-    # manoeuvres) and stretching them where the trajectory is smooth. For the
-    # bounded GRU-ODE field this is a direct, low-risk accuracy win, so GRU-ODE
-    # defaults to dopri5; the plain NODE/ANODE/SONODE models keep fixed-step rk4
-    # to preserve their existing behaviour.
-    ode_method = "dopri5" if model_type in ("gruode", "gruode-min") else "rk4"
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method=ode_method, adjoint=False)
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
 
-    if frame == "dcu":
+    if frame in ("dcu", "geodesic"):
         velocity_indicies = (3, 4, 5)
-    elif frame == "grdth":
+    elif frame in ("grdth",):
         velocity_indicies = (2, 3, 4)
-    elif frame == "geodesic":
-        # geodesic-integrated is a 5-state [s, h, v_s, v_alpha, v_h] -> vel at
-        # (2, 3, 4); geodesic-original is a 6-state [s, az, h, v_s, v_alpha, v_h]
-        # -> vel at (3, 4, 5). model_states disambiguates the two modes.
-        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
     else:
         raise ValueError("That frame is not known for what the velocity indicies are")
     # Define custom loss function.
@@ -403,8 +666,21 @@ def train_NEXT(
     # )
     # early_stop_metric_name = "val_loss_unweighted"
 
-    # Define the Neural ODE model
-    node = NODEPredictor(
+    # frame-dependent second-order structure and physical boundary invariant
+    if frame in ("dcu", "geodesic"):
+        # states: [Down, Cross, Up, dotD, dotC, dotU]; d(pos)/dt = vel; Up >= 0
+        gruode_order_shift = slice(3, 6)
+        gruode_boundary_idx = 2
+    elif frame in ("grdth",):
+        # states: [GR, Down, dotGR, dotD, VTheta]; d(GR,Down)/dt = (dotGR,dotD); GR >= 0
+        gruode_order_shift = slice(2, 4)
+        gruode_boundary_idx = 0
+    else:
+        gruode_order_shift = None
+        gruode_boundary_idx = None
+
+    # Define the Neural ODE model (training harness)
+    predictor_kwargs = dict(
         architecture=FFNNArchitecture(
             layer_channels=[5, 5],  # this doesn't do anything when using ODEfunc
             # layer_activation=Activation.RELU,
@@ -419,6 +695,16 @@ def train_NEXT(
         checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
         aug_dim=aug_dim,
     )
+    if model_type == "gruode":
+        node = GRUODEPredictor(
+            recon_weight=recon_weight,
+            boundary_weight=boundary_weight,
+            boundary_idx=gruode_boundary_idx,
+            scaler=scaler_traj if use_scalar else None,
+            **predictor_kwargs,
+        )
+    else:
+        node = NODEPredictor(**predictor_kwargs)
     if HAVE_GPU:
         node.device = torch.device(f"cuda:{gpu_index}")
         node._initialize_losses(node.criterion)
@@ -454,109 +740,24 @@ def train_NEXT(
             aug_dim=0,
             order_shift_slice=slice(3, 6),
         ).to(node.device)
-    elif model_type in ("gruode", "gruode-min"):
+    elif model_type == "gruode":
         # ------------------------------------------------------------
-        #  GRU-ODE (De Brouwer et al., NeurIPS 2019) forecasting model
+        #  GRU-ODE (continuous-time GRU, De Brouwer et al. 2019)
         # ------------------------------------------------------------
-        # The solver integrates an AUGMENTED state [y_read ; h] where y_read is
-        # the physical kinematic vector (n_features = model_states) and h is the
-        # bounded GRU-ODE latent. We therefore set the NODEPredictor aug_dim to
-        # the latent width so batch_loss builds x0 = [x0_phys ; zeros(H)] and
-        # slices the leading n_features (y_read) as the prediction -- no changes
-        # to the training engine are required.
-        #
-        # Latent width: reuse nhidden as the GRU-ODE hidden size H. The MLP
-        # heads inside the cell also use H, so a single knob controls capacity.
-        gru_hidden = nhidden
-        cell_kind = "minimal" if model_type == "gruode-min" else "full"
-
-        # --- Physics-informed kinematic structure --------------------------
-        # In every supported frame the state is laid out with a leading block of
-        # position channels immediately followed by their exact time
-        # derivatives (the velocity channels), i.e.
-        #     [ p_0 ... p_{k-1} | v_0 ... v_{k-1} | extra_rates... ]
-        # where k = len(velocity_indicies) and the velocity channels start at
-        # index k. Because d(p_i)/dt = v_i is a KINEMATIC IDENTITY, we hard-wire
-        # those derivatives instead of asking the network to learn them. This is
-        # the dominant accuracy lever for trajectory integration: it eliminates
-        # position drift (phugoid / S-curve divergence) and frees all model
-        # capacity for the acceleration / force model.
-        # This holds for:
-        #   dcu (6) : pos (0,1,2), vel (3,4,5)                 -> 3 pairs
-        #   grdth(5): pos (0,1),  vel (2,3), extra Vtheta (4)  -> 2 pairs
-        #   geo-int (5): pos (0,1), vel (2,3), extra v_alpha(4)-> 2 pairs
-        #   geo-orig(6): (s,az,h) & (v_s,v_alpha,v_h)          -> 3 pairs
-        #
-        # The number of derivative pairs k is the number of LEADING POSITION
-        # channels -- i.e. velocity_indicies[0], the index at which the first
-        # velocity appears. NOTE this is NOT len(velocity_indicies): GRDTH and
-        # geodesic-integrated carry an EXTRA rate channel (Vtheta / v_alpha)
-        # that is a "velocity index" for the loss but is NOT the time-derivative
-        # of any stored position, so it must stay in the learned head. The
-        # paired velocities are exactly velocity_indicies[0:k] = (k, ..., 2k-1),
-        # which we verify below.
-        k = velocity_indicies[0]  # number of leading position channels
-        paired_vel = tuple(velocity_indicies[:k])
-        if paired_vel == tuple(range(k, 2 * k)):
-            n_derivative_pairs = k
-        else:
-            # Layout assumption violated (e.g. a future non-contiguous frame).
-            # Fall back to a fully-learned read-out rather than silently
-            # hard-wiring the wrong channels.
-            print(
-                "warning: leading velocity indices",
-                paired_vel,
-                "are not the contiguous block immediately after the positions; "
-                "disabling the kinematic-identity hard-wiring for safety.",
-            )
-            n_derivative_pairs = 0
-
-        # --- Kinematic-identity mode --------------------------------------
-        # The position derivatives use d(p~)/dt = v~ ("raw") by default. This is
-        # the convention the original order_shift_slice model used and it trains
-        # to lower position error: it keeps the position loss strongly coupled to
-        # the velocity head (coefficient 1). The physically-exact "scaled" mode
-        # (d(p~)/dt = (sig_v/sig_p) v~ + mu_v/sig_p) is available but empirically
-        # WORSE here -- with sig_v/sig_p ~ 0.03 it starves the position->velocity
-        # gradient -- so it is left off by default. Flip GRUODE_IDENTITY_MODE to
-        # "scaled" only to experiment; it additionally needs the scaler stats.
-        GRUODE_IDENTITY_MODE = "raw"  # "raw" (default, recommended) or "scaled"
-
-        pos_scale = vel_scale = vel_mean = None
-        if GRUODE_IDENTITY_MODE == "scaled" and use_scalar and n_derivative_pairs > 0 and scaler_traj is not None:
-            # Positions are channels [0:k], their paired velocities are [k:2k].
-            k = n_derivative_pairs
-            pos_scale = scaler_traj.scale_[0:k]
-            vel_scale = scaler_traj.scale_[k : 2 * k]
-            vel_mean = scaler_traj.mean_[k : 2 * k]
-
-        gru_func = GRUODEFunc(
-            n_features=model_states,
-            hidden_size=gru_hidden,
-            cell=cell_kind,
-            couple_state=True,  # feed physical channels into the field
-            n_derivative_pairs=n_derivative_pairs,
-            # couple only non-position channels (velocities / rates); absolute
-            # positions are large & unbounded and saturate the field's gates.
-            couple_indices=tuple(range(n_derivative_pairs, model_states)),
-            identity_mode=GRUODE_IDENTITY_MODE,
-            pos_scale=pos_scale,
-            vel_scale=vel_scale,
-            vel_mean=vel_mean,
-        )
-        node.model = GRUODEPredictorModel(gru_func).to(node.device)
-        # Override aug_dim so the solver carries the latent block.
-        node.aug_dim = gru_hidden
-        aug_dim = gru_hidden  # keep local var in sync for the ONNX example input
-        # GRU-ODE exposes the func.forward(t, state) signature; it must be driven
-        # by a solver that calls the field with (t, state) and whose ONNX example
-        # input is the (None, state) tuple. TorchdiffeqSolver satisfies both.
-        if not isinstance(ode_solver, TorchdiffeqSolver):
-            raise ValueError(
-                "GRU-ODE requires TorchdiffeqSolver (t, state) field signature; "
-                f"got {type(ode_solver).__name__}. Set the solver to "
-                "TorchdiffeqSolver(dt=trajectory_dt, method='dopri5')."
-            )
+        # Joint ODE state [x_phys | h_latent]. GRU-Bayes initializes h(0)
+        # from the initial condition; the GRU-ODE cell evolves the bounded
+        # latent between (virtual) observations; a physics-structured MLP
+        # head produces the physical derivatives with an exact kinematic
+        # order shift (position derivatives copied from velocity states,
+        # affine-corrected for the StandardScaler).
+        node.model = GRUODEFunc(
+            state_dim=model_states,
+            latent_dim=latent_dim,
+            nhidden=nhidden,
+            order_shift_slice=gruode_order_shift,
+            minimal=gruode_minimal,
+            scaler=scaler_traj if use_scalar else None,
+        ).to(node.device)
     elif model_type == "latentode":
         # ------------------------------------------------------------
         #  Latent-ODE model – a completely different object
@@ -732,13 +933,35 @@ def train_NEXT(
 
     # TODO: move this conversion to a separate script
     # export the model to ONNX binary (protobuf) format
+    # For gruode the ODE state carries latent_dim extra dims instead of the
+    # zero-padded aug dims; downstream must initialize them with the exported
+    # *_init.onnx network (GRU-Bayes update at t=0), not with zeros.
+    extra_state_dims = latent_dim if model_type == "gruode" else aug_dim
     if isinstance(ode_solver, TorchdiffeqSolver):
         example_input = (
             None,
-            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device),
+            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(extra_state_dims))).to(node.device),
         )
     else:
-        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(extra_state_dims))).to(
+            node.device
+        )
+
+    if model_type == "gruode":
+        # export the GRU-Bayes initial hidden-state network: x0 (D,) -> h0 (H,)
+        init_example_input = scaled_traj_targets_train_posvel[0][0].to(node.device)
+        init_onx = torch.onnx.export(
+            node.model.init_net,
+            init_example_input,
+            os.path.join(model_save_path, model_name + "_init.onnx"),
+            export_params=True,
+            opset_version=18,
+            external_data=False,
+            input_names=["x0"],
+            output_names=["h0"],
+        )
+        with open(os.path.join(model_save_path, model_name + "_init_plain.onnx"), "w") as f:
+            f.write(onnx.printer.to_text(init_onx.model_proto))
     model_onx = torch.onnx.export(
         node.model,
         example_input,
@@ -947,32 +1170,17 @@ def prep_trajectory(x):
         # check the inverse transform
         check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
     elif args.frame == "geodesic":
-        # convert to geodesic frame relative to the impact point.
-        # geodesic_mode selects the 6-state (original) or 5-state frame-trick
-        # (integrated) representation, matching sbi_trajectory_prep.
-        geodesic_mode = getattr(args, "geodesic_mode", "original")
-        if geodesic_mode == "original":
-            next_frame_data = ecef_to_local_geodesic_vec(
-                resampled_sr_ecef_data[:, POS_SLICE],
-                resampled_sr_ecef_data[:, VEL_SLICE],
-                np.zeros_like(
-                    resampled_sr_ecef_data[:, VEL_SLICE]
-                ),  # TODO: better handling of acceleration being in the transform functions
-                ref_ecef,
-            )
-            # Prepend time and only include pos and vel
-            next_frame_data = np.hstack(
-                [resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]]
-            )
-        else:  # integrated frame trick -> 5-state [s, h, v_s, v_alpha, v_h]
-            geodesic_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
-                resampled_sr_ecef_data[:, POS_SLICE],
-                resampled_sr_ecef_data[:, VEL_SLICE],
-                ref_ecef,
-            )
-            next_frame_data = np.hstack(
-                [resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], geodesic_state]
-            )
+        # convert to geodesic frame relative to the impact point
+        next_frame_data = ecef_to_local_geodesic_vec(
+            resampled_sr_ecef_data[:, POS_SLICE],
+            resampled_sr_ecef_data[:, VEL_SLICE],
+            np.zeros_like(
+                resampled_sr_ecef_data[:, VEL_SLICE]
+            ),  # TODO: better handling of acceleration being in the transform functions
+            ref_ecef,
+        )
+        # Prepend time and only include pos and vel
+        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
         # SBI HighE HGV special things
         # # limit by altitude to remove exo flight
         # remove_exo_index = next_frame_data[:, 3] < 100e3
@@ -1299,32 +1507,19 @@ def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajecto
         # check the inverse transform
         check_ecef = next_grdth_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading)
     elif args.frame == "geodesic":
-        # Two geodesic sub-modes (Jackson's frame trick):
-        #   original   -> 6-state [s, az, h, v_s, v_alpha, v_h] (azimuth kept)
-        #   integrated -> 5-state [s, h, v_s, v_alpha, v_h] (azimuth dropped;
-        #                 reconstructed from v_alpha on the inverse transform)
-        if args.geodesic_mode == "original":
-            timeseries_in_next_frame = ecef_to_local_geodesic_vec(
-                resampled_timeseries[:, POS_SLICE],
-                resampled_timeseries[:, VEL_SLICE],
-                np.zeros_like(
-                    resampled_timeseries[:, VEL_SLICE]
-                ),  # TODO: better handling of acceleration being in the transform functions
-                ref_ecef,  # grab the impact point as the reference ecef point
-            )
-            # Prepend time and only include pos and vel (only needed for the geodesic transform. the DCU and GRDTH functions handle time internally)
-            timeseries_in_next_frame = np.hstack(
-                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
-            )
-        else:  # integrated (frame trick): 5-state, tracks azimuth rate
-            timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
-                resampled_timeseries[:, POS_SLICE],
-                resampled_timeseries[:, VEL_SLICE],
-                ref_ecef,
-            )
-            timeseries_in_next_frame = np.hstack(
-                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state]
-            )
+        # for this exmple we will use the geodesic transform
+        timeseries_in_next_frame = ecef_to_local_geodesic_vec(
+            resampled_timeseries[:, POS_SLICE],
+            resampled_timeseries[:, VEL_SLICE],
+            np.zeros_like(
+                resampled_timeseries[:, VEL_SLICE]
+            ),  # TODO: better handling of acceleration being in the transform functions
+            ref_ecef,  # grap the impact point as the reference ecef point
+        )
+        # Prepend time and only include pos and vel (only needed for the geodesic transform. the DCU and GRDTH functions handle time internally)
+        timeseries_in_next_frame = np.hstack(
+            [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
+        )
         # TODO: add check_ecef
     else:
         raise NotImplementedError("haven't gotten to adding this frame transform code for SBI")
@@ -1406,12 +1601,42 @@ def main():
     parser.add_argument(
         "--model-type",
         default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"],
+        choices=["node", "anode", "sonode", "latentode", "gruode"],
         help=(
-            "Which ODE architecture to train: regular NODE, Augmented NODE, "
-            "Second-Order NODE, Latent-ODE, GRU-ODE (full cell) or GRU-ODE "
-            "with the minimal cell (gruode-min)."
+            "Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, "
+            "or GRU-ODE (continuous-time GRU with GRU-Bayes initial update, De Brouwer et al. 2019)."
         ),
+    )
+    parser.add_argument(
+        "--latent-dim",
+        default=64,
+        type=int,
+        help="[gruode] Dimension of the bounded GRU-ODE latent state h(t)",
+        dest="latent_dim",
+    )
+    parser.add_argument(
+        "--recon-weight",
+        default=0.1,
+        type=float,
+        help="[gruode] Weight of the latent autoencoder reconstruction loss (readout(h_t) vs target). 0 disables",
+        dest="recon_weight",
+    )
+    parser.add_argument(
+        "--boundary-weight",
+        default=0.0,
+        type=float,
+        help=(
+            "[gruode] Weight of the soft physical boundary penalty in unscaled units "
+            "(Up >= 0 for dcu/geodesic, GroundRange >= 0 for grdth). 0 disables"
+        ),
+        dest="boundary_weight",
+    )
+    parser.add_argument(
+        "--gruode-minimal",
+        default=False,
+        action="store_true",
+        help="[gruode] Use the minimal (single-gate) GRU-ODE cell variant (paper Appendix G)",
+        dest="gruode_minimal",
     )
     parser.add_argument(
         "--dt",
@@ -1425,31 +1650,13 @@ def main():
         choices=["boost", "glide", "impact"],
         help="The reference point for the frame transformations",
     )
-    parser.add_argument(
-        "--geodesic-mode",
-        default="original",
-        choices=["original", "integrated"],
-        help=(
-            "Geodesic frame mode: 'original' keeps absolute azimuth in the "
-            "state (6-state); 'integrated' drops azimuth and reconstructs it "
-            "from the azimuth rate v_alpha (5-state frame trick). Only used "
-            "when --frame geodesic."
-        ),
-    )
 
     args = parser.parse_args()
 
-    # State-vector width per frame:
-    #   dcu                    -> 6  [D, C, U, dotD, dotC, dotU]
-    #   grdth                  -> 5  [GR, Down, dotGR, dotD, VTheta]
-    #   geodesic (original)    -> 6  [s, az, h, v_s, v_alpha, v_h]
-    #   geodesic (integrated)  -> 5  [s, h, v_s, v_alpha, v_h]  (frame trick)
     model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
-    if args.frame == "grdth":
-        model_states = 5
-    elif args.frame == "geodesic" and args.geodesic_mode == "integrated":
-        # The integration trick drops the absolute-azimuth state (Jackson's
-        # frame trick) -- resolves the old TODO about a 5-state geodesic frame.
+    if (
+        args.frame in ("grdth",)
+    ):  # TODO: geodesic frame should also be 5 (drop azimuth state). need to change the math to do the integration trick
         model_states = 5
 
     trajectory_dt = args.dt  # [s]
@@ -1470,12 +1677,9 @@ def main():
         batch_size = 1024
 
     # TODO: make an object to hold the data and the metadata
-    # Encode the geodesic sub-mode in the model name so original/integrated
-    # runs don't collide on disk.
-    frame_tag = args.frame
-    if args.frame == "geodesic":
-        frame_tag = f"geodesic-{args.geodesic_mode}"
-    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{args.model_type}_{args.frame}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    if args.model_type == "gruode":
+        model_name_wo_epochs = model_name_wo_epochs + f"_{args.latent_dim}lat"
     if args.use_scalar:
         model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
 
@@ -1584,14 +1788,9 @@ def main():
         )
 
     stacked_posvel = np.vstack(traj_targets_train_posvel)
-    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]  # dcu default
+    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
     if args.frame == "grdth":
         column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
-    elif args.frame == "geodesic":
-        if args.geodesic_mode == "integrated":
-            column_names = ["s", "h", "v_s", "v_alpha", "v_h"]
-        else:  # original
-            column_names = ["s", "az", "h", "v_s", "v_alpha", "v_h"]
     plot_column_distributions(
         stacked_posvel,
         column_names=column_names,
@@ -1637,6 +1836,10 @@ def main():
         args.gpu_index,
         args.model_type,
         args.frame,
+        latent_dim=args.latent_dim,
+        recon_weight=args.recon_weight,
+        boundary_weight=args.boundary_weight,
+        gruode_minimal=args.gruode_minimal,
     )
     # NOTE: After this was the whole chain of evaluation functions. Skipping adding that to this unclass side for now. It really should be a separate script.
 

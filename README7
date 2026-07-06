@@ -481,27 +481,48 @@ def train_NEXT(
         # the dominant accuracy lever for trajectory integration: it eliminates
         # position drift (phugoid / S-curve divergence) and frees all model
         # capacity for the acceleration / force model.
-        #
         # This holds for:
         #   dcu (6) : pos (0,1,2), vel (3,4,5)                 -> 3 pairs
         #   grdth(5): pos (0,1),  vel (2,3), extra Vtheta (4)  -> 2 pairs
         #   geo-int (5): pos (0,1), vel (2,3), extra v_alpha(4)-> 2 pairs
         #   geo-orig(6): (s,az,h) & (v_s,v_alpha,v_h)          -> 3 pairs
-        # In each case velocity_indicies is exactly the contiguous block that
-        # follows the positions, so n_derivative_pairs == len(velocity_indicies)
-        # and the velocity block starts at that same count.
-        n_derivative_pairs = len(velocity_indicies)
-        if tuple(velocity_indicies) != tuple(range(n_derivative_pairs, 2 * n_derivative_pairs)):
+        #
+        # The number of derivative pairs k is the number of LEADING POSITION
+        # channels -- i.e. velocity_indicies[0], the index at which the first
+        # velocity appears. NOTE this is NOT len(velocity_indicies): GRDTH and
+        # geodesic-integrated carry an EXTRA rate channel (Vtheta / v_alpha)
+        # that is a "velocity index" for the loss but is NOT the time-derivative
+        # of any stored position, so it must stay in the learned head. The
+        # paired velocities are exactly velocity_indicies[0:k] = (k, ..., 2k-1),
+        # which we verify below.
+        k = velocity_indicies[0]  # number of leading position channels
+        paired_vel = tuple(velocity_indicies[:k])
+        if paired_vel == tuple(range(k, 2 * k)):
+            n_derivative_pairs = k
+        else:
             # Layout assumption violated (e.g. a future non-contiguous frame).
             # Fall back to a fully-learned read-out rather than silently
             # hard-wiring the wrong channels.
             print(
-                "warning: velocity_indicies",
-                tuple(velocity_indicies),
+                "warning: leading velocity indices",
+                paired_vel,
                 "are not the contiguous block immediately after the positions; "
                 "disabling the kinematic-identity hard-wiring for safety.",
             )
             n_derivative_pairs = 0
+
+        # --- Scaler-aware kinematic identity -------------------------------
+        # The solver integrates in NORMALIZED space (StandardScaler per channel),
+        # so d(p_i)/dt = v_i must be rewritten in scaled coordinates as
+        #   d(p~_i)/dt = (sig_v_i/sig_p_i) v~_i + (mu_v_i/sig_p_i).
+        # Pull the per-pair position/velocity statistics out of scaler_traj.
+        # Positions are channels [0:k], their paired velocities are [k:2k].
+        pos_scale = vel_scale = vel_mean = None
+        if use_scalar and n_derivative_pairs > 0 and scaler_traj is not None:
+            k = n_derivative_pairs
+            pos_scale = scaler_traj.scale_[0:k]
+            vel_scale = scaler_traj.scale_[k : 2 * k]
+            vel_mean = scaler_traj.mean_[k : 2 * k]
 
         gru_func = GRUODEFunc(
             n_features=model_states,
@@ -512,6 +533,9 @@ def train_NEXT(
             # couple only non-position channels (velocities / rates); absolute
             # positions are large & unbounded and saturate the field's gates.
             couple_indices=tuple(range(n_derivative_pairs, model_states)),
+            pos_scale=pos_scale,
+            vel_scale=vel_scale,
+            vel_mean=vel_mean,
         )
         node.model = GRUODEPredictorModel(gru_func).to(node.device)
         # Override aug_dim so the solver carries the latent block.

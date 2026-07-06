@@ -1,128 +1,17 @@
-# loss_functions.py
-"""Loss functions for a Neural Ordinary Differential Equation model."""
+# NEXT_training.py (Partial Snippet - Modified Block Placement)
+# ... [Preceding lines are completely unmodified] ...
 
-from __future__ import annotations
+        # OPTIMIZED CURRICULUM: Smooth step decays to absorb expanded timeline integration load
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 3e-5),  
+            (0.5, 3000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 8e-6),  # Stepped down to resolve the 0.5 boundary shock
+            (0.7, 2000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 4e-6),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 2e-6),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 5e-6),
+            (1.0, 5000, EarlyStopper(60, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+        ]
 
-from typing import Callable
-
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
-
-
-class WrappedMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        position_loss_weight: float = 80.0,
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-        kinematic_consistency_weight: float = 5.0,
-    ) -> None:
-        """Initializes WrappedMSELoss with explicit Kinematic Consistency constraints."""
-        super().__init__(reduction="none")
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.position_loss_weight = position_loss_weight
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.kinematic_consistency_weight = kinematic_consistency_weight
-        self.model_ref = None
-
-    def set_model(self, model: torch.nn.Module) -> None:
-        self.model_ref = model
-
-    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
-        
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct scale-space prioritization weights
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        
-        # 4. Generate a linear temporal ramp to penalize late-horizon integration drift
-        if self.temporal_weighting:
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            weighted_loss = elementwise_loss * weights.view(1, 1, -1) * t_weights
-        else:
-            weighted_loss = elementwise_loss * weights.view(1, 1, -1)
-            
-        # 5. Mask and normalize base track loss against active elements only
-        masked_loss = weighted_loss * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
-
-        # 6. Physics-Informed Regularization: Kinematic Consistency Loss
-        # In a stable frame, the temporal derivative of position equals velocity.
-        # This bridges the gradient gap, ensuring velocity vectors optimize alongside position steps.
-        if self.kinematic_consistency_weight > 0 and n_timesteps > 1:
-            # Finite differences for position components: (B, T-1, pos_dims)
-            pos_pred_steps = pred[..., :pos_end_idx]
-            dt_pos = pos_pred_steps[:, 1:, :] - pos_pred_steps[:, :-1, :]
-            
-            # Match paired normalized velocity profiles across the matching step window
-            vel_pred_steps = pred[..., pos_end_idx : 2 * pos_end_idx]
-            matched_vel = vel_pred_steps[:, :-1, :]
-            
-            # Evaluate consistency error under the sequence tracking mask
-            consistency_err = torch.nn.functional.mse_loss(dt_pos, matched_vel, reduction="none")
-            step_mask = valid_mask[:, :-1, :]
-            
-            kin_loss = (consistency_err * step_mask).sum() / (step_mask.sum() * pos_end_idx + 1e-8)
-            loss_data = loss_data + self.kinematic_consistency_weight * kin_loss
-
-        # 7. Apply L2 Regularization parameter penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
-
-        # 8. Compute accurate physical metrics stripped of padding pollution
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
-            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
-
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-# ... [Remaining loss definitions are unmodified] ...
+        for len_strat in length_strategies:
+# ... [Remaining script is completely unmodified] ...

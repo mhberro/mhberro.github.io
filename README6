@@ -1,25 +1,384 @@
-Traceback (most recent call last):
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_new.py", line 791, in <module>
-    main()
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_new.py", line 783, in main
-    node, model_name = train_NEXT(
-                       ^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_new.py", line 481, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 248, in fit
-    metrics = self.batch_loss(x=x_batch.to(self.device))
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 399, in batch_loss
-    metrics = self.criterion(x_pred, x)
-              ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/loss_functions.py", line 56, in forward
-    weights[self.vel_indices] = self.velocity_loss_weight
-    ~~~~~~~^^^^^^^^^^^^^^^^^^
-IndexError: too many indices for tensor of dimension 1
+# loss_functions.py
+"""Loss functions for a Neural Ordinary Differential Equation model."""
+
+from __future__ import annotations
+
+from typing import Callable
+
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from torch import Tensor
+from torch.nn import MSELoss
+from tslearn.metrics import SoftDTWLossPyTorch
+
+
+class WrappedMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int] | tuple[int, ...],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        position_loss_weight: float = 80.0,
+        velocity_loss_weight: float = 5.0,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        """Initializes WrappedMSELoss with scale-invariant gradient normalization."""
+        super().__init__(reduction="none")
+        self.height_idx = height_idx
+        # Enforce list type to prevent PyTorch multi-dimensional tuple indexing errors
+        self.vel_indices = list(vel_indices)
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.position_loss_weight = position_loss_weight
+        self.velocity_loss_weight = velocity_loss_weight
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Saves a reference to inspect model parameters for manual weight decay."""
+        self.model_ref = model
+
+    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # 2. Compute elementwise unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # 3. Construct scale-space prioritization weights using safe list-based indexing
+        pos_end_idx = self.vel_indices[0]
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[:pos_end_idx] = self.position_loss_weight
+        weights[self.vel_indices] = self.velocity_loss_weight
+        weights_view = weights.view(1, 1, -1)
+        
+        # 4. Generate linear temporal ramp weights
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        # 5. High-Gain Normalization against active elements only
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # 6. Apply L2 Regularization parameter penalty
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # 7. Compute accurate physical metrics stripped of padding pollution
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
+            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class SecondOrderSplitMSELoss(torch.nn.Module):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        vel_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        pos_expect: float = "inf",
+        vel_expect: float = "inf",
+    ) -> None:
+        """Initializes SecondOrderSplitMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.vel_weight = vel_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.pos_expect = pos_expect
+        self.vel_expect = vel_expect
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+
+        if self.scaler is not None:
+            pred_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+            target_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+        else:
+            pred_unscaled = pred.detach()
+            target_unscaled = target.detach()
+
+        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
+        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
+        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
+        vel_target_unscaled = target_unscaled[..., self.vel_indices]
+
+        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
+        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
+
+        pos_pred = pred[..., : self.vel_indices[0]]
+        pos_target = target[..., : self.vel_indices[0]]
+        vel_pred = pred[..., self.vel_indices]
+        vel_target = target[..., self.vel_indices]
+
+        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
+        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
+
+        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
+        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
+        total_loss = pos_loss + vel_loss
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class EnergyMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
+        energy_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes EnergyMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.energy_fn = energy_fn
+        self.energy_weight = energy_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
+        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
+        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
+
+        total_loss = loss_data + loss_energy
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "energy_loss": loss_energy,
+        }
+
+
+class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
+    def __init__(self) -> None:
+        """Initializes ReverseLinearWeightingLoss."""
+        super().__init__()
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, time_steps, n_features = pred.shape
+
+        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
+        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
+        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
+
+        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
+
+
+class SoftDTWLossWrapper(SoftDTWLossPyTorch):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        gamma=1,
+        normalize=False,
+        dist_func=None,
+    ):
+        super().__init__(gamma, normalize, dist_func)
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class WeightedHuberLoss(torch.nn.Module):
+    def __init__(
+        self,
+        delta_pos,
+        delta_vel,
+        vel_indices: list[int],
+        weight_pos=1.0,
+        weight_vel=1.0,
+        scaler=None,
+        N_FEATURES: int = 6,
+    ):
+        super().__init__()
+        self.delta_pos = delta_pos
+        self.delta_vel = delta_vel
+        self.delta_pos_unsacled = delta_pos
+        self.delta_vel_unsacled = delta_vel
+        self.vel_indices = list(vel_indices)
+        self.wp = weight_pos
+        self.wv = weight_vel
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        if scaler is not None:
+            sigma = scaler.scale_
+            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
+            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
+
+    def forward(self, pred, target):
+        n_timesteps = pred.size(1)
+
+        pos_pred_scaled = pred[..., : self.vel_indices[0]]
+        pos_target_scaled = target[..., : self.vel_indices[0]]
+        vel_pred_scaled = pred[..., self.vel_indices]
+        vel_target_scaled = target[..., self.vel_indices]
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
+            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
+
+        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
+        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
+
+        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
+        total_loss_unweighted = loss_pos + loss_vel
+        return {
+            "loss": total_loss,
+            "loss_unweighted": total_loss_unweighted,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "pos_err_scaled": avg_pos_diff_scaled,
+            "vel_err_scaled": avg_vel_diff_scaled,
+        }

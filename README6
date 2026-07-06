@@ -255,6 +255,9 @@ class GRUODEFunc(nn.Module):
         couple_state: bool = True,
         n_derivative_pairs: int | None = None,
         couple_indices: tuple[int, ...] | None = None,
+        pos_scale: "torch.Tensor | None" = None,
+        vel_scale: "torch.Tensor | None" = None,
+        vel_mean: "torch.Tensor | None" = None,
     ):
         """GRU-ODE forecasting field with physics-informed kinematic structure.
 
@@ -282,6 +285,20 @@ class GRUODEFunc(nn.Module):
                 (indices >= n_derivative_pairs), which are the actual drivers of
                 the dynamics and are far better conditioned. If None and
                 couple_state is True, this is derived automatically.
+            pos_scale, vel_scale, vel_mean: per-derivative-pair StandardScaler
+                statistics (each of length n_derivative_pairs). REQUIRED whenever
+                the model integrates in normalized coordinates and the kinematic
+                identity is on. In physical units d(p_i)/dt = v_i, but the solver
+                integrates NORMALIZED channels p~ = (p - mu_p)/sig_p and
+                v~ = (v - mu_v)/sig_v. The chain rule then gives the correct
+                normalized identity
+                    d(p~_i)/dt = (sig_v_i / sig_p_i) * v~_i + (mu_v_i / sig_p_i).
+                Passing the raw normalized velocity (i.e. assuming sig_p == sig_v
+                and mu_v == 0) integrates position at the WRONG rate -- typically
+                ~100x too fast, since sig_p (position spread, ~1e5-1e6 m) far
+                exceeds sig_v (velocity spread, ~1e3 m/s) -- and is a dominant
+                source of position error. If these are None, the raw-velocity
+                identity is used (only correct for unscaled training).
         """
         super().__init__()
         self.n_features = n_features
@@ -302,6 +319,37 @@ class GRUODEFunc(nn.Module):
         # The learned dynamics only needs to produce the NON-position channels:
         # the velocities of the paired block plus any trailing extra rates.
         self.n_learned = n_features - n_derivative_pairs
+
+        # ------------------------------------------------------------------
+        # Scaler-aware kinematic-identity coefficients.
+        #   d(p~_i)/dt = kin_a_i * v~_i + kin_b_i
+        # with kin_a_i = sig_v_i / sig_p_i and kin_b_i = mu_v_i / sig_p_i.
+        # Stored as non-trainable buffers so they move with the module's device
+        # and serialize into the ONNX graph.
+        # ------------------------------------------------------------------
+        if n_derivative_pairs > 0 and pos_scale is not None and vel_scale is not None:
+            pos_scale_t = torch.as_tensor(pos_scale, dtype=torch.float32).reshape(-1)
+            vel_scale_t = torch.as_tensor(vel_scale, dtype=torch.float32).reshape(-1)
+            if vel_mean is None:
+                vel_mean_t = torch.zeros_like(vel_scale_t)
+            else:
+                vel_mean_t = torch.as_tensor(vel_mean, dtype=torch.float32).reshape(-1)
+            if not (pos_scale_t.numel() == vel_scale_t.numel() == n_derivative_pairs):
+                raise ValueError(
+                    "pos_scale/vel_scale/vel_mean must each have length "
+                    f"n_derivative_pairs={n_derivative_pairs}; got "
+                    f"{pos_scale_t.numel()}, {vel_scale_t.numel()}, {vel_mean_t.numel()}"
+                )
+            kin_a = vel_scale_t / pos_scale_t
+            kin_b = vel_mean_t / pos_scale_t
+            self._scaled_identity = True
+        else:
+            # Unscaled identity: d(p~)/dt = v~ (kin_a = 1, kin_b = 0).
+            kin_a = torch.ones(max(n_derivative_pairs, 0))
+            kin_b = torch.zeros(max(n_derivative_pairs, 0))
+            self._scaled_identity = False
+        self.register_buffer("kin_a", kin_a)
+        self.register_buffer("kin_b", kin_b)
 
         # ------------------------------------------------------------------
         # Coupling feature selection (input x(t) to the field).
@@ -347,16 +395,20 @@ class GRUODEFunc(nn.Module):
         return y_read[..., list(self.couple_indices)]
 
     def _assemble_dstate(self, y_read: torch.Tensor, dy_learned: torch.Tensor, dh: torch.Tensor) -> torch.Tensor:
-        """Build d(state)/dt = [ dp (=velocities) | dy_learned | dh ].
+        """Build d(state)/dt = [ dp | dy_learned | dh ].
 
-        The first n_derivative_pairs derivatives are taken DIRECTLY from the
-        current velocity channels (kinematic identity dp_i/dt = v_i); the
-        remaining physical derivatives come from the learned head.
+        The first n_derivative_pairs position derivatives come from the
+        kinematic identity applied in NORMALIZED coordinates:
+            d(p~_i)/dt = kin_a_i * v~_i + kin_b_i
+        where v~_i is the paired normalized velocity channel. kin_a = sig_v/sig_p
+        and kin_b = mu_v/sig_p convert the physical identity d(p)/dt = v into the
+        scaled space the solver actually integrates in. The remaining physical
+        derivatives (velocities + extra rates) come from the learned head.
         """
         if self.n_derivative_pairs > 0:
             k = self.n_derivative_pairs
-            # velocities that are the exact derivative of the position block
-            dp = y_read[..., k : 2 * k]
+            v_norm = y_read[..., k : 2 * k]  # paired normalized velocities
+            dp = self.kin_a * v_norm + self.kin_b
             dy = torch.cat((dp, dy_learned), dim=-1)
         else:
             dy = dy_learned

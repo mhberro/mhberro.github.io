@@ -22,8 +22,9 @@ class WrappedMSELoss(MSELoss):
         position_loss_weight: float = 80.0,
         l2_reg: float = 1e-4,
         temporal_weighting: bool = True,
+        kinematic_consistency_weight: float = 5.0,
     ) -> None:
-        """Initializes WrappedMSELoss with padding-exclusion and temporal weighting."""
+        """Initializes WrappedMSELoss with explicit Kinematic Consistency constraints."""
         super().__init__(reduction="none")
         self.height_idx = height_idx
         self.vel_indices = vel_indices
@@ -32,17 +33,17 @@ class WrappedMSELoss(MSELoss):
         self.position_loss_weight = position_loss_weight
         self.l2_reg = l2_reg
         self.temporal_weighting = temporal_weighting
+        self.kinematic_consistency_weight = kinematic_consistency_weight
         self.model_ref = None
 
     def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a reference to inspect model parameters for manual weight decay."""
         self.model_ref = model
 
     def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
         batch_size, n_timesteps, _ = pred.shape
         
         # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()  # (batch, timesteps, 1)
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
         
         # 2. Compute elementwise unreduced normalized loss
         elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
@@ -54,17 +55,35 @@ class WrappedMSELoss(MSELoss):
         
         # 4. Generate a linear temporal ramp to penalize late-horizon integration drift
         if self.temporal_weighting:
-            # Ramps from 1.0 at t_0 up to 4.0 at the end of the sequence window
             t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
             weighted_loss = elementwise_loss * weights.view(1, 1, -1) * t_weights
         else:
             weighted_loss = elementwise_loss * weights.view(1, 1, -1)
             
-        # 5. Mask and normalize against active elements only
+        # 5. Mask and normalize base track loss against active elements only
         masked_loss = weighted_loss * valid_mask
         loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
 
-        # 6. Apply L2 Regularization parameter penalty
+        # 6. Physics-Informed Regularization: Kinematic Consistency Loss
+        # In a stable frame, the temporal derivative of position equals velocity.
+        # This bridges the gradient gap, ensuring velocity vectors optimize alongside position steps.
+        if self.kinematic_consistency_weight > 0 and n_timesteps > 1:
+            # Finite differences for position components: (B, T-1, pos_dims)
+            pos_pred_steps = pred[..., :pos_end_idx]
+            dt_pos = pos_pred_steps[:, 1:, :] - pos_pred_steps[:, :-1, :]
+            
+            # Match paired normalized velocity profiles across the matching step window
+            vel_pred_steps = pred[..., pos_end_idx : 2 * pos_end_idx]
+            matched_vel = vel_pred_steps[:, :-1, :]
+            
+            # Evaluate consistency error under the sequence tracking mask
+            consistency_err = torch.nn.functional.mse_loss(dt_pos, matched_vel, reduction="none")
+            step_mask = valid_mask[:, :-1, :]
+            
+            kin_loss = (consistency_err * step_mask).sum() / (step_mask.sum() * pos_end_idx + 1e-8)
+            loss_data = loss_data + self.kinematic_consistency_weight * kin_loss
+
+        # 7. Apply L2 Regularization parameter penalty
         if self.model_ref is not None and self.l2_reg > 0:
             l2_penalty = 0.0
             for param in self.model_ref.parameters():
@@ -72,7 +91,7 @@ class WrappedMSELoss(MSELoss):
                     l2_penalty += torch.sum(param ** 2)
             loss_data = loss_data + self.l2_reg * l2_penalty
 
-        # 7. Compute accurate physical metrics stripped of padding pollution
+        # 8. Compute accurate physical metrics stripped of padding pollution
         with torch.no_grad():
             if self.scaler is not None:
                 pred_unscaled = torch.from_numpy(
@@ -106,4 +125,4 @@ class WrappedMSELoss(MSELoss):
             "vel_err": avg_vel_diff,
         }
 
-# ... [Remainder of SecondOrderSplitMSELoss, EnergyMSELoss, and Huber classes remain intact] ...
+# ... [Remaining loss definitions are unmodified] ...

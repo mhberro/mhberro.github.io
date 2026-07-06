@@ -339,7 +339,16 @@ def train_NEXT(
     )
     # ode_solver = EulerSolver(dt=trajectory_dt)
     # ode_solver = RK4Solver(dt=trajectory_dt)
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
+    # Solver choice matters for accuracy on chaotic trajectories. The GRU-ODE
+    # paper (Appendix C) shows the adaptive Dormand-Prince method (dopri5)
+    # reaches the same accuracy as fixed-step Euler/RK4 with FEWER function
+    # evaluations, concentrating steps where the dynamics are fast (near
+    # manoeuvres) and stretching them where the trajectory is smooth. For the
+    # bounded GRU-ODE field this is a direct, low-risk accuracy win, so GRU-ODE
+    # defaults to dopri5; the plain NODE/ANODE/SONODE models keep fixed-step rk4
+    # to preserve their existing behaviour.
+    ode_method = "dopri5" if model_type in ("gruode", "gruode-min") else "rk4"
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method=ode_method, adjoint=False)
 
     if frame == "dcu":
         velocity_indicies = (3, 4, 5)
@@ -460,11 +469,49 @@ def train_NEXT(
         # heads inside the cell also use H, so a single knob controls capacity.
         gru_hidden = nhidden
         cell_kind = "minimal" if model_type == "gruode-min" else "full"
+
+        # --- Physics-informed kinematic structure --------------------------
+        # In every supported frame the state is laid out with a leading block of
+        # position channels immediately followed by their exact time
+        # derivatives (the velocity channels), i.e.
+        #     [ p_0 ... p_{k-1} | v_0 ... v_{k-1} | extra_rates... ]
+        # where k = len(velocity_indicies) and the velocity channels start at
+        # index k. Because d(p_i)/dt = v_i is a KINEMATIC IDENTITY, we hard-wire
+        # those derivatives instead of asking the network to learn them. This is
+        # the dominant accuracy lever for trajectory integration: it eliminates
+        # position drift (phugoid / S-curve divergence) and frees all model
+        # capacity for the acceleration / force model.
+        #
+        # This holds for:
+        #   dcu (6) : pos (0,1,2), vel (3,4,5)                 -> 3 pairs
+        #   grdth(5): pos (0,1),  vel (2,3), extra Vtheta (4)  -> 2 pairs
+        #   geo-int (5): pos (0,1), vel (2,3), extra v_alpha(4)-> 2 pairs
+        #   geo-orig(6): (s,az,h) & (v_s,v_alpha,v_h)          -> 3 pairs
+        # In each case velocity_indicies is exactly the contiguous block that
+        # follows the positions, so n_derivative_pairs == len(velocity_indicies)
+        # and the velocity block starts at that same count.
+        n_derivative_pairs = len(velocity_indicies)
+        if tuple(velocity_indicies) != tuple(range(n_derivative_pairs, 2 * n_derivative_pairs)):
+            # Layout assumption violated (e.g. a future non-contiguous frame).
+            # Fall back to a fully-learned read-out rather than silently
+            # hard-wiring the wrong channels.
+            print(
+                "warning: velocity_indicies",
+                tuple(velocity_indicies),
+                "are not the contiguous block immediately after the positions; "
+                "disabling the kinematic-identity hard-wiring for safety.",
+            )
+            n_derivative_pairs = 0
+
         gru_func = GRUODEFunc(
             n_features=model_states,
             hidden_size=gru_hidden,
             cell=cell_kind,
-            couple_state=True,  # feed y(t) into the field for well-posed rollout
+            couple_state=True,  # feed physical channels into the field
+            n_derivative_pairs=n_derivative_pairs,
+            # couple only non-position channels (velocities / rates); absolute
+            # positions are large & unbounded and saturate the field's gates.
+            couple_indices=tuple(range(n_derivative_pairs, model_states)),
         )
         node.model = GRUODEPredictorModel(gru_func).to(node.device)
         # Override aug_dim so the solver carries the latent block.
@@ -477,7 +524,7 @@ def train_NEXT(
             raise ValueError(
                 "GRU-ODE requires TorchdiffeqSolver (t, state) field signature; "
                 f"got {type(ode_solver).__name__}. Set the solver to "
-                "TorchdiffeqSolver(dt=trajectory_dt, method='rk4')."
+                "TorchdiffeqSolver(dt=trajectory_dt, method='dopri5')."
             )
     elif model_type == "latentode":
         # ------------------------------------------------------------

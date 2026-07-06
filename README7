@@ -249,7 +249,12 @@ def train_NEXT(
         ode_method = GRUODE_SOLVER_METHOD
     else:
         ode_method = "rk4"
+        
     ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method=ode_method, adjoint=False)
+    if hasattr(ode_solver, 'atol'):
+        ode_solver.atol = 1e-8
+    if hasattr(ode_solver, 'rtol'):
+        ode_solver.rtol = 1e-6
 
     if frame == "dcu":
         velocity_indicies = (3, 4, 5)
@@ -267,8 +272,9 @@ def train_NEXT(
         vel_indices=velocity_indicies,
         scaler=scaler_traj if use_scalar else None,
         N_FEATURES=model_states,
-        position_loss_weight=25.0,
+        position_loss_weight=80.0,
         l2_reg=1e-4,
+        temporal_weighting=True,
     )
 
     node = NODEPredictor(
@@ -429,15 +435,16 @@ def train_NEXT(
                 for (obs, tgt) in test_data
             ]
 
+        # OPTIMIZED CURRICULUM: Smooth monotonic non-increasing learning rates & relaxed early stopping
         length_strategies = [
-            (0.1, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.5, 3000, EarlyStopper(20, 5e-5, metric_name=early_stop_metric_name), 1e-4),
-            (0.7, 2000, EarlyStopper(20, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-3),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 5000, EarlyStopper(50, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+            (0.1, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(50, 1e-6, metric_name=early_stop_metric_name), 3e-5),  # Damps horizon step shock
+            (0.5, 3000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 1e-5),
+            (0.7, 2000, EarlyStopper(40, 1e-5, metric_name=early_stop_metric_name), 5e-6),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 2e-6),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 1500, EarlyStopper(60, 1e-5, metric_name=early_stop_metric_name), 5e-6),
+            (1.0, 5000, EarlyStopper(60, 5e-3, metric_name=early_stop_metric_name), 1e-7),
         ]
 
         for len_strat in length_strategies:

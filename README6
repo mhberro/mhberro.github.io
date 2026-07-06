@@ -222,7 +222,15 @@ class GRUODEFunc(nn.Module):
     and::
 
         dh/dt      = GRU-ODE field on tanh-clamped h
-        dy_read/dt = W_obs h            (linear observation dynamics)
+        dp_i/dt    = v_i               (kinematic identity, hard-wired)
+        dv/dt, ... = obs_head(h)       (learned force / rate model)
+
+    where the leading ``n_derivative_pairs`` position channels get their exact
+    derivatives from the corresponding velocity channels (not from the network),
+    and only the velocities and any extra rate channels are produced by the
+    learned observation head. This physics-informed split is the dominant
+    accuracy lever: it removes position integration drift and concentrates model
+    capacity on the accelerations.
 
     ``batch_loss`` slices the leading ``n_features`` channels (``y_read``) as the
     trajectory prediction, so the physical output is exactly the first block of
@@ -245,21 +253,68 @@ class GRUODEFunc(nn.Module):
         hidden_size: int = 64,
         cell: str = "full",
         couple_state: bool = True,
+        n_derivative_pairs: int | None = None,
+        couple_indices: tuple[int, ...] | None = None,
     ):
+        """GRU-ODE forecasting field with physics-informed kinematic structure.
+
+        Args:
+            n_features: physical state width (== model_states).
+            hidden_size: GRU-ODE latent width H.
+            cell: "full" or "minimal" GRU-ODE cell.
+            couple_state: feed physical channels back into the field as x(t).
+            n_derivative_pairs: number of leading state channels whose exact time
+                derivative is another stored channel (the position block).
+                For a kinematic vector laid out as
+                    [ p_0 ... p_{k-1} | v_0 ... v_{k-1} | extra_rates... ]
+                we have d(p_i)/dt = v_i EXACTLY (a kinematic identity), so the
+                network must NOT try to learn it. With n_derivative_pairs = k the
+                field hard-wires dp_i/dt = v_i and only the velocities/extra rates
+                are produced by the learned dynamics. This is the single most
+                important structural prior for trajectory integration: it removes
+                position drift and frees all model capacity for the force model
+                (the accelerations). If None, no channels are hard-wired
+                (falls back to a fully-learned read-out).
+            couple_indices: which physical channels to feed back into the field
+                as the continuous input x(t). Absolute positions have huge,
+                unbounded magnitudes that saturate the bounded field's input
+                gates, so by default we couple only the velocity / rate channels
+                (indices >= n_derivative_pairs), which are the actual drivers of
+                the dynamics and are far better conditioned. If None and
+                couple_state is True, this is derived automatically.
+        """
         super().__init__()
         self.n_features = n_features
         self.hidden_size = hidden_size
         self.couple_state = couple_state
 
-        # When couple_state is True the physical read-out y(t) is fed back into
-        # the GRU-ODE field as its continuous input x(t). This is what keeps a
-        # single-initial-condition *forecast* rollout well-posed: without the
-        # GRU-Bayes jumps of the original paper (which re-anchor h at every
-        # observation), a purely autonomous bounded field relaxes to its fixed
-        # point. Coupling y(t) -> field lets the latent track the object's
-        # actual kinematic state, so the dynamics stay informative over the
-        # whole horizon while retaining the bounded/Lipschitz h-block.
-        input_size = n_features if couple_state else 0
+        # ------------------------------------------------------------------
+        # Kinematic structure: which leading channels have a known derivative.
+        # ------------------------------------------------------------------
+        if n_derivative_pairs is None:
+            n_derivative_pairs = 0
+        if not (0 <= n_derivative_pairs * 2 <= n_features):
+            raise ValueError(
+                f"n_derivative_pairs={n_derivative_pairs} incompatible with "
+                f"n_features={n_features} (need 2*pairs <= n_features)"
+            )
+        self.n_derivative_pairs = n_derivative_pairs
+        # The learned dynamics only needs to produce the NON-position channels:
+        # the velocities of the paired block plus any trailing extra rates.
+        self.n_learned = n_features - n_derivative_pairs
+
+        # ------------------------------------------------------------------
+        # Coupling feature selection (input x(t) to the field).
+        # ------------------------------------------------------------------
+        if couple_state:
+            if couple_indices is None:
+                # default: couple everything EXCEPT absolute positions
+                couple_indices = tuple(range(n_derivative_pairs, n_features))
+            self.couple_indices = tuple(couple_indices)
+            input_size = len(self.couple_indices)
+        else:
+            self.couple_indices = ()
+            input_size = 0
 
         if cell == "full":
             self.ode_cell = FullGRUODECell(hidden_size, input_size=input_size)
@@ -275,14 +330,37 @@ class GRUODEFunc(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.Tanh(),
         )
-        # observation head: h -> d(y_read)/dt. A small nonlinear head is more
-        # expressive than a bare linear map yet still cheap and ONNX-clean.
+        # observation head: h -> derivative of the LEARNED channels only
+        # (velocities + extra rates). Positions are supplied by the kinematic
+        # identity, not by this head.
         self.obs_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
-            nn.Linear(hidden_size, n_features),
+            nn.Linear(hidden_size, self.n_learned),
         )
         self.nfe = 0
+
+    def _couple_input(self, y_read: torch.Tensor) -> torch.Tensor | None:
+        """Select the physical channels fed back into the field as x(t)."""
+        if not self.couple_state:
+            return None
+        return y_read[..., list(self.couple_indices)]
+
+    def _assemble_dstate(self, y_read: torch.Tensor, dy_learned: torch.Tensor, dh: torch.Tensor) -> torch.Tensor:
+        """Build d(state)/dt = [ dp (=velocities) | dy_learned | dh ].
+
+        The first n_derivative_pairs derivatives are taken DIRECTLY from the
+        current velocity channels (kinematic identity dp_i/dt = v_i); the
+        remaining physical derivatives come from the learned head.
+        """
+        if self.n_derivative_pairs > 0:
+            k = self.n_derivative_pairs
+            # velocities that are the exact derivative of the position block
+            dp = y_read[..., k : 2 * k]
+            dy = torch.cat((dp, dy_learned), dim=-1)
+        else:
+            dy = dy_learned
+        return torch.cat((dy, dh), dim=-1)
 
     # -- initial-state construction (called by the wrapper, not the solver) ---
     def build_initial_state(self, x0_phys: torch.Tensor) -> torch.Tensor:
@@ -300,12 +378,11 @@ class GRUODEFunc(nn.Module):
         # the negative feedback already enforces this, tanh makes it exact under
         # any solver step) then evaluate the GRU-ODE field.
         h = torch.tanh(h)
-        x_in = y_read if self.couple_state else None
+        x_in = self._couple_input(y_read)
         dh = self.ode_cell(t, h, x_in)
-        dy = self.obs_head(h)
+        dy_learned = self.obs_head(h)
 
-        dstate = torch.cat((dy, dh), dim=-1)
-        return dstate
+        return self._assemble_dstate(y_read, dy_learned, dh)
 
 
 class GRUODEPredictorModel(nn.Module):
@@ -338,23 +415,40 @@ class GRUODEPredictorModel(nn.Module):
     def forward(self, t, state: torch.Tensor) -> torch.Tensor:
         """ODE field over the augmented state.
 
-        The trainer augments x0 to ``[x0_phys ; zeros(hidden_size)]``. On the
-        very first evaluation (t == 0, all-zero latent block) we lift x0_phys
-        into h0 so the latent is properly seeded; thereafter we integrate
-        normally. This latch is expressed with a differentiable ``where`` so the
-        graph stays static for ONNX.
+        The trainer augments x0 to ``[x0_phys ; zeros(hidden_size)]``. The latent
+        block must be seeded from x0_phys via the encoder on the initial call.
+
+        Seeding is keyed off the integration time ``t == 0`` rather than off an
+        all-zero latent block. The old "is the latent all zeros" heuristic
+        (1) re-ran the encoder on every solver evaluation, and (2) silently
+        misfired for any genuinely zero latent produced mid-rollout. Keying on
+        ``t`` is unambiguous, runs the encoder only at the initial time, and
+        stays a static graph for ONNX (a scalar comparison broadcast over the
+        batch).
+
+        ONNX export contract: the export tracer calls this with ``t=None`` (see
+        the training script's example_input), which resolves to the interior
+        (non-seeding) field. Consumers of the exported graph must therefore seed
+        the latent block themselves via :meth:`GRUODEFunc.build_initial_state`
+        before stepping, exactly as the training solver's augmented x0 is seeded
+        here at t == 0.
         """
+        self.func.nfe += 1
         y_read = state[..., : self.n_features]
         h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-        # Seed h from the physical read-out when the latent block is still zero
-        # (i.e. the solver's first call on the augmented initial condition).
-        needs_seed = (h.abs().sum(dim=-1, keepdim=True) == 0).to(state.dtype)
-        h_seeded = self.func.encoder(y_read)
-        h = needs_seed * h_seeded + (1.0 - needs_seed) * h
+        # is_initial is a 0/1 scalar. torch.Tensor -> compare to 0; None or any
+        # non-zero t -> interior step (no seeding).
+        if isinstance(t, torch.Tensor):
+            is_initial = (t == 0).to(state.dtype)
+            h_seeded = self.func.encoder(y_read)
+            h = is_initial * h_seeded + (1.0 - is_initial) * h
+        elif t == 0:
+            h = self.func.encoder(y_read)
+        # else: interior step / ONNX trace -> use h as carried in the state
 
         h = torch.tanh(h)
-        x_in = y_read if self.func.couple_state else None
+        x_in = self.func._couple_input(y_read)
         dh = self.func.ode_cell(t, h, x_in)
-        dy = self.func.obs_head(h)
-        return torch.cat((dy, dh), dim=-1)
+        dy_learned = self.func.obs_head(h)
+        return self.func._assemble_dstate(y_read, dy_learned, dh)

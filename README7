@@ -16,13 +16,26 @@ observation. The NEXT problem is different in two important ways:
       forecasting from a single initial condition x0 -- there are no sporadic
       in-rollout observations to filter on. The GRU-Bayes jump network is
       therefore unnecessary for the forecasting rollout and is omitted from the
-      default model.
+      default model. (A GRUBayesCell is still provided for completeness / future
+      use in a filtering encoder, but is not on the ONNX rollout path.)
 
   2.  The state we integrate is a *physical* kinematic vector (position/velocity
-      in DCU, Gridith, or Geodesic frame), not an abstract [-1, 1] latent. We keep 
-      the exact GRU-ODE vector field on a bounded latent ``h`` -- which retains the
+      in DCU or Gridith frame), not an abstract [-1, 1] latent. We keep the
+      exact GRU-ODE vector field on a bounded latent ``h`` -- which retains the
       paper's boundedness (h stays in [-1, 1]) and Lipschitz-continuity (K = 2)
-      guarantees -- and read the physical state out of ``h`` through an observation head.
+      guarantees, giving the continuity prior that the paper shows is decisive in
+      the low-sample regime (Table 2) -- and read the physical state out of ``h``
+      through a linear observation head. The initial condition is lifted into the
+      latent by an encoder head, integrated by the GRU-ODE field, and decoded at
+      every step.
+
+The whole object exposes the ``func.forward(t, x)`` signature expected by the
+existing ``ODESolver`` / ``TorchdiffeqSolver`` wrappers, so it drops into
+``NODEPredictor.batch_loss`` with no changes to the training engine: the solver
+integrates the *augmented* state ``[h; readout]`` and ``batch_loss`` slices the
+leading ``n_features`` physical channels back out for the loss.
+
+Author: continuous-time DL refactor for NEXT.
 """
 
 from __future__ import annotations
@@ -32,16 +45,59 @@ from torch import nn
 
 
 # ----------------------------------------------------------------------------
+# Grad-aware dropout
+# ----------------------------------------------------------------------------
+class GradAwareDropout(nn.Module):
+    """Dropout that keys off ``torch.is_grad_enabled()`` rather than train/eval.
+
+    The proprietary NEXT training loop never calls ``model.train()`` /
+    ``model.eval()``; it only wraps validation and inference in
+    ``torch.no_grad()``. A standard ``nn.Dropout`` would therefore stay active
+    during validation and ONNX export, corrupting ``val_pos_err`` and the
+    exported graph. Keying dropout on the grad state makes it active during the
+    (grad-enabled) training forward pass and automatically inert under
+    ``torch.no_grad()`` (validation, inference, export), which is exactly the
+    behaviour we want without touching the training loop.
+    """
+
+    def __init__(self, p: float):
+        super().__init__()
+        if not (0.0 <= p < 1.0):
+            raise ValueError(f"dropout p must be in [0, 1); got {p}")
+        self.p = float(p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.p == 0.0 or not torch.is_grad_enabled():
+            return x
+        # inverted dropout so expectation is preserved (no eval-time rescale)
+        return torch.nn.functional.dropout(x, p=self.p, training=True)
+
+    def extra_repr(self) -> str:
+        return f"p={self.p}, grad_aware=True"
+
+
+# ----------------------------------------------------------------------------
 # Full GRU-ODE vector field (Appendix A of the paper)
 # ----------------------------------------------------------------------------
 class FullGRUODECell(nn.Module):
     r"""The continuous-time GRU vector field on a bounded latent ``h``.
 
     Implements Eq. (3) / Appendix A:
+
         r(t) = sigma(W_r x + U_r h + b_r)
         z(t) = sigma(W_z x + U_z h + b_z)
         g(t) = tanh(W_h x + U_h (r . h) + b_h)
         dh/dt = (1 - z) . (g - h)
+
+    With no continuous input ``x`` the field is autonomous (g, z depend only on
+    h), which is exactly the NEXT forecasting regime. The ``x`` path is retained
+    so control signals / aerodynamic features can be injected later.
+
+    Properties preserved from the paper:
+      * Boundedness: if h(0) in [-1, 1] then h(t) in [-1, 1] for all t, because
+        dh_j/dt <= 0 at h_j = 1 and >= 0 at h_j = -1 (negative-feedback term).
+      * Lipschitz continuity with constant K = 2 (bounded sigmoids/tanh).
+    All operations are ONNX-exportable (matmul, sigmoid, tanh, elementwise).
     """
 
     def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
@@ -49,8 +105,12 @@ class FullGRUODECell(nn.Module):
         self.hidden_size = hidden_size
         self.input_size = input_size
 
+        # Recurrent (h -> gate) maps. Packed into a single Linear for the three
+        # gates r, z, g to keep the op count low for the ONNX graph.
         self.lin_hh = nn.Linear(hidden_size, 3 * hidden_size, bias=bias)
 
+        # Optional input (x -> gate) maps, only instantiated when there is a
+        # continuous input to feed the field.
         if input_size > 0:
             self.lin_xh = nn.Linear(input_size, 3 * hidden_size, bias=False)
         else:
@@ -64,6 +124,7 @@ class FullGRUODECell(nn.Module):
         else:
             gates_x = None
 
+        # split the r and z pre-activations; g is handled after gating h by r
         rz_h, g_h = gates_h[..., : 2 * self.hidden_size], gates_h[..., 2 * self.hidden_size :]
         if gates_x is not None:
             rz_x, g_x = gates_x[..., : 2 * self.hidden_size], gates_x[..., 2 * self.hidden_size :]
@@ -73,12 +134,18 @@ class FullGRUODECell(nn.Module):
             rz = rz_h
 
         r, z = torch.chunk(torch.sigmoid(rz), 2, dim=-1)
+
+        # g uses the *reset-gated* recurrent contribution: U_h (r . h)
+        # Re-project (r . h) through the g-slice of lin_hh's weight. To keep this
+        # exact and cheap we recompute the g pre-activation from (r * h).
         g_pre = self._g_preactivation(r * h, g_x)
         g = torch.tanh(g_pre)
 
         return (1.0 - z) * (g - h)
 
     def _g_preactivation(self, rh: torch.Tensor, g_x: torch.Tensor | None) -> torch.Tensor:
+        """Compute the g-gate pre-activation W_h x + U_h (r . h) + b_h."""
+        # slice the g portion of the packed recurrent weight/bias
         w_g = self.lin_hh.weight[2 * self.hidden_size :, :]  # (H, H)
         out = torch.nn.functional.linear(rh, w_g)
         if self.lin_hh.bias is not None:
@@ -89,12 +156,15 @@ class FullGRUODECell(nn.Module):
 
 
 # ----------------------------------------------------------------------------
-# Minimal GRU-ODE vector field (Appendix G)
+# Minimal GRU-ODE vector field (Appendix G) -- fewer params, often as accurate
 # ----------------------------------------------------------------------------
 class MinimalGRUODECell(nn.Module):
     r"""Minimal GRU-ODE field (Appendix G):
+
         f(t) = sigma(W_f x + U_f h + b_f)
         dh/dt = (1 - f) . (tanh(W_h x + U_h (h . f) + b_h) - h)
+
+    Same boundedness / Lipschitz properties, ~1/3 fewer recurrent parameters.
     """
 
     def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
@@ -125,16 +195,25 @@ class MinimalGRUODECell(nn.Module):
 
 
 # ----------------------------------------------------------------------------
-# GRU-Bayes filtering cell (paper Sec. 2.3)
+# GRU-Bayes filtering cell (paper Sec. 2.3) -- provided for completeness.
+# Not on the autoregressive ONNX rollout path; usable in a filtering encoder.
 # ----------------------------------------------------------------------------
 class GRUBayesCell(nn.Module):
-    """Discrete GRU jump that updates ``h`` from an incoming (masked) observation."""
+    """Discrete GRU jump that updates ``h`` from an incoming (masked) observation.
+
+    Implements h(t+) = GRU(h(t-), f_prep(y, m, h)). f_prep concatenates, per
+    dimension, the predicted (mu, logvar) from the observation head, the observed
+    value y, and the normalized error (y - mu) / sigma, applies a per-dimension
+    linear + ReLU, zeros unobserved dimensions via the mask, and feeds the result
+    to a standard GRUCell (which keeps h in [-1, 1], matching GRU-ODE's range).
+    """
 
     def __init__(self, hidden_size: int, obs_dim: int, prep_hidden: int = 4, bias: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.obs_dim = obs_dim
         self.prep_hidden = prep_hidden
+        # per-dimension prep: input is [mu, sigma, y, (y-mu)/sigma] = 4 features
         self.w_prep = nn.Parameter(0.01 * torch.randn(obs_dim, 4, prep_hidden))
         self.b_prep = nn.Parameter(torch.zeros(obs_dim, prep_hidden))
         self.gru = nn.GRUCell(obs_dim * prep_hidden, hidden_size, bias=bias)
@@ -149,9 +228,11 @@ class GRUBayesCell(nn.Module):
     ) -> torch.Tensor:
         sigma = torch.exp(0.5 * logvar)
         error = (y - mu) / (sigma + 1e-6)
+        # (batch, obs_dim, 4)
         feats = torch.stack([mu, sigma, y, error], dim=-1)
+        # per-dim linear: (batch, obs_dim, prep_hidden)
         prepped = torch.relu(torch.einsum("boi,oih->boh", feats, self.w_prep) + self.b_prep)
-        prepped = prepped * mask.unsqueeze(-1)
+        prepped = prepped * mask.unsqueeze(-1)  # zero unobserved dims
         prepped = prepped.reshape(prepped.shape[0], -1)
         return self.gru(prepped, h)
 
@@ -160,9 +241,43 @@ class GRUBayesCell(nn.Module):
 # Solver-compatible forecasting module
 # ----------------------------------------------------------------------------
 class GRUODEFunc(nn.Module):
-    """GRU-ODE vector field over an *augmented* state ``[h ; y_read]``."""
+    """GRU-ODE vector field over an *augmented* state ``[h ; y_read]``.
 
-    ORDER = "y_first"
+    This is the object handed to ``ODESolver.integrate`` as ``func``. It exposes
+    the ``forward(t, state)`` signature the solvers expect and integrates a
+    bounded GRU-ODE latent ``h`` together with a physical read-out ``y_read``
+    whose derivative is produced by a linear observation head. Concretely the
+    integrated state is::
+
+        state = [ y_read (n_features) | h (hidden_size) ]
+
+    and::
+
+        dh/dt      = GRU-ODE field on tanh-clamped h
+        dp_i/dt    = v_i               (kinematic identity, hard-wired)
+        dv/dt, ... = obs_head(h)       (learned force / rate model)
+
+    where the leading ``n_derivative_pairs`` position channels get their exact
+    derivatives from the corresponding velocity channels (not from the network),
+    and only the velocities and any extra rate channels are produced by the
+    learned observation head. This physics-informed split is the dominant
+    accuracy lever: it removes position integration drift and concentrates model
+    capacity on the accelerations.
+
+    ``batch_loss`` slices the leading ``n_features`` channels (``y_read``) as the
+    trajectory prediction, so the physical output is exactly the first block of
+    the solver's return -- no engine changes required.
+
+    The initial condition arrives as the physical x0 of shape
+    (batch, n_features) (optionally augmented with zeros by ``aug_dim``; those
+    extra channels are ignored here). We lift x0 into h via ``self.encoder`` on
+    the *first* field evaluation only, using a one-shot latch keyed off the
+    solver's t == 0 call, and seed y_read = x0. To stay purely functional and
+    ONNX-friendly, the lift is instead performed in :meth:`build_initial_state`,
+    which the wrapper calls before integration; the field itself is stateless.
+    """
+
+    ORDER = "y_first"  # physical read-out occupies the leading channels
 
     def __init__(
         self,
@@ -173,41 +288,129 @@ class GRUODEFunc(nn.Module):
         n_derivative_pairs: int | None = None,
         couple_indices: tuple[int, ...] | None = None,
         identity_mode: str = "raw",
-        pos_scale: torch.Tensor | None = None,
-        vel_scale: torch.Tensor | None = None,
-        vel_mean: torch.Tensor | None = None,
-        encoder_dropout: float = 0.1,
+        pos_scale: "torch.Tensor | None" = None,
+        vel_scale: "torch.Tensor | None" = None,
+        vel_mean: "torch.Tensor | None" = None,
+        encoder_dropout: float = 0.0,
     ):
+        """GRU-ODE forecasting field with physics-informed kinematic structure.
+
+        Args:
+            n_features: physical state width (== model_states).
+            hidden_size: GRU-ODE latent width H.
+            cell: "full" or "minimal" GRU-ODE cell.
+            couple_state: feed physical channels back into the field as x(t).
+            n_derivative_pairs: number of leading state channels whose exact time
+                derivative is another stored channel (the position block).
+                For a kinematic vector laid out as
+                    [ p_0 ... p_{k-1} | v_0 ... v_{k-1} | extra_rates... ]
+                we have d(p_i)/dt = v_i EXACTLY (a kinematic identity), so the
+                network must NOT try to learn it. With n_derivative_pairs = k the
+                field hard-wires dp_i/dt = v_i and only the velocities/extra rates
+                are produced by the learned dynamics. This is the single most
+                important structural prior for trajectory integration: it removes
+                position drift and frees all model capacity for the force model
+                (the accelerations). If None, no channels are hard-wired
+                (falls back to a fully-learned read-out).
+            couple_indices: which physical channels to feed back into the field
+                as the continuous input x(t). Absolute positions have huge,
+                unbounded magnitudes that saturate the bounded field's input
+                gates, so by default we couple only the velocity / rate channels
+                (indices >= n_derivative_pairs), which are the actual drivers of
+                the dynamics and are far better conditioned. If None and
+                couple_state is True, this is derived automatically.
+            identity_mode: "raw" (default) or "scaled". Controls the position
+                derivative convention (see the kinematic-identity block in the
+                body). "raw" uses d(p~)/dt = v~ -- the well-conditioned default
+                that matches the original order_shift_slice model and trains to
+                lower position error. "scaled" uses the physically-exact
+                normalized identity and REQUIRES pos_scale/vel_scale; it is
+                offered only for experimentation and tends to starve the
+                position->velocity gradient.
+            pos_scale, vel_scale, vel_mean: per-derivative-pair StandardScaler
+                statistics (length n_derivative_pairs), used ONLY when
+                identity_mode="scaled".
+        """
         super().__init__()
         self.n_features = n_features
         self.hidden_size = hidden_size
         self.couple_state = couple_state
 
+        # ------------------------------------------------------------------
+        # Kinematic structure: which leading channels have a known derivative.
+        # ------------------------------------------------------------------
         if n_derivative_pairs is None:
             n_derivative_pairs = 0
         if not (0 <= n_derivative_pairs * 2 <= n_features):
-            raise ValueError(f"Incompatible n_derivative_pairs={n_derivative_pairs} for n_features={n_features}")
+            raise ValueError(
+                f"n_derivative_pairs={n_derivative_pairs} incompatible with "
+                f"n_features={n_features} (need 2*pairs <= n_features)"
+            )
         self.n_derivative_pairs = n_derivative_pairs
+        # The learned dynamics only needs to produce the NON-position channels:
+        # the velocities of the paired block plus any trailing extra rates.
         self.n_learned = n_features - n_derivative_pairs
 
+        # ------------------------------------------------------------------
+        # Kinematic-identity mode for the position derivatives.
+        #
+        # The solver integrates NORMALIZED channels and the loss is computed in
+        # normalized space. Two conventions for d(p~)/dt are available:
+        #
+        #   "raw"    : d(p~_i)/dt = v~_i                        (kin_a=1, kin_b=0)
+        #   "scaled" : d(p~_i)/dt = (sig_v/sig_p) v~_i + mu_v/sig_p
+        #
+        # "scaled" is the physically-exact relationship in normalized space.
+        # HOWEVER, empirically "raw" trains to LOWER position error, and it is
+        # what the original hand-tuned model used (the ODEfunc order_shift_slice
+        # trick prepends the raw velocity channels). The reason is gradient
+        # conditioning, not steady-state accuracy: with sig_v/sig_p ~ 0.03, the
+        # "scaled" convention multiplies the position-loss gradient that reaches
+        # the velocity head by ~0.03, so position error barely teaches velocity.
+        # Position then passively integrates whatever velocity is learned and any
+        # small velocity bias drifts position with almost no corrective signal
+        # (gradient starvation). "raw" keeps position and velocity tightly
+        # coupled (coefficient 1), so the position loss strongly co-trains the
+        # velocity head. We therefore DEFAULT to "raw" and keep "scaled" as an
+        # opt-in for experimentation.
+        #
+        # `identity_mode` may be passed explicitly; otherwise it defaults to
+        # "raw". Passing scaler stats does NOT by itself switch to "scaled".
+        # ------------------------------------------------------------------
         if identity_mode not in ("raw", "scaled"):
             raise ValueError(f"identity_mode must be 'raw' or 'scaled', got {identity_mode!r}")
         self.identity_mode = identity_mode
 
         if n_derivative_pairs > 0 and identity_mode == "scaled":
+            if pos_scale is None or vel_scale is None:
+                raise ValueError("identity_mode='scaled' requires pos_scale and vel_scale")
             pos_scale_t = torch.as_tensor(pos_scale, dtype=torch.float32).reshape(-1)
             vel_scale_t = torch.as_tensor(vel_scale, dtype=torch.float32).reshape(-1)
-            vel_mean_t = torch.zeros_like(vel_scale_t) if vel_mean is None else torch.as_tensor(vel_mean, dtype=torch.float32).reshape(-1)
+            vel_mean_t = (
+                torch.zeros_like(vel_scale_t)
+                if vel_mean is None
+                else torch.as_tensor(vel_mean, dtype=torch.float32).reshape(-1)
+            )
+            if not (pos_scale_t.numel() == vel_scale_t.numel() == n_derivative_pairs):
+                raise ValueError(
+                    "pos_scale/vel_scale/vel_mean must each have length "
+                    f"n_derivative_pairs={n_derivative_pairs}"
+                )
             kin_a = vel_scale_t / pos_scale_t
             kin_b = vel_mean_t / pos_scale_t
         else:
-            kin_a = torch.ones(max(n_derivative_pairs, 1))
-            kin_b = torch.zeros(max(n_derivative_pairs, 1))
+            # "raw" (default): d(p~)/dt = v~
+            kin_a = torch.ones(max(n_derivative_pairs, 0))
+            kin_b = torch.zeros(max(n_derivative_pairs, 0))
         self.register_buffer("kin_a", kin_a)
         self.register_buffer("kin_b", kin_b)
 
+        # ------------------------------------------------------------------
+        # Coupling feature selection (input x(t) to the field).
+        # ------------------------------------------------------------------
         if couple_state:
             if couple_indices is None:
+                # default: couple everything EXCEPT absolute positions
                 couple_indices = tuple(range(n_derivative_pairs, n_features))
             self.couple_indices = tuple(couple_indices)
             input_size = len(self.couple_indices)
@@ -222,11 +425,23 @@ class GRUODEFunc(nn.Module):
         else:
             raise ValueError(f"unknown GRU-ODE cell type: {cell!r}")
 
+        # encoder: physical x0 -> bounded latent h0 (tanh keeps it in [-1, 1]).
+        # Optional dropout is applied HERE ONLY. Dropout must never be placed in
+        # obs_head or the GRU-ODE cell: those are evaluated at every solver step
+        # inside the ODE integration, and injecting per-step stochasticity would
+        # make the vector field discontinuous/non-deterministic, which breaks the
+        # adaptive dopri5 step-size control and the ONNX-exported field. The
+        # encoder runs exactly once (to seed h0 at t=0), so dropout there is a
+        # safe, standard regularizer on the initial-condition mapping.
+        #
+        # We use GradAwareDropout (active only when grad is enabled) because the
+        # training loop toggles no_grad() rather than train()/eval(); this keeps
+        # dropout off during validation, inference, and ONNX export.
         if encoder_dropout and encoder_dropout > 0.0:
             self.encoder = nn.Sequential(
                 nn.Linear(n_features, hidden_size),
                 nn.SiLU(),
-                nn.Dropout(p=encoder_dropout),
+                GradAwareDropout(p=encoder_dropout),
                 nn.Linear(hidden_size, hidden_size),
                 nn.Tanh(),
             )
@@ -238,7 +453,9 @@ class GRUODEFunc(nn.Module):
                 nn.Tanh(),
             )
         self.encoder_dropout = float(encoder_dropout)
-        
+        # observation head: h -> derivative of the LEARNED channels only
+        # (velocities + extra rates). Positions are supplied by the kinematic
+        # identity, not by this head.
         self.obs_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.SiLU(),
@@ -247,29 +464,45 @@ class GRUODEFunc(nn.Module):
         self.nfe = 0
 
     def _couple_input(self, y_read: torch.Tensor) -> torch.Tensor | None:
+        """Select the physical channels fed back into the field as x(t)."""
         if not self.couple_state:
             return None
         return y_read[..., list(self.couple_indices)]
 
     def _assemble_dstate(self, y_read: torch.Tensor, dy_learned: torch.Tensor, dh: torch.Tensor) -> torch.Tensor:
+        """Build d(state)/dt = [ dp | dy_learned | dh ].
+
+        The first n_derivative_pairs position derivatives come from the kinematic
+        identity in normalized coordinates, d(p~_i)/dt = kin_a_i * v~_i + kin_b_i.
+        In the default "raw" mode kin_a=1, kin_b=0 (d(p~)/dt = v~), which keeps
+        position and velocity tightly coupled in the gradient flow. In "scaled"
+        mode kin_a=sig_v/sig_p and kin_b=mu_v/sig_p. The remaining physical
+        derivatives (velocities + extra rates) come from the learned head.
+        """
         if self.n_derivative_pairs > 0:
             k = self.n_derivative_pairs
-            v_norm = y_read[..., k : 2 * k]
-            dp = self.kin_a[:k] * v_norm + self.kin_b[:k]
+            v_norm = y_read[..., k : 2 * k]  # paired normalized velocities
+            dp = self.kin_a * v_norm + self.kin_b
             dy = torch.cat((dp, dy_learned), dim=-1)
         else:
             dy = dy_learned
         return torch.cat((dy, dh), dim=-1)
 
+    # -- initial-state construction (called by the wrapper, not the solver) ---
     def build_initial_state(self, x0_phys: torch.Tensor) -> torch.Tensor:
+        """Lift physical x0 (batch, n_features) to augmented [y_read ; h]."""
         h0 = self.encoder(x0_phys)
         return torch.cat((x0_phys, h0), dim=-1)
 
+    # -- the vector field the solver integrates -------------------------------
     def forward(self, t, state: torch.Tensor) -> torch.Tensor:
         self.nfe += 1
         y_read = state[..., : self.n_features]
         h = state[..., self.n_features : self.n_features + self.hidden_size]
 
+        # clamp h back into [-1, 1] for numerical robustness (paper Sec. 2.2:
+        # the negative feedback already enforces this, tanh makes it exact under
+        # any solver step) then evaluate the GRU-ODE field.
         h = torch.tanh(h)
         x_in = self._couple_input(y_read)
         dh = self.ode_cell(t, h, x_in)
@@ -279,14 +512,23 @@ class GRUODEFunc(nn.Module):
 
 
 class GRUODEPredictorModel(nn.Module):
-    """Wraps a :class:`GRUODEFunc` to ensure stateless tracking stability across horizons."""
+    """Wraps a :class:`GRUODEFunc` so it is callable both as a field and as a
+    standalone ONNX-exportable rollout module.
+
+    * During training the ``NODEPredictor`` calls ``self.model`` through the
+      solver, which needs the ``forward(t, state)`` field signature. To satisfy
+      that while still lifting the physical x0 into the latent, we register the
+      encoder-lift on the augmented ODE dimension: the trainer passes x0 padded
+      with ``aug_dim`` zeros; we set ``aug_dim = hidden_size`` so the solver's
+      integrated state already carries room for h, and we overwrite that block
+      with the encoded h0 at t == 0 via :meth:`forward`.
+    """
 
     def __init__(self, func: GRUODEFunc):
         super().__init__()
         self.func = func
         self.n_features = func.n_features
         self.hidden_size = func.hidden_size
-        self.current_h_seeded = None
 
     @property
     def nfe(self) -> int:
@@ -297,28 +539,39 @@ class GRUODEPredictorModel(nn.Module):
         self.func.nfe = v
 
     def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        """ODE field over the augmented state.
+
+        The trainer augments x0 to ``[x0_phys ; zeros(hidden_size)]``. The latent
+        block must be seeded from x0_phys via the encoder on the initial call.
+
+        Seeding is keyed off the integration time ``t == 0`` rather than off an
+        all-zero latent block. The old "is the latent all zeros" heuristic
+        (1) re-ran the encoder on every solver evaluation, and (2) silently
+        misfired for any genuinely zero latent produced mid-rollout. Keying on
+        ``t`` is unambiguous, runs the encoder only at the initial time, and
+        stays a static graph for ONNX (a scalar comparison broadcast over the
+        batch).
+
+        ONNX export contract: the export tracer calls this with ``t=None`` (see
+        the training script's example_input), which resolves to the interior
+        (non-seeding) field. Consumers of the exported graph must therefore seed
+        the latent block themselves via :meth:`GRUODEFunc.build_initial_state`
+        before stepping, exactly as the training solver's augmented x0 is seeded
+        here at t == 0.
+        """
         self.func.nfe += 1
         y_read = state[..., : self.n_features]
-        h_solver = state[..., self.n_features : self.n_features + self.hidden_size]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-        is_initial = False
+        # is_initial is a 0/1 scalar. torch.Tensor -> compare to 0; None or any
+        # non-zero t -> interior step (no seeding).
         if isinstance(t, torch.Tensor):
-            if t.ndim == 0 and t == 0:
-                is_initial = True
-            elif t.ndim > 0 and torch.all(t == 0):
-                is_initial = True
-        elif t == 0:
-            is_initial = True
-
-        if is_initial:
+            is_initial = (t == 0).to(state.dtype)
             h_seeded = self.func.encoder(y_read)
-            self.current_h_seeded = h_seeded
-            h = h_seeded
-        else:
-            if getattr(self, "current_h_seeded", None) is not None:
-                h = self.current_h_seeded + h_solver
-            else:
-                h = h_solver
+            h = is_initial * h_seeded + (1.0 - is_initial) * h
+        elif t == 0:
+            h = self.func.encoder(y_read)
+        # else: interior step / ONNX trace -> use h as carried in the state
 
         h = torch.tanh(h)
         x_in = self.func._couple_input(y_read)

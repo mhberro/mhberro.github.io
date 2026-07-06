@@ -1,1848 +1,758 @@
-#NEXT_training
-# Built-ins
-import argparse
-import json
-import math
-import multiprocessing as mp
-import os
-import pickle
-from copy import deepcopy
-from pathlib import Path
-
-# 3rd party
-import matplotlib.pyplot as plt
-import numpy as np
-import onnx
-import pandas as pd
-import psutil
-import scipy
-import seaborn as sns
-import torch
-from scipy.interpolate import make_interp_spline  # TODO: cubic hermite spline?
-from sklearn.compose import ColumnTransformer
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
-
-# LM packages
-from lm_ai_torch_models.activations import Activation
-from lm_ai_torch_training.configuration import TrainingConfiguration
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
-from lm_ai_torch_training.optimizers.adam import AdamOptimizer
-from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
-from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
-
-# Local
-from coordinate_transform_functions import (
-    dcu_to_ned,
-    ecef_to_ned,
-    ecef_to_ned_velocity,
-    frd_to_dcu,
-    ned_to_dcu,
-    ned_to_ecef,
-    ned_to_ecef_velocity,
-)
-from energy_functions import mechanical_energy
-from load_truth import load_single_truth
-from loss_functions import EnergyMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
-
-# from prediction.mlearn.neural_ode.neural_ode import (
-#     DEFAULT_LOSS,
-#     EarlyStopper,
-#     ModelCheckpoint,
-#     NODEPredictor,
-# )
-from neural_ode_mod import (
-    DEFAULT_LOSS,
-    EarlyStopper,
-    ModelCheckpoint,
-    NODEPredictor,
-)
-from NEXT_frames import (
-    ecef_to_local_geodesic_vec,
-    ecef_to_next_dcu,
-    ecef_to_next_grdth,
-    local_geodesic_to_ecef_vec,
-    next_dcu_to_ecef,
-    next_grdth_to_ecef,
-)
-from torchdiffeq_solver import TorchdiffeqSolver
-from trajectory_helpers import (
-    ACC_SLICE,
-    DOWN_DOT_INDEX,
-    DOWN_INDEX,
-    GR_DOT_INDEX,
-    GR_INDEX,
-    POS_SLICE,
-    THETA_DOT_INDEX,
-    TIME_INDEX,
-    VEL_SLICE,
-    check_time_series,
-    resample_traj_data,
-)
-
-# example command
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/train/PrSM --validation-data-path datasets/test/PrSM --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/all/simple_ballistic_trajs --sr 100000
-# python NEXT_training.py --tgt-data-paths datasets/all/simple_ballistic_trajs --sr 300000 --use-grdth --use-scalar
-# python NEXT_training.py --tgt-data-paths datasets/mini/simple_ballistic_trajs --sr 100000 --use-scalar --use-grdth  # worked with 5 trajs
-# python NEXT_training.py --tgt-data-paths datasets/mini/simple_ballistic_trajs --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200
-# python NEXT_training.py --tgt-data-paths datasets/mini/PrSM --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 200 -o model_outputs/PrSM_mini50_energy
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --use-grdth --aug 5 --nhidden 200 -o model_outputs/PrSM
-
-# GRU-ODE (De Brouwer et al. 2019). Recommended starting point:
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --frame dcu --model-type gruode --latent-dim 64 --nhidden 200 --recon-weight 0.1 -o model_outputs/PrSM_gruode
-# python NEXT_training.py --tgt-data-paths datasets/all/PrSM --sr 100000 --use-scalar --frame grdth --model-type gruode --latent-dim 64 --nhidden 200 --recon-weight 0.1 --boundary-weight 0.01 -o model_outputs/PrSM_gruode_grdth
-
-# SBI
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/DF_5 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/DF_5_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/KN_20 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/KN_20_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/KN_22 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/KN_22_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/SS_19 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/SS_19_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/All_ICBM_Trajs/SS_25 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/SS_25_v001
-# python NEXT_training.py --tgt-data-paths datasets/SBI/HighE_HGV_4NEXT/GITCOMMIT_4baca132 --sr 100000 --use-scalar --use-grdth --aug 0 --nhidden 100 -o model_outputs/SBI/HighE_HGV_v001
-
-HAVE_HIGH_MEMORY = False
-if psutil.virtual_memory().total > 64e9:
-    HAVE_HIGH_MEMORY = True
-
-HAVE_GPU = False
-if torch.cuda.device_count() != 0:
-    HAVE_GPU = True
-    print("there is a gpu in this node")
-    for i in range(torch.cuda.device_count()):
-        print(torch.cuda.get_device_properties(i))
-
-BUCKET_SIZE = 5000  # [m]
-
-
-class ODEfunc(torch.nn.Module):
-    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
-        super(ODEfunc, self).__init__()
-        # aug_dim: is the number of zeros that have been added on to the initial conditions
-        # order_shift_slice: is slice of states that will be shifted left in the output vector. This works for both
-        #   balanced order (e.g. 3 position and 3 velocity) and non-balanced order (e.g. 2 position and 3 velocity).
-        #   For non-balanced order, only the velocity states that relate to the position states should be sliced. This
-        #   does mean that the arrangement of the states in the vector does matter. (e.g. the arrangement for a 2-3
-        #   state must be px,py,vx,vy,vz)
-        self.order_shift_slice = order_shift_slice
-        self.len_of_order_shift_slice = 0
-        if self.order_shift_slice is not None:
-            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
-            self.len_of_order_shift_slice = len(order_indicies)
-        # self.act = torch.nn.ELU(inplace=False)
-        # self.act = torch.nn.ReLU(inplace=False)  # not a smooth function. this lead to slow epochs
-        self.act1 = torch.nn.SiLU(inplace=False)
-        self.act2 = torch.nn.SiLU(inplace=False)
-        # self.act3 = torch.nn.SiLU(inplace=False)
-        # self.act = torch.nn.Tanh()
-        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
-        self.fc2 = torch.nn.Linear(nhidden, nhidden)
-        # self.fc3 = torch.nn.Linear(nhidden, nhidden)
-        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
-        self.nfe = 0
-
-    # def forward(self, x: torch.Tensor) -> torch.Tensor:  # this is the signature needed by PCM
-    def forward(self, t, x: torch.Tensor) -> torch.Tensor:  # this is the signature needed by torchdiffeq
-        if self.order_shift_slice is not None:
-            # Is narrow the best option here? I'm trying to do slicing on the last dimension and have it work in ONNX
-            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
-        self.nfe += 1
-        out = self.fc1(x)  # TODO: swap out this manual MLP with torchvision.ops.MLP
-        out = self.act1(out)
-        out = self.fc2(out)
-        out = self.act2(out)
-        # out = self.fc3(out)  # TODO: why so many layers?
-        # out = self.act(out)
-        out = self.fc4(out)
-        if self.order_shift_slice is not None:
-            return torch.cat((v, out), dim=x.ndim - 1)
-            # return torch.cat((v, out), dim=x.ndim - 1)  # TODO: subtract a small MLP here for dissipation on the acceleration term
-        else:
-            return out
-
-
-# =====================================================================
-#  GRU-ODE (De Brouwer, Simm, Arany, Moreau — "GRU-ODE-Bayes", NeurIPS 2019)
-# =====================================================================
-# The classes below implement a continuous-time GRU hidden process that is
-# integrated jointly with the physical trajectory state by the existing ODE
-# solver stack (Euler / RK4 / torchdiffeq / dopri5).
-#
-# ODE state layout (last dim):   s = [ x (D physical states) | h (H latents) ]
-#
-#   dh/dt = (1 - z(x,h)) ∘ (g(x,h) - h)          (paper Eq. 3 / Appendix A)
-#   dx/dt = [ kinematic shift of velocities | MLP([x,h]) ]
-#
-# Properties inherited from the paper that matter for chaotic kinematic
-# trajectories:
-#   * h(t) is invariant on [-1, 1] (negative feedback term) → bounded latents,
-#     which damps phugoid-mode blow-up during long free-run rollouts.
-#   * The field is Lipschitz (K=2 on the latent block) → a continuity prior on
-#     the hidden process, which the paper shows is decisive in the
-#     small-sample regime (Table 2) — exactly the few-trajectories-per-target
-#     situation of this pipeline.
-#   * Purely elementwise gates + Linear layers → clean ONNX opset-18 export
-#     (Sigmoid, Tanh, MatMul/Gemm, Mul, Sub, Concat only).
-#
-# GRU-Bayes: in this pipeline the truth is resampled onto a uniform dt grid
-# and the harness forecasts from a single initial condition, so the sporadic
-# jump machinery collapses to a single Bayes update at t=0 from the empty
-# prior h(0-)=0. That update is implemented in GRUBayesInit below (discrete
-# GRU gate math, so h(0+) ∈ [-1,1] as required for the invariance property).
-# If sporadic mid-rollout measurements are introduced later, apply
-# GRUBayesInit.update(h, x_obs) at each observation time between solver
-# segments — no other change is needed.
-
-
-class GRUODECell(torch.nn.Module):
-    """Full continuous-time GRU cell: dh/dt = (1 - z) ∘ (g - h).
-
-    x(t) is the continuous input signal — here the physical trajectory state
-    riding in the same ODE state vector, giving the tight ODE/input
-    interleaving the paper argues for (vs. decoupled encoder-decoder NODEs).
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.lin_rx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
-        self.lin_rh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.lin_zx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
-        self.lin_zh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.lin_gx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
-        self.lin_gh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
-
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        r = torch.sigmoid(self.lin_rx(x) + self.lin_rh(h))
-        z = torch.sigmoid(self.lin_zx(x) + self.lin_zh(h))
-        g = torch.tanh(self.lin_gx(x) + self.lin_gh(r * h))
-        return (1.0 - z) * (g - h)
-
-
-class MinimalGRUODECell(torch.nn.Module):
-    """Minimal GRU-ODE variant (paper Appendix G): one gate, ~2/3 the params.
-
-    dh/dt = (1 - f) ∘ (tanh(W_h x + U_h (h ∘ f) + b_h) - h)
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int):
-        super().__init__()
-        self.lin_fx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
-        self.lin_fh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.lin_gx = torch.nn.Linear(input_dim, hidden_dim, bias=False)
-        self.lin_gh = torch.nn.Linear(hidden_dim, hidden_dim, bias=True)
-
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
-        f = torch.sigmoid(self.lin_fx(x) + self.lin_fh(h))
-        g = torch.tanh(self.lin_gx(x) + self.lin_gh(h * f))
-        return (1.0 - f) * (g - h)
-
-
-class GRUBayesInit(torch.nn.Module):
-    """GRU-Bayes observation update, specialized to the t=0 initial condition.
-
-    Discrete GRU gate math applied once from the empty prior h(0-) = 0:
-        h(0+) = z ∘ h(0-) + (1 - z) ∘ g  =  (1 - z) ∘ g   ∈ [-1, 1]
-    The f_prep step of Appendix D reduces to a Linear+ReLU lift of the fully
-    observed state vector (mask ≡ 1 on this uniformly resampled data).
-    Implemented manually (not torch.nn.GRUCell) so that the standalone ONNX
-    export traces to primitive ops only.
-    """
-
-    def __init__(self, input_dim: int, hidden_dim: int, prep_dim: int | None = None):
-        super().__init__()
-        prep_dim = prep_dim or 2 * hidden_dim
-        self.prep = torch.nn.Sequential(
-            torch.nn.Linear(input_dim, prep_dim),
-            torch.nn.ReLU(inplace=False),
-        )
-        self.lin_z = torch.nn.Linear(prep_dim, hidden_dim, bias=True)
-        self.lin_g = torch.nn.Linear(prep_dim, hidden_dim, bias=True)
-
-    def forward(self, x0: torch.Tensor) -> torch.Tensor:
-        q = self.prep(x0)
-        z = torch.sigmoid(self.lin_z(q))
-        g = torch.tanh(self.lin_g(q))
-        return (1.0 - z) * g  # h(0-) = 0 ⇒ z ∘ h(0-) vanishes
-
-    def update(self, h: torch.Tensor, x_obs: torch.Tensor) -> torch.Tensor:
-        """General GRU-Bayes jump h(t-) → h(t+) for future sporadic-obs use."""
-        q = self.prep(x_obs)
-        z = torch.sigmoid(self.lin_z(q))
-        g = torch.tanh(self.lin_g(q))
-        return z * h + (1.0 - z) * g
-
-
-class GRUODEFunc(torch.nn.Module):
-    """Joint ODE field over s = [x_phys, h_latent] for the NODE solver stack.
-
-    * Latent block: GRU-ODE (full or minimal cell) driven continuously by x(t).
-    * Physical block: second-order kinematic structure. The derivative of the
-      integrated position-like states is copied *exactly* from the velocity
-      states (with the correct affine correction when the states are
-      standardized: d x̂_p/dt = (σ_v x̂_v + μ_v)/σ_p), and only the true
-      dynamics (accelerations, heading-rate derivative) are learned by an MLP
-      conditioned on [x, h].
-
-    forward signature is (t, s) to match torchdiffeq; s: (..., D + H).
-    """
-
-    def __init__(
-        self,
-        state_dim: int,
-        latent_dim: int,
-        nhidden: int,
-        order_shift_slice: slice | None = None,
-        minimal: bool = False,
-        scaler=None,
-    ):
-        super().__init__()
-        self.state_dim = state_dim
-        self.latent_dim = latent_dim
-        self.order_shift_slice = order_shift_slice
-        self.len_of_order_shift_slice = 0
-        if order_shift_slice is not None:
-            self.len_of_order_shift_slice = len(range(*order_shift_slice.indices(state_dim)))
-
-        cell_cls = MinimalGRUODECell if minimal else GRUODECell
-        self.gru_ode = cell_cls(state_dim, latent_dim)
-        self.init_net = GRUBayesInit(state_dim, latent_dim)
-
-        dx_out = state_dim - self.len_of_order_shift_slice
-        self.act1 = torch.nn.SiLU(inplace=False)
-        self.act2 = torch.nn.SiLU(inplace=False)
-        self.fc1 = torch.nn.Linear(state_dim + latent_dim, nhidden)
-        self.fc2 = torch.nn.Linear(nhidden, nhidden)
-        self.fc3 = torch.nn.Linear(nhidden, dx_out)
-
-        # linear latent readout used as an autoencoder-style consistency head
-        # during training (not part of the exported ODE field)
-        self.latent_readout = torch.nn.Linear(latent_dim, state_dim)
-
-        # affine correction for the kinematic shift under StandardScaler
-        n_shift = max(self.len_of_order_shift_slice, 1)
-        vel_scale = torch.ones(n_shift)
-        vel_mean = torch.zeros(n_shift)
-        pos_scale = torch.ones(n_shift)
-        if scaler is not None and order_shift_slice is not None:
-            vs = order_shift_slice.start
-            length = self.len_of_order_shift_slice
-            vel_scale = torch.tensor(scaler.scale_[vs : vs + length], dtype=torch.float32)
-            vel_mean = torch.tensor(scaler.mean_[vs : vs + length], dtype=torch.float32)
-            pos_scale = torch.tensor(scaler.scale_[0:length], dtype=torch.float32)
-        self.register_buffer("shift_vel_scale", vel_scale)
-        self.register_buffer("shift_vel_mean", vel_mean)
-        self.register_buffer("shift_pos_scale", pos_scale)
-
-        self.nfe = 0
-
-    def init_hidden(self, x0: torch.Tensor) -> torch.Tensor:
-        """GRU-Bayes update at t=0 from empty prior. h(0) ∈ [-1, 1]."""
-        return self.init_net(x0)
-
-    def forward(self, t, s: torch.Tensor) -> torch.Tensor:  # torchdiffeq signature
-        self.nfe += 1
-        x = torch.narrow(s, dim=-1, start=0, length=self.state_dim)
-        h = torch.narrow(s, dim=-1, start=self.state_dim, length=self.latent_dim)
-
-        # latent flow (bounded, Lipschitz)
-        dh = self.gru_ode(x, h)
-
-        # learned physical dynamics conditioned on [x, h]
-        out = self.fc1(torch.cat((x, h), dim=-1))
-        out = self.act1(out)
-        out = self.fc2(out)
-        out = self.act2(out)
-        dx_free = self.fc3(out)
-
-        if self.order_shift_slice is not None:
-            v = torch.narrow(s, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
-            # exact d(pos)/dt = vel, corrected for standardization
-            dpos = (v * self.shift_vel_scale + self.shift_vel_mean) / self.shift_pos_scale
-            dx = torch.cat((dpos, dx_free), dim=s.ndim - 1)
-        else:
-            dx = dx_free
-        return torch.cat((dx, dh), dim=s.ndim - 1)
-
-
-class GRUODEPredictor(NODEPredictor):
-    """NODEPredictor whose ODE state is [x_phys | h_latent].
-
-    Overrides batch_loss/infer to (1) run the GRU-Bayes initial update to get
-    h(0), (2) integrate the joint state, (3) score the loss on the physical
-    slice only, plus two optional physics-informed regularizers:
-      * latent autoencoder reconstruction: readout(h_t) ≈ x_t (target), which
-        forces h to encode the full kinematic state and stabilizes long
-        rollouts,
-      * physical boundary penalty: soft hinge on the frame invariant
-        (Up ≥ 0 in DCU/geodesic, GroundRange ≥ 0 in GRDTH), evaluated in
-        unscaled physical units.
-    """
-
-    def __init__(
-        self,
-        *nargs,
-        recon_weight: float = 0.1,
-        boundary_weight: float = 0.0,
-        boundary_idx: int | None = None,
-        scaler=None,
-        **kwargs,
-    ):
-        super().__init__(*nargs, **kwargs)
-        self.recon_weight = recon_weight
-        self.boundary_weight = boundary_weight
-        self.boundary_idx = boundary_idx
-        # differentiable unscale constants for the boundary term
-        if scaler is not None and boundary_idx is not None:
-            self.register_buffer(
-                "bnd_scale", torch.tensor(float(scaler.scale_[boundary_idx]), dtype=torch.float32)
-            )
-            self.register_buffer("bnd_mean", torch.tensor(float(scaler.mean_[boundary_idx]), dtype=torch.float32))
-        else:
-            self.register_buffer("bnd_scale", torch.tensor(1.0))
-            self.register_buffer("bnd_mean", torch.tensor(0.0))
-
-    def batch_loss(self, x: torch.Tensor, extra_feat: torch.Tensor | None = None) -> dict[str, torch.Tensor]:
-        if self.solver.adjoint:
-            raise NotImplementedError("GRUODEPredictor uses torchdiffeq's odeint_adjoint via the solver method flag")
-        batch_size, time_steps, n_features = x.shape
-        x0 = x[:, 0]
-        h0 = self.model.init_hidden(x0)  # GRU-Bayes jump from empty prior
-        s0 = torch.cat((x0, h0), dim=-1)
-
-        s_pred = self.solver.integrate(
-            func=self.model,
-            x0=s0,
-            steps=time_steps - 1,
-            extra_feat=extra_feat,
-        )
-        x_pred = s_pred[:, :, : self.model.state_dim]
-        h_pred = s_pred[:, :, self.model.state_dim :]
-
-        x_pred = torch.nan_to_num(x_pred, nan=0)
-        x_tgt = torch.nan_to_num(x, nan=0)
-        metrics = self.criterion(x_pred, x_tgt)
-
-        if self.recon_weight > 0:
-            recon = self.model.latent_readout(h_pred)
-            recon_loss = torch.nn.functional.mse_loss(recon, x_tgt)
-            metrics["latent_recon"] = recon_loss.detach()
-            metrics["loss"] = metrics["loss"] + self.recon_weight * recon_loss
-
-        if self.boundary_weight > 0 and self.boundary_idx is not None:
-            phys = x_pred[..., self.boundary_idx] * self.bnd_scale.to(x_pred.device) + self.bnd_mean.to(
-                x_pred.device
-            )
-            boundary_loss = torch.nn.functional.relu(-phys).mean()
-            metrics["boundary_pen"] = boundary_loss.detach()
-            metrics["loss"] = metrics["loss"] + self.boundary_weight * boundary_loss
-
-        return metrics
-
-    def infer(self, x0: torch.Tensor, steps: int = 1, extra_feat: torch.Tensor | None = None) -> torch.Tensor:
-        with torch.no_grad():
-            h0 = self.model.init_hidden(x0)
-            s0 = torch.cat((x0, h0), dim=-1)
-            s = self.solver.integrate(func=self.model, x0=s0, steps=steps, extra_feat=extra_feat)
-            return s[:, :, : self.model.state_dim]
-
-
-# wrap the sklearn StandardScalar
-class Normaliser(torch.nn.Module):
-    def __init__(self, scaler):
-        super().__init__()
-        self.mean = torch.nn.Parameter(torch.tensor(scaler.mean_, dtype=torch.float32), requires_grad=False)
-        self.scale = torch.nn.Parameter(torch.tensor(scaler.scale_, dtype=torch.float32), requires_grad=False)
-
-    def forward(self, x):  # phys → norm
-        return (x - self.mean) / self.scale
-
-    def inverse(self, z):  # norm → phys
-        return z * self.scale + self.mean
-
-
-# -------------------------------------------------
-# 2️⃣  Encoder – maps a short observation window to μ, logσ
-# -------------------------------------------------
-class Encoder(torch.nn.Module):
-    """
-    Input: (B, K, 6)  – K initial time steps per trajectory
-    Output: μ, logσ each of shape (B, latent_dim)
-    """
-
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        # TODO: replace 6 with state size
-        self.rnn = torch.nn.GRU(input_size=6, hidden_size=hidden, batch_first=True, num_layers=1)
-        self.mu_head = torch.nn.Linear(hidden, latent_dim)
-        self.logvar_head = torch.nn.Linear(hidden, latent_dim)
-
-    def forward(self, x):
-        # x already normalised
-        _, h_n = self.rnn(x)  # h_n: (1, B, hidden)
-        h = h_n.squeeze(0)  # (B, hidden)
-        mu = self.mu_head(h)
-        logvar = self.logvar_head(h)
-        return mu, logvar
-
-
-# -------------------------------------------------
-# 3️⃣  Latent ODE dynamics (continuous flow)
-# -------------------------------------------------
-class LatentODEFunc(torch.nn.Module):
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, latent_dim),
-        )
-
-    def forward(self, t, z):
-        return self.net(z)
-
-
-# -------------------------------------------------
-# 4️⃣  Decoder – maps latent state back to (p, v)
-# -------------------------------------------------
-class Decoder(torch.nn.Module):
-    def __init__(self, latent_dim=8, hidden=128):
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(latent_dim, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, hidden),
-            torch.nn.SiLU(),
-            torch.nn.Linear(hidden, 6),  # TODO: replace 6 with state size
-        )  # output 6-D physical state (still normalised)
-
-    def forward(self, z):
-        return self.net(z)
-
-
-# -------------------------------------------------
-# 5️⃣  Full model wrapper (for a single trajectory)
-# -------------------------------------------------
-from torchdiffeq import odeint_adjoint
-
-
-class LatentNODE(torch.nn.Module):
-    def __init__(self, latent_dim=8):
-        super().__init__()
-        self.encoder = Encoder(latent_dim)
-        self.odefunc = LatentODEFunc(latent_dim)
-        self.decoder = Decoder(latent_dim)
-
-    def forward(self, obs_window_and_times: tuple[torch.Tensor, torch.Tensor]):
-        """
-        obs_window : (B, K, 6)  – normalised observations used by encoder
-        t_eval     : (T,)       – times at which we want a reconstruction
-        Returns:
-            recon   : (B, T, 6) – decoded physical state (still normalised)
-            mu, logvar : (B, latent_dim)  – encoder statistics (for KL)
-        """
-        obs_window, t_eval = obs_window_and_times
-        mu, logvar = self.encoder(obs_window)
-
-        # Reparameterisation trick (sample z₀)
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z0 = mu + eps * std  # (B, latent_dim)
-
-        # Integrate the latent ODE
-        # odeint expects (T, B, latent_dim); we transpose after
-        z_t = odeint_adjoint(self.odefunc, z0, t_eval, atol=1e-5, rtol=1e-5)  # (T, B, latent_dim)
-        z_t = z_t.permute(1, 0, 2)  # (B, T, latent_dim)
-
-        # Decode every latent snapshot
-        recon = self.decoder(z_t)  # (B, T, 6)
-        return recon, mu, logvar
-
-
-def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """Standard normal-prior KL term used by VAEs / latent ODEs."""
-    # 0.5 * Σ (1 + logσ² – μ² – σ²)
-    return 0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar), dim=1))
-
-
-def _make_obs_target(
-    traj: torch.Tensor,
-    obs_len: int = 10,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns a short observation window (first *obs_len* points) that will be
-    fed to the encoder and the full trajectory (starting at the same first
-    time-step) that will be used as the reconstruction target.
-    """
-    assert traj.shape[0] > obs_len, "trajectory shorter than observation window"
-    obs_window = traj[:obs_len].unsqueeze(0)  # (B=1, K=obs_len, D)
-    target = traj.unsqueeze(0)  # (B=1, T, D)
-    return obs_window, target
-
-
-def train_NEXT(
-    model_name,
-    traj_targets_train,
-    traj_targets_test,
-    scaler_traj,
-    model_save_path,
-    trajectory_dt,
-    batch_size,
-    use_scalar,
-    model_states,
-    aug_dim,
-    nhidden,
-    gpu_index,
-    model_type: str = "node",
-    frame: str = "dcu",
-    latent_dim: int = 64,
-    recon_weight: float = 0.1,
-    boundary_weight: float = 0.0,
-    gruode_minimal: bool = False,
-):
-    # define initial training configuration
-    training_configuration = TrainingConfiguration(
-        n_epochs=1,
-        optimizer=AdamOptimizer(learning_rate=1e-3),
-        # optimizer=ReduceLROnPlateauConfiguration("loss").create_from_optimizer(AdamOptimizer(learning_rate=1e-3)),
-        batch_size=batch_size,
-        num_workers=100,  # is this the parallel control? cpu_count()//2?
-        verbose=True,
-    )
-    # ode_solver = EulerSolver(dt=trajectory_dt)
-    # ode_solver = RK4Solver(dt=trajectory_dt)
-    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False)
-
-    if frame in ("dcu", "geodesic"):
-        velocity_indicies = (3, 4, 5)
-    elif frame in ("grdth",):
-        velocity_indicies = (2, 3, 4)
-    else:
-        raise ValueError("That frame is not known for what the velocity indicies are")
-    # Define custom loss function.
-    early_stop_metric_name = "val_loss"
-    # loss_func = EnergyMSELoss(
-    #     height_idx=1,  # This changes for GRDTH frame
-    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
-    #     energy_fn=mechanical_energy,
-    #     energy_weight=1,
-    #     scaler=scaler_traj if use_scalar else None,
-    #     N_FEATURES=model_states,
-    # )
-    loss_func = WrappedMSELoss(
-        height_idx=1,  # This changes for GRDTH frame
-        vel_indices=velocity_indicies,  # This changes for GRDTH frame
-        scaler=scaler_traj if use_scalar else None,
-        N_FEATURES=model_states,
-    )
-
-    # this does have influence, but it is not a hard limit on the given expected values
-    # loss_func = SecondOrderSplitMSELoss(
-    #     height_idx=1,  # This changes for GRDTH frame
-    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
-    #     vel_weight=1.0,  # TODO: try this set to zero so that only position is used for loss
-    #     scaler=scaler_traj if use_scalar else None,
-    #     N_FEATURES=model_states,
-    #     pos_expect=1e9,
-    #     vel_expect=1e9,
-    # )
-
-    # more influential, but not a hard limit
-    # loss_func = WeightedHuberLoss(
-    #     delta_pos=1e500,
-    #     delta_vel=1e500,
-    #     # height_idx=1,  # This changes for GRDTH frame
-    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
-    #     # vel_weight=1.0,
-    #     scaler=scaler_traj if use_scalar else None,
-    #     N_FEATURES=model_states,
-    #     weight_pos=1.0,
-    #     weight_vel=1.0,
-    # )
-    # early_stop_metric_name = "val_loss_unweighted"
-
-    # frame-dependent second-order structure and physical boundary invariant
-    if frame in ("dcu", "geodesic"):
-        # states: [Down, Cross, Up, dotD, dotC, dotU]; d(pos)/dt = vel; Up >= 0
-        gruode_order_shift = slice(3, 6)
-        gruode_boundary_idx = 2
-    elif frame in ("grdth",):
-        # states: [GR, Down, dotGR, dotD, VTheta]; d(GR,Down)/dt = (dotGR,dotD); GR >= 0
-        gruode_order_shift = slice(2, 4)
-        gruode_boundary_idx = 0
-    else:
-        gruode_order_shift = None
-        gruode_boundary_idx = None
-
-    # Define the Neural ODE model (training harness)
-    predictor_kwargs = dict(
-        architecture=FFNNArchitecture(
-            layer_channels=[5, 5],  # this doesn't do anything when using ODEfunc
-            # layer_activation=Activation.RELU,
-            # layer_activation=Activation.TANH,
-            layer_activation=Activation.SILU,
-        ),
-        training_configuration=training_configuration,
-        solver=ode_solver,
-        logging_interval=5,
-        loss_func=loss_func,
-        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
-        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
-        aug_dim=aug_dim,
-    )
-    if model_type == "gruode":
-        node = GRUODEPredictor(
-            recon_weight=recon_weight,
-            boundary_weight=boundary_weight,
-            boundary_idx=gruode_boundary_idx,
-            scaler=scaler_traj if use_scalar else None,
-            **predictor_kwargs,
-        )
-    else:
-        node = NODEPredictor(**predictor_kwargs)
-    if HAVE_GPU:
-        node.device = torch.device(f"cuda:{gpu_index}")
-        node._initialize_losses(node.criterion)
-        node._initialize_model()
-        node._initialize_optimizer()
-
-    # --------------------------------------------------------------------
-    #  Build the requested model
-    # --------------------------------------------------------------------
-    if model_type == "node":
-        # plain NODE (no augmentation, no order-shift)
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "anode":
-        # Augmented NODE – aug_dim comes from the CLI flag
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=aug_dim,
-            order_shift_slice=None,
-        ).to(node.device)
-    elif model_type == "sonode":
-        # Second-order NODE – shift the velocity slice left
-        # (the slice that selects the velocity components; adjust if you
-        # change the state ordering)
-        node.model = ODEfunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            aug_dim=0,
-            order_shift_slice=slice(3, 6),
-        ).to(node.device)
-    elif model_type == "gruode":
-        # ------------------------------------------------------------
-        #  GRU-ODE (continuous-time GRU, De Brouwer et al. 2019)
-        # ------------------------------------------------------------
-        # Joint ODE state [x_phys | h_latent]. GRU-Bayes initializes h(0)
-        # from the initial condition; the GRU-ODE cell evolves the bounded
-        # latent between (virtual) observations; a physics-structured MLP
-        # head produces the physical derivatives with an exact kinematic
-        # order shift (position derivatives copied from velocity states,
-        # affine-corrected for the StandardScaler).
-        node.model = GRUODEFunc(
-            state_dim=model_states,
-            latent_dim=latent_dim,
-            nhidden=nhidden,
-            order_shift_slice=gruode_order_shift,
-            minimal=gruode_minimal,
-            scaler=scaler_traj if use_scalar else None,
-        ).to(node.device)
-    elif model_type == "latentode":
-        # ------------------------------------------------------------
-        #  Latent-ODE model – a completely different object
-        # ------------------------------------------------------------
-        # Encoder/Decoder expect a *state size* of 6 (or whatever you use).
-        # They are already defined above (Encoder, Decoder, LatentODEFunc,
-        # LatentNODE).  We just instantiate the wrapper.
-        latent_dim = nhidden // 2 if nhidden >= 20 else 8  # a sensible default
-        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
-
-        # For latent ODE we need a **different loss** that adds the KL term.
-        # Keep the same MSE wrapper you already use for the physical states.
-        recon_criterion = WrappedMSELoss(
-            height_idx=1,
-            vel_indices=[3, 4, 5],
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-        )
-
-        def latent_ode_loss_fn(recon, target, mu, logvar):
-            """Reconstruction (MSE) + KL."""
-            recon_loss = recon_criterion(recon, target)
-            kl = _kl_divergence(mu, logvar)
-            # You may weight the KL term; 0.1 works well for many problems.
-            return recon_loss + 0.1 * kl
-
-        # Replace the NODEPredictor's loss with our custom wrapper.
-        # NOTE: NODEPredictor expects a callable that takes (pred, true).
-        # We therefore bind the extra arguments via a lambda.
-        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
-    else:
-        raise ValueError(f"Unsupported model_type: {model_type}")
-
-    # Train the model if it does not exist
-    if use_scalar:
-        scaled_traj_targets_train_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
-        ]
-        scaled_traj_targets_test_posvel = [
-            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
-        ]
-    else:
-        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
-        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
-    gen_model = False
-    try:
-        # Try loading the specific requested model
-        node.load(directory=model_save_path, model_name=model_name)
-    except ValueError:
-        gen_model = True
-        pass
-
-    if gen_model:
-        # did not find a model to load. creating a new one
-
-        # Model file not found. Train and create it
-        # node._log_metrics = new_log_metrics.__get__(node)
-        # try:
-        #     node.model.compile()  # this resulted in slower epochs on cpu
-        #     print("successfully compile the nn")
-        # except Exception as e:
-        #     print("failed to compile the nn due to", e)
-
-        if model_type == "latentode":
-            # Choose a short window (e.g. 10 time-steps).  You can expose this
-            # as another CLI argument if you wish.
-            OBS_WINDOW = 10
-
-            train_data = [
-                _make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel
-            ]  # list of (obs_window, target)
-            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
-            # reshape for NODEPredictor: it expects a list of tensors.
-            # We will pack the tuple into a single tensor where the first two
-            # dimensions are (B, K/ T) and let the model unpack them.
-            # The simplest approach is to keep them as tuples and let the
-            # training loop handle them.
-            # → In the `node.fit` call below replace `fraction_of_data` /
-            #   `fraction_of_data_val` with these lists.
-
-        # length strategies is a trick from NODE literature to initialize the model on shorter time frames
-        length_strategies = [
-            (0.1, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(20, 5e-6, metric_name=early_stop_metric_name), 1e-4),
-            (0.5, 3000, EarlyStopper(20, 5e-5, metric_name=early_stop_metric_name), 1e-4),
-            (0.7, 2000, EarlyStopper(20, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-3),
-            # TODO: get rid of this one when the ReduceOnPlateau lr scheduler is working
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(50, 5e-4, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 5000, EarlyStopper(50, 5e-3, metric_name=early_stop_metric_name), 1e-7),
-        ]
-
-        for len_strat in length_strategies:
-            print("running length strategy", len_strat)
-            data_fraction, epochs, early_stopper, learning_rate = len_strat
-            # update the training configuration for the new length strategy
-            node.training_configuration = TrainingConfiguration(
-                n_epochs=epochs,
-                optimizer=AdamOptimizer(learning_rate=learning_rate),
-                # optimizer=ReduceLROnPlateauConfiguration("loss").create_from_optimizer(
-                #     torch.optim.Adam(node.parameters(), learning_rate)
-                # ),
-                # optimizer=torch.optim.lr_scheduler.ReduceLROnPlateau(
-                #     torch.optim.Adam(node.parameters(), learning_rate)
-                # ),
-                batch_size=batch_size,
-                num_workers=2,  # is this the parallel control? cpu_count()//2?
-                verbose=True,
-            )
-
-            # manually re-initialize some of the neural_ode object things. copied from NODEPredictor.__init__
-            # Parse parameters from the training configuration.
-            node.optimizer_config = node.training_configuration.optimizer
-            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
-
-            # Set the iteration parameter for required optimizers.
-            node.training_metrics = {}
-
-            # Setup the model for training and inference.
-            node._initialize_optimizer()
-
-            # reset the early stop check
-            node.early_stopper = early_stopper
-            # node.early_stopper = None
-
-            min_states = 5
-            if math.ceil(scaled_traj_targets_train_posvel[0].shape[0] * data_fraction) < min_states:
-                print("length strategy results in too few states. overriding to maintain stability")
-            if model_type == "latentode":
-                # each element is a tuple (obs_window, target)
-                fraction_of_data = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],  # obs_window
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )  # target
-                    for (obs, tgt) in train_data
-                ]
-                fraction_of_data_val = [
-                    (
-                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
-                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
-                    )
-                    for (obs, tgt) in test_data
-                ]
-            else:
-                # existing behaviour (plain NODE/ANODE/SONODE)
-                fraction_of_data = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_train_posvel
-                ]
-                fraction_of_data_val = [
-                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                    for x in scaled_traj_targets_test_posvel
-                ]
-
-            # torch.autograd.set_detect_anomaly(True)  # the magic command to look into the guts of torch
-            metrics = node.fit(
-                x=fraction_of_data,
-                validation_data=fraction_of_data_val,
-                # validation_data=fraction_of_data,
-                enable_checkpoints=True if data_fraction == 1.0 else False,
-            )
-        p = Path(model_save_path, model_name + ".checkpoint.pt")
-        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
-
-    # load the saved checkpoint model
-    node.load(directory=model_save_path, model_name=model_name)
-
-    # disable training mode on the model
-    node.model.train(False)
-    node.model.eval()
-
-    # TODO: move this conversion to a separate script
-    # export the model to ONNX binary (protobuf) format
-    # For gruode the ODE state carries latent_dim extra dims instead of the
-    # zero-padded aug dims; downstream must initialize them with the exported
-    # *_init.onnx network (GRU-Bayes update at t=0), not with zeros.
-    extra_state_dims = latent_dim if model_type == "gruode" else aug_dim
-    if isinstance(ode_solver, TorchdiffeqSolver):
-        example_input = (
-            None,
-            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(extra_state_dims))).to(node.device),
-        )
-    else:
-        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(extra_state_dims))).to(
-            node.device
-        )
-
-    if model_type == "gruode":
-        # export the GRU-Bayes initial hidden-state network: x0 (D,) -> h0 (H,)
-        init_example_input = scaled_traj_targets_train_posvel[0][0].to(node.device)
-        init_onx = torch.onnx.export(
-            node.model.init_net,
-            init_example_input,
-            os.path.join(model_save_path, model_name + "_init.onnx"),
-            export_params=True,
-            opset_version=18,
-            external_data=False,
-            input_names=["x0"],
-            output_names=["h0"],
-        )
-        with open(os.path.join(model_save_path, model_name + "_init_plain.onnx"), "w") as f:
-            f.write(onnx.printer.to_text(init_onx.model_proto))
-    model_onx = torch.onnx.export(
-        node.model,
-        example_input,
-        os.path.join(model_save_path, model_name + ".onnx"),
-        export_params=True,
-        opset_version=18,  # 18 is the max we can go do right now. 17 is max w/o dynamo. https://onnxruntime.ai/docs/reference/compatibility.html#onnx-opset-support
-        external_data=False,
-        input_names=["input"],
-        output_names=["output"],
-        # dynamo=False,
-    )
-
-    # export the model to ONNX plain text format
-    with open(
-        os.path.join(model_save_path, model_name + "_plain.onnx"),
-        "w",
-    ) as f:
-        f.write(onnx.printer.to_text(model_onx.model_proto))  # This is plain text
-
-    # export the scalar to ONNX format
-    # NOTE: slk2onnx does not support the inverse transform call that NEXT needs
-    # onx = to_onnx(
-    #     scaler_traj,
-    #     traj_targets_train[0].numpy(),
-    #     target_opset=18,
-    # )
-    # print(type(onx))
-    # with open(
-    #     os.path.join(model_save_path, model_name + "_scalar.onnx"),
-    #     "wb",
-    # ) as f:
-    #     f.write(onx.SerializeToString())  # This is a protobuf format
-    # with open(
-    #     os.path.join(model_save_path, model_name + "_scalar_plain.onnx"),
-    #     "w",
-    # ) as f:
-    #     f.write(onnx.printer.to_text(onx))  # This is plain text
-
-    # save a protobuf text file of the scalar
-    if isinstance(scaler_traj, MinMaxScaler):
-        min_input = scaler_traj.min_
-        scale_input = scaler_traj.scale_
-        data_min_input = scaler_traj.data_min_
-        data_max_input = scaler_traj.data_max_
-
-        with open(
-            os.path.join(
-                model_save_path,
-                f"{model_name}_scalar_params_and_test_inputs.txt",
-            ),
-            "w",
-            encoding="utf-8",
-        ) as f:
-            for m, s, dmin, dmax in zip(min_input, scale_input, data_min_input, data_max_input):
-                f.write(f"""InputScaleFactorsMinMaxScaler
-{{
-\tMin: {m}
-\tScale: {s}
-\tDataMin: {dmin}
-\tDataMax: {dmax}
-}}""")
-    elif isinstance(scaler_traj, StandardScaler):
-        scale_input = scaler_traj.scale_
-        mean_input = scaler_traj.mean_
-        var_input = scaler_traj.var_
-
-        with open(
-            os.path.join(
-                model_save_path,
-                f"{model_name}_scalar_params_and_test_inputs.txt",
-            ),
-            "w",
-            encoding="utf-8",
-        ) as f:
-            for s, m, v in zip(scale_input, mean_input, var_input):
-                f.write(f"""InputScaleFactorsStandardScaler
-{{
-\tScale: {s}
-\tMean: {m}
-\tVariance: {v}
-}}""")
-    return node, model_name
-
-
-def prep_trajectory(x):
-    # load_single_truth(x, debug=False), x.name, args.sr, path
-    ecef_data, traj_number, max_sr, trajectory_dt, args = x
-    # keep time, pos, vel. don't need the rest of the columns
-    ecef_data = ecef_data[:, 0:7]
-    print("prepping traj", traj_number)
-    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
-
-    # remove launch point based on near zero speed state
-    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
-    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
-        ecef_data = ecef_data[1:]
-
-    # begin PrSM data mods
-    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
-    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
-    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
-    # # covert to impact frame
-    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
-
-    # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(ecef_data)
-    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
-    # for i in range(ecef_data.shape[0]):
-    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
-    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
-    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
-    #     new_ecef_data[i, POS_SLICE] = p_ecef
-
-    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
-    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
-    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
-    #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # ecef_data = new_ecef_data
-    # end PrSM data mods
-
-    # BEGIN SBI HighE HGV handling
-    # remove launch phase from SBI
-    # end_of_launch_index = 122  # SBI HighE HGV
-    end_of_launch_index = 62  # SBI LowE 3f39bfb6 HGV and for the 555063a9 too?
-
-    # write the boost out to CSV
-    # boost_ecef = ecef_data[:end_of_launch_index]
-    sbi_target_name = "LowE_555063a9_HGV"
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "boost"), exist_ok=True)
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "impact"), exist_ok=True)
-    # os.makedirs(Path("SBI_boost-glide", sbi_target_name, "glide"), exist_ok=True)
-    # pd.DataFrame(boost_ecef, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-    #     Path("SBI_boost-glide", sbi_target_name, "boost", traj_number), index=False
-    # )
-    # impact_slice = np.atleast_2d(ecef_data[-1])
-    # df = pd.DataFrame(impact_slice)
-    # print("baaa", df)
-    # pd.DataFrame(impact_slice, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-    #     Path("SBI_boost-glide", sbi_target_name, "impact", traj_number), index=False
-    # )
-
-    # ecef_data = ecef_data[end_of_launch_index:]
-
-    # filter the points by max slant range from impact
-    # TODO: can this be done with np.where?
-    sr_ecef_data = np.asarray(
-        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-        # tuple(x for x in ecef_data if 2500e3 < np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
-        dtype=np.float64,
-    )
-    # TODO: add a min slant range to avoid the origin discontinuity
-    # sr_ecef_data = np.asarray(
-    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
-    #     dtype=np.float64,
-    # )
-
-    # nice idea, but it wasn't the source of the problem
-    # filter the points by only those above the horizon. Work from impact backwards.
-    # def while_gen_backward_up(data):
-    #     for x in reversed(data):
-    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
-    #             yield x
-    #         else:
-    #             break
-
-    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
-
-    # TODO: move this to a trajectory time check helper function file
-    # check the time rate of the data
-    # diff the time column, run unique, print that if there is more than 1 unique
-    if sr_ecef_data.shape[-1] < 5:
-        print(f"{traj_number} does not have enough time stamps for this slant range")
-        return None, None
-    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(
-            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
-        )
-
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
-
-    try:
-        resampled_sr_ecef_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    sr_ecef_data[:, 0],
-                    sr_ecef_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
-        )
-        # for when resampling of the truth data is not desired
-        # resampled_sr_ecef_data = sr_ecef_data
-    except Exception as e:
-        print(f"warning: {traj_number} had the error with interpolation")
-        raise e
-
-    if args.frame == "grdth":
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
-    elif args.frame == "geodesic":
-        # convert to geodesic frame relative to the impact point
-        next_frame_data = ecef_to_local_geodesic_vec(
-            resampled_sr_ecef_data[:, POS_SLICE],
-            resampled_sr_ecef_data[:, VEL_SLICE],
-            np.zeros_like(
-                resampled_sr_ecef_data[:, VEL_SLICE]
-            ),  # TODO: better handling of acceleration being in the transform functions
-            ref_ecef,
-        )
-        # Prepend time and only include pos and vel
-        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
-        # SBI HighE HGV special things
-        # # limit by altitude to remove exo flight
-        # remove_exo_index = next_frame_data[:, 3] < 100e3
-        # next_frame_data = next_frame_data[remove_exo_index]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_exo_index]
-        # # limit by altitude to remove terminal flight
-        # remove_terminal_index = next_frame_data[:, 3] > 15e3
-        # next_frame_data = next_frame_data[remove_terminal_index]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[remove_terminal_index]
-        # # check for time jumps
-        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        # # remove everything before the time jump
-        # time_jump_index = np.argmax(time_diffs) + 2
-        # next_frame_data = next_frame_data[time_jump_index:]
-        # resampled_sr_ecef_data = resampled_sr_ecef_data[time_jump_index:]
-        # # recalc for the check
-        # time_diffs = np.diff(next_frame_data[:, TIME_INDEX])
-        # if np.any(time_diffs > trajectory_dt):
-        #     print("time diffs are weird", time_diffs)
-        #     raise ValueError("woah there! we've got a time gap")
-        # check_ecef = local_geodesic_to_ecef_vec(
-        #     np.hstack([next_frame_data, np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE])]), ref_ecef
-        # )
-        # write the glide out to a csv
-        # pd.DataFrame(resampled_sr_ecef_data, columns=("time", "x", "y", "z", "vx", "vy", "vz")).to_csv(
-        #     Path("SBI_boost-glide", sbi_target_name, "glide", traj_number), index=False
-        # )
-    elif args.frame == "dcu":
-        # convert ecef truth to the training frame
-        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
-    else:
-        raise NotImplementedError("That frame is not supported yet")
-    # closeness_check
-    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
-    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
-    # print(f"MSE round-trip position: {pos_err:.3e}")
-    # print(f"MSE round-trip velocity: {vel_err:.3e}")
-
-    # add column for traj number
-    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
-
-    # add columns for ECEF reference point (12, 13, 14)
-    # TODO: stop doing this to save some RAM and use a metadata attribute
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
-    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
-
-    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
-    #     print(next_frame_data)
-    # np.savetxt(
-    #     "grdth_" + traj_number,
-    #     next_frame_data,
-    #     delimiter=",",
-    #     # header=",".join(header_row),
-    #     comments="",
-    #     fmt="%.8f",
-    # )
-
-    return next_frame_data, traj_number
-
-
-def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
-    # tempory piece of code for the phase SBI modeling
-    boost_ecef = []
-    glide_ecef = []
-    impact_ecef = []
-    target_path = Path(path)
-    for phase in ["boost", "glide", "impact"]:
-        phase_path = target_path / phase
-
-        # create a list of the files that need to be loaded
-        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
-
-        if len(traj_files) == 0:
-            raise ValueError("bad target path", path)
-
-        # create a tuple with the data plus metadata
-        # TODO: Turn this into an object rather than a tuple
-        traj_targets = []  # list of tuples (ecef traj tables data loaded from truth files, traj_number/filename)
-        traj_targets = [
-            load_single_truth(
-                x,
-                debug=False,
-                low_memory=not HAVE_HIGH_MEMORY,
-                memory_map=HAVE_HIGH_MEMORY,
-                min_state_vector_size=7,
-            )
-            for x in traj_files
-        ]
-        if phase == "boost":
-            boost_ecef = traj_targets
-        elif phase == "glide":
-            glide_ecef = traj_targets
-        elif phase == "impact":
-            impact_ecef = traj_targets
-        else:
-            raise NotImplementedError("That phase is not handled yet.")
-
-    if not do_prep:
-        # return data in ECEF frame
-        return list(
-            zip(
-                list(zip(boost_ecef, glide_ecef, impact_ecef)),
-                [x.name for x in traj_files],
-            )
-        )  # this return is here for the temporary SBI support
-        return list(zip(traj_targets, [x.name for x in traj_files]))
-
-    # multiprocessed trajectory prep (the output is ordered like the input)
-    cpu_count = psutil.cpu_count(logical=False)
-    if cpu_count is None:
-        cpu_count = mp.cpu_count()
-    print(f"there are {cpu_count} cpus being used for trajectory prep")
-    with mp.Pool(processes=cpu_count) as pool:
-        tmp_data = pool.map(prep_trajectory, traj_targets)
-    # single threaded, but single line
-    # tmp_data = map(prep_trajectory, traj_targets)
-    # single threaded, but one at a time
-    # tmp_data = []
-    # for x in traj_targets[7:]:
-    #     tmp_data.append(prep_trajectory(x))
-    #     exit(0)
-
-    tmp_data = [x for x in tmp_data if x[0] is not None]
-
-    # check if all of the trajectories are much shorter than the asked for bucket
-    # if not use_grdth:
-    #     if all((np.linalg.norm(x[0, POS_SLICE] - x[-1, POS_SLICE]) < args.sr - BUCKET_SIZE for x, _ in tmp_data)):
-    #         print(
-    #             f"All trajectories are shorter than the SR ({args.sr}) minus bucket size ({BUCKET_SIZE}). Skipping making this model"
-    #         )
-    #         exit()
-
-    print("post-prep. how many made it though prep", len(tmp_data))
-    return tmp_data
-
-
-def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
-    # scale the trajectories
-    def find_traj_targets_minmax(
-        traj_targets: list[torch.Tensor],
-    ) -> np.ndarray:
-        """Finds the main and max values in the list of the trajectories."""
-        traj_targets_min = torch.min(
-            torch.Tensor([torch.min(i, dim=0).values.tolist() for i in traj_targets]),
-            dim=0,
-        ).values.tolist()
-        traj_targets_max = torch.max(
-            torch.Tensor([torch.max(i, dim=0).values.tolist() for i in traj_targets]),
-            dim=0,
-        ).values.tolist()
-        return np.array([traj_targets_min, traj_targets_max])
-
-    # traj_targets_minmax = find_traj_targets_minmax(traj_targets_train_posvel)
-    # scaler_traj = MinMaxScaler(feature_range=(-1, 1))
-    # scaler_traj.fit(traj_targets_minmax)
-    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
-    scaler_traj = StandardScaler().fit(stacked_posvel)
-
-    # pickle the scaler
-    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
-    with open(pickle_scalar_name, "wb") as o:
-        pickle.dump(scaler_traj, o)
-    return scaler_traj
-
-
-def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
-    """
-    Plot the distribution of each column of a 2-D array in its own subplot.
-
-    Parameters
-    ----------
-    data : np.ndarray
-        2-D array of shape (n_samples, n_columns).
-    bins : int or sequence, optional
-        Number of histogram bins (default 30).  Pass a sequence to specify
-        custom bin edges for all columns.
-    cmap : str, optional
-        Matplotlib colormap name used to assign a distinct color to each subplot.
-    """
-    if data.ndim != 2:
-        raise ValueError("`data` must be a 2-D array (samples x columns).")
-
-    n_cols = data.shape[1]
-
-    # Choose a layout that keeps subplots readable.
-    # Up to 5 columns → a single row, otherwise wrap to multiple rows.
-    max_per_row = 5
-    n_rows = int(np.ceil(n_cols / max_per_row))
-    n_cols_plot = min(n_cols, max_per_row)
-
-    # Create subplots
-    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
-
-    # If there is only one row, `axes` is 1-D; make it 2-D for consistent indexing.
-    if n_rows == 1:
-        axes = np.expand_dims(axes, axis=0)
-
-    colors = plt.get_cmap(cmap).colors
-
-    for idx in range(data.shape[1]):
-        row = idx // max_per_row
-        col = idx % max_per_row
-        ax = axes[row, col]
-
-        # Plot histogram - `density=True` gives a probability density (area = 1)
-        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
-
-        if column_names is None:
-            ax.set_title(f"Column {idx}")
-        else:
-            ax.set_title(column_names[idx])
-        ax.set_xlabel("Value")
-        ax.set_ylabel("Density")
-        # Each axis gets its own y-scale automatically
-
-    # Hide any unused sub-axes (when columns < rows*max_per_row)
-    total_plots = n_rows * n_cols_plot
-    for empty_idx in range(data.shape[1], total_plots):
-        row = empty_idx // max_per_row
-        col = empty_idx % max_per_row
-        fig.delaxes(axes[row, col])
-
-    plt.suptitle("Column-wise Distributions", fontsize=16, y=1.02)
-    # plt.show()
-    plt.savefig(data_path + "_feature_distribution.png")
-
-
-def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
-    """
-    Visualise the correlation matrix of the columns.
-
-    Parameters
-    ----------
-    data : np.ndarray
-        2-D array (samples x columns).
-    method : str, optional
-        Correlation method passed to ``np.corrcoef`` - ``'pearson'`` (default)
-        or ``'spearman'`` (requires scipy.stats.spearmanr).
-    cmap : str, optional
-        Colormap for the heat-map.
-    """
-    if data.ndim != 2:
-        raise ValueError("`data` must be a 2-D array (samples x columns).")
-
-    # ------------------------------------------------------------------
-    # Compute correlation matrix
-    # ------------------------------------------------------------------
-    if method == "pearson":
-        corr = np.corrcoef(data, rowvar=False)  # shape (n_cols, n_cols)
-    elif method == "spearman":
-        from scipy.stats import spearmanr
-
-        corr, _ = spearmanr(data, axis=0)
-    else:
-        raise ValueError("Unsupported method; choose 'pearson' or 'spearman'.")
-
-    # ------------------------------------------------------------------
-    # Plot heat-map
-    # ------------------------------------------------------------------
-    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
-    sns.heatmap(
-        corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5
-    )
-    labels = [f"Col {i}" for i in range(corr.shape[0])]
-    if column_names is not None:
-        labels = column_names
-    plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
-    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
-    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
-    plt.tight_layout()
-    # plt.show()
-    plt.savefig(data_path + "_correlation_matrix.png")
-
-
-def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
-    # input is a tuple of three 2d arrays with columns time, x, y, z, vx, vy, vz
-    # phase_to_transform selects with phase to transform
-    # the impact point is also availble if needed for the transform
-    # if there are mulptiple timestamps, resample the data to align to a common time grid
-    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
-    if timeseries_to_transform.shape[0] < 10:
-        print(
-            "the shape of the timeseries to be transformed seems small. skipping this one",
-            timeseries_to_transform.shape,
-            timeseries_to_transform[-1],
-        )
-        return None
-    new_times = np.arange(
-        timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt
-    )
-    resampled_timeseries = np.hstack(
-        [np.atleast_2d(new_times).T]
-        + [
-            make_interp_spline(
-                timeseries_to_transform[:, TIME_INDEX],
-                timeseries_to_transform[:, 1:],
-                bc_type="not-a-knot",
-            )(new_times, extrapolate=True)
-        ]
-    )
-
-    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
-    # Changing the reference frame to be at the end of the desired phase rather than impact
-    if args.ref_ecef == "boost":
-        ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
-    elif args.ref_ecef == "glide":
-        ref_ecef = ecef_data_traj[1][-1, POS_SLICE]
-
-    # now apply a transform
-    if args.frame == "dcu":
-        # convert ecef truth to the training frame
-        timeseries_in_next_frame, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_dcu_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading, flip_c)
-    elif args.frame == "grdth":
-        # convert ecef truth to the training frame
-        timeseries_in_next_frame, initial_point_heading = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
-
-        # check the inverse transform
-        check_ecef = next_grdth_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading)
-    elif args.frame == "geodesic":
-        # for this exmple we will use the geodesic transform
-        timeseries_in_next_frame = ecef_to_local_geodesic_vec(
-            resampled_timeseries[:, POS_SLICE],
-            resampled_timeseries[:, VEL_SLICE],
-            np.zeros_like(
-                resampled_timeseries[:, VEL_SLICE]
-            ),  # TODO: better handling of acceleration being in the transform functions
-            ref_ecef,  # grap the impact point as the reference ecef point
-        )
-        # Prepend time and only include pos and vel (only needed for the geodesic transform. the DCU and GRDTH functions handle time internally)
-        timeseries_in_next_frame = np.hstack(
-            [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
-        )
-        # TODO: add check_ecef
-    else:
-        raise NotImplementedError("haven't gotten to adding this frame transform code for SBI")
-
-    # output is a 2d array with the same columns
-    return timeseries_in_next_frame
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Training script for creating NEXT models",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument(
-        "--tgt-data-paths",
-        default=[],
-        type=str,
-        nargs="+",
-        help="A list of directories where training data can be found. Data will be test/train split if validation data is not provided. It is suggested thet the final directory in the path be named for the target. Ex: datasets/train/PrSM",
-    )
-    parser.add_argument(
-        "--validation-data-paths",
-        default=[],
-        type=str,
-        nargs="+",
-        help="A list of directories where validation data can be found. Helpful for when the test/train split has already been done. Ex: datasets/test/PrSM",
-    )
-    # parser.add_argument("--max-epoch", default=50, type=int)
-    parser.add_argument(
-        "--sr",
-        default=100000,
-        type=int,
-        help="The maximum slant range to trim data at. All data less than this value will be used. [meters]",
-    )
-    parser.add_argument(
-        "-o",
-        default="model_outputs",
-        type=str,
-        help="Directory to place pickles, JSON, checkpoints, ModelProto, and ONNX files related to the model",
-    )
-    parser.add_argument(
-        "--use-scalar",
-        default=False,
-        action="store_true",
-        help="Enable training with a scalar",
-    )
-    parser.add_argument(
-        "--frame",
-        default="dcu",
-        choices=["dcu", "grdth", "geodesic"],
-        help="Select which frame to put the data in for training the model",
-    )
-    parser.add_argument(
-        "--sbi-phase",
-        default="boost",
-        choices=["boost", "glide"],
-        help="Select which SBI phase to train a model for",
-    )
-    parser.add_argument(
-        "--nhidden",
-        default=200,
-        type=int,
-        help="The size of the hidden layers of the MLP/FFNN",
-    )
-    parser.add_argument(
-        "--aug",
-        default=0,
-        type=int,
-        help="The size of the zeros augmented to the initial states",
-        dest="aug_dim",
-    )
-    parser.add_argument(
-        "--gpuidx",
-        default=0,
-        type=int,
-        help="The index of the gpu to use",
-        dest="gpu_index",
-    )
-    parser.add_argument(
-        "--model-type",
-        default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode"],
-        help=(
-            "Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, "
-            "or GRU-ODE (continuous-time GRU with GRU-Bayes initial update, De Brouwer et al. 2019)."
-        ),
-    )
-    parser.add_argument(
-        "--latent-dim",
-        default=64,
-        type=int,
-        help="[gruode] Dimension of the bounded GRU-ODE latent state h(t)",
-        dest="latent_dim",
-    )
-    parser.add_argument(
-        "--recon-weight",
-        default=0.1,
-        type=float,
-        help="[gruode] Weight of the latent autoencoder reconstruction loss (readout(h_t) vs target). 0 disables",
-        dest="recon_weight",
-    )
-    parser.add_argument(
-        "--boundary-weight",
-        default=0.0,
-        type=float,
-        help=(
-            "[gruode] Weight of the soft physical boundary penalty in unscaled units "
-            "(Up >= 0 for dcu/geodesic, GroundRange >= 0 for grdth). 0 disables"
-        ),
-        dest="boundary_weight",
-    )
-    parser.add_argument(
-        "--gruode-minimal",
-        default=False,
-        action="store_true",
-        help="[gruode] Use the minimal (single-gate) GRU-ODE cell variant (paper Appendix G)",
-        dest="gruode_minimal",
-    )
-    parser.add_argument(
-        "--dt",
-        default=0.1,
-        type=float,
-        help="The delta time to use for resampling the truth trajectory to align the time grid",
-    )
-    parser.add_argument(
-        "--ref-ecef",
-        default="impact",
-        choices=["boost", "glide", "impact"],
-        help="The reference point for the frame transformations",
-    )
-
-    args = parser.parse_args()
-
-    model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
-    if (
-        args.frame in ("grdth",)
-    ):  # TODO: geodesic frame should also be 5 (drop azimuth state). need to change the math to do the integration trick
-        model_states = 5
-
-    trajectory_dt = args.dt  # [s]
-
-    seed = 47
-    # random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    target_strs = [Path(x).name for x in args.tgt_data_paths]
-    model_name_target_str = "+".join(target_strs)
-    model_path = args.o
-    model_save_path = os.path.join(model_path, model_name_target_str)
-
-    batch_size = 512  # increase the number when more RAM is available
-    if HAVE_HIGH_MEMORY:
-        batch_size = 1024
-
-    # TODO: make an object to hold the data and the metadata
-    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{args.model_type}_{args.frame}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
-    if args.model_type == "gruode":
-        model_name_wo_epochs = model_name_wo_epochs + f"_{args.latent_dim}lat"
-    if args.use_scalar:
-        model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
-
-    # TODO: Move the epoch name string to somewhere else after the callbacks thing
-    model_name = f"{model_name_wo_epochs}"
-
-    # load data
-    traj_targets_train = []
-    traj_targets_test = []
-    # traj_targets = []
-    if len(args.validation_data_paths) == 0:
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets = load_data_dir(
-                tgt_data_path, trajectory_dt, args, do_prep=False
-            )  # NOTE: do_prep is false for SBI support
-            # this is where the test/train split has been for a while. Move it to in the train_NEXT function?
-            (
-                traj_targets_train_one_tgt,
-                traj_targets_test_one_tgt,
-            ) = train_test_split(traj_targets, test_size=0.2, random_state=26525)
-            traj_targets_train.extend(traj_targets_train_one_tgt)
-            traj_targets_test.extend(traj_targets_test_one_tgt)
-    else:
-        # the split has already been done
-        print("split already done")
-        for tgt_data_path in args.tgt_data_paths:
-            traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
-        for tgt_data_path in args.validation_data_paths:
-            traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
-
-    print(
-        f"There are {len(traj_targets_train)} training trajs and {len(traj_targets_test)} validation trajs. There will be {(len(traj_targets_train) // batch_size) + 1} batch(es) for training and {(len(traj_targets_test) // batch_size) + 1} for validation"
-    )
-
-    # split the trajectory data from the metadata
-    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
-    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
-    # create a list of all of the trajectories loaded with a notation of which side of the split they were on
-    split_dict = {
-        "train": traj_targets_train_traj_numbers,
-        "test": traj_targets_test_traj_numbers,
-    }
-    os.makedirs(os.path.join(model_path, model_name_target_str), exist_ok=True)
-    with open(
-        os.path.join(
-            model_path,
-            model_name_target_str,
-            f"{model_name_wo_epochs}_train_test_split.json",
-        ),
-        "w",
-        encoding="utf-8",
-    ) as f:
-        json.dump(split_dict, f)
-
-    # NOTE: For SBI, at this point in the script the traj_targets_train and traj_targets_test variables are a size 3 tuple. The tuple is boost_ecef, glide_ecef, and impact_ecef.
-    # print(traj_targets_train[0])
-    phase_to_model = args.sbi_phase
-    traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
-    traj_targets_test = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_test]
-
-    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
-    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
-
-    # check that each traj has at least 10 points of data. 10 points seems like enough to get a decent model. Doing an FFT might be good.
-    time_series_point_count = [x.shape[0] for x in traj_targets_train + traj_targets_test]
-    if any(x < 10 for x in time_series_point_count):
-        raise ValueError(
-            "Some of the training or test data has less than 10 time series points. Consider changing the trajectory_dt or extending to a further slant range",
-            time_series_point_count,
-        )
-
-    # validate that the derivative of position is close to velocity
-    # if args.use_grdth:
-    #     # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
-    #     # print(np.gradient(traj_targets_train[0][:-3, 1], traj_targets_train[0][:-3, 0]), traj_targets_train[0][:-3, 2])
-    #     # print(np.gradient(traj_targets_train[0][:-3, 1], traj_targets_train[0][:-3, 0]) - traj_targets_train[0][:-3, 2])
-    #     if not all(
-    #         [np.isclose(np.gradient(x[:-3, 1], x[:-3, 0]), x[:-3, 2], atol=5).all() for x in traj_targets_train]
-    #     ):
-    #         raise ValueError("Numerical derivative of ground range is not close to the ground range rate values")
-    #     # print(np.gradient(traj_targets_train[0][:, 4], traj_targets_train[0][:, 0]), traj_targets_train[0][:, 5])
-    #     # print(np.gradient(traj_targets_train[0][:, 4], traj_targets_train[0][:, 0]) - traj_targets_train[0][:, 5])
-    #     if not all(
-    #         [np.isclose(np.gradient(x[:-3, 4], x[:-3, 0]), x[:-3, 5], atol=5).all() for x in traj_targets_train]
-    #     ):
-    #         raise ValueError("Numerical derivative of down is not close to the down rate values")
-    # TODO: try validating that the integral of the velocity is close to the position
-
-    # delete time plus (zero index), the extra state variables/metadata (everything from the last state to the end), convert to float64 data, and covert to tensor
-    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
-    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
-    # print(
-    #     "initial points",
-    #     [x[0, :] for x in traj_targets_train_posvel],
-    #     [x[0, :] for x in traj_targets_test_posvel],
-    # )
-
-    # check if any of the data turned into a NaN in the transforms
-    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any(
-        [torch.isnan(x).any() for x in traj_targets_test_posvel]
-    ):
-        print("traj_targets_train_posvel", traj_targets_train)
-        print("traj_targets_test_posvel", traj_targets_test)
-        raise ValueError(
-            "There are NaN(s) in the training or validation data. See the data dump above for where the NaN(s) are."
-        )
-
-    stacked_posvel = np.vstack(traj_targets_train_posvel)
-    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
-    if args.frame == "grdth":
-        column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
-    plot_column_distributions(
-        stacked_posvel,
-        column_names=column_names,
-        data_path=str(
-            Path(
-                model_path,
-                model_name_target_str,
-                model_name_wo_epochs,
-            )
-        ),
-    )
-    plot_correlation_matrix(
-        stacked_posvel,
-        column_names=column_names,
-        data_path=str(
-            Path(
-                model_path,
-                model_name_target_str,
-                model_name_wo_epochs,
-            )
-        ),
-    )
-
-    # plot up the distribution of each feature
-
-    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
-
-    # call training a model on the data
-    # TODO: why does this return the model name? shouldn't that be an input?
-    # train_NEXT(traj_targets_train, traj_targets_test, max_epochs, scaler_traj)
-    (node, model_name) = train_NEXT(
-        model_name,
-        traj_targets_train_posvel,
-        traj_targets_test_posvel,
-        scaler_traj,
-        model_save_path,
-        trajectory_dt,
-        batch_size,
-        args.use_scalar,
-        model_states,
-        args.aug_dim,
-        args.nhidden,
-        args.gpu_index,
-        args.model_type,
-        args.frame,
-        latent_dim=args.latent_dim,
-        recon_weight=args.recon_weight,
-        boundary_weight=args.boundary_weight,
-        gruode_minimal=args.gruode_minimal,
-    )
-    # NOTE: After this was the whole chain of evaluation functions. Skipping adding that to this unclass side for now. It really should be a separate script.
-
-
-if __name__ == "__main__":
-    main()
+python NEXT_training_cl_new.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 10000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_cl_new/GEODESIC/glide --frame geodesic --model-type gruode --ref-ecef glide --sbi-phase glide --geodesic-mode integrated
+there is a gpu in this node
+_CudaDeviceProperties(name='NVIDIA A100-SXM4-80GB', major=8, minor=0, total_memory=81152MB, multi_processor_count=108, uuid=78c6e557-8c9e-39eb-078b-37a803194bd9, pci_bus_id=78, pci_device_id=0, pci_domain_id=0, L2_cache_size=40MB)
+There are 120 training trajs and 30 validation trajs. There will be 1 batch(es) for training and 1 for validation
+the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
+  3.33451128e+03  2.49174647e+03  3.30483557e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
+ -2.11725726e+02  3.46356979e+03  2.44161046e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
+ -2.53746866e+03  3.40224301e+03  2.13890946e+03]
+warning: velocity_indicies (2, 3, 4) are not the contiguous block immediately after the positions; disabling the kinematic-identity hard-wiring for safety.
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f331ad1f740>, 0.0001)
+[INFO] Epoch 5: loss: 0.7272246 pos_err: 220900.9062500 vel_err: 226.4853516 val_loss: 0.3646254 val_pos_err: 167203.3281250 val_vel_err: 158.0116882
+[INFO] Epoch 10: loss: 0.1929254 pos_err: 116265.1718750 vel_err: 104.5465546 val_loss: 0.1305710 val_pos_err: 72236.7968750 val_vel_err: 101.7518845
+[INFO] Epoch 15: loss: 0.1240216 pos_err: 81153.8984375 vel_err: 113.5272903 val_loss: 0.1177950 val_pos_err: 79512.0625000 val_vel_err: 112.1252747
+[INFO] Epoch 20: loss: 0.1020551 pos_err: 75746.5312500 vel_err: 100.6587296 val_loss: 0.1043625 val_pos_err: 63377.6132812 val_vel_err: 104.2616806
+[INFO] Epoch 25: loss: 0.0965965 pos_err: 67884.1718750 vel_err: 94.1939240 val_loss: 0.1004568 val_pos_err: 60901.2578125 val_vel_err: 102.9785309
+[INFO] Epoch 30: loss: 0.0853420 pos_err: 69157.5625000 vel_err: 89.5972519 val_loss: 0.0921716 val_pos_err: 67040.0703125 val_vel_err: 94.8636398
+[INFO] Epoch 35: loss: 0.0773955 pos_err: 62097.9804688 vel_err: 84.6098022 val_loss: 0.0837321 val_pos_err: 59471.8671875 val_vel_err: 88.5218277
+[INFO] Epoch 40: loss: 0.0721131 pos_err: 58201.8398438 vel_err: 78.0965424 val_loss: 0.0783392 val_pos_err: 58951.6953125 val_vel_err: 83.0205002
+[INFO] Epoch 45: loss: 0.0706790 pos_err: 56655.2500000 vel_err: 77.4253387 val_loss: 0.0796319 val_pos_err: 59866.6992188 val_vel_err: 82.1757889
+[INFO] Epoch 50: loss: 0.0667681 pos_err: 55382.4531250 vel_err: 72.1669769 val_loss: 0.0789232 val_pos_err: 59880.1523438 val_vel_err: 79.7105179
+[INFO] Epoch 55: loss: 0.0709399 pos_err: 57939.9023438 vel_err: 69.6882553 val_loss: 0.0837293 val_pos_err: 60990.9179688 val_vel_err: 75.2618942
+[INFO] Epoch 60: loss: 0.0672979 pos_err: 56205.8359375 vel_err: 70.1456985 val_loss: 0.0723591 val_pos_err: 58946.6601562 val_vel_err: 73.3320236
+[INFO] Epoch 65: loss: 0.0658207 pos_err: 54830.7695312 vel_err: 67.2565536 val_loss: 0.0752268 val_pos_err: 60004.9414062 val_vel_err: 74.6779709
+[INFO] Epoch 70: loss: 0.0662068 pos_err: 54376.3984375 vel_err: 68.0777054 val_loss: 0.0761848 val_pos_err: 59086.0585938 val_vel_err: 75.2079010
+[INFO] Epoch 75: loss: 0.0603769 pos_err: 52557.5234375 vel_err: 64.6842728 val_loss: 0.0724178 val_pos_err: 58296.9960938 val_vel_err: 73.8912659
+[INFO] Epoch 80: loss: 0.0595951 pos_err: 52213.9335938 vel_err: 64.5925369 val_loss: 0.0727527 val_pos_err: 58645.1953125 val_vel_err: 72.9376297
+[INFO] Epoch 85: loss: 0.0612621 pos_err: 52007.4882812 vel_err: 65.0846939 val_loss: 0.0709346 val_pos_err: 57506.4101562 val_vel_err: 72.5661087
+[INFO] Epoch 90: loss: 0.0586271 pos_err: 51702.7109375 vel_err: 64.1182861 val_loss: 0.0707928 val_pos_err: 57919.0820312 val_vel_err: 71.2835999
+[INFO] Epoch 95: loss: 0.0610394 pos_err: 53400.0937500 vel_err: 63.3919296 val_loss: 0.0712427 val_pos_err: 57656.1992188 val_vel_err: 70.9383392
+[INFO] Epoch 100: loss: 0.0581711 pos_err: 51806.6953125 vel_err: 62.4705429 val_loss: 0.0678984 val_pos_err: 56275.5429688 val_vel_err: 70.6186905
+[INFO] Epoch 105: loss: 0.0582644 pos_err: 50123.0546875 vel_err: 62.1510887 val_loss: 0.0672673 val_pos_err: 56022.6718750 val_vel_err: 70.3132782
+[INFO] Epoch 110: loss: 0.0584890 pos_err: 49764.0781250 vel_err: 61.6366234 val_loss: 0.0663534 val_pos_err: 55885.5937500 val_vel_err: 69.3268127
+[INFO] Epoch 115: loss: 0.0594619 pos_err: 52670.6523438 vel_err: 62.1488647 val_loss: 0.0688224 val_pos_err: 57149.2421875 val_vel_err: 69.6441345
+[INFO] Epoch 120: loss: 0.0561819 pos_err: 50478.0468750 vel_err: 59.7536926 val_loss: 0.0649332 val_pos_err: 55186.3945312 val_vel_err: 68.5278397
+[INFO] Epoch 125: loss: 0.0554373 pos_err: 48654.0078125 vel_err: 59.3762550 val_loss: 0.0646325 val_pos_err: 55042.9804688 val_vel_err: 68.2663727
+[INFO] Epoch 130: loss: 0.0549069 pos_err: 48483.9687500 vel_err: 59.1517563 val_loss: 0.0641951 val_pos_err: 55561.5781250 val_vel_err: 68.0332794
+[INFO] Epoch 135: loss: 0.0538559 pos_err: 49125.9687500 vel_err: 58.1698761 val_loss: 0.0641475 val_pos_err: 55277.8203125 val_vel_err: 67.6166687
+[INFO] Epoch 140: loss: 0.0530852 pos_err: 48860.6796875 vel_err: 58.0027084 val_loss: 0.0635377 val_pos_err: 54393.3203125 val_vel_err: 67.3515778
+[INFO] Epoch 145: loss: 0.0542110 pos_err: 47983.4101562 vel_err: 57.9787674 val_loss: 0.0619417 val_pos_err: 54153.8203125 val_vel_err: 66.8505707
+[INFO] Epoch 150: loss: 0.0538179 pos_err: 47838.1640625 vel_err: 57.1553116 val_loss: 0.0629511 val_pos_err: 54745.7773438 val_vel_err: 66.6721802
+[INFO] Epoch 155: loss: 0.0519567 pos_err: 48425.1445312 vel_err: 57.3291359 val_loss: 0.0622603 val_pos_err: 54442.7343750 val_vel_err: 66.3497543
+[INFO] Epoch 160: loss: 0.0514195 pos_err: 48095.7656250 vel_err: 56.9479332 val_loss: 0.0612632 val_pos_err: 53540.7187500 val_vel_err: 66.0803909
+[INFO] Epoch 165: loss: 0.0529731 pos_err: 47397.2773438 vel_err: 56.4379387 val_loss: 0.0606321 val_pos_err: 53297.8671875 val_vel_err: 65.7364044
+[INFO] Epoch 170: loss: 0.0525074 pos_err: 47248.5234375 vel_err: 56.0219460 val_loss: 0.0609136 val_pos_err: 53875.0351562 val_vel_err: 65.5413437
+[INFO] Epoch 175: loss: 0.0502668 pos_err: 47473.2656250 vel_err: 55.9563789 val_loss: 0.0601328 val_pos_err: 53505.8398438 val_vel_err: 65.1925583
+[INFO] Epoch 180: loss: 0.0496997 pos_err: 47118.4648438 vel_err: 55.5267410 val_loss: 0.0599251 val_pos_err: 52738.0546875 val_vel_err: 65.0519028
+[INFO] Epoch 185: loss: 0.0523033 pos_err: 47084.5312500 vel_err: 55.3352547 val_loss: 0.0594413 val_pos_err: 52480.9882812 val_vel_err: 64.7563248
+[INFO] Epoch 190: loss: 0.0505325 pos_err: 46681.6953125 vel_err: 54.6639481 val_loss: 0.0600229 val_pos_err: 53297.5351562 val_vel_err: 64.6807404
+[INFO] Epoch 195: loss: 0.0506750 pos_err: 48335.3359375 vel_err: 55.7640724 val_loss: 0.0607468 val_pos_err: 53767.3007812 val_vel_err: 64.7008133
+[INFO] Epoch 200: loss: 0.0508059 pos_err: 48476.0585938 vel_err: 56.2425652 val_loss: 0.0569294 val_pos_err: 51845.7890625 val_vel_err: 63.8786087
+[INFO] Epoch 205: loss: 0.0479831 pos_err: 45899.1835938 vel_err: 53.8924904 val_loss: 0.0565489 val_pos_err: 51627.3007812 val_vel_err: 63.6530304
+[INFO] Epoch 210: loss: 0.0477844 pos_err: 45888.6835938 vel_err: 53.6502266 val_loss: 0.0589864 val_pos_err: 53385.7070312 val_vel_err: 64.5431519
+[INFO] Epoch 215: loss: 0.0486252 pos_err: 47240.6835938 vel_err: 54.6423683 val_loss: 0.0580075 val_pos_err: 52624.5546875 val_vel_err: 64.1287308
+[INFO] Epoch 220: loss: 0.0476518 pos_err: 46694.0742188 vel_err: 54.1024590 val_loss: 0.0559780 val_pos_err: 51015.0351562 val_vel_err: 63.3095856
+[INFO] Epoch 225: loss: 0.0481161 pos_err: 45857.7695312 vel_err: 53.1944542 val_loss: 0.0556337 val_pos_err: 50863.6523438 val_vel_err: 63.2307167
+[INFO] Epoch 230: loss: 0.0478461 pos_err: 45642.4257812 vel_err: 53.0401230 val_loss: 0.0563416 val_pos_err: 51959.4140625 val_vel_err: 63.5485420
+[INFO] Epoch 235: loss: 0.0464121 pos_err: 45968.3593750 vel_err: 53.5197601 val_loss: 0.0556966 val_pos_err: 51494.0742188 val_vel_err: 63.3849602
+[INFO] Epoch 240: loss: 0.0459219 pos_err: 45708.7265625 vel_err: 53.1565399 val_loss: 0.0550706 val_pos_err: 50450.7382812 val_vel_err: 62.9553070
+[INFO] Epoch 245: loss: 0.0479115 pos_err: 45570.4257812 vel_err: 52.6909370 val_loss: 0.0548447 val_pos_err: 50258.6796875 val_vel_err: 62.6879845
+[INFO] Epoch 250: loss: 0.0474571 pos_err: 46093.8476562 vel_err: 52.5722427 val_loss: 0.0550110 val_pos_err: 50833.9296875 val_vel_err: 63.3378525
+[INFO] Epoch 255: loss: 0.0459604 pos_err: 46353.0195312 vel_err: 52.7886391 val_loss: 0.0548559 val_pos_err: 51305.7070312 val_vel_err: 62.7787094
+[INFO] Epoch 260: loss: 0.0454689 pos_err: 45740.9804688 vel_err: 52.9890327 val_loss: 0.0535503 val_pos_err: 49783.5742188 val_vel_err: 62.0690231
+[INFO] Epoch 265: loss: 0.0456020 pos_err: 45178.3515625 vel_err: 51.8621521 val_loss: 0.0529273 val_pos_err: 49579.3789062 val_vel_err: 62.2909431
+[INFO] Epoch 270: loss: 0.0451812 pos_err: 44611.6328125 vel_err: 51.5527458 val_loss: 0.0548687 val_pos_err: 51584.0039062 val_vel_err: 62.4948921
+[INFO] Epoch 275: loss: 0.0450385 pos_err: 45516.3945312 vel_err: 52.8469810 val_loss: 0.0539892 val_pos_err: 50645.3632812 val_vel_err: 62.5667076
+[INFO] Epoch 280: loss: 0.0444430 pos_err: 45432.7031250 vel_err: 52.1806374 val_loss: 0.0523391 val_pos_err: 49183.5000000 val_vel_err: 61.7808418
+[INFO] Epoch 285: loss: 0.0451514 pos_err: 44619.8750000 vel_err: 51.2316475 val_loss: 0.0523908 val_pos_err: 49110.5664062 val_vel_err: 61.3935928
+[INFO] Epoch 290: loss: 0.0449956 pos_err: 45076.9921875 vel_err: 51.2863274 val_loss: 0.0531991 val_pos_err: 50021.9062500 val_vel_err: 62.4654655
+[INFO] Epoch 295: loss: 0.0440029 pos_err: 45434.6015625 vel_err: 51.6273499 val_loss: 0.0526705 val_pos_err: 50036.7109375 val_vel_err: 61.8602409
+[INFO] Epoch 300: loss: 0.0434058 pos_err: 44893.2656250 vel_err: 51.4709816 val_loss: 0.0517997 val_pos_err: 48700.6054688 val_vel_err: 60.9554100
+[INFO] Epoch 305: loss: 0.0447072 pos_err: 44927.3867188 vel_err: 50.8268204 val_loss: 0.0511075 val_pos_err: 48611.7578125 val_vel_err: 61.2661629
+[INFO] Epoch 310: loss: 0.0441768 pos_err: 44078.4375000 vel_err: 50.4728775 val_loss: 0.0522624 val_pos_err: 50108.4570312 val_vel_err: 61.1688881
+[INFO] Epoch 315: loss: 0.0429477 pos_err: 44549.3671875 vel_err: 51.3779793 val_loss: 0.0516462 val_pos_err: 49565.2578125 val_vel_err: 61.1199646
+[INFO] Epoch 320: loss: 0.0425051 pos_err: 44423.0937500 vel_err: 50.9109077 val_loss: 0.0504627 val_pos_err: 48202.8203125 val_vel_err: 60.6954193
+[INFO] Epoch 325: loss: 0.0438406 pos_err: 43997.6054688 vel_err: 50.0452271 val_loss: 0.0505390 val_pos_err: 48047.1132812 val_vel_err: 60.1307030
+[INFO] Epoch 330: loss: 0.0434718 pos_err: 44331.2265625 vel_err: 49.9877472 val_loss: 0.0510258 val_pos_err: 49062.2070312 val_vel_err: 61.0378342
+[INFO] Epoch 335: loss: 0.0420780 pos_err: 44405.7695312 vel_err: 50.4185410 val_loss: 0.0505639 val_pos_err: 48827.9218750 val_vel_err: 60.7595520
+[INFO] Epoch 340: loss: 0.0416977 pos_err: 44151.7617188 vel_err: 50.1426048 val_loss: 0.0496931 val_pos_err: 47630.1171875 val_vel_err: 59.7813911
+[INFO] Epoch 345: loss: 0.0430472 pos_err: 43930.5976562 vel_err: 49.4222260 val_loss: 0.0492660 val_pos_err: 47492.4765625 val_vel_err: 59.6741409
+[INFO] Epoch 350: loss: 0.0425604 pos_err: 43715.3906250 vel_err: 49.2086792 val_loss: 0.0500874 val_pos_err: 48655.7968750 val_vel_err: 60.3166008
+[INFO] Epoch 355: loss: 0.0412604 pos_err: 43986.4257812 vel_err: 49.7915039 val_loss: 0.0496262 val_pos_err: 48393.9296875 val_vel_err: 60.0262833
+[INFO] Epoch 360: loss: 0.0408816 pos_err: 43712.6523438 vel_err: 49.5188141 val_loss: 0.0487342 val_pos_err: 47101.8906250 val_vel_err: 59.1555176
+[INFO] Epoch 365: loss: 0.0423182 pos_err: 43535.7343750 vel_err: 48.7551765 val_loss: 0.0483645 val_pos_err: 46945.7968750 val_vel_err: 59.0152855
+[INFO] Epoch 370: loss: 0.0418510 pos_err: 43308.7929688 vel_err: 48.5518494 val_loss: 0.0491172 val_pos_err: 48086.4335938 val_vel_err: 59.6252060
+[INFO] Epoch 375: loss: 0.0404379 pos_err: 43520.8398438 vel_err: 49.1566277 val_loss: 0.0486618 val_pos_err: 47783.3945312 val_vel_err: 59.3708420
+[INFO] Epoch 380: loss: 0.0400765 pos_err: 43252.0234375 vel_err: 48.8860245 val_loss: 0.0478511 val_pos_err: 46514.7187500 val_vel_err: 58.5278664
+[INFO] Epoch 385: loss: 0.0416217 pos_err: 43099.2851562 vel_err: 48.1232872 val_loss: 0.0475102 val_pos_err: 46337.0664062 val_vel_err: 58.3649254
+[INFO] Epoch 390: loss: 0.0411428 pos_err: 42873.1679688 vel_err: 47.9263535 val_loss: 0.0481890 val_pos_err: 47436.2773438 val_vel_err: 58.9926147
+[INFO] Epoch 395: loss: 0.0396703 pos_err: 43058.2304688 vel_err: 48.5574722 val_loss: 0.0477538 val_pos_err: 47121.3554688 val_vel_err: 58.7583275
+[INFO] Epoch 400: loss: 0.0393269 pos_err: 42795.4023438 vel_err: 48.2924957 val_loss: 0.0469742 val_pos_err: 45867.8476562 val_vel_err: 57.8998642
+[INFO] Epoch 405: loss: 0.0408713 pos_err: 42611.3476562 vel_err: 47.4988556 val_loss: 0.0466450 val_pos_err: 45673.4531250 val_vel_err: 57.7337608
+[INFO] Epoch 410: loss: 0.0403824 pos_err: 42373.0312500 vel_err: 47.3105469 val_loss: 0.0473452 val_pos_err: 46771.2734375 val_vel_err: 58.4127846
+[INFO] Epoch 415: loss: 0.0389773 pos_err: 42615.7070312 vel_err: 48.0127182 val_loss: 0.0469297 val_pos_err: 46447.0742188 val_vel_err: 58.1963921
+[INFO] Epoch 420: loss: 0.0386451 pos_err: 42349.1992188 vel_err: 47.7570496 val_loss: 0.0461181 val_pos_err: 45181.1054688 val_vel_err: 57.3031273
+[INFO] Epoch 425: loss: 0.0400938 pos_err: 42078.8476562 vel_err: 46.9070549 val_loss: 0.0457985 val_pos_err: 44977.5351562 val_vel_err: 57.1506386
+[INFO] Epoch 430: loss: 0.0396089 pos_err: 41829.5742188 vel_err: 46.7319374 val_loss: 0.0465837 val_pos_err: 46095.8046875 val_vel_err: 57.8993950
+[INFO] Epoch 435: loss: 0.0383574 pos_err: 42193.1484375 vel_err: 47.5226135 val_loss: 0.0461844 val_pos_err: 45765.7734375 val_vel_err: 57.6912575
+[INFO] Epoch 440: loss: 0.0380302 pos_err: 41917.7226562 vel_err: 47.2735939 val_loss: 0.0453092 val_pos_err: 44470.6015625 val_vel_err: 56.7489243
+[INFO] Epoch 445: loss: 0.0393344 pos_err: 41525.8046875 vel_err: 46.3600693 val_loss: 0.0450029 val_pos_err: 44264.2617188 val_vel_err: 56.6118927
+[INFO] Epoch 450: loss: 0.0388644 pos_err: 41277.3710938 vel_err: 46.1985168 val_loss: 0.0458918 val_pos_err: 45422.0976562 val_vel_err: 57.4341087
+[INFO] Epoch 455: loss: 0.0378009 pos_err: 41786.7890625 vel_err: 47.0798149 val_loss: 0.0455040 val_pos_err: 45090.0078125 val_vel_err: 57.2278938
+[INFO] Epoch 460: loss: 0.0374751 pos_err: 41501.9492188 vel_err: 46.8360863 val_loss: 0.0445564 val_pos_err: 43757.9648438 val_vel_err: 56.2418747
+[INFO] Epoch 465: loss: 0.0386190 pos_err: 40977.2617188 vel_err: 45.8527298 val_loss: 0.0442673 val_pos_err: 43554.2812500 val_vel_err: 56.1185036
+[INFO] Epoch 470: loss: 0.0381684 pos_err: 40736.9765625 vel_err: 45.7028770 val_loss: 0.0452566 val_pos_err: 44763.6718750 val_vel_err: 57.0007401
+[INFO] Epoch 475: loss: 0.0372972 pos_err: 41395.5234375 vel_err: 46.6773376 val_loss: 0.0448769 val_pos_err: 44431.0039062 val_vel_err: 56.7964020
+[INFO] Epoch 480: loss: 0.0369704 pos_err: 41103.1210938 vel_err: 46.4371719 val_loss: 0.0438632 val_pos_err: 43064.1484375 val_vel_err: 55.7799873
+[INFO] Epoch 485: loss: 0.0379593 pos_err: 40452.4218750 vel_err: 45.3868294 val_loss: 0.0435906 val_pos_err: 42867.5859375 val_vel_err: 55.6677437
+[INFO] Epoch 490: loss: 0.0375289 pos_err: 40222.4960938 vel_err: 45.2489204 val_loss: 0.0446650 val_pos_err: 44127.9609375 val_vel_err: 56.5963287
+[INFO] Epoch 495: loss: 0.0368357 pos_err: 41023.2265625 vel_err: 46.3121490 val_loss: 0.0442913 val_pos_err: 43796.3476562 val_vel_err: 56.3960342
+[INFO] Epoch 500: loss: 0.0365063 pos_err: 40724.8476562 vel_err: 46.0740547 val_loss: 0.0432286 val_pos_err: 42403.8906250 val_vel_err: 55.3582497
+[INFO] Epoch 505: loss: 0.0373589 pos_err: 39963.1679688 vel_err: 44.9617844 val_loss: 0.0429704 val_pos_err: 42216.6757812 val_vel_err: 55.2561913
+[INFO] Epoch 510: loss: 0.0369479 pos_err: 39746.4140625 vel_err: 44.8352432 val_loss: 0.0441065 val_pos_err: 43521.6992188 val_vel_err: 56.2240639
+[INFO] Epoch 515: loss: 0.0364066 pos_err: 40675.0234375 vel_err: 45.9770699 val_loss: 0.0437374 val_pos_err: 43193.6484375 val_vel_err: 56.0267906
+[INFO] Epoch 520: loss: 0.0360743 pos_err: 40373.7265625 vel_err: 45.7394028 val_loss: 0.0426479 val_pos_err: 41786.9804688 val_vel_err: 54.9789772
+[INFO] Epoch 525: loss: 0.0368167 pos_err: 39522.1679688 vel_err: 44.5774612 val_loss: 0.0424020 val_pos_err: 41610.7539062 val_vel_err: 54.8857346
+[INFO] Epoch 530: loss: 0.0364227 pos_err: 39318.7773438 vel_err: 44.4616165 val_loss: 0.0435737 val_pos_err: 42954.8750000 val_vel_err: 55.8793983
+[INFO] Epoch 535: loss: 0.0360023 pos_err: 40355.5312500 vel_err: 45.6645927 val_loss: 0.0432089 val_pos_err: 42635.9062500 val_vel_err: 55.6862793
+[INFO] Epoch 540: loss: 0.0356676 pos_err: 40054.4101562 vel_err: 45.4286232 val_loss: 0.0421152 val_pos_err: 41221.4375000 val_vel_err: 54.6284637
+[INFO] Epoch 545: loss: 0.0363267 pos_err: 39132.0742188 vel_err: 44.2365494 val_loss: 0.0418787 val_pos_err: 41057.2460938 val_vel_err: 54.5400352
+[INFO] Epoch 550: loss: 0.0359465 pos_err: 38943.6640625 vel_err: 44.1330338 val_loss: 0.0430629 val_pos_err: 42450.4921875 val_vel_err: 55.5542717
+[INFO] Epoch 555: loss: 0.0356193 pos_err: 40076.0390625 vel_err: 45.3783073 val_loss: 0.0427030 val_pos_err: 42142.9726562 val_vel_err: 55.3612022
+[INFO] Epoch 560: loss: 0.0352835 pos_err: 39780.5078125 vel_err: 45.1481628 val_loss: 0.0416223 val_pos_err: 40716.7656250 val_vel_err: 54.3047638
+[INFO] Epoch 565: loss: 0.0358787 pos_err: 38800.2421875 vel_err: 43.9514046 val_loss: 0.0413923 val_pos_err: 40566.7617188 val_vel_err: 54.2236366
+[INFO] Epoch 570: loss: 0.0355083 pos_err: 38628.1132812 vel_err: 43.8624077 val_loss: 0.0425747 val_pos_err: 42005.6992188 val_vel_err: 55.2460365
+[INFO] Epoch 575: loss: 0.0352583 pos_err: 39851.4296875 vel_err: 45.1374779 val_loss: 0.0422206 val_pos_err: 41711.3125000 val_vel_err: 55.0595741
+[INFO] Epoch 580: loss: 0.0349230 pos_err: 39567.4062500 vel_err: 44.9184151 val_loss: 0.0411596 val_pos_err: 40271.4882812 val_vel_err: 54.0110779
+[INFO] Epoch 585: loss: 0.0354588 pos_err: 38534.2421875 vel_err: 43.7210083 val_loss: 0.0409336 val_pos_err: 40138.3125000 val_vel_err: 53.9344673
+[INFO] Epoch 590: loss: 0.0350947 pos_err: 38382.5390625 vel_err: 43.6415901 val_loss: 0.0421127 val_pos_err: 41636.3046875 val_vel_err: 54.9672165
+[INFO] Epoch 595: loss: 0.0349238 pos_err: 39705.9414062 vel_err: 44.9487953 val_loss: 0.0417651 val_pos_err: 41358.3554688 val_vel_err: 54.7837715
+[INFO] Epoch 600: loss: 0.0345898 pos_err: 39430.1093750 vel_err: 44.7376976 val_loss: 0.0407170 val_pos_err: 39882.5664062 val_vel_err: 53.7311668
+[INFO] Epoch 605: loss: 0.0350530 pos_err: 38344.8828125 vel_err: 43.5207253 val_loss: 0.0404935 val_pos_err: 39765.3671875 val_vel_err: 53.6561279
+[INFO] Epoch 610: loss: 0.0346932 pos_err: 38208.5898438 vel_err: 43.4463348 val_loss: 0.0416816 val_pos_err: 41342.1171875 val_vel_err: 54.7031555
+[INFO] Epoch 615: loss: 0.0346217 pos_err: 39610.6757812 vel_err: 44.7961693 val_loss: 0.0413405 val_pos_err: 41075.8632812 val_vel_err: 54.5210228
+[INFO] Epoch 620: loss: 0.0342890 pos_err: 39341.7187500 vel_err: 44.5884781 val_loss: 0.0402859 val_pos_err: 39555.8828125 val_vel_err: 53.4572563
+[INFO] Epoch 625: loss: 0.0346499 pos_err: 38196.8750000 vel_err: 43.3350220 val_loss: 0.0400643 val_pos_err: 39456.2460938 val_vel_err: 53.3839836
+[INFO] Epoch 630: loss: 0.0342938 pos_err: 38066.0937500 vel_err: 43.2644768 val_loss: 0.0412849 val_pos_err: 41098.0429688 val_vel_err: 54.4523125
+[INFO] Epoch 635: loss: 0.0343570 pos_err: 39563.2304688 vel_err: 44.6729431 val_loss: 0.0409493 val_pos_err: 40838.0000000 val_vel_err: 54.2716713
+[INFO] Epoch 640: loss: 0.0340244 pos_err: 39295.2382812 vel_err: 44.4685097 val_loss: 0.0398600 val_pos_err: 39270.3320312 val_vel_err: 53.1888504
+[INFO] Epoch 645: loss: 0.0342428 pos_err: 38055.7617188 vel_err: 43.1569176 val_loss: 0.0396406 val_pos_err: 39176.8828125 val_vel_err: 53.1177673
+[INFO] Epoch 650: loss: 0.0338916 pos_err: 37929.2460938 vel_err: 43.0910912 val_loss: 0.0409242 val_pos_err: 40887.4140625 val_vel_err: 54.2160378
+[INFO] Epoch 655: loss: 0.0341330 pos_err: 39547.4960938 vel_err: 44.5789566 val_loss: 0.0405925 val_pos_err: 40630.1835938 val_vel_err: 54.0368004
+[INFO] Epoch 660: loss: 0.0337985 pos_err: 39277.3242188 vel_err: 44.3755722 val_loss: 0.0394356 val_pos_err: 38997.9218750 val_vel_err: 52.9258041
+[INFO] Epoch 665: loss: 0.0338291 pos_err: 37913.0781250 vel_err: 42.9864426 val_loss: 0.0392194 val_pos_err: 38910.0507812 val_vel_err: 52.8577843
+[INFO] Epoch 670: loss: 0.0334848 pos_err: 37789.9375000 vel_err: 42.9257774 val_loss: 0.0405990 val_pos_err: 40708.2656250 val_vel_err: 53.9949837
+[INFO] Epoch 675: loss: 0.0339513 pos_err: 39559.7187500 vel_err: 44.5106010 val_loss: 0.0402695 val_pos_err: 40453.1171875 val_vel_err: 53.8165359
+[INFO] Epoch 680: loss: 0.0336123 pos_err: 39285.5937500 vel_err: 44.3068428 val_loss: 0.0390110 val_pos_err: 38736.9804688 val_vel_err: 52.6686630
+[INFO] Epoch 685: loss: 0.0334084 pos_err: 37763.7187500 vel_err: 42.8206635 val_loss: 0.0387990 val_pos_err: 38656.9335938 val_vel_err: 52.6043472
+[INFO] Epoch 690: loss: 0.0330732 pos_err: 37645.1328125 vel_err: 42.7654953 val_loss: 0.0403086 val_pos_err: 40559.4882812 val_vel_err: 53.7897415
+[INFO] Epoch 695: loss: 0.0338132 pos_err: 39599.9804688 vel_err: 44.4670410 val_loss: 0.0399793 val_pos_err: 40305.0546875 val_vel_err: 53.6112442
+[INFO] Epoch 700: loss: 0.0334670 pos_err: 39320.5000000 vel_err: 44.2609825 val_loss: 0.0385850 val_pos_err: 38487.3906250 val_vel_err: 52.4169197
+[INFO] Epoch 705: loss: 0.0329810 pos_err: 37607.5625000 vel_err: 42.6571045 val_loss: 0.0383782 val_pos_err: 38412.9257812 val_vel_err: 52.3569031
+[INFO] Epoch 710: loss: 0.0326570 pos_err: 37494.8828125 vel_err: 42.6074142 val_loss: 0.0400521 val_pos_err: 40440.8281250 val_vel_err: 53.6016045
+[INFO] Epoch 715: loss: 0.0337203 pos_err: 39670.6093750 vel_err: 44.4461479 val_loss: 0.0397215 val_pos_err: 40184.8203125 val_vel_err: 53.4223022
+[INFO] Epoch 720: loss: 0.0333641 pos_err: 39384.6289062 vel_err: 44.2361755 val_loss: 0.0381572 val_pos_err: 38241.4882812 val_vel_err: 52.1693954
+[INFO] Epoch 725: loss: 0.0325472 pos_err: 37445.3515625 vel_err: 42.4944572 val_loss: 0.0379555 val_pos_err: 38173.9023438 val_vel_err: 52.1139069
+[INFO] Epoch 730: loss: 0.0322366 pos_err: 37340.0976562 vel_err: 42.4502792 val_loss: 0.0398288 val_pos_err: 40347.1484375 val_vel_err: 53.4301910
+[INFO] Epoch 735: loss: 0.0336746 pos_err: 39775.3164062 vel_err: 44.4474945 val_loss: 0.0394953 val_pos_err: 40087.0039062 val_vel_err: 53.2474594
+[INFO] Epoch 740: loss: 0.0333051 pos_err: 39481.3554688 vel_err: 44.2311478 val_loss: 0.0377267 val_pos_err: 37998.9609375 val_vel_err: 51.9246140
+[INFO] Epoch 745: loss: 0.0321077 pos_err: 37279.5859375 vel_err: 42.3320656 val_loss: 0.0375279 val_pos_err: 37938.0117188 val_vel_err: 51.8749390
+[INFO] Epoch 750: loss: 0.0318126 pos_err: 37182.5390625 vel_err: 42.2918739 val_loss: 0.0396363 val_pos_err: 40275.4101562 val_vel_err: 53.2692146
+[INFO] Epoch 755: loss: 0.0336745 pos_err: 39913.6835938 vel_err: 44.4666862 val_loss: 0.0392991 val_pos_err: 40007.3437500 val_vel_err: 53.0758858
+[INFO] Epoch 760: loss: 0.0332838 pos_err: 39606.5703125 vel_err: 44.2367821 val_loss: 0.0372952 val_pos_err: 37755.0429688 val_vel_err: 51.6812553
+[INFO] Epoch 765: loss: 0.0316686 pos_err: 37113.7656250 vel_err: 42.1697426 val_loss: 0.0370848 val_pos_err: 37697.4726562 val_vel_err: 51.6373787
+[INFO] Epoch 770: loss: 0.0313942 pos_err: 37021.0546875 vel_err: 42.1225967 val_loss: 0.0394523 val_pos_err: 40197.5039062 val_vel_err: 53.0915489
+[INFO] Epoch 775: loss: 0.0336533 pos_err: 40022.1367188 vel_err: 44.4586029 val_loss: 0.0391035 val_pos_err: 39884.2109375 val_vel_err: 52.8446693
+[INFO] Epoch 780: loss: 0.0331631 pos_err: 39626.8242188 vel_err: 44.1528740 val_loss: 0.0368979 val_pos_err: 37497.3984375 val_vel_err: 51.4237022
+[INFO] Epoch 785: loss: 0.0313568 pos_err: 36987.3593750 vel_err: 42.0133896 val_loss: 0.0366018 val_pos_err: 37423.0429688 val_vel_err: 51.3887444
+[INFO] Epoch 790: loss: 0.0312286 pos_err: 36885.1250000 vel_err: 41.8810654 val_loss: 0.0386836 val_pos_err: 39613.5625000 val_vel_err: 52.6909981
+[INFO] Epoch 795: loss: 0.0325719 pos_err: 39111.6640625 vel_err: 43.9324570 val_loss: 0.0381222 val_pos_err: 38979.2070312 val_vel_err: 52.2258301
+[INFO] Epoch 800: loss: 0.0318123 pos_err: 38459.3046875 vel_err: 43.3747482 val_loss: 0.0371904 val_pos_err: 37405.0351562 val_vel_err: 51.3072853
+[INFO] Epoch 805: loss: 0.0318688 pos_err: 37225.4570312 vel_err: 42.0886383 val_loss: 0.0368042 val_pos_err: 37302.6015625 val_vel_err: 51.1931534
+[INFO] Early stopping triggered at 809
+running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x7f334d2af3b0>, 0.0001)
+[INFO] Epoch 5: loss: 0.2205169 pos_err: 66278.6328125 vel_err: 125.1057892 val_loss: 0.2043373 val_pos_err: 81121.8203125 val_vel_err: 116.2323608
+[INFO] Epoch 10: loss: 0.1742783 pos_err: 66518.7734375 vel_err: 95.4886093 val_loss: 0.1984058 val_pos_err: 83619.4296875 val_vel_err: 97.2522888
+[INFO] Epoch 15: loss: 0.1585068 pos_err: 75800.3906250 vel_err: 121.3265839 val_loss: 0.1546081 val_pos_err: 71344.6953125 val_vel_err: 106.6191406
+[INFO] Epoch 20: loss: 0.1515685 pos_err: 80671.7265625 vel_err: 83.3694687 val_loss: 0.1494015 val_pos_err: 67985.6562500 val_vel_err: 86.2291107
+[INFO] Epoch 25: loss: 0.1317444 pos_err: 62582.2304688 vel_err: 83.3311920 val_loss: 0.1349062 val_pos_err: 54319.9179688 val_vel_err: 94.0886230
+[INFO] Epoch 30: loss: 0.1242288 pos_err: 57471.0859375 vel_err: 81.5103912 val_loss: 0.1281719 val_pos_err: 51990.5585938 val_vel_err: 89.0713959
+[INFO] Epoch 35: loss: 0.1207085 pos_err: 55816.9062500 vel_err: 77.3297272 val_loss: 0.1202936 val_pos_err: 55880.6250000 val_vel_err: 82.9860535
+[INFO] Epoch 40: loss: 0.1139989 pos_err: 58172.0195312 vel_err: 71.8244476 val_loss: 0.1133225 val_pos_err: 51360.5117188 val_vel_err: 78.2755203
+[INFO] Epoch 45: loss: 0.1119909 pos_err: 58101.5312500 vel_err: 71.4380646 val_loss: 0.1153900 val_pos_err: 53302.1914062 val_vel_err: 75.0247192
+[INFO] Epoch 50: loss: 0.1187138 pos_err: 54486.7968750 vel_err: 76.7438660 val_loss: 0.1090462 val_pos_err: 54347.2031250 val_vel_err: 78.7206726
+[INFO] Epoch 55: loss: 0.1128987 pos_err: 64833.3789062 vel_err: 69.5450974 val_loss: 0.1191253 val_pos_err: 64576.9648438 val_vel_err: 79.4129562
+[INFO] Epoch 60: loss: 0.1302845 pos_err: 75918.3984375 vel_err: 96.9204865 val_loss: 0.0942270 val_pos_err: 51763.3593750 val_vel_err: 70.1339874
+[INFO] Epoch 65: loss: 0.0964066 pos_err: 53419.9843750 vel_err: 71.3037338 val_loss: 0.0949696 val_pos_err: 53098.4257812 val_vel_err: 72.2581253
+[INFO] Epoch 70: loss: 0.0842860 pos_err: 51044.5507812 vel_err: 67.0415878 val_loss: 0.0885746 val_pos_err: 46650.1523438 val_vel_err: 70.5530014
+[INFO] Epoch 75: loss: 0.0819045 pos_err: 51033.9218750 vel_err: 69.2409897 val_loss: 0.0897064 val_pos_err: 51556.4335938 val_vel_err: 70.4815598
+[INFO] Epoch 80: loss: 0.0881271 pos_err: 53084.8320312 vel_err: 71.0465317 val_loss: 0.0871945 val_pos_err: 47028.1562500 val_vel_err: 74.1735687
+[INFO] Epoch 85: loss: 0.0910304 pos_err: 54167.6171875 vel_err: 68.4729538 val_loss: 0.0903858 val_pos_err: 46207.8984375 val_vel_err: 71.4260788
+[INFO] Epoch 90: loss: 0.0842982 pos_err: 49790.5546875 vel_err: 76.0161438 val_loss: 0.0826575 val_pos_err: 45075.6484375 val_vel_err: 72.6243744
+[INFO] Epoch 95: loss: 0.0744302 pos_err: 46344.4648438 vel_err: 64.0843506 val_loss: 0.0833271 val_pos_err: 42637.6562500 val_vel_err: 69.9472961
+[INFO] Epoch 100: loss: 0.0743185 pos_err: 49523.2109375 vel_err: 66.7767944 val_loss: 0.0845522 val_pos_err: 46099.4921875 val_vel_err: 70.7991638
+[INFO] Epoch 105: loss: 0.0755294 pos_err: 48940.6250000 vel_err: 72.5105972 val_loss: 0.0825187 val_pos_err: 43479.7304688 val_vel_err: 69.5697403
+[INFO] Epoch 110: loss: 0.0753525 pos_err: 52623.3125000 vel_err: 72.8749695 val_loss: 0.0825877 val_pos_err: 47152.6914062 val_vel_err: 72.6864777
+[INFO] Epoch 115: loss: 0.0716797 pos_err: 47989.6523438 vel_err: 63.3946571 val_loss: 0.0807418 val_pos_err: 44280.6875000 val_vel_err: 70.4340057
+[INFO] Epoch 120: loss: 0.0671953 pos_err: 47987.3515625 vel_err: 64.2633133 val_loss: 0.0824821 val_pos_err: 46464.0468750 val_vel_err: 70.0785980
+[INFO] Epoch 125: loss: 0.0673642 pos_err: 47597.4687500 vel_err: 66.3043747 val_loss: 0.0790170 val_pos_err: 42513.5859375 val_vel_err: 69.1243210
+[INFO] Epoch 130: loss: 0.0667998 pos_err: 47596.5156250 vel_err: 64.5860291 val_loss: 0.0846134 val_pos_err: 45060.8242188 val_vel_err: 71.1114883
+[INFO] Epoch 135: loss: 0.0653287 pos_err: 48544.7187500 vel_err: 65.5098572 val_loss: 0.0808223 val_pos_err: 45491.5664062 val_vel_err: 71.3036728
+[INFO] Epoch 140: loss: 0.0830930 pos_err: 56545.7304688 vel_err: 66.6684875 val_loss: 0.0805208 val_pos_err: 41223.2695312 val_vel_err: 71.5875702
+[INFO] Epoch 145: loss: 0.0819369 pos_err: 47839.6640625 vel_err: 65.1549835 val_loss: 0.0855708 val_pos_err: 45687.9101562 val_vel_err: 74.3290634
+[INFO] Epoch 150: loss: 0.0743958 pos_err: 47172.2343750 vel_err: 62.6332970 val_loss: 0.0910092 val_pos_err: 45133.3398438 val_vel_err: 72.7249756
+[INFO] Epoch 155: loss: 0.0742455 pos_err: 49139.9765625 vel_err: 73.4534225 val_loss: 0.0787341 val_pos_err: 41165.3593750 val_vel_err: 69.0731430
+[INFO] Early stopping triggered at 157
+running length strategy (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x7f3344292660>, 0.0001)
+[INFO] Epoch 5: loss: 0.6545673 pos_err: 325670.5937500 vel_err: 225.3417358 val_loss: 0.2347293 val_pos_err: 79187.0000000 val_vel_err: 92.1101532
+[INFO] Epoch 10: loss: 0.1908514 pos_err: 86569.3593750 vel_err: 87.1960526 val_loss: 0.1867356 val_pos_err: 60554.6250000 val_vel_err: 85.3009872
+[INFO] Epoch 15: loss: 0.5631903 pos_err: 206639.7187500 vel_err: 277.8874817 val_loss: 0.2845491 val_pos_err: 86398.8437500 val_vel_err: 164.5174408
+[INFO] Epoch 20: loss: 0.1631231 pos_err: 77998.2109375 vel_err: 81.4785385 val_loss: 0.3291332 val_pos_err: 135182.3281250 val_vel_err: 156.4832458
+[INFO] Epoch 25: loss: 0.1844554 pos_err: 82122.1484375 vel_err: 91.7154236 val_loss: 0.2338691 val_pos_err: 79136.1953125 val_vel_err: 107.7459946
+[INFO] Epoch 30: loss: 0.3165532 pos_err: 170149.9843750 vel_err: 192.2782745 val_loss: 0.3422744 val_pos_err: 170564.6875000 val_vel_err: 182.2422638
+[INFO] Early stopping triggered at 30
+running length strategy (0.7, 2000, <neural_ode_mod.EarlyStopper object at 0x7f334492fd40>, 0.0001)
+[INFO] Epoch 5: loss: 0.2127805 pos_err: 96775.1406250 vel_err: 98.9417648 val_loss: 0.4440279 val_pos_err: 181539.3437500 val_vel_err: 178.9668274
+[INFO] Epoch 10: loss: 0.1742162 pos_err: 62056.8867188 vel_err: 76.9810410 val_loss: 0.2595960 val_pos_err: 88125.6718750 val_vel_err: 97.4191589
+[INFO] Epoch 15: loss: 0.1699679 pos_err: 56995.3164062 vel_err: 78.7161026 val_loss: 0.2667705 val_pos_err: 64678.9765625 val_vel_err: 96.1014481
+[INFO] Epoch 20: loss: 0.1526606 pos_err: 47102.4687500 vel_err: 80.8156586 val_loss: 0.2233827 val_pos_err: 66612.3593750 val_vel_err: 94.6862869
+[INFO] Epoch 25: loss: 0.1524522 pos_err: 55931.4531250 vel_err: 83.6104050 val_loss: 0.2376182 val_pos_err: 69415.5078125 val_vel_err: 104.6166687
+[INFO] Epoch 30: loss: 0.1449803 pos_err: 54325.7265625 vel_err: 78.1292038 val_loss: 0.2250985 val_pos_err: 66431.1328125 val_vel_err: 89.2560577
+[INFO] Epoch 35: loss: 0.1549532 pos_err: 68335.3828125 vel_err: 92.6509399 val_loss: 0.2155846 val_pos_err: 57010.4492188 val_vel_err: 108.8676605
+[INFO] Epoch 40: loss: 0.1388878 pos_err: 56080.1093750 vel_err: 90.4928818 val_loss: 0.2088828 val_pos_err: 57629.8359375 val_vel_err: 94.1435013
+[INFO] Epoch 45: loss: 0.1317990 pos_err: 43339.5585938 vel_err: 79.5466385 val_loss: 0.2170801 val_pos_err: 55994.7539062 val_vel_err: 102.1539688
+[INFO] Epoch 50: loss: 0.1272777 pos_err: 43628.1015625 vel_err: 77.4538498 val_loss: 0.2092865 val_pos_err: 58335.1289062 val_vel_err: 87.8455124
+[INFO] Epoch 55: loss: 0.1286260 pos_err: 44836.9570312 vel_err: 74.3146744 val_loss: 0.2221593 val_pos_err: 56565.2851562 val_vel_err: 100.5292587
+[INFO] Epoch 60: loss: 0.1563635 pos_err: 46972.8281250 vel_err: 84.3058853 val_loss: 0.2328947 val_pos_err: 50987.5820312 val_vel_err: 98.0665817
+[INFO] Epoch 65: loss: 0.1298278 pos_err: 41395.1250000 vel_err: 71.9024048 val_loss: 0.2299278 val_pos_err: 80032.3593750 val_vel_err: 97.3385849
+[INFO] Epoch 70: loss: 0.1448495 pos_err: 42352.4101562 vel_err: 74.5203629 val_loss: 0.2187630 val_pos_err: 53028.2929688 val_vel_err: 95.1421509
+[INFO] Epoch 75: loss: 0.1372116 pos_err: 57859.0507812 vel_err: 73.8119278 val_loss: 0.1969351 val_pos_err: 53541.4101562 val_vel_err: 89.8345261
+[INFO] Epoch 80: loss: 0.1210981 pos_err: 42120.0234375 vel_err: 72.8717422 val_loss: 0.2219752 val_pos_err: 58397.0312500 val_vel_err: 84.9281082
+[INFO] Epoch 85: loss: 0.1628458 pos_err: 44849.2578125 vel_err: 84.1387253 val_loss: 0.2091543 val_pos_err: 51987.7617188 val_vel_err: 97.2615738
+[INFO] Epoch 90: loss: 0.1447835 pos_err: 54960.3203125 vel_err: 81.9417725 val_loss: 0.1977779 val_pos_err: 50243.2031250 val_vel_err: 89.6248627
+[INFO] Epoch 95: loss: 0.1338618 pos_err: 44994.6757812 vel_err: 74.5682144 val_loss: 0.2282207 val_pos_err: 63445.8828125 val_vel_err: 108.8103409
+[INFO] Early stopping triggered at 99
+running length strategy (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x7f331acb48c0>, 0.001)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 1210.9835205 pos_err: 1923913.7500000 vel_err: 12180.1064453 val_loss: 13.5710516 val_pos_err: 328742.3437500 val_vel_err: 1574.0167236
+[INFO] Saved checkpoint at 5
+[INFO] Saved checkpoint at 6
+[INFO] Saved checkpoint at 7
+[INFO] Saved checkpoint at 8
+[INFO] Saved checkpoint at 9
+[INFO] Epoch 10: loss: 0.4530053 pos_err: 136050.0312500 vel_err: 158.4495697 val_loss: 0.5787392 val_pos_err: 160209.1562500 val_vel_err: 190.5166168
+[INFO] Saved checkpoint at 10
+[INFO] Saved checkpoint at 11
+[INFO] Saved checkpoint at 12
+[INFO] Saved checkpoint at 13
+[INFO] Saved checkpoint at 14
+[INFO] Epoch 15: loss: 0.4368329 pos_err: 134978.7343750 vel_err: 145.6594238 val_loss: 0.5629157 val_pos_err: 155940.2031250 val_vel_err: 187.2311249
+[INFO] Saved checkpoint at 15
+[INFO] Saved checkpoint at 16
+[INFO] Epoch 20: loss: 14.6615067 pos_err: 1098491.0000000 vel_err: 1551.8748779 val_loss: 6.3406796 val_pos_err: 762312.1875000 val_vel_err: 1071.8029785
+[INFO] Epoch 25: loss: 0.4425591 pos_err: 147525.7031250 vel_err: 151.8068695 val_loss: 0.5724600 val_pos_err: 158841.9531250 val_vel_err: 185.8278961
+[INFO] Epoch 30: loss: 0.4468320 pos_err: 135073.4687500 vel_err: 152.4755707 val_loss: 0.5821786 val_pos_err: 160052.7968750 val_vel_err: 193.2228088
+[INFO] Epoch 35: loss: 0.4392750 pos_err: 133294.6718750 vel_err: 146.3088379 val_loss: 0.5636002 val_pos_err: 151751.7812500 val_vel_err: 181.5731354
+[INFO] Epoch 40: loss: 1.1946298 pos_err: 363166.5937500 vel_err: 419.9902649 val_loss: 0.6773669 val_pos_err: 215087.4375000 val_vel_err: 260.3888855
+[INFO] Epoch 45: loss: 0.4463505 pos_err: 138147.5625000 vel_err: 158.2131653 val_loss: 0.5773065 val_pos_err: 158486.9687500 val_vel_err: 192.4490814
+[INFO] Epoch 50: loss: 0.4478764 pos_err: 133799.1093750 vel_err: 147.2719116 val_loss: 0.5814953 val_pos_err: 158673.0000000 val_vel_err: 187.4512482
+[INFO] Epoch 55: loss: 0.4468778 pos_err: 134977.9687500 vel_err: 143.4331818 val_loss: 0.5807014 val_pos_err: 158771.1718750 val_vel_err: 186.1021271
+[INFO] Epoch 60: loss: 0.4423818 pos_err: 131435.4062500 vel_err: 144.6562958 val_loss: 0.5733195 val_pos_err: 155761.3906250 val_vel_err: 186.6386719
+[INFO] Epoch 65: loss: 2.9882469 pos_err: 566280.0625000 vel_err: 157.8394928 val_loss: 2.1590922 val_pos_err: 527134.1875000 val_vel_err: 232.2793884
+[INFO] Early stopping triggered at 66
+running length strategy (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x7f331acb75c0>, 0.0001)
+[INFO] Epoch 5: loss: 0.4124310 pos_err: 143907.6562500 vel_err: 150.8169556 val_loss: 0.5371187 val_pos_err: 155950.7656250 val_vel_err: 188.0986328
+[INFO] Epoch 10: loss: 0.3949030 pos_err: 135847.6250000 vel_err: 146.8466949 val_loss: 0.5395223 val_pos_err: 162010.2968750 val_vel_err: 190.3394775
+[INFO] Saved checkpoint at 13
+[INFO] Saved checkpoint at 14
+[INFO] Epoch 15: loss: 0.3826664 pos_err: 146757.6718750 vel_err: 147.7950592 val_loss: 0.4975930 val_pos_err: 153027.2343750 val_vel_err: 183.6381226
+[INFO] Saved checkpoint at 15
+[INFO] Saved checkpoint at 18
+[INFO] Saved checkpoint at 19
+[INFO] Epoch 20: loss: 0.3732456 pos_err: 139259.2343750 vel_err: 143.4163818 val_loss: 0.4856455 val_pos_err: 149004.2500000 val_vel_err: 180.6506653
+[INFO] Saved checkpoint at 20
+[INFO] Saved checkpoint at 23
+[INFO] Saved checkpoint at 24
+[INFO] Epoch 25: loss: 0.3624888 pos_err: 131946.5625000 vel_err: 140.7640076 val_loss: 0.4791363 val_pos_err: 139943.5625000 val_vel_err: 177.3135223
+[INFO] Saved checkpoint at 26
+[INFO] Epoch 30: loss: 0.3551925 pos_err: 131664.4687500 vel_err: 139.6176910 val_loss: 0.4671676 val_pos_err: 135672.2812500 val_vel_err: 174.2870941
+[INFO] Saved checkpoint at 30
+[INFO] Saved checkpoint at 32
+[INFO] Epoch 35: loss: 0.5304613 pos_err: 202447.5156250 vel_err: 170.7982788 val_loss: 0.5845864 val_pos_err: 178688.2343750 val_vel_err: 189.5436096
+[INFO] Epoch 40: loss: 0.3686482 pos_err: 139003.1718750 vel_err: 141.7971039 val_loss: 0.4745968 val_pos_err: 141341.4531250 val_vel_err: 175.0474701
+[INFO] Saved checkpoint at 41
+[INFO] Epoch 45: loss: 0.6710616 pos_err: 260308.5000000 vel_err: 205.2829742 val_loss: 0.6383179 val_pos_err: 198162.9687500 val_vel_err: 198.6910248
+[INFO] Epoch 50: loss: 0.3630905 pos_err: 134923.1250000 vel_err: 140.9132080 val_loss: 0.4716072 val_pos_err: 139232.5781250 val_vel_err: 175.0272064
+[INFO] Epoch 55: loss: 0.4377440 pos_err: 154756.0468750 vel_err: 150.0597076 val_loss: 0.5037301 val_pos_err: 151192.0468750 val_vel_err: 177.6220398
+[INFO] Saved checkpoint at 56
+[INFO] Epoch 60: loss: 0.3505929 pos_err: 131244.5625000 vel_err: 139.7548828 val_loss: 0.4542501 val_pos_err: 132354.8906250 val_vel_err: 171.5824738
+[INFO] Saved checkpoint at 60
+[INFO] Saved checkpoint at 61
+[INFO] Saved checkpoint at 64
+[INFO] Epoch 65: loss: 0.3332549 pos_err: 127052.0546875 vel_err: 136.9396362 val_loss: 0.4497116 val_pos_err: 132639.2812500 val_vel_err: 170.6955719
+[INFO] Saved checkpoint at 68
+[INFO] Epoch 70: loss: 0.3862197 pos_err: 144038.2343750 vel_err: 143.9586334 val_loss: 0.6068599 val_pos_err: 185714.4687500 val_vel_err: 198.0113373
+[INFO] Saved checkpoint at 73
+[INFO] Epoch 75: loss: 0.3409033 pos_err: 129499.9453125 vel_err: 139.0431366 val_loss: 0.4464009 val_pos_err: 132309.0468750 val_vel_err: 170.5689240
+[INFO] Epoch 80: loss: 0.3308336 pos_err: 124176.8593750 vel_err: 135.9569244 val_loss: 0.4402660 val_pos_err: 126741.5937500 val_vel_err: 167.5744934
+[INFO] Saved checkpoint at 80
+[INFO] Epoch 85: loss: 0.3317826 pos_err: 124356.7656250 vel_err: 135.9943848 val_loss: 0.4470831 val_pos_err: 129106.6796875 val_vel_err: 168.0005035
+[INFO] Epoch 90: loss: 0.3555095 pos_err: 131184.7343750 vel_err: 138.1473999 val_loss: 0.4405356 val_pos_err: 126826.5078125 val_vel_err: 166.1893158
+[INFO] Saved checkpoint at 91
+[INFO] Saved checkpoint at 92
+[INFO] Saved checkpoint at 93
+[INFO] Epoch 95: loss: 0.3235974 pos_err: 120142.3593750 vel_err: 134.1915131 val_loss: 0.4361499 val_pos_err: 125599.0156250 val_vel_err: 165.0342865
+[INFO] Saved checkpoint at 95
+[INFO] Saved checkpoint at 96
+[INFO] Saved checkpoint at 98
+[INFO] Epoch 100: loss: 0.3565932 pos_err: 128942.7578125 vel_err: 137.3855896 val_loss: 0.5230452 val_pos_err: 153859.0937500 val_vel_err: 177.7275085
+[INFO] Saved checkpoint at 102
+[INFO] Epoch 105: loss: 0.3347557 pos_err: 127564.4765625 vel_err: 138.8081207 val_loss: 0.4461519 val_pos_err: 134740.4687500 val_vel_err: 170.7263336
+[INFO] Saved checkpoint at 107
+[INFO] Epoch 110: loss: 0.4974635 pos_err: 176148.6875000 vel_err: 165.2147522 val_loss: 0.6501302 val_pos_err: 200836.8281250 val_vel_err: 201.7731628
+[INFO] Epoch 115: loss: 0.3263289 pos_err: 122910.6250000 vel_err: 137.2292328 val_loss: 0.4417557 val_pos_err: 131448.8437500 val_vel_err: 168.9783173
+[INFO] Saved checkpoint at 117
+[INFO] Epoch 120: loss: 0.5630040 pos_err: 203745.9375000 vel_err: 184.3475494 val_loss: 0.6583090 val_pos_err: 205781.0312500 val_vel_err: 207.2001190
+[INFO] Epoch 125: loss: 0.3250324 pos_err: 122679.8437500 vel_err: 137.8437653 val_loss: 0.4400624 val_pos_err: 130744.9375000 val_vel_err: 168.9897614
+[INFO] Epoch 130: loss: 0.3475223 pos_err: 127293.6796875 vel_err: 139.9929810 val_loss: 0.4458875 val_pos_err: 131080.3437500 val_vel_err: 165.9127502
+[INFO] Saved checkpoint at 131
+[INFO] Epoch 135: loss: 0.3221863 pos_err: 121188.0937500 vel_err: 136.5659637 val_loss: 0.4316013 val_pos_err: 123908.8828125 val_vel_err: 164.7232361
+[INFO] Saved checkpoint at 139
+[INFO] Epoch 140: loss: 0.3074524 pos_err: 111577.7734375 vel_err: 134.1877747 val_loss: 0.4238374 val_pos_err: 118208.4687500 val_vel_err: 162.7618408
+[INFO] Saved checkpoint at 141
+[INFO] Saved checkpoint at 142
+[INFO] Epoch 145: loss: 0.3053986 pos_err: 110346.5937500 vel_err: 132.2895660 val_loss: 0.4274471 val_pos_err: 123301.7187500 val_vel_err: 161.6352234
+[INFO] Saved checkpoint at 147
+[INFO] Saved checkpoint at 149
+[INFO] Epoch 150: loss: 0.3043120 pos_err: 110270.8281250 vel_err: 133.7483521 val_loss: 0.4248039 val_pos_err: 120609.7421875 val_vel_err: 161.0921326
+[INFO] Epoch 155: loss: 0.3089024 pos_err: 114954.4375000 vel_err: 135.2606049 val_loss: 0.4173296 val_pos_err: 115485.5468750 val_vel_err: 160.1022949
+[INFO] Saved checkpoint at 155
+[INFO] Epoch 160: loss: 0.3021178 pos_err: 110547.2500000 vel_err: 132.6930847 val_loss: 0.4204791 val_pos_err: 119597.2890625 val_vel_err: 160.5465393
+[INFO] Saved checkpoint at 161
+[INFO] Epoch 165: loss: 0.3053893 pos_err: 110349.5546875 vel_err: 132.5414581 val_loss: 0.4163952 val_pos_err: 116051.1093750 val_vel_err: 159.1102600
+[INFO] Saved checkpoint at 167
+[INFO] Epoch 170: loss: 0.3087146 pos_err: 109998.5781250 vel_err: 133.9546509 val_loss: 0.4125673 val_pos_err: 113393.2031250 val_vel_err: 157.6891479
+[INFO] Saved checkpoint at 170
+[INFO] Saved checkpoint at 174
+[INFO] Epoch 175: loss: 0.2986973 pos_err: 105361.4531250 vel_err: 132.1931763 val_loss: 0.4163955 val_pos_err: 116001.1015625 val_vel_err: 158.4371796
+[INFO] Saved checkpoint at 176
+[INFO] Epoch 180: loss: 0.3001674 pos_err: 109109.1171875 vel_err: 133.5066833 val_loss: 0.4104997 val_pos_err: 112421.5546875 val_vel_err: 157.1257935
+[INFO] Saved checkpoint at 182
+[INFO] Epoch 185: loss: 0.3057276 pos_err: 114169.1796875 vel_err: 135.7361755 val_loss: 0.4157475 val_pos_err: 116657.0390625 val_vel_err: 160.3383179
+[INFO] Saved checkpoint at 186
+[INFO] Saved checkpoint at 188
+[INFO] Epoch 190: loss: 0.2981592 pos_err: 108402.4531250 vel_err: 132.9364166 val_loss: 0.4140662 val_pos_err: 115752.8203125 val_vel_err: 158.5361938
+[INFO] Saved checkpoint at 194
+[INFO] Epoch 195: loss: 0.2933628 pos_err: 105203.4843750 vel_err: 131.7942810 val_loss: 0.4066384 val_pos_err: 109248.9765625 val_vel_err: 155.5512390
+[INFO] Saved checkpoint at 195
+[INFO] Saved checkpoint at 196
+[INFO] Saved checkpoint at 197
+[INFO] Epoch 200: loss: 0.2941056 pos_err: 105975.0156250 vel_err: 131.6493683 val_loss: 0.4037342 val_pos_err: 108760.5546875 val_vel_err: 153.8596954
+[INFO] Saved checkpoint at 200
+[INFO] Saved checkpoint at 201
+[INFO] Saved checkpoint at 203
+[INFO] Epoch 205: loss: 0.3041090 pos_err: 109525.4531250 vel_err: 132.8063049 val_loss: 0.4226415 val_pos_err: 123397.0390625 val_vel_err: 158.5117188
+[INFO] Saved checkpoint at 206
+[INFO] Epoch 210: loss: 0.2950110 pos_err: 107328.7968750 vel_err: 132.2944489 val_loss: 0.3982649 val_pos_err: 104137.5000000 val_vel_err: 152.1483002
+[INFO] Saved checkpoint at 210
+[INFO] Epoch 215: loss: 0.2926681 pos_err: 102931.8593750 vel_err: 128.2917023 val_loss: 0.3997624 val_pos_err: 103462.0781250 val_vel_err: 148.9865570
+[INFO] Saved checkpoint at 219
+[INFO] Epoch 220: loss: 0.2853683 pos_err: 95554.4531250 vel_err: 125.8628235 val_loss: 0.4126152 val_pos_err: 113583.7031250 val_vel_err: 153.8639679
+[INFO] Saved checkpoint at 224
+[INFO] Epoch 225: loss: 0.2843642 pos_err: 97538.0859375 vel_err: 128.6031189 val_loss: 0.4294734 val_pos_err: 128044.9140625 val_vel_err: 159.9999847
+[INFO] Saved checkpoint at 228
+[INFO] Epoch 230: loss: 0.2975649 pos_err: 98112.9453125 vel_err: 123.1138382 val_loss: 0.4085818 val_pos_err: 106875.9062500 val_vel_err: 148.7901459
+[INFO] Saved checkpoint at 231
+[INFO] Epoch 235: loss: 0.3049860 pos_err: 115648.3281250 vel_err: 139.9063416 val_loss: 0.3958637 val_pos_err: 107061.1250000 val_vel_err: 153.7759552
+[INFO] Saved checkpoint at 239
+[INFO] Epoch 240: loss: 0.2821496 pos_err: 89272.1015625 vel_err: 122.9401093 val_loss: 0.4101632 val_pos_err: 112125.4375000 val_vel_err: 149.1977081
+[INFO] Saved checkpoint at 241
+[INFO] Saved checkpoint at 244
+[INFO] Epoch 245: loss: 0.2775116 pos_err: 79343.8984375 vel_err: 113.4945526 val_loss: 0.4352374 val_pos_err: 126266.1171875 val_vel_err: 156.7025604
+[INFO] Saved checkpoint at 248
+[INFO] Epoch 250: loss: 0.2953453 pos_err: 103591.8828125 vel_err: 129.4943390 val_loss: 0.4211224 val_pos_err: 118032.6093750 val_vel_err: 157.2688141
+[INFO] Epoch 255: loss: 0.2999578 pos_err: 109193.1640625 vel_err: 135.9714203 val_loss: 0.3995975 val_pos_err: 112269.6328125 val_vel_err: 154.4436340
+[INFO] Saved checkpoint at 258
+[INFO] Saved checkpoint at 259
+[INFO] Epoch 260: loss: 0.2725246 pos_err: 74397.8750000 vel_err: 111.4839020 val_loss: 0.3825153 val_pos_err: 84930.0703125 val_vel_err: 134.9469910
+[INFO] Epoch 265: loss: 0.2719317 pos_err: 81822.4062500 vel_err: 118.9369278 val_loss: 0.3795826 val_pos_err: 87378.5000000 val_vel_err: 140.1217194
+[INFO] Saved checkpoint at 267
+[INFO] Epoch 270: loss: 0.2786984 pos_err: 83789.6015625 vel_err: 119.5350266 val_loss: 0.3867671 val_pos_err: 104488.5390625 val_vel_err: 144.2226410
+[INFO] Epoch 275: loss: 0.2735184 pos_err: 81256.5468750 vel_err: 119.1222687 val_loss: 0.3714646 val_pos_err: 90164.4687500 val_vel_err: 146.0576630
+[INFO] Saved checkpoint at 275
+[INFO] Saved checkpoint at 277
+[INFO] Saved checkpoint at 278
+[INFO] Saved checkpoint at 279
+[INFO] Epoch 280: loss: 0.2644807 pos_err: 74073.3437500 vel_err: 117.0314102 val_loss: 0.3629174 val_pos_err: 78700.8984375 val_vel_err: 135.2719727
+[INFO] Saved checkpoint at 280
+[INFO] Epoch 285: loss: 0.2616927 pos_err: 72543.6484375 vel_err: 115.0211487 val_loss: 0.3648163 val_pos_err: 80554.3046875 val_vel_err: 135.3842316
+[INFO] Epoch 290: loss: 0.2636914 pos_err: 72373.1015625 vel_err: 113.3393021 val_loss: 0.3840402 val_pos_err: 109802.9843750 val_vel_err: 155.4369202
+[INFO] Epoch 295: loss: 0.2705841 pos_err: 74054.4218750 vel_err: 114.3007050 val_loss: 0.3661467 val_pos_err: 83776.0937500 val_vel_err: 136.7525177
+[INFO] Saved checkpoint at 297
+[INFO] Epoch 300: loss: 0.2614105 pos_err: 74762.1406250 vel_err: 117.3759995 val_loss: 0.3772826 val_pos_err: 98134.9921875 val_vel_err: 151.8847656
+[INFO] Epoch 305: loss: 0.2691367 pos_err: 79837.2109375 vel_err: 117.5295334 val_loss: 0.3798132 val_pos_err: 101549.0156250 val_vel_err: 145.7467041
+[INFO] Epoch 310: loss: 0.2595149 pos_err: 72064.0156250 vel_err: 116.1234436 val_loss: 0.3609982 val_pos_err: 76226.6562500 val_vel_err: 133.4909363
+[INFO] Saved checkpoint at 310
+[INFO] Saved checkpoint at 311
+[INFO] Epoch 315: loss: 0.2565605 pos_err: 65624.9921875 vel_err: 111.4986649 val_loss: 0.3620116 val_pos_err: 81824.3125000 val_vel_err: 137.5955658
+[INFO] Saved checkpoint at 316
+[INFO] Saved checkpoint at 317
+[INFO] Epoch 320: loss: 0.2598489 pos_err: 76379.4453125 vel_err: 120.4027405 val_loss: 0.3702445 val_pos_err: 81718.3437500 val_vel_err: 136.7782288
+[INFO] Epoch 325: loss: 0.2649845 pos_err: 74886.1875000 vel_err: 114.8152924 val_loss: 0.3646253 val_pos_err: 82728.4609375 val_vel_err: 136.1074677
+[INFO] Epoch 330: loss: 0.2578862 pos_err: 71112.9843750 vel_err: 113.8532028 val_loss: 0.3716334 val_pos_err: 97443.4687500 val_vel_err: 150.3126678
+[INFO] Epoch 335: loss: 0.2657502 pos_err: 77886.1640625 vel_err: 117.0329361 val_loss: 0.3712575 val_pos_err: 96057.6484375 val_vel_err: 144.0782166
+[INFO] Saved checkpoint at 337
+[INFO] Epoch 340: loss: 0.2716646 pos_err: 88104.4062500 vel_err: 127.4138718 val_loss: 0.3571598 val_pos_err: 75418.3359375 val_vel_err: 134.0598602
+[INFO] Saved checkpoint at 340
+[INFO] Saved checkpoint at 341
+[INFO] Epoch 345: loss: 0.2627600 pos_err: 72937.8125000 vel_err: 112.7673569 val_loss: 0.3644134 val_pos_err: 78482.0937500 val_vel_err: 133.2654877
+[INFO] Epoch 350: loss: 0.2592099 pos_err: 70385.1718750 vel_err: 111.5454865 val_loss: 0.3622436 val_pos_err: 86060.8906250 val_vel_err: 140.2700043
+[INFO] Epoch 355: loss: 0.2629443 pos_err: 76866.8281250 vel_err: 119.8658829 val_loss: 0.3698826 val_pos_err: 96200.3906250 val_vel_err: 147.5530548
+[INFO] Saved checkpoint at 357
+[INFO] Epoch 360: loss: 0.2679366 pos_err: 80632.7578125 vel_err: 119.7406998 val_loss: 0.3548737 val_pos_err: 74504.1328125 val_vel_err: 131.7463837
+[INFO] Saved checkpoint at 360
+[INFO] Epoch 365: loss: 0.2548349 pos_err: 67612.3593750 vel_err: 111.1022873 val_loss: 0.3571409 val_pos_err: 74612.9375000 val_vel_err: 132.0983887
+[INFO] Epoch 370: loss: 0.2571852 pos_err: 69465.0000000 vel_err: 111.4474335 val_loss: 0.3608729 val_pos_err: 84513.7421875 val_vel_err: 139.9521027
+[INFO] Epoch 375: loss: 0.2537477 pos_err: 66345.6093750 vel_err: 113.7182007 val_loss: 0.3570844 val_pos_err: 79394.1406250 val_vel_err: 137.1402740
+[INFO] Epoch 380: loss: 0.2537300 pos_err: 66553.8359375 vel_err: 112.6552734 val_loss: 0.3597413 val_pos_err: 76870.3671875 val_vel_err: 132.2174377
+[INFO] Epoch 385: loss: 0.2538422 pos_err: 66424.2031250 vel_err: 109.9421539 val_loss: 0.3543860 val_pos_err: 73653.7187500 val_vel_err: 131.3930969
+[INFO] Saved checkpoint at 385
+[INFO] Saved checkpoint at 388
+[INFO] Epoch 390: loss: 0.2509946 pos_err: 64003.0507812 vel_err: 109.8025436 val_loss: 0.3758670 val_pos_err: 104429.0625000 val_vel_err: 152.3247528
+[INFO] Saved checkpoint at 392
+[INFO] Saved checkpoint at 393
+[INFO] Epoch 395: loss: 0.2689930 pos_err: 83022.6015625 vel_err: 122.5400543 val_loss: 0.3719238 val_pos_err: 99755.8515625 val_vel_err: 148.6131134
+[INFO] Epoch 400: loss: 0.2642603 pos_err: 78787.9687500 vel_err: 121.2758713 val_loss: 0.3528500 val_pos_err: 73112.5859375 val_vel_err: 131.3526306
+[INFO] Saved checkpoint at 401
+[INFO] Epoch 405: loss: 0.2510374 pos_err: 64500.6679688 vel_err: 109.5706863 val_loss: 0.3523055 val_pos_err: 72615.3437500 val_vel_err: 131.0741577
+[INFO] Saved checkpoint at 405
+[INFO] Saved checkpoint at 409
+[INFO] Epoch 410: loss: 0.2504330 pos_err: 64273.4453125 vel_err: 109.6095886 val_loss: 0.3688469 val_pos_err: 96538.7109375 val_vel_err: 147.3928833
+[INFO] Saved checkpoint at 413
+[INFO] Epoch 415: loss: 0.2632547 pos_err: 77910.7578125 vel_err: 120.9043198 val_loss: 0.3668785 val_pos_err: 94842.3828125 val_vel_err: 147.1213074
+[INFO] Epoch 420: loss: 0.2600029 pos_err: 73856.6171875 vel_err: 117.6099548 val_loss: 0.3517369 val_pos_err: 72896.5234375 val_vel_err: 130.5970917
+[INFO] Saved checkpoint at 420
+[INFO] Saved checkpoint at 421
+[INFO] Epoch 425: loss: 0.2506953 pos_err: 64505.1250000 vel_err: 109.5312653 val_loss: 0.3520480 val_pos_err: 72253.5000000 val_vel_err: 130.8051147
+[INFO] Epoch 430: loss: 0.2504631 pos_err: 64781.7226562 vel_err: 109.6340637 val_loss: 0.3638734 val_pos_err: 91231.3046875 val_vel_err: 144.9312592
+[INFO] Epoch 435: loss: 0.2575063 pos_err: 71347.1718750 vel_err: 116.6880875 val_loss: 0.3590307 val_pos_err: 85557.2578125 val_vel_err: 140.4243469
+[INFO] Epoch 440: loss: 0.2545201 pos_err: 68445.6093750 vel_err: 115.6017380 val_loss: 0.3536758 val_pos_err: 73773.2734375 val_vel_err: 130.7981720
+[INFO] Epoch 445: loss: 0.2528377 pos_err: 67183.8984375 vel_err: 110.1582718 val_loss: 0.3530305 val_pos_err: 73833.9062500 val_vel_err: 130.5894928
+[INFO] Epoch 450: loss: 0.2521299 pos_err: 66587.6171875 vel_err: 109.8255310 val_loss: 0.3572640 val_pos_err: 83239.9140625 val_vel_err: 140.2127228
+[INFO] Epoch 455: loss: 0.2526851 pos_err: 66529.5234375 vel_err: 113.4131470 val_loss: 0.3549197 val_pos_err: 80658.3593750 val_vel_err: 137.7154388
+[INFO] Epoch 460: loss: 0.2522263 pos_err: 66045.4453125 vel_err: 114.0142517 val_loss: 0.3532516 val_pos_err: 74108.3125000 val_vel_err: 130.5966339
+[INFO] Epoch 465: loss: 0.2513192 pos_err: 65948.3984375 vel_err: 109.5906067 val_loss: 0.3516036 val_pos_err: 72729.3671875 val_vel_err: 130.2836609
+[INFO] Saved checkpoint at 469
+[INFO] Epoch 470: loss: 0.2496823 pos_err: 64405.3203125 vel_err: 109.2114868 val_loss: 0.3592502 val_pos_err: 86386.5078125 val_vel_err: 141.4407349
+[INFO] Saved checkpoint at 473
+[INFO] Epoch 475: loss: 0.2568733 pos_err: 71082.7343750 vel_err: 117.0960464 val_loss: 0.3594762 val_pos_err: 86802.4843750 val_vel_err: 142.1780090
+[INFO] Saved checkpoint at 477
+[INFO] Epoch 480: loss: 0.2561283 pos_err: 70289.0937500 vel_err: 116.1363144 val_loss: 0.3496697 val_pos_err: 71798.4453125 val_vel_err: 129.9458008
+[INFO] Saved checkpoint at 480
+[INFO] Saved checkpoint at 481
+[INFO] Epoch 485: loss: 0.2483336 pos_err: 63285.6015625 vel_err: 108.9691086 val_loss: 0.3489218 val_pos_err: 71281.2109375 val_vel_err: 130.0919189
+[INFO] Saved checkpoint at 485
+[INFO] Saved checkpoint at 488
+[INFO] Saved checkpoint at 489
+[INFO] Epoch 490: loss: 0.2475247 pos_err: 62638.0312500 vel_err: 108.9437332 val_loss: 0.3635130 val_pos_err: 92020.3437500 val_vel_err: 145.5032501
+[INFO] Saved checkpoint at 493
+[INFO] Epoch 495: loss: 0.2595905 pos_err: 73952.9453125 vel_err: 118.3793106 val_loss: 0.3605466 val_pos_err: 88645.3359375 val_vel_err: 142.7133789
+[INFO] Saved checkpoint at 496
+[INFO] Saved checkpoint at 497
+[INFO] Epoch 500: loss: 0.2585659 pos_err: 73880.2578125 vel_err: 119.4935684 val_loss: 0.3486518 val_pos_err: 70977.2421875 val_vel_err: 130.2441864
+[INFO] Saved checkpoint at 504
+[INFO] Epoch 505: loss: 0.2474211 pos_err: 63671.7656250 vel_err: 109.4701004 val_loss: 0.3471870 val_pos_err: 70847.2890625 val_vel_err: 129.9411011
+[INFO] Epoch 510: loss: 0.2466435 pos_err: 61179.4375000 vel_err: 108.4040222 val_loss: 0.3595286 val_pos_err: 87944.6015625 val_vel_err: 141.8261261
+[INFO] Saved checkpoint at 512
+[INFO] Epoch 515: loss: 0.2576226 pos_err: 73819.3359375 vel_err: 120.4807129 val_loss: 0.3617606 val_pos_err: 91554.7421875 val_vel_err: 146.7173309
+[INFO] Epoch 520: loss: 0.2538589 pos_err: 69868.5859375 vel_err: 114.7512589 val_loss: 0.3466954 val_pos_err: 72542.5468750 val_vel_err: 129.6993103
+[INFO] Saved checkpoint at 521
+[INFO] Epoch 525: loss: 0.2473302 pos_err: 61705.0273438 vel_err: 109.3978348 val_loss: 0.3483393 val_pos_err: 70151.7421875 val_vel_err: 129.5790558
+[INFO] Saved checkpoint at 529
+[INFO] Epoch 530: loss: 0.2470118 pos_err: 63898.2343750 vel_err: 109.4126663 val_loss: 0.3600329 val_pos_err: 89474.4140625 val_vel_err: 145.6045685
+[INFO] Epoch 535: loss: 0.2500629 pos_err: 65882.8828125 vel_err: 112.2468491 val_loss: 0.3467198 val_pos_err: 76400.8671875 val_vel_err: 132.4343872
+[INFO] Epoch 540: loss: 0.2567784 pos_err: 74804.6796875 vel_err: 122.3743134 val_loss: 0.3492794 val_pos_err: 71965.9687500 val_vel_err: 132.6734467
+[INFO] Epoch 545: loss: 0.2505674 pos_err: 67608.5546875 vel_err: 110.7933807 val_loss: 0.3471442 val_pos_err: 71291.9453125 val_vel_err: 129.0740662
+[INFO] Epoch 550: loss: 0.2458985 pos_err: 60969.5156250 vel_err: 107.8821259 val_loss: 0.3507292 val_pos_err: 80273.3671875 val_vel_err: 135.5411835
+[INFO] Saved checkpoint at 553
+[INFO] Epoch 555: loss: 0.2541285 pos_err: 70404.7031250 vel_err: 118.3489914 val_loss: 0.3609826 val_pos_err: 91705.1875000 val_vel_err: 147.6448975
+[INFO] Epoch 560: loss: 0.2496744 pos_err: 68072.8359375 vel_err: 113.0123749 val_loss: 0.3478227 val_pos_err: 74881.7656250 val_vel_err: 130.1981964
+[INFO] Epoch 565: loss: 0.2467691 pos_err: 61576.9804688 vel_err: 109.3235550 val_loss: 0.3475060 val_pos_err: 69776.3593750 val_vel_err: 129.3643341
+[INFO] Saved checkpoint at 569
+[INFO] Epoch 570: loss: 0.2467955 pos_err: 64426.4648438 vel_err: 109.3251114 val_loss: 0.3538533 val_pos_err: 82681.4218750 val_vel_err: 140.0085907
+[INFO] Epoch 575: loss: 0.2495128 pos_err: 64454.5820312 vel_err: 112.5178833 val_loss: 0.3465119 val_pos_err: 75930.4921875 val_vel_err: 132.8155823
+[INFO] Epoch 580: loss: 0.2471170 pos_err: 62199.8046875 vel_err: 112.1778107 val_loss: 0.3496691 val_pos_err: 71855.8906250 val_vel_err: 129.4342651
+[INFO] Epoch 585: loss: 0.2499547 pos_err: 66077.7187500 vel_err: 109.1732483 val_loss: 0.3486801 val_pos_err: 73627.3593750 val_vel_err: 129.5705719
+[INFO] Saved checkpoint at 586
+[INFO] Epoch 590: loss: 0.2467387 pos_err: 63194.6054688 vel_err: 108.5888519 val_loss: 0.3533958 val_pos_err: 82414.0234375 val_vel_err: 141.3726807
+[INFO] Saved checkpoint at 593
+[INFO] Epoch 595: loss: 0.2518853 pos_err: 67830.7500000 vel_err: 113.6734772 val_loss: 0.3514673 val_pos_err: 80925.3750000 val_vel_err: 136.8087769
+[INFO] Saved checkpoint at 596
+[INFO] Epoch 600: loss: 0.2559615 pos_err: 71373.7265625 vel_err: 117.7522964 val_loss: 0.3430863 val_pos_err: 68740.5078125 val_vel_err: 128.4316711
+[INFO] Saved checkpoint at 600
+[INFO] Saved checkpoint at 601
+[INFO] Epoch 605: loss: 0.2431310 pos_err: 59421.1093750 vel_err: 107.7863693 val_loss: 0.3426485 val_pos_err: 68623.4687500 val_vel_err: 129.0094757
+[INFO] Saved checkpoint at 605
+[INFO] Saved checkpoint at 608
+[INFO] Epoch 610: loss: 0.2426486 pos_err: 59150.0156250 vel_err: 107.8469772 val_loss: 0.3593614 val_pos_err: 89572.4687500 val_vel_err: 144.4762268
+[INFO] Epoch 615: loss: 0.2554079 pos_err: 70526.8359375 vel_err: 116.8215561 val_loss: 0.3529769 val_pos_err: 82366.7812500 val_vel_err: 139.1896057
+[INFO] Saved checkpoint at 616
+[INFO] Epoch 620: loss: 0.2511889 pos_err: 66648.2500000 vel_err: 115.0577469 val_loss: 0.3457449 val_pos_err: 68552.5703125 val_vel_err: 128.4918823
+[INFO] Epoch 625: loss: 0.2472388 pos_err: 66463.3281250 vel_err: 110.3244476 val_loss: 0.3444995 val_pos_err: 71442.0312500 val_vel_err: 129.1795197
+[INFO] Epoch 630: loss: 0.2475534 pos_err: 62305.8125000 vel_err: 107.5956650 val_loss: 0.3445345 val_pos_err: 73264.5078125 val_vel_err: 132.2570190
+[INFO] Epoch 635: loss: 0.2493367 pos_err: 65029.6523438 vel_err: 115.4617691 val_loss: 0.3506616 val_pos_err: 79288.5000000 val_vel_err: 139.3865967
+[INFO] Saved checkpoint at 637
+[INFO] Epoch 640: loss: 0.2517280 pos_err: 67577.1875000 vel_err: 113.8951950 val_loss: 0.3425473 val_pos_err: 67606.4531250 val_vel_err: 127.8890762
+[INFO] Epoch 645: loss: 0.2439410 pos_err: 64554.3867188 vel_err: 109.9949265 val_loss: 0.3422826 val_pos_err: 70074.7500000 val_vel_err: 128.8619385
+[INFO] Epoch 650: loss: 0.2513718 pos_err: 65119.2617188 vel_err: 108.2219849 val_loss: 0.3416401 val_pos_err: 68861.4843750 val_vel_err: 129.2480164
+[INFO] Saved checkpoint at 652
+[INFO] Saved checkpoint at 653
+[INFO] Epoch 655: loss: 0.2429791 pos_err: 59685.3828125 vel_err: 110.3811874 val_loss: 0.3421466 val_pos_err: 67500.8125000 val_vel_err: 127.5184326
+[INFO] Epoch 660: loss: 0.2427354 pos_err: 62997.7851562 vel_err: 112.2084732 val_loss: 0.3469118 val_pos_err: 75849.8125000 val_vel_err: 131.0670013
+[INFO] Epoch 665: loss: 0.2456850 pos_err: 59277.8867188 vel_err: 106.3139114 val_loss: 0.3449710 val_pos_err: 68676.3984375 val_vel_err: 127.6854630
+[INFO] Epoch 670: loss: 0.2421483 pos_err: 61463.1445312 vel_err: 108.8459702 val_loss: 0.3490302 val_pos_err: 78478.6796875 val_vel_err: 139.6463165
+[INFO] Epoch 675: loss: 0.2458907 pos_err: 62103.6445312 vel_err: 111.2274551 val_loss: 0.3449573 val_pos_err: 75524.3046875 val_vel_err: 134.2363281
+[INFO] Epoch 680: loss: 0.2489743 pos_err: 64576.9921875 vel_err: 115.2116318 val_loss: 0.3393274 val_pos_err: 67621.1328125 val_vel_err: 128.1450653
+[INFO] Saved checkpoint at 680
+[INFO] Saved checkpoint at 681
+[INFO] Epoch 685: loss: 0.2426153 pos_err: 57658.7851562 vel_err: 105.8880768 val_loss: 0.3422240 val_pos_err: 67481.6796875 val_vel_err: 127.3947449
+[INFO] Epoch 690: loss: 0.2439687 pos_err: 63545.3203125 vel_err: 108.9187012 val_loss: 0.3425222 val_pos_err: 71298.8281250 val_vel_err: 133.7157440
+[INFO] Epoch 695: loss: 0.2406039 pos_err: 56609.6171875 vel_err: 107.5415421 val_loss: 0.3398210 val_pos_err: 69339.9375000 val_vel_err: 130.3528442
+[INFO] Epoch 700: loss: 0.2447408 pos_err: 61013.3750000 vel_err: 113.0535355 val_loss: 0.3399469 val_pos_err: 68153.4062500 val_vel_err: 127.8600769
+[INFO] Epoch 705: loss: 0.2400662 pos_err: 55318.1835938 vel_err: 105.5308380 val_loss: 0.3384096 val_pos_err: 66079.4531250 val_vel_err: 127.4713593
+[INFO] Saved checkpoint at 705
+[INFO] Saved checkpoint at 708
+[INFO] Epoch 710: loss: 0.2412240 pos_err: 61848.5742188 vel_err: 108.6555862 val_loss: 0.3425553 val_pos_err: 72228.6562500 val_vel_err: 133.9768677
+[INFO] Saved checkpoint at 714
+[INFO] Epoch 715: loss: 0.2390664 pos_err: 56549.5429688 vel_err: 107.2098083 val_loss: 0.3441749 val_pos_err: 73359.7968750 val_vel_err: 135.6983643
+[INFO] Saved checkpoint at 718
+[INFO] Epoch 720: loss: 0.2715191 pos_err: 84942.3671875 vel_err: 124.9849014 val_loss: 0.3904857 val_pos_err: 119021.6250000 val_vel_err: 161.3666382
+[INFO] Epoch 725: loss: 0.2484041 pos_err: 62315.9531250 vel_err: 107.0807648 val_loss: 0.3432598 val_pos_err: 71317.3203125 val_vel_err: 134.4502563
+[INFO] Saved checkpoint at 727
+[INFO] Epoch 730: loss: 0.2438139 pos_err: 57650.1171875 vel_err: 104.9729080 val_loss: 0.3490916 val_pos_err: 81781.0625000 val_vel_err: 136.4642792
+[INFO] Epoch 735: loss: 0.2433585 pos_err: 63180.4765625 vel_err: 112.4054031 val_loss: 0.3391323 val_pos_err: 70780.4140625 val_vel_err: 131.6743011
+[INFO] Epoch 740: loss: 0.2400295 pos_err: 54669.0117188 vel_err: 106.9379807 val_loss: 0.3436608 val_pos_err: 69851.5781250 val_vel_err: 127.5400162
+[INFO] Epoch 745: loss: 0.2378171 pos_err: 54685.8398438 vel_err: 106.0147095 val_loss: 0.3367967 val_pos_err: 66040.7968750 val_vel_err: 129.1254578
+[INFO] Saved checkpoint at 746
+[INFO] Epoch 750: loss: 0.2568125 pos_err: 72636.8203125 vel_err: 118.3935165 val_loss: 0.3648891 val_pos_err: 96297.1718750 val_vel_err: 150.8686523
+[INFO] Epoch 755: loss: 0.2669678 pos_err: 78519.4062500 vel_err: 115.2609253 val_loss: 0.3367306 val_pos_err: 64434.5273438 val_vel_err: 128.0627289
+[INFO] Epoch 760: loss: 0.3052929 pos_err: 110569.4843750 vel_err: 140.5538177 val_loss: 0.3460074 val_pos_err: 69515.8984375 val_vel_err: 128.8258667
+[INFO] Epoch 765: loss: 0.2425641 pos_err: 59597.6914062 vel_err: 108.7085419 val_loss: 0.3879294 val_pos_err: 99465.6484375 val_vel_err: 153.4370270
+[INFO] Epoch 770: loss: 0.2436835 pos_err: 60017.6250000 vel_err: 110.4320450 val_loss: 0.3586673 val_pos_err: 75503.4765625 val_vel_err: 130.2917023
+[INFO] Epoch 775: loss: 0.2518739 pos_err: 65437.9570312 vel_err: 117.8041000 val_loss: 0.3464477 val_pos_err: 69345.9921875 val_vel_err: 133.9517517
+[INFO] Epoch 780: loss: 0.2513499 pos_err: 72161.5781250 vel_err: 115.2227402 val_loss: 0.3349395 val_pos_err: 68572.2265625 val_vel_err: 126.4714890
+[INFO] Saved checkpoint at 780
+[INFO] Epoch 785: loss: 0.2527711 pos_err: 75344.1250000 vel_err: 126.7845840 val_loss: 0.3471963 val_pos_err: 75077.3359375 val_vel_err: 139.5785828
+[INFO] Saved checkpoint at 786
+[INFO] Epoch 790: loss: 0.2406104 pos_err: 54117.8867188 vel_err: 104.3022385 val_loss: 0.3442567 val_pos_err: 67953.0156250 val_vel_err: 127.8099442
+[INFO] Epoch 795: loss: 0.2453670 pos_err: 70707.4531250 vel_err: 112.6228943 val_loss: 0.3385366 val_pos_err: 73628.0703125 val_vel_err: 129.3175812
+[INFO] Early stopping triggered at 796
+running length strategy (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x7f331acb7500>, 1e-05)
+[INFO] Epoch 5: loss: 0.2379639 pos_err: 55365.9609375 vel_err: 106.5378571 val_loss: 0.3390067 val_pos_err: 71591.3671875 val_vel_err: 131.5955963
+[INFO] Saved checkpoint at 8
+[INFO] Epoch 10: loss: 0.2366930 pos_err: 55245.9648438 vel_err: 105.0565643 val_loss: 0.3342372 val_pos_err: 65281.7656250 val_vel_err: 126.5847168
+[INFO] Saved checkpoint at 10
+[INFO] Saved checkpoint at 11
+[INFO] Epoch 15: loss: 0.2362603 pos_err: 53969.6953125 vel_err: 105.7587128 val_loss: 0.3344144 val_pos_err: 64792.6289062 val_vel_err: 126.9333878
+[INFO] Epoch 20: loss: 0.2361689 pos_err: 54367.5937500 vel_err: 106.0821991 val_loss: 0.3337324 val_pos_err: 65100.3203125 val_vel_err: 127.6187973
+[INFO] Epoch 25: loss: 0.2358425 pos_err: 53791.5859375 vel_err: 105.8645096 val_loss: 0.3340517 val_pos_err: 64939.0937500 val_vel_err: 127.9883194
+[INFO] Saved checkpoint at 27
+[INFO] Saved checkpoint at 28
+[INFO] Saved checkpoint at 29
+[INFO] Epoch 30: loss: 0.2356611 pos_err: 53844.6054688 vel_err: 105.7259598 val_loss: 0.3336355 val_pos_err: 64586.3125000 val_vel_err: 127.7998123
+[INFO] Saved checkpoint at 34
+[INFO] Epoch 35: loss: 0.2355311 pos_err: 53630.5468750 vel_err: 105.9189911 val_loss: 0.3333346 val_pos_err: 64310.7617188 val_vel_err: 127.6778107
+[INFO] Saved checkpoint at 35
+[INFO] Saved checkpoint at 36
+[INFO] Epoch 40: loss: 0.2353887 pos_err: 53411.1132812 vel_err: 105.9647369 val_loss: 0.3331795 val_pos_err: 63817.7734375 val_vel_err: 127.3488541
+[INFO] Saved checkpoint at 40
+[INFO] Saved checkpoint at 41
+[INFO] Saved checkpoint at 42
+[INFO] Saved checkpoint at 43
+[INFO] Epoch 45: loss: 0.2352312 pos_err: 53381.1757812 vel_err: 105.7391739 val_loss: 0.3330312 val_pos_err: 63743.8281250 val_vel_err: 127.5550461
+[INFO] Saved checkpoint at 47
+[INFO] Saved checkpoint at 48
+[INFO] Epoch 50: loss: 0.2350559 pos_err: 53238.7500000 vel_err: 106.0122604 val_loss: 0.3327433 val_pos_err: 63597.6406250 val_vel_err: 127.5184174
+[INFO] Saved checkpoint at 50
+[INFO] Saved checkpoint at 52
+[INFO] Saved checkpoint at 53
+[INFO] Saved checkpoint at 54
+[INFO] Epoch 55: loss: 0.2348808 pos_err: 53146.5078125 vel_err: 105.8085327 val_loss: 0.3325118 val_pos_err: 63512.3476562 val_vel_err: 127.4751740
+[INFO] Saved checkpoint at 55
+[INFO] Saved checkpoint at 57
+[INFO] Saved checkpoint at 58
+[INFO] Saved checkpoint at 59
+[INFO] Epoch 60: loss: 0.2347088 pos_err: 52921.6992188 vel_err: 105.8593445 val_loss: 0.3323444 val_pos_err: 63474.3632812 val_vel_err: 127.4764099
+[INFO] Saved checkpoint at 60
+[INFO] Saved checkpoint at 61
+[INFO] Saved checkpoint at 63
+[INFO] Saved checkpoint at 64
+[INFO] Epoch 65: loss: 0.2345369 pos_err: 52896.7148438 vel_err: 105.7505188 val_loss: 0.3321807 val_pos_err: 63444.4257812 val_vel_err: 127.5274048
+[INFO] Saved checkpoint at 65
+[INFO] Saved checkpoint at 66
+[INFO] Saved checkpoint at 67
+[INFO] Saved checkpoint at 68
+[INFO] Saved checkpoint at 69
+[INFO] Epoch 70: loss: 0.2343640 pos_err: 52762.9570312 vel_err: 105.7632370 val_loss: 0.3319916 val_pos_err: 63358.5195312 val_vel_err: 127.4247589
+[INFO] Saved checkpoint at 70
+[INFO] Saved checkpoint at 71
+[INFO] Saved checkpoint at 72
+[INFO] Saved checkpoint at 73
+[INFO] Saved checkpoint at 74
+[INFO] Epoch 75: loss: 0.2341944 pos_err: 52664.3398438 vel_err: 105.7149277 val_loss: 0.3318314 val_pos_err: 63372.6875000 val_vel_err: 127.4860077
+[INFO] Saved checkpoint at 75
+[INFO] Saved checkpoint at 76
+[INFO] Saved checkpoint at 77
+[INFO] Saved checkpoint at 78
+[INFO] Saved checkpoint at 79
+[INFO] Epoch 80: loss: 0.2340248 pos_err: 52598.2109375 vel_err: 105.6550293 val_loss: 0.3316616 val_pos_err: 63357.0546875 val_vel_err: 127.5126572
+[INFO] Saved checkpoint at 80
+[INFO] Saved checkpoint at 81
+[INFO] Saved checkpoint at 82
+[INFO] Saved checkpoint at 83
+[INFO] Saved checkpoint at 84
+[INFO] Epoch 85: loss: 0.2338560 pos_err: 52509.1562500 vel_err: 105.6255569 val_loss: 0.3314835 val_pos_err: 63309.6523438 val_vel_err: 127.5063553
+[INFO] Saved checkpoint at 85
+[INFO] Saved checkpoint at 86
+[INFO] Saved checkpoint at 87
+[INFO] Saved checkpoint at 88
+[INFO] Saved checkpoint at 89
+[INFO] Epoch 90: loss: 0.2336866 pos_err: 52393.6054688 vel_err: 105.5925980 val_loss: 0.3313096 val_pos_err: 63261.2539062 val_vel_err: 127.5023193
+[INFO] Saved checkpoint at 90
+[INFO] Saved checkpoint at 91
+[INFO] Saved checkpoint at 92
+[INFO] Saved checkpoint at 93
+[INFO] Saved checkpoint at 94
+[INFO] Epoch 95: loss: 0.2335174 pos_err: 52273.8164062 vel_err: 105.5527496 val_loss: 0.3311424 val_pos_err: 63220.6406250 val_vel_err: 127.5143814
+[INFO] Saved checkpoint at 95
+[INFO] Saved checkpoint at 96
+[INFO] Saved checkpoint at 97
+[INFO] Saved checkpoint at 98
+[INFO] Saved checkpoint at 99
+[INFO] Epoch 100: loss: 0.2333481 pos_err: 52163.4023438 vel_err: 105.5128708 val_loss: 0.3309804 val_pos_err: 63189.1718750 val_vel_err: 127.5416718
+[INFO] Saved checkpoint at 100
+[INFO] Saved checkpoint at 101
+[INFO] Saved checkpoint at 102
+[INFO] Saved checkpoint at 103
+[INFO] Saved checkpoint at 104
+[INFO] Epoch 105: loss: 0.2331781 pos_err: 52046.9062500 vel_err: 105.4784393 val_loss: 0.3308159 val_pos_err: 63147.8320312 val_vel_err: 127.5579987
+[INFO] Saved checkpoint at 105
+[INFO] Saved checkpoint at 106
+[INFO] Saved checkpoint at 107
+[INFO] Saved checkpoint at 108
+[INFO] Saved checkpoint at 109
+[INFO] Epoch 110: loss: 0.2330080 pos_err: 51921.9375000 vel_err: 105.4531097 val_loss: 0.3306425 val_pos_err: 63081.5312500 val_vel_err: 127.5309143
+[INFO] Saved checkpoint at 110
+[INFO] Saved checkpoint at 111
+[INFO] Saved checkpoint at 112
+[INFO] Saved checkpoint at 113
+[INFO] Saved checkpoint at 114
+[INFO] Epoch 115: loss: 0.2328395 pos_err: 51837.1953125 vel_err: 105.3513336 val_loss: 0.3305205 val_pos_err: 63121.5937500 val_vel_err: 127.6950607
+[INFO] Saved checkpoint at 116
+[INFO] Saved checkpoint at 118
+[INFO] Epoch 120: loss: 0.2326757 pos_err: 51661.8359375 vel_err: 105.4165726 val_loss: 0.3303322 val_pos_err: 63015.5664062 val_vel_err: 127.6105576
+[INFO] Saved checkpoint at 120
+[INFO] Saved checkpoint at 121
+[INFO] Saved checkpoint at 123
+[INFO] Epoch 125: loss: 0.2325169 pos_err: 51544.3750000 vel_err: 105.3910751 val_loss: 0.3301550 val_pos_err: 62909.5546875 val_vel_err: 127.5057449
+[INFO] Saved checkpoint at 125
+[INFO] Saved checkpoint at 127
+[INFO] Saved checkpoint at 128
+[INFO] Saved checkpoint at 129
+[INFO] Epoch 130: loss: 0.2323400 pos_err: 51462.3554688 vel_err: 105.2655029 val_loss: 0.3300086 val_pos_err: 62886.9531250 val_vel_err: 127.5684357
+[INFO] Saved checkpoint at 130
+[INFO] Saved checkpoint at 132
+[INFO] Saved checkpoint at 134
+[INFO] Epoch 135: loss: 0.2322316 pos_err: 51504.7734375 vel_err: 105.0428848 val_loss: 0.3298961 val_pos_err: 62909.4375000 val_vel_err: 127.7294006
+[INFO] Saved checkpoint at 137
+[INFO] Saved checkpoint at 138
+[INFO] Epoch 140: loss: 0.2320816 pos_err: 51206.9882812 vel_err: 105.3760605 val_loss: 0.3296990 val_pos_err: 62708.4492188 val_vel_err: 127.4320908
+[INFO] Saved checkpoint at 140
+[INFO] Saved checkpoint at 142
+[INFO] Saved checkpoint at 143
+[INFO] Saved checkpoint at 144
+[INFO] Epoch 145: loss: 0.2318631 pos_err: 51130.8046875 vel_err: 105.1241150 val_loss: 0.3295748 val_pos_err: 62725.5273438 val_vel_err: 127.6040878
+[INFO] Saved checkpoint at 145
+[INFO] Saved checkpoint at 147
+[INFO] Saved checkpoint at 149
+[INFO] Epoch 150: loss: 0.2317174 pos_err: 51076.1015625 vel_err: 104.9775009 val_loss: 0.3294642 val_pos_err: 62743.1796875 val_vel_err: 127.7594910
+[INFO] Saved checkpoint at 151
+[INFO] Saved checkpoint at 152
+[INFO] Saved checkpoint at 154
+[INFO] Epoch 155: loss: 0.2316048 pos_err: 51058.4414062 vel_err: 104.8480225 val_loss: 0.3293273 val_pos_err: 62690.1601562 val_vel_err: 127.7832031
+[INFO] Saved checkpoint at 157
+[INFO] Saved checkpoint at 158
+[INFO] Epoch 160: loss: 0.2315953 pos_err: 50815.0664062 vel_err: 105.3882675 val_loss: 0.3293732 val_pos_err: 62904.9804688 val_vel_err: 128.2005310
+[INFO] Saved checkpoint at 163
+[INFO] Epoch 165: loss: 0.2315156 pos_err: 50757.7890625 vel_err: 105.4115448 val_loss: 0.3292556 val_pos_err: 62897.6562500 val_vel_err: 128.2383575
+[INFO] Saved checkpoint at 166
+[INFO] Saved checkpoint at 168
+[INFO] Epoch 170: loss: 0.2313727 pos_err: 50660.3046875 vel_err: 105.3371353 val_loss: 0.3290903 val_pos_err: 62775.9882812 val_vel_err: 128.1437225
+[INFO] Saved checkpoint at 171
+[INFO] Saved checkpoint at 173
+[INFO] Epoch 175: loss: 0.2316221 pos_err: 50805.6289062 vel_err: 105.6604538 val_loss: 0.3300762 val_pos_err: 64010.6132812 val_vel_err: 129.4631805
+[INFO] Epoch 180: loss: 0.2312596 pos_err: 50933.5781250 vel_err: 104.5049820 val_loss: 0.3290985 val_pos_err: 62780.5664062 val_vel_err: 128.3293762
+[INFO] Saved checkpoint at 182
+[INFO] Epoch 185: loss: 0.2314789 pos_err: 51284.7421875 vel_err: 104.4188995 val_loss: 0.3287092 val_pos_err: 62257.2265625 val_vel_err: 127.3129501
+[INFO] Saved checkpoint at 185
+[INFO] Epoch 190: loss: 0.2308227 pos_err: 50332.0234375 vel_err: 104.7237167 val_loss: 0.3287872 val_pos_err: 62289.6132812 val_vel_err: 126.9773102
+[INFO] Saved checkpoint at 191
+[INFO] Saved checkpoint at 192
+[INFO] Epoch 195: loss: 0.2307839 pos_err: 50066.6093750 vel_err: 104.7965240 val_loss: 0.3287937 val_pos_err: 62264.1953125 val_vel_err: 127.0021667
+[INFO] Saved checkpoint at 197
+[INFO] Epoch 200: loss: 0.2316058 pos_err: 50822.7460938 vel_err: 105.8516083 val_loss: 0.3295243 val_pos_err: 63316.1875000 val_vel_err: 129.1344147
+[INFO] Saved checkpoint at 203
+[INFO] Epoch 205: loss: 0.2308355 pos_err: 50400.2617188 vel_err: 105.1939392 val_loss: 0.3290482 val_pos_err: 62853.0468750 val_vel_err: 128.6348114
+[INFO] Epoch 210: loss: 0.2305789 pos_err: 50552.8554688 vel_err: 104.9869308 val_loss: 0.3283479 val_pos_err: 62119.9531250 val_vel_err: 127.2852936
+[INFO] Saved checkpoint at 214
+[INFO] Epoch 215: loss: 0.2305760 pos_err: 50612.0898438 vel_err: 104.4970932 val_loss: 0.3278479 val_pos_err: 62163.5820312 val_vel_err: 127.0750504
+[INFO] Saved checkpoint at 215
+[INFO] Epoch 220: loss: 0.2304207 pos_err: 49878.3750000 vel_err: 104.3282623 val_loss: 0.3284417 val_pos_err: 62422.9296875 val_vel_err: 128.2447205
+[INFO] Epoch 225: loss: 0.2302909 pos_err: 49823.8593750 vel_err: 104.7314911 val_loss: 0.3285092 val_pos_err: 62392.9257812 val_vel_err: 128.2833252
+[INFO] Epoch 230: loss: 0.2302054 pos_err: 50043.1445312 vel_err: 104.8543854 val_loss: 0.3280008 val_pos_err: 61955.0312500 val_vel_err: 127.4201126
+[INFO] Epoch 235: loss: 0.2300875 pos_err: 49978.0664062 vel_err: 104.3613281 val_loss: 0.3277971 val_pos_err: 61943.7109375 val_vel_err: 127.4601669
+[INFO] Saved checkpoint at 235
+[INFO] Epoch 240: loss: 0.2299594 pos_err: 49807.4023438 vel_err: 104.3705444 val_loss: 0.3279645 val_pos_err: 62382.6132812 val_vel_err: 128.2578735
+[INFO] Saved checkpoint at 242
+[INFO] Epoch 245: loss: 0.2299038 pos_err: 49583.1992188 vel_err: 104.6676483 val_loss: 0.3279267 val_pos_err: 62173.6328125 val_vel_err: 128.1687775
+[INFO] Saved checkpoint at 246
+[INFO] Saved checkpoint at 247
+[INFO] Epoch 250: loss: 0.2297574 pos_err: 49556.2773438 vel_err: 104.5392227 val_loss: 0.3277508 val_pos_err: 61774.6171875 val_vel_err: 127.3569336
+[INFO] Saved checkpoint at 254
+[INFO] Epoch 255: loss: 0.2297578 pos_err: 49851.7148438 vel_err: 104.1727829 val_loss: 0.3274792 val_pos_err: 61745.0312500 val_vel_err: 127.3039169
+[INFO] Saved checkpoint at 255
+[INFO] Saved checkpoint at 259
+[INFO] Epoch 260: loss: 0.2296059 pos_err: 49664.4843750 vel_err: 104.1522903 val_loss: 0.3275135 val_pos_err: 62045.8984375 val_vel_err: 128.1138000
+[INFO] Saved checkpoint at 262
+[INFO] Saved checkpoint at 263
+[INFO] Epoch 265: loss: 0.2294692 pos_err: 49349.1796875 vel_err: 104.5235596 val_loss: 0.3274615 val_pos_err: 62026.8632812 val_vel_err: 128.1489563
+[INFO] Early stopping triggered at 265
+running length strategy (1.0, 5000, <neural_ode_mod.EarlyStopper object at 0x7f331acb4800>, 1e-07)
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 0.2293861 pos_err: 49351.4296875 vel_err: 104.3587875 val_loss: 0.3273441 val_pos_err: 61829.7460938 val_vel_err: 127.8454971
+[INFO] Saved checkpoint at 5
+[INFO] Saved checkpoint at 6
+[INFO] Saved checkpoint at 7
+[INFO] Saved checkpoint at 8
+[INFO] Saved checkpoint at 9
+[INFO] Epoch 10: loss: 0.2293829 pos_err: 49382.8945312 vel_err: 104.2396622 val_loss: 0.3273050 val_pos_err: 61745.4765625 val_vel_err: 127.6702805
+[INFO] Saved checkpoint at 10
+[INFO] Saved checkpoint at 11
+[INFO] Saved checkpoint at 12
+[INFO] Saved checkpoint at 13
+[INFO] Saved checkpoint at 14
+[INFO] Epoch 15: loss: 0.2293825 pos_err: 49395.2304688 vel_err: 104.2379227 val_loss: 0.3272977 val_pos_err: 61752.5703125 val_vel_err: 127.6866074
+[INFO] Saved checkpoint at 15
+[INFO] Epoch 20: loss: 0.2293750 pos_err: 49383.2265625 vel_err: 104.2942123 val_loss: 0.3273082 val_pos_err: 61797.5429688 val_vel_err: 127.7828293
+[INFO] Epoch 25: loss: 0.2293745 pos_err: 49375.5312500 vel_err: 104.3365097 val_loss: 0.3273211 val_pos_err: 61826.6601562 val_vel_err: 127.8402557
+[INFO] Epoch 30: loss: 0.2293719 pos_err: 49371.9492188 vel_err: 104.3270645 val_loss: 0.3273169 val_pos_err: 61812.6835938 val_vel_err: 127.8161774
+[INFO] Epoch 35: loss: 0.2293689 pos_err: 49372.6718750 vel_err: 104.2936783 val_loss: 0.3273076 val_pos_err: 61786.8281250 val_vel_err: 127.7668152
+[INFO] Epoch 40: loss: 0.2293672 pos_err: 49373.3046875 vel_err: 104.2788239 val_loss: 0.3273037 val_pos_err: 61780.5000000 val_vel_err: 127.7543488
+[INFO] Epoch 45: loss: 0.2293646 pos_err: 49369.9140625 vel_err: 104.2903214 val_loss: 0.3273049 val_pos_err: 61792.6015625 val_vel_err: 127.7790680
+[INFO] Epoch 50: loss: 0.2293624 pos_err: 49366.9882812 vel_err: 104.3046494 val_loss: 0.3273054 val_pos_err: 61802.2929688 val_vel_err: 127.7989655
+[INFO] Early stopping triggered at 51

@@ -1,124 +1,164 @@
-# loss_functions.py
-"""Loss functions for a Neural Ordinary Differential Equation model."""
+# gru_ode.py
+"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting.
+
+This module implements the GRU-ODE dynamics of De Brouwer et al. (NeurIPS 2019,
+"GRU-ODE-Bayes: Continuous modeling of sporadically-observed time series"),
+adapted to the NEXT trajectory-forecasting pipeline.
+
+Design notes / deviations from the paper
+-----------------------------------------
+The original GRU-ODE-Bayes targets *sporadically* observed multivariate series,
+alternating a GRU-ODE *prediction* flow with a GRU-Bayes *filtering* jump at each
+observation. The NEXT problem is different in two important ways:
+
+  1.  The truth trajectories are resampled onto a *dense, regular* time grid
+      (``trajectory_dt``) before training, and the task is pure autoregressive
+      forecasting from a single initial condition x0 -- there are no sporadic
+      in-rollout observations to filter on. The GRU-Bayes jump network is
+      therefore unnecessary for the forecasting rollout and is omitted from the
+      default model.
+
+  2.  The state we integrate is a *physical* kinematic vector (position/velocity
+      in DCU, Gridith, or Geodesic frame), not an abstract [-1, 1] latent. We keep 
+      the exact GRU-ODE vector field on a bounded latent ``h`` -- which retains the
+      paper's boundedness (h stays in [-1, 1]) and Lipschitz-continuity (K = 2)
+      guarantees -- and read the physical state out of ``h`` through an observation head.
+"""
 
 from __future__ import annotations
 
-from typing import Callable
-
 import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
+from torch import nn
 
 
-class WrappedMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        position_loss_weight: float = 80.0,
-        velocity_loss_weight: float = 10.0,  # Added targeted velocity scaling parameter
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
-        """Initializes WrappedMSELoss with padding-exclusion and temporal weighting."""
-        super().__init__(reduction="none")
-        self.height_idx = height_idx
-        self.vel_indices = vel_indices
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.position_loss_weight = position_loss_weight
-        self.velocity_loss_weight = velocity_loss_weight
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
+# ----------------------------------------------------------------------------
+# Full GRU-ODE vector field (Appendix A of the paper)
+# ----------------------------------------------------------------------------
+class FullGRUODECell(nn.Module):
+    r"""The continuous-time GRU vector field on a bounded latent ``h``.
 
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a reference to inspect model parameters for manual weight decay."""
-        self.model_ref = model
+    Implements Eq. (3) / Appendix A:
+        r(t) = sigma(W_r x + U_r h + b_r)
+        z(t) = sigma(W_z x + U_z h + b_z)
+        g(t) = tanh(W_h x + U_h (r . h) + b_h)
+        dh/dt = (1 - z) . (g - h)
+    """
 
-    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
-        
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()  # (batch, timesteps, 1)
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct scale-space prioritization weights
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        
-        # Explicitly prioritize velocity features without modifying denominator structures
-        for idx in self.vel_indices:
-            weights[idx] = self.velocity_loss_weight
-        
-        # 4. Generate a linear temporal ramp to penalize late-horizon integration drift
-        if self.temporal_weighting:
-            # Ramps from 1.0 at t_0 up to 4.0 at the end of the sequence window
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            weighted_loss = elementwise_loss * weights.view(1, 1, -1) * t_weights
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+
+        self.lin_hh = nn.Linear(hidden_size, 3 * hidden_size, bias=bias)
+
+        if input_size > 0:
+            self.lin_xh = nn.Linear(input_size, 3 * hidden_size, bias=False)
         else:
-            weighted_loss = elementwise_loss * weights.view(1, 1, -1)
-            
-        # 5. Mask and normalize against active elements only (Preserves high-gain unnormalized rule)
-        masked_loss = weighted_loss * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+            self.lin_xh = None
 
-        # 6. Apply L2 Regularization parameter penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
+    def forward(self, t: torch.Tensor, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        """Return dh/dt for a bounded latent ``h`` of shape (batch, hidden)."""
+        gates_h = self.lin_hh(h)
+        if self.lin_xh is not None and x is not None:
+            gates_x = self.lin_xh(x)
+        else:
+            gates_x = None
 
-        # 7. Compute accurate physical metrics stripped of padding pollution
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+        rz_h, g_h = gates_h[..., : 2 * self.hidden_size], gates_h[..., 2 * self.hidden_size :]
+        if gates_x is not None:
+            rz_x, g_x = gates_x[..., : 2 * self.hidden_size], gates_x[..., 2 * self.hidden_size :]
+            rz = rz_h + rz_x
+        else:
+            g_x = None
+            rz = rz_h
 
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
+        r, z = torch.chunk(torch.sigmoid(rz), 2, dim=-1)
+        g_pre = self._g_preactivation(r * h, g_x)
+        g = torch.tanh(g_pre)
 
-            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
-            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
+        return (1.0 - z) * (g - h)
 
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
+    def _g_preactivation(self, rh: torch.Tensor, g_x: torch.Tensor | None) -> torch.Tensor:
+        w_g = self.lin_hh.weight[2 * self.hidden_size :, :]  # (H, H)
+        out = torch.nn.functional.linear(rh, w_g)
+        if self.lin_hh.bias is not None:
+            out = out + self.lin_hh.bias[2 * self.hidden_size :]
+        if g_x is not None:
+            out = out + g_x
+        return out
 
 
-=========================================================
-==================================================
+# ----------------------------------------------------------------------------
+# Minimal GRU-ODE vector field (Appendix G)
+# ----------------------------------------------------------------------------
+class MinimalGRUODECell(nn.Module):
+    r"""Minimal GRU-ODE field (Appendix G):
+        f(t) = sigma(W_f x + U_f h + b_f)
+        dh/dt = (1 - f) . (tanh(W_h x + U_h (h . f) + b_h) - h)
+    """
 
-# gru_ode.py
-# (Showing only modified GRUODEFunc code blocks for scannability; all other cells remain intact)
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hf = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.lin_hh = nn.Linear(hidden_size, hidden_size, bias=bias)
+        if input_size > 0:
+            self.lin_xf = nn.Linear(input_size, hidden_size, bias=False)
+            self.lin_xh = nn.Linear(input_size, hidden_size, bias=False)
+        else:
+            self.lin_xf = None
+            self.lin_xh = None
 
+    def forward(self, t: torch.Tensor, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        f_pre = self.lin_hf(h)
+        if self.lin_xf is not None and x is not None:
+            f_pre = f_pre + self.lin_xf(x)
+        f = torch.sigmoid(f_pre)
+
+        g_pre = self.lin_hh(h * f)
+        if self.lin_xh is not None and x is not None:
+            g_pre = g_pre + self.lin_xh(x)
+        g = torch.tanh(g_pre)
+
+        return (1.0 - f) * (g - h)
+
+
+# ----------------------------------------------------------------------------
+# GRU-Bayes filtering cell (paper Sec. 2.3)
+# ----------------------------------------------------------------------------
+class GRUBayesCell(nn.Module):
+    """Discrete GRU jump that updates ``h`` from an incoming (masked) observation."""
+
+    def __init__(self, hidden_size: int, obs_dim: int, prep_hidden: int = 4, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.obs_dim = obs_dim
+        self.prep_hidden = prep_hidden
+        self.w_prep = nn.Parameter(0.01 * torch.randn(obs_dim, 4, prep_hidden))
+        self.b_prep = nn.Parameter(torch.zeros(obs_dim, prep_hidden))
+        self.gru = nn.GRUCell(obs_dim * prep_hidden, hidden_size, bias=bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        sigma = torch.exp(0.5 * logvar)
+        error = (y - mu) / (sigma + 1e-6)
+        feats = torch.stack([mu, sigma, y, error], dim=-1)
+        prepped = torch.relu(torch.einsum("boi,oih->boh", feats, self.w_prep) + self.b_prep)
+        prepped = prepped * mask.unsqueeze(-1)
+        prepped = prepped.reshape(prepped.shape[0], -1)
+        return self.gru(prepped, h)
+
+
+# ----------------------------------------------------------------------------
+# Solver-compatible forecasting module
+# ----------------------------------------------------------------------------
 class GRUODEFunc(nn.Module):
     """GRU-ODE vector field over an *augmented* state ``[h ; y_read]``."""
 
@@ -148,7 +188,6 @@ class GRUODEFunc(nn.Module):
         if not (0 <= n_derivative_pairs * 2 <= n_features):
             raise ValueError(f"Incompatible n_derivative_pairs={n_derivative_pairs} for n_features={n_features}")
         self.n_derivative_pairs = n_derivative_pairs
-        self.n_leaving_learned = n_features - n_derivative_pairs  # Adjusted to prevent shadow-naming conflicts
         self.n_learned = n_features - n_derivative_pairs
 
         if identity_mode not in ("raw", "scaled"):
@@ -200,14 +239,8 @@ class GRUODEFunc(nn.Module):
             )
         self.encoder_dropout = float(encoder_dropout)
         
-        # Deep Capacity Expansion via sequential linear-normalization structures 
-        # Resolves high-frequency kinematic trajectory mapping distortions over expanded windows
         self.obs_head = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
             nn.SiLU(),
             nn.Linear(hidden_size, self.n_learned),
         )
@@ -244,147 +277,51 @@ class GRUODEFunc(nn.Module):
 
         return self._assemble_dstate(y_read, dy_learned, dh)
 
-=======================================
-===============================
 
-# torchdiffeq_solver.py
-"""Euler Ordinary Differential Equation Solver for NODE implementation."""
+class GRUODEPredictorModel(nn.Module):
+    """Wraps a :class:`GRUODEFunc` to ensure stateless tracking stability across horizons."""
 
-from __future__ import annotations
+    def __init__(self, func: GRUODEFunc):
+        super().__init__()
+        self.func = func
+        self.n_features = func.n_features
+        self.hidden_size = func.hidden_size
+        self.current_h_seeded = None
 
-from typing import Callable
+    @property
+    def nfe(self) -> int:
+        return self.func.nfe
 
-import torch
-from prediction.mlearn.neural_ode.ode_solver import ODESolver
+    @nfe.setter
+    def nfe(self, v: int) -> None:
+        self.func.nfe = v
 
-try:
-    import torchdiffeq as tde
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+        y_read = state[..., : self.n_features]
+        h_solver = state[..., self.n_features : self.n_features + self.hidden_size]
 
-except ModuleNotFoundError:
-    tde = None
+        is_initial = False
+        if isinstance(t, torch.Tensor):
+            if t.ndim == 0 and t == 0:
+                is_initial = True
+            elif t.ndim > 0 and torch.all(t == 0):
+                is_initial = True
+        elif t == 0:
+            is_initial = True
 
+        if is_initial:
+            h_seeded = self.func.encoder(y_read)
+            self.current_h_seeded = h_seeded
+            h = h_seeded
+        else:
+            if getattr(self, "current_h_seeded", None) is not None:
+                h = self.current_h_seeded + h_solver
+            else:
+                h = h_solver
 
-class TorchdiffeqSolver(ODESolver):
-    """ODE Solver that wraps torchdiffeq"""
-
-    def __init__(self, dt=1, *, adjoint=False, method="dopri5", atol=1e-8, rtol=1e-6):
-        super().__init__(dt, adjoint=False)
-        self.method = method
-        self.atol = atol
-        self.rtol = rtol
-        if tde is None:
-            raise ImportError("Prediction Core is not able to use torchdiffeq. Please install torchdiffeq")
-        self.odeint = tde.odeint
-        if adjoint:
-            self.odeint = tde.odeint_adjoint
-
-    def integrate(
-        self,
-        func: torch.nn.Module,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Solves an ODE by integrating it from the initial conditions."""
-        if extra_feat is not None:
-            raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
-        
-        epsilon = 1e-10
-        times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
-        
-        # Bugfix: explicitly forwarding error bounds down into the integration backend
-        x = self.odeint(
-            func,
-            x0,
-            times,
-            method=self.method,
-            atol=self.atol,
-            rtol=self.rtol,
-        )
-        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
-
-        return x
-
-===========================
-==============================
-
-# NEXT_training.py
-# (Showing adjusted train_NEXT function blocks where solver parameters and wrapped criteria initialize)
-
-def train_NEXT(
-    model_name,
-    traj_targets_train,
-    traj_targets_test,
-    scaler_traj,
-    model_save_path,
-    trajectory_dt,
-    batch_size,
-    use_scalar,
-    model_states,
-    aug_dim,
-    nhidden,
-    gpu_index,
-    model_type: str = "node",
-    frame: str = "dcu",
-):
-    training_configuration = TrainingConfiguration(
-        n_epochs=1,
-        optimizer=AdamOptimizer(learning_rate=1e-3),
-        batch_size=batch_size,
-        num_workers=100,
-        verbose=True,
-    )
-    
-    GRUODE_SOLVER_METHOD = "dopri5"
-    if model_type in ("gruode", "gruode-min"):
-        ode_method = GRUODE_SOLVER_METHOD
-    else:
-        ode_method = "rk4"
-        
-    # Tightened local tolerances to prevent truncation propagation over 10,000km rollouts
-    ode_solver = TorchdiffeqSolver(
-        dt=trajectory_dt, 
-        method=ode_method, 
-        adjoint=False, 
-        atol=1e-9, 
-        rtol=1e-7
-    )
-
-    if frame == "dcu":
-        velocity_indicies = (3, 4, 5)
-    elif frame == "grdth":
-        velocity_indicies = (2, 3, 4)
-    elif frame == "geodesic":
-        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
-    else:
-        raise ValueError("That frame is not known for what the velocity indicies are")
-        
-    early_stop_metric_name = "val_loss"
-    
-    # Leverages the new non-diluting velocity loss balance parameter
-    loss_func = WrappedMSELoss(
-        height_idx=1,
-        vel_indices=velocity_indicies,
-        scaler=scaler_traj if use_scalar else None,
-        N_FEATURES=model_states,
-        position_loss_weight=80.0,
-        velocity_loss_weight=10.0,
-        l2_reg=1e-4,
-        temporal_weighting=True,
-    )
-
-    node = NODEPredictor(
-        architecture=FFNNArchitecture(
-            layer_channels=[5, 5],
-            layer_activation=Activation.SILU,
-        ),
-        training_configuration=training_configuration,
-        solver=ode_solver,
-        logging_interval=5,
-        loss_func=loss_func,
-        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
-        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
-        aug_dim=aug_dim,
-    )
-    
-    # (Rest of fit loop, curriculum configurations, and exports continue matching original setup)
+        h = torch.tanh(h)
+        x_in = self.func._couple_input(y_read)
+        dh = self.func.ode_cell(t, h, x_in)
+        dy_learned = self.func.obs_head(h)
+        return self.func._assemble_dstate(y_read, dy_learned, dh)

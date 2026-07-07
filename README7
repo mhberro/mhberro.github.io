@@ -1,69 +1,222 @@
-for len_strat in length_strategies:
-            print("running length strategy", len_strat)
-            data_fraction, epochs, early_stopper, learning_rate = len_strat
-            
-            # ... [Keep training configuration blocks intact] ...
-
-            metrics = node.fit(
-                x=fraction_of_data,
-                validation_data=fraction_of_data_val,
-                enable_checkpoints=True, # Changed to True across all strategy blocks
-            )
-            
-            # Post-strategy rollback: Recover the absolute best state before expanding horizons
-            print(f"Strategy block complete for fraction {data_fraction}. Reloading optimal checkpoint configuration.")
-            node.load(directory=model_save_path, model_name=model_name + ".checkpoint")
-
-
-========================================
-====================
-
-if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-                
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-            ):
-                logger.info(f"Early stopping triggered at {epoch}. Rolling back to best checkpoint state.")
-                # Force rollback to the historical minimum saved by the checkpointer
-                self.load(directory=self.checkpoint.directory, model_name=self.checkpoint.model_name)
-                break
-
-===============================
-==========================
-
-# 3. Construct scale-space prioritization weights
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        
-        for v_idx in self.vel_indices:
-            weights[v_idx] = self.velocity_loss_weight
-            
-        # Target index 3 (v_alpha cross-track rate) for high-gain scalar isolation
-        if self.N_FEATURES == 5 and len(self.vel_indices) == 3:
-            weights[3] = self.velocity_loss_weight * 3.0  # Amplified focus on angular cross-track tracking
-
-========================
-=====================
-
-self.optimizer.zero_grad()
-                metrics["loss"].backward()
-                
-                # Tightened to 0.5 to prevent late-horizon parameter displacement
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=0.5,
-                    norm_type=2.0,
-                )
-                self.optimizer.step()
+((.venv) ) 1010670000@magenta-gorilla-0:~/lm_cm_repos/next$ python NEXT_training_cl_new.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 10000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_cl_new2/GEODESIC/glide --frame geodesic --model-type gruode --ref-ecef glide --sbi-phase glide --geodesic-mode integrated
+there is a gpu in this node
+_CudaDeviceProperties(name='NVIDIA A100-SXM4-80GB', major=8, minor=0, total_memory=81152MB, multi_processor_count=108, uuid=5b5d6cba-3513-65ed-0eae-b230d24aff5f, pci_bus_id=15, pci_device_id=0, pci_domain_id=0, L2_cache_size=40MB)
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x7f627b4f7e60>, 0.0001)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 69.2484131 pos_err: 193474.7968750 vel_err: 370.3423767 val_loss: 46.3827171 val_pos_err: 157399.4843750 val_vel_err: 349.9479980
+[INFO] Saved checkpoint at 5
+[INFO] Saved checkpoint at 7
+[INFO] Saved checkpoint at 8
+[INFO] Saved checkpoint at 9
+[INFO] Epoch 10: loss: 16.7515297 pos_err: 93939.7421875 vel_err: 262.8085022 val_loss: 14.6628914 val_pos_err: 89658.4843750 val_vel_err: 203.5565338
+[INFO] Saved checkpoint at 10
+[INFO] Saved checkpoint at 11
+[INFO] Saved checkpoint at 12
+[INFO] Saved checkpoint at 13
+[INFO] Saved checkpoint at 14
+[INFO] Epoch 15: loss: 7.9372735 pos_err: 56385.7812500 vel_err: 179.8737335 val_loss: 7.3426723 val_pos_err: 57595.5351562 val_vel_err: 160.7635803
+[INFO] Saved checkpoint at 17
+[INFO] Saved checkpoint at 18
+[INFO] Saved checkpoint at 19
+[INFO] Epoch 20: loss: 6.1912675 pos_err: 54101.7343750 vel_err: 161.0690308 val_loss: 6.6795635 val_pos_err: 49362.3164062 val_vel_err: 148.0567017
+[INFO] Saved checkpoint at 22
+[INFO] Epoch 25: loss: 5.6489654 pos_err: 57679.7812500 vel_err: 128.1808929 val_loss: 5.3237257 val_pos_err: 37586.7968750 val_vel_err: 119.8101730
+[INFO] Saved checkpoint at 25
+[INFO] Saved checkpoint at 28
+[INFO] Saved checkpoint at 29
+[INFO] Epoch 30: loss: 4.0555973 pos_err: 35814.6250000 vel_err: 115.2414246 val_loss: 5.3443971 val_pos_err: 27336.8339844 val_vel_err: 107.7827454
+[INFO] Saved checkpoint at 32
+[INFO] Saved checkpoint at 33
+[INFO] Epoch 35: loss: 4.0722632 pos_err: 31699.7500000 vel_err: 111.0025558 val_loss: 3.7717118 val_pos_err: 26719.4238281 val_vel_err: 105.6542206
+[INFO] Saved checkpoint at 35
+[INFO] Saved checkpoint at 39
+[INFO] Epoch 40: loss: 2.8898973 pos_err: 24213.3691406 vel_err: 96.7849655 val_loss: 3.4751506 val_pos_err: 30225.5585938 val_vel_err: 87.4548035
+[INFO] Saved checkpoint at 44
+[INFO] Epoch 45: loss: 2.6554065 pos_err: 24791.4316406 vel_err: 84.7871170 val_loss: 3.3043127 val_pos_err: 24389.8398438 val_vel_err: 86.7959747
+[INFO] Saved checkpoint at 46
+[INFO] Saved checkpoint at 47
+[INFO] Saved checkpoint at 49
+[INFO] Epoch 50: loss: 2.6350060 pos_err: 24219.9746094 vel_err: 76.9889145 val_loss: 2.6887343 val_pos_err: 22678.5488281 val_vel_err: 75.5207291
+[INFO] Saved checkpoint at 50
+[INFO] Saved checkpoint at 51
+[INFO] Saved checkpoint at 52
+[INFO] Saved checkpoint at 53
+[INFO] Epoch 55: loss: 2.1220434 pos_err: 22963.8632812 vel_err: 60.3546410 val_loss: 2.9205570 val_pos_err: 29333.8457031 val_vel_err: 59.3020477
+[INFO] Saved checkpoint at 56
+[INFO] Saved checkpoint at 58
+[INFO] Saved checkpoint at 59
+[INFO] Epoch 60: loss: 1.7737736 pos_err: 22850.9570312 vel_err: 57.8436050 val_loss: 1.9619175 val_pos_err: 22197.8144531 val_vel_err: 53.5511703
+[INFO] Saved checkpoint at 61
+[INFO] Saved checkpoint at 62
+[INFO] Saved checkpoint at 64
+[INFO] Epoch 65: loss: 1.4274812 pos_err: 23462.3222656 vel_err: 52.7954254 val_loss: 1.4325516 val_pos_err: 18561.4042969 val_vel_err: 51.4886780
+[INFO] Saved checkpoint at 65
+[INFO] Saved checkpoint at 66
+[INFO] Epoch 70: loss: 1.2172520 pos_err: 20534.3750000 vel_err: 57.8577957 val_loss: 1.3423131 val_pos_err: 20745.4570312 val_vel_err: 50.3435745
+[INFO] Saved checkpoint at 73
+[INFO] Epoch 75: loss: 1.2638742 pos_err: 27862.5292969 vel_err: 53.4811211 val_loss: 1.1671828 val_pos_err: 25936.7500000 val_vel_err: 61.8500862
+[INFO] Saved checkpoint at 78
+[INFO] Epoch 80: loss: 1.5763599 pos_err: 28252.2636719 vel_err: 49.2703094 val_loss: 1.3651847 val_pos_err: 26768.0214844 val_vel_err: 53.5275345
+[INFO] Saved checkpoint at 83
+[INFO] Epoch 85: loss: 1.0613098 pos_err: 22808.7890625 vel_err: 47.5040169 val_loss: 1.0233809 val_pos_err: 17756.4746094 val_vel_err: 49.7558670
+[INFO] Saved checkpoint at 86
+[INFO] Epoch 90: loss: 0.9861834 pos_err: 19146.0761719 vel_err: 44.3604965 val_loss: 1.0813724 val_pos_err: 25872.2382812 val_vel_err: 46.7379227
+[INFO] Saved checkpoint at 92
+[INFO] Epoch 95: loss: 1.1262846 pos_err: 27342.9355469 vel_err: 40.8515816 val_loss: 1.0174875 val_pos_err: 25454.1367188 val_vel_err: 48.1455154
+[INFO] Saved checkpoint at 97
+[INFO] Epoch 100: loss: 1.4218003 pos_err: 22228.3300781 vel_err: 42.8927727 val_loss: 1.0622693 val_pos_err: 19700.2460938 val_vel_err: 43.8736305
+[INFO] Epoch 105: loss: 1.0641427 pos_err: 30697.4257812 vel_err: 42.7584152 val_loss: 0.8912954 val_pos_err: 19284.7304688 val_vel_err: 44.8724327
+[INFO] Saved checkpoint at 106
+[INFO] Epoch 110: loss: 0.7883187 pos_err: 24214.0039062 vel_err: 39.8797836 val_loss: 0.8229114 val_pos_err: 18948.0410156 val_vel_err: 45.4273300
+[INFO] Saved checkpoint at 113
+[INFO] Epoch 115: loss: 1.3529634 pos_err: 22899.4726562 vel_err: 37.1766129 val_loss: 1.2579453 val_pos_err: 21993.3496094 val_vel_err: 42.0985947
+[INFO] Saved checkpoint at 117
+[INFO] Epoch 120: loss: 0.9516124 pos_err: 16844.8769531 vel_err: 43.2978592 val_loss: 0.8884345 val_pos_err: 21433.9335938 val_vel_err: 39.0228577
+[INFO] Saved checkpoint at 122
+[INFO] Epoch 125: loss: 1.0011883 pos_err: 25331.4843750 vel_err: 42.0207100 val_loss: 0.8923791 val_pos_err: 19766.3085938 val_vel_err: 43.4879494
+[INFO] Saved checkpoint at 129
+[INFO] Epoch 130: loss: 0.6435246 pos_err: 15094.2949219 vel_err: 36.9775772 val_loss: 0.9736552 val_pos_err: 20491.9316406 val_vel_err: 44.7271118
+[INFO] Saved checkpoint at 132
+[INFO] Epoch 135: loss: 1.0105784 pos_err: 20969.1933594 vel_err: 35.1020813 val_loss: 0.9684920 val_pos_err: 14542.1845703 val_vel_err: 36.6875610
+[INFO] Epoch 140: loss: 0.6637668 pos_err: 17607.3164062 vel_err: 35.3303413 val_loss: 0.6607415 val_pos_err: 14812.5410156 val_vel_err: 35.3964958
+[INFO] Saved checkpoint at 140
+[INFO] Epoch 145: loss: 0.6551999 pos_err: 13628.0986328 vel_err: 35.9755592 val_loss: 0.8092442 val_pos_err: 18242.3085938 val_vel_err: 36.2242775
+[INFO] Epoch 150: loss: 0.6474937 pos_err: 22167.0800781 vel_err: 34.8133812 val_loss: 0.6019717 val_pos_err: 15972.5449219 val_vel_err: 34.3273048
+[INFO] Saved checkpoint at 150
+[INFO] Saved checkpoint at 154
+[INFO] Epoch 155: loss: 0.5387340 pos_err: 15709.3515625 vel_err: 34.4736061 val_loss: 0.7948062 val_pos_err: 23072.0683594 val_vel_err: 34.3803635
+[INFO] Epoch 160: loss: 0.6611599 pos_err: 21175.9335938 vel_err: 36.0691338 val_loss: 0.6056407 val_pos_err: 16319.1181641 val_vel_err: 32.5365868
+[INFO] Epoch 165: loss: 0.7242492 pos_err: 26145.7128906 vel_err: 32.4433517 val_loss: 0.6685603 val_pos_err: 14046.0507812 val_vel_err: 31.7969208
+[INFO] Epoch 170: loss: 0.9055482 pos_err: 20076.9648438 vel_err: 38.5677757 val_loss: 0.6313515 val_pos_err: 15812.5810547 val_vel_err: 32.5607185
+[INFO] Epoch 175: loss: 0.5381898 pos_err: 16571.8691406 vel_err: 33.3942108 val_loss: 0.8145632 val_pos_err: 26218.4335938 val_vel_err: 32.2293167
+[INFO] Saved checkpoint at 177
+[INFO] Epoch 180: loss: 0.6070927 pos_err: 12025.6250000 vel_err: 35.7305336 val_loss: 0.7498831 val_pos_err: 18095.8320312 val_vel_err: 33.9883270
+[INFO] Saved checkpoint at 184
+[INFO] Epoch 185: loss: 0.4458652 pos_err: 12449.3964844 vel_err: 32.7444267 val_loss: 0.7845728 val_pos_err: 22598.4980469 val_vel_err: 32.3095512
+[INFO] Saved checkpoint at 189
+[INFO] Epoch 190: loss: 0.5020331 pos_err: 12736.6152344 vel_err: 36.3976440 val_loss: 0.6202557 val_pos_err: 17018.1738281 val_vel_err: 30.7425671
+[INFO] Epoch 195: loss: 0.6537653 pos_err: 23645.7050781 vel_err: 31.7897072 val_loss: 0.6905869 val_pos_err: 11904.1210938 val_vel_err: 34.2015610
+[INFO] Epoch 200: loss: 0.6967968 pos_err: 12949.6455078 vel_err: 31.2600136 val_loss: 0.6593275 val_pos_err: 12932.9824219 val_vel_err: 31.1444149
+[INFO] Saved checkpoint at 202
+[INFO] Epoch 205: loss: 0.6685023 pos_err: 14103.1826172 vel_err: 31.1709843 val_loss: 0.5856918 val_pos_err: 13063.7519531 val_vel_err: 29.5674248
+[INFO] Epoch 210: loss: 0.5552078 pos_err: 16648.5625000 vel_err: 28.7968941 val_loss: 0.6738312 val_pos_err: 10653.2890625 val_vel_err: 28.8015804
+[INFO] Epoch 215: loss: 0.5521610 pos_err: 13123.0126953 vel_err: 31.3608990 val_loss: 0.5932152 val_pos_err: 17511.4824219 val_vel_err: 28.3460693
+[INFO] Saved checkpoint at 218
+[INFO] Epoch 220: loss: 0.6546423 pos_err: 18728.2207031 vel_err: 28.8919392 val_loss: 0.6267973 val_pos_err: 13147.9833984 val_vel_err: 33.3097992
+[INFO] Epoch 225: loss: 0.5119683 pos_err: 13291.9013672 vel_err: 30.6990547 val_loss: 0.8058195 val_pos_err: 15900.5839844 val_vel_err: 38.1122627
+[INFO] Saved checkpoint at 228
+[INFO] Epoch 230: loss: 0.5599722 pos_err: 11589.5371094 vel_err: 27.4800606 val_loss: 0.4645688 val_pos_err: 14265.9599609 val_vel_err: 29.7749004
+[INFO] Epoch 235: loss: 0.6789904 pos_err: 26201.9980469 vel_err: 30.7986927 val_loss: 0.4328642 val_pos_err: 10629.5107422 val_vel_err: 28.0007725
+[INFO] Saved checkpoint at 235
+[INFO] Saved checkpoint at 237
+[INFO] Epoch 240: loss: 1.1088535 pos_err: 31264.5937500 vel_err: 28.7894058 val_loss: 0.5876417 val_pos_err: 12214.8925781 val_vel_err: 29.0120392
+[INFO] Epoch 245: loss: 0.5082681 pos_err: 20099.5507812 vel_err: 27.1431103 val_loss: 0.5955268 val_pos_err: 17556.1679688 val_vel_err: 31.3590622
+[INFO] Epoch 250: loss: 0.7872950 pos_err: 14741.2451172 vel_err: 34.3803253 val_loss: 0.6371408 val_pos_err: 12488.9677734 val_vel_err: 28.1093712
+[INFO] Epoch 255: loss: 0.5700380 pos_err: 15386.3349609 vel_err: 29.0576458 val_loss: 0.5892369 val_pos_err: 13060.7705078 val_vel_err: 31.3151875
+[INFO] Epoch 260: loss: 0.6262743 pos_err: 12086.2841797 vel_err: 27.5691547 val_loss: 0.6439506 val_pos_err: 17003.0488281 val_vel_err: 31.5067101
+[INFO] Epoch 265: loss: 0.4385180 pos_err: 13846.9394531 vel_err: 25.5306454 val_loss: 0.5152078 val_pos_err: 13632.6015625 val_vel_err: 28.6643677
+[INFO] Epoch 270: loss: 0.5588407 pos_err: 19702.6796875 vel_err: 26.8197899 val_loss: 0.5324258 val_pos_err: 12794.2480469 val_vel_err: 27.0544147
+[INFO] Epoch 275: loss: 0.6284966 pos_err: 13407.4941406 vel_err: 31.4813194 val_loss: 0.4771075 val_pos_err: 15321.6748047 val_vel_err: 27.6484909
+[INFO] Epoch 280: loss: 0.4098867 pos_err: 14579.6054688 vel_err: 24.8786335 val_loss: 0.6981919 val_pos_err: 13541.4541016 val_vel_err: 30.8682308
+[INFO] Epoch 285: loss: 0.5442910 pos_err: 11744.2158203 vel_err: 24.3558540 val_loss: 0.5148373 val_pos_err: 11179.8583984 val_vel_err: 24.6018467
+[INFO] Early stopping triggered at 287. Rolling back to best checkpoint state.
+running length strategy (0.2, 4000, <neural_ode_mod.EarlyStopper object at 0x7f627ad0dc70>, 5e-05)
+[INFO] Epoch 5: loss: 12.1358833 pos_err: 60975.0585938 vel_err: 70.7314301 val_loss: 3.4667013 val_pos_err: 42821.7812500 val_vel_err: 56.8195610
+[INFO] Epoch 10: loss: 5.3150644 pos_err: 48125.7734375 vel_err: 88.1961670 val_loss: 3.9019487 val_pos_err: 41644.8593750 val_vel_err: 69.9005966
+[INFO] Epoch 15: loss: 2.7990475 pos_err: 23691.5195312 vel_err: 58.1282616 val_loss: 3.0522504 val_pos_err: 20344.5117188 val_vel_err: 74.4370804
+[INFO] Epoch 20: loss: 2.2577946 pos_err: 28237.9609375 vel_err: 53.3097038 val_loss: 2.8054073 val_pos_err: 25234.2128906 val_vel_err: 47.3200722
+[INFO] Epoch 25: loss: 2.5484827 pos_err: 40184.7851562 vel_err: 54.9192963 val_loss: 2.7731667 val_pos_err: 31175.1855469 val_vel_err: 67.3974991
+[INFO] Epoch 30: loss: 2.7571108 pos_err: 37387.3359375 vel_err: 49.8571625 val_loss: 2.7330744 val_pos_err: 27143.1191406 val_vel_err: 52.8025055
+[INFO] Epoch 35: loss: 2.8792248 pos_err: 43014.1562500 vel_err: 54.6055260 val_loss: 1.9601585 val_pos_err: 24572.2812500 val_vel_err: 49.3381424
+[INFO] Epoch 40: loss: 1.9375730 pos_err: 22623.5546875 vel_err: 48.5585213 val_loss: 1.6258513 val_pos_err: 20252.4179688 val_vel_err: 56.0305710
+[INFO] Epoch 45: loss: 2.0704048 pos_err: 30378.6875000 vel_err: 48.4328575 val_loss: 1.9657292 val_pos_err: 32730.5449219 val_vel_err: 47.0949440
+[INFO] Epoch 50: loss: 1.3793933 pos_err: 18314.9902344 vel_err: 46.9534836 val_loss: 1.2009283 val_pos_err: 16713.6171875 val_vel_err: 49.9248772
+[INFO] Epoch 55: loss: 2.4275072 pos_err: 27426.7617188 vel_err: 47.0792770 val_loss: 4.2930856 val_pos_err: 25869.2128906 val_vel_err: 45.4231606
+[INFO] Epoch 60: loss: 2.4924684 pos_err: 23954.8574219 vel_err: 56.5111313 val_loss: 1.9495943 val_pos_err: 33709.6289062 val_vel_err: 53.0299187
+[INFO] Epoch 65: loss: 1.9121537 pos_err: 44712.8320312 vel_err: 46.1642723 val_loss: 1.1617929 val_pos_err: 19836.3242188 val_vel_err: 46.7228851
+[INFO] Epoch 70: loss: 1.4755179 pos_err: 18610.5527344 vel_err: 63.9938736 val_loss: 1.4042045 val_pos_err: 29357.9394531 val_vel_err: 48.6508636
+[INFO] Epoch 75: loss: 2.3285286 pos_err: 19037.3867188 vel_err: 55.7001381 val_loss: 2.7584813 val_pos_err: 25981.8867188 val_vel_err: 58.4479294
+[INFO] Epoch 80: loss: 1.7339140 pos_err: 43909.6250000 vel_err: 49.3878441 val_loss: 1.7757249 val_pos_err: 41258.0039062 val_vel_err: 51.1169281
+[INFO] Epoch 85: loss: 1.5593795 pos_err: 30684.2851562 vel_err: 55.2443085 val_loss: 1.0618858 val_pos_err: 17941.1210938 val_vel_err: 50.7329140
+[INFO] Epoch 90: loss: 1.4242010 pos_err: 27101.0683594 vel_err: 45.4341774 val_loss: 1.4596796 val_pos_err: 23205.5117188 val_vel_err: 52.7887878
+[INFO] Epoch 95: loss: 1.9844357 pos_err: 48002.3437500 vel_err: 43.0633698 val_loss: 3.1596396 val_pos_err: 61821.6875000 val_vel_err: 52.0364914
+[INFO] Epoch 100: loss: 1.4675342 pos_err: 31323.7871094 vel_err: 53.6162643 val_loss: 1.8950124 val_pos_err: 28627.0781250 val_vel_err: 56.3201103
+[INFO] Epoch 105: loss: 1.5359068 pos_err: 42027.9960938 vel_err: 43.6538887 val_loss: 1.0590044 val_pos_err: 19632.9687500 val_vel_err: 45.1374054
+[INFO] Epoch 110: loss: 0.9401152 pos_err: 16805.9179688 vel_err: 46.7440071 val_loss: 1.8404648 val_pos_err: 22128.4257812 val_vel_err: 48.7638016
+[INFO] Epoch 115: loss: 1.1023453 pos_err: 23905.4433594 vel_err: 44.5538979 val_loss: 1.3249012 val_pos_err: 27583.4667969 val_vel_err: 50.2852631
+[INFO] Epoch 120: loss: 1.3482708 pos_err: 17935.8984375 vel_err: 43.9744492 val_loss: 1.2445377 val_pos_err: 21643.8671875 val_vel_err: 46.4012833
+[INFO] Epoch 125: loss: 1.6715658 pos_err: 33597.6953125 vel_err: 41.9108009 val_loss: 1.1646525 val_pos_err: 18293.3183594 val_vel_err: 45.9942398
+[INFO] Epoch 130: loss: 1.5462947 pos_err: 17097.5234375 vel_err: 44.9969368 val_loss: 0.9903423 val_pos_err: 13489.7714844 val_vel_err: 45.6126480
+[INFO] Epoch 135: loss: 1.2178586 pos_err: 14751.5673828 vel_err: 44.0308571 val_loss: 1.4647975 val_pos_err: 15718.4619141 val_vel_err: 46.3641510
+[INFO] Epoch 140: loss: 1.7780516 pos_err: 22083.6933594 vel_err: 47.2186661 val_loss: 1.2153436 val_pos_err: 18145.2246094 val_vel_err: 47.0314255
+[INFO] Epoch 145: loss: 2.6664619 pos_err: 32745.9160156 vel_err: 41.3252983 val_loss: 1.3121718 val_pos_err: 22819.4355469 val_vel_err: 45.2978516
+[INFO] Epoch 150: loss: 1.2085150 pos_err: 15291.1318359 vel_err: 42.8331184 val_loss: 1.8696725 val_pos_err: 24033.8378906 val_vel_err: 46.0762100
+[INFO] Epoch 155: loss: 1.3963268 pos_err: 18601.8496094 vel_err: 43.0511818 val_loss: 1.7560196 val_pos_err: 21433.8320312 val_vel_err: 50.8339272
+[INFO] Epoch 160: loss: 1.6373684 pos_err: 21960.6152344 vel_err: 43.7376900 val_loss: 1.0959066 val_pos_err: 14472.4355469 val_vel_err: 44.3602524
+[INFO] Epoch 165: loss: 1.5931135 pos_err: 24548.6308594 vel_err: 42.8699188 val_loss: 2.0676091 val_pos_err: 25050.8906250 val_vel_err: 46.7984695
+[INFO] Epoch 170: loss: 0.9875596 pos_err: 15604.8232422 vel_err: 42.7711411 val_loss: 1.8275484 val_pos_err: 24388.1152344 val_vel_err: 45.2056351
+[INFO] Early stopping triggered at 173. Rolling back to best checkpoint state.
+running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x7f6283f49070>, 4e-05)
+[INFO] Epoch 5: loss: 13.3288431 pos_err: 71022.3828125 vel_err: 99.0664825 val_loss: 10.6381235 val_pos_err: 47042.7500000 val_vel_err: 85.3196106
+[INFO] Epoch 10: loss: 9.8815403 pos_err: 63241.6875000 vel_err: 120.9673309 val_loss: 10.3011923 val_pos_err: 59289.1562500 val_vel_err: 90.9868164
+[INFO] Epoch 15: loss: 8.2293282 pos_err: 38696.2851562 vel_err: 96.4998779 val_loss: 6.0585136 val_pos_err: 30735.6035156 val_vel_err: 75.9073334
+[INFO] Epoch 20: loss: 7.0341349 pos_err: 37189.0429688 vel_err: 101.3159332 val_loss: 5.8749042 val_pos_err: 28019.6425781 val_vel_err: 97.3720551
+[INFO] Epoch 25: loss: 4.8642716 pos_err: 30072.3007812 vel_err: 102.2676544 val_loss: 6.7869887 val_pos_err: 31482.1699219 val_vel_err: 94.0721359
+[INFO] Epoch 30: loss: 4.4948196 pos_err: 35831.0664062 vel_err: 97.4732513 val_loss: 5.3385797 val_pos_err: 38080.0859375 val_vel_err: 88.1929092
+[INFO] Epoch 35: loss: 5.0963292 pos_err: 52701.2421875 vel_err: 101.1647720 val_loss: 4.8056030 val_pos_err: 46260.1328125 val_vel_err: 101.8253326
+[INFO] Epoch 40: loss: 3.9081466 pos_err: 26254.0781250 vel_err: 89.8778381 val_loss: 3.7452960 val_pos_err: 32839.4453125 val_vel_err: 91.2887115
+[INFO] Epoch 45: loss: 3.1280119 pos_err: 25029.7031250 vel_err: 89.2626495 val_loss: 3.1179268 val_pos_err: 29485.6660156 val_vel_err: 92.5924759
+[INFO] Epoch 50: loss: 2.9049523 pos_err: 28636.0156250 vel_err: 89.2896194 val_loss: 2.4976788 val_pos_err: 23126.9550781 val_vel_err: 83.0480118
+[INFO] Epoch 55: loss: 3.0355799 pos_err: 26406.8339844 vel_err: 84.9676208 val_loss: 2.3984611 val_pos_err: 29672.9511719 val_vel_err: 78.4330063
+[INFO] Epoch 60: loss: 2.9344475 pos_err: 34241.7851562 vel_err: 83.0564270 val_loss: 2.9343445 val_pos_err: 39698.6757812 val_vel_err: 82.7154236
+[INFO] Epoch 65: loss: 2.4930689 pos_err: 24435.2324219 vel_err: 77.2768402 val_loss: 2.8362067 val_pos_err: 23213.2519531 val_vel_err: 82.5115967
+[INFO] Epoch 70: loss: 2.6468832 pos_err: 35362.1562500 vel_err: 74.3313980 val_loss: 2.3851273 val_pos_err: 23688.5214844 val_vel_err: 77.8895264
+[INFO] Epoch 75: loss: 2.3292546 pos_err: 28895.1113281 vel_err: 73.2765045 val_loss: 2.2200074 val_pos_err: 22338.5214844 val_vel_err: 75.8075256
+[INFO] Epoch 80: loss: 2.3315160 pos_err: 29454.5214844 vel_err: 74.2791138 val_loss: 2.2211022 val_pos_err: 26409.2480469 val_vel_err: 75.5866928
+[INFO] Epoch 85: loss: 2.2661815 pos_err: 25784.9882812 vel_err: 71.1409912 val_loss: 2.2322638 val_pos_err: 22112.9921875 val_vel_err: 76.2448730
+[INFO] Epoch 90: loss: 2.4948153 pos_err: 26532.9687500 vel_err: 72.7610245 val_loss: 2.3240206 val_pos_err: 24533.4121094 val_vel_err: 75.4335556
+[INFO] Epoch 95: loss: 2.2596295 pos_err: 26786.8320312 vel_err: 69.4007263 val_loss: 2.0078392 val_pos_err: 22935.6445312 val_vel_err: 70.3301392
+[INFO] Epoch 100: loss: 1.9848886 pos_err: 23878.1015625 vel_err: 66.6750565 val_loss: 2.1841638 val_pos_err: 24353.2910156 val_vel_err: 73.8958435
+[INFO] Epoch 105: loss: 2.0114648 pos_err: 24599.6328125 vel_err: 65.2513733 val_loss: 2.1798372 val_pos_err: 25418.1152344 val_vel_err: 71.6777649
+[INFO] Epoch 110: loss: 1.8956462 pos_err: 24246.4179688 vel_err: 66.4926987 val_loss: 1.9837124 val_pos_err: 21280.9902344 val_vel_err: 70.3223419
+[INFO] Epoch 115: loss: 1.7659274 pos_err: 21822.9316406 vel_err: 67.6951141 val_loss: 2.0215466 val_pos_err: 20614.6601562 val_vel_err: 68.8436279
+[INFO] Epoch 120: loss: 1.8959888 pos_err: 25861.6679688 vel_err: 65.2294846 val_loss: 1.9049728 val_pos_err: 20998.5722656 val_vel_err: 67.1525192
+[INFO] Epoch 125: loss: 1.7634455 pos_err: 23220.2617188 vel_err: 62.7795029 val_loss: 1.8911077 val_pos_err: 23294.8632812 val_vel_err: 70.1138077
+[INFO] Epoch 130: loss: 1.8885213 pos_err: 23522.2187500 vel_err: 64.5274582 val_loss: 1.8685163 val_pos_err: 22298.4316406 val_vel_err: 67.8847885
+[INFO] Epoch 135: loss: 1.7354904 pos_err: 23761.6894531 vel_err: 62.8743820 val_loss: 1.7297827 val_pos_err: 20740.2910156 val_vel_err: 67.2124786
+[INFO] Epoch 140: loss: 1.7823855 pos_err: 22063.9863281 vel_err: 60.0753174 val_loss: 1.8342605 val_pos_err: 21033.0019531 val_vel_err: 67.5617828
+[INFO] Epoch 145: loss: 1.7769057 pos_err: 24693.5117188 vel_err: 60.5524750 val_loss: 1.7908133 val_pos_err: 20762.0136719 val_vel_err: 69.9682999
+[INFO] Epoch 150: loss: 1.6559954 pos_err: 23849.2070312 vel_err: 60.7931709 val_loss: 1.7915660 val_pos_err: 20037.6347656 val_vel_err: 67.8156204
+[INFO] Epoch 155: loss: 1.5878928 pos_err: 23327.3007812 vel_err: 59.7242203 val_loss: 1.9683897 val_pos_err: 22410.9707031 val_vel_err: 66.6747360
+[INFO] Epoch 160: loss: 1.8777770 pos_err: 25422.6054688 vel_err: 59.6238899 val_loss: 2.0511937 val_pos_err: 23676.0175781 val_vel_err: 65.6215591
+[INFO] Epoch 165: loss: 1.7393104 pos_err: 23406.7792969 vel_err: 59.8483658 val_loss: 1.8120723 val_pos_err: 21292.5566406 val_vel_err: 68.6827316
+[INFO] Epoch 170: loss: 1.6574854 pos_err: 21688.7539062 vel_err: 60.6727028 val_loss: 1.6058146 val_pos_err: 19636.8828125 val_vel_err: 64.4725876
+[INFO] Epoch 175: loss: 1.5542691 pos_err: 20204.7246094 vel_err: 61.0354385 val_loss: 1.8007611 val_pos_err: 25059.4101562 val_vel_err: 64.3777771
+[INFO] Epoch 180: loss: 1.6251895 pos_err: 21004.5273438 vel_err: 56.5251846 val_loss: 1.7590884 val_pos_err: 22342.9375000 val_vel_err: 64.2868271
+[INFO] Epoch 185: loss: 1.4219660 pos_err: 20410.0058594 vel_err: 56.0561104 val_loss: 1.8436080 val_pos_err: 20729.5019531 val_vel_err: 64.0322647
+[INFO] Epoch 190: loss: 1.6200254 pos_err: 25372.9082031 vel_err: 58.3101120 val_loss: 1.6949553 val_pos_err: 23600.3125000 val_vel_err: 62.7822037
+[INFO] Epoch 195: loss: 1.4458556 pos_err: 21614.7148438 vel_err: 58.2381821 val_loss: 2.0355999 val_pos_err: 19649.1523438 val_vel_err: 61.1344986
+[INFO] Epoch 200: loss: 1.6420774 pos_err: 21814.0742188 vel_err: 55.1993065 val_loss: 1.7582375 val_pos_err: 20007.1113281 val_vel_err: 60.3690491
+[INFO] Epoch 205: loss: 1.5729539 pos_err: 20033.9062500 vel_err: 54.8569717 val_loss: 1.6967421 val_pos_err: 21850.1035156 val_vel_err: 65.2249451
+[INFO] Epoch 210: loss: 1.6072353 pos_err: 23798.3593750 vel_err: 57.1280518 val_loss: 1.6952605 val_pos_err: 20821.5703125 val_vel_err: 62.5633812
+[INFO] Epoch 215: loss: 1.4482312 pos_err: 22621.3515625 vel_err: 56.7182236 val_loss: 1.8174177 val_pos_err: 18870.5625000 val_vel_err: 61.2317772
+[INFO] Epoch 220: loss: 1.4134322 pos_err: 21539.7734375 vel_err: 55.7830658 val_loss: 1.7088759 val_pos_err: 18037.1562500 val_vel_err: 61.1780014
+[INFO] Epoch 225: loss: 1.3934993 pos_err: 22427.7343750 vel_err: 55.1371765 val_loss: 1.7472228 val_pos_err: 20091.5605469 val_vel_err: 62.3298531
+[INFO] Epoch 230: loss: 1.4656824 pos_err: 21605.5449219 vel_err: 56.5464554 val_loss: 1.6568420 val_pos_err: 19771.6875000 val_vel_err: 62.1833305
+[INFO] Epoch 235: loss: 1.3221396 pos_err: 20607.3457031 vel_err: 57.6467094 val_loss: 1.9361612 val_pos_err: 19823.6777344 val_vel_err: 58.5751610
+[INFO] Epoch 240: loss: 1.4310622 pos_err: 19872.1210938 vel_err: 54.2003098 val_loss: 1.8623471 val_pos_err: 18094.5761719 val_vel_err: 60.7123337
+[INFO] Early stopping triggered at 244. Rolling back to best checkpoint state.
+running length strategy (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x7f627af52780>, 1e-05)
+[INFO] Epoch 5: loss: 19.3550797 pos_err: 74795.0078125 vel_err: 169.8060760 val_loss: 15.6004248 val_pos_err: 53189.4921875 val_vel_err: 138.5681915
+[INFO] Epoch 10: loss: 16.5355282 pos_err: 67708.7578125 vel_err: 179.3788147 val_loss: 16.1444530 val_pos_err: 60614.0468750 val_vel_err: 158.6731415
+[INFO] Epoch 15: loss: 14.6615610 pos_err: 54310.7968750 vel_err: 154.9306030 val_loss: 13.2475710 val_pos_err: 48120.5390625 val_vel_err: 138.8468170
+[INFO] Epoch 20: loss: 12.2840033 pos_err: 50849.8750000 vel_err: 157.0395355 val_loss: 12.0207176 val_pos_err: 49975.0859375 val_vel_err: 133.8959045
+[INFO] Epoch 25: loss: 11.4736271 pos_err: 54949.0039062 vel_err: 150.7997284 val_loss: 12.0515556 val_pos_err: 51288.6484375 val_vel_err: 138.1889038
+[INFO] Epoch 30: loss: 11.0128946 pos_err: 52869.6289062 vel_err: 152.2722321 val_loss: 11.4244022 val_pos_err: 49938.6406250 val_vel_err: 142.0532684
+[INFO] Epoch 35: loss: 9.9274349 pos_err: 56090.5664062 vel_err: 151.1076355 val_loss: 11.4037514 val_pos_err: 51818.5585938 val_vel_err: 137.9866791
+[INFO] Epoch 40: loss: 9.2951298 pos_err: 53675.5312500 vel_err: 148.8357391 val_loss: 10.7764053 val_pos_err: 52083.9609375 val_vel_err: 139.8889465
+[INFO] Epoch 45: loss: 8.7329035 pos_err: 47646.4531250 vel_err: 145.4288177 val_loss: 9.8660927 val_pos_err: 47743.1796875 val_vel_err: 140.4865875
+[INFO] Epoch 50: loss: 8.3213892 pos_err: 46452.9375000 vel_err: 143.0783997 val_loss: 9.0014019 val_pos_err: 44889.1484375 val_vel_err: 136.5151062
+[INFO] Epoch 55: loss: 7.7774582 pos_err: 45976.6328125 vel_err: 143.3186646 val_loss: 8.8318729 val_pos_err: 48757.6054688 val_vel_err: 138.9169617

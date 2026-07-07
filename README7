@@ -1,482 +1,2313 @@
-# Copyright 2026 Lockheed Martin Corporation
-# Lockheed Martin Proprietary Information
+#NEXT_training.py
 
-"""Base training class for a Neural Ordinary Differential Equation model."""
-
-from __future__ import annotations
-
+# Built-ins
+import argparse
+import json
 import math
-import random
-from typing import TYPE_CHECKING
+import multiprocessing as mp
+import os
+import pickle
+from copy import deepcopy
+from pathlib import Path
 
+# 3rd party
+import matplotlib.pyplot as plt
+import numpy as np
+import onnx
+import pandas as pd
+import psutil
+import scipy
+import seaborn as sns
 import torch
-from torch import nn
+from scipy.interpolate import make_interp_spline  # TODO: cubic hermite spline?
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
-from cm_utilities.logger import logger
-from lm_ai_torch_training.device_type import DeviceType
+
+from lm_ai_torch_models.activations import Activation
+from lm_ai_torch_training.configuration import TrainingConfiguration
 from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
+from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
+from lm_ai_torch_training.optimizers.adam import AdamOptimizer
+from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
+from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
+
+# Local
+from coordinate_transform_functions import (
+    dcu_to_ned,
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    frd_to_dcu,
+    ned_to_dcu,
+    ned_to_ecef,
+    ned_to_ecef_velocity,
 )
-from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
-from prediction.mlearn.neural_ode.loss_functions import (
-    ReverseLinearWeightingLoss,
+from energy_functions import mechanical_energy
+from load_truth import load_single_truth
+from loss_functions import EnergyMSELoss, PhysicsSplitMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+
+# from prediction.mlearn.neural_ode.neural_ode import (
+#     DEFAULT_LOSS,
+#     EarlyStopper,
+#     ModelCheckpoint,
+#     NODEPredictor,
+# )
+from neural_ode_mod import (
+    DEFAULT_LOSS,
+    EarlyStopper,
+    ModelCheckpoint,
+    NODEPredictor,
+)
+from NEXT_frames import (
+    ecef_to_local_geodesic_vec,
+    ecef_to_next_dcu,
+    ecef_to_next_grdth,
+    local_geodesic_to_ecef_vec,
+    next_dcu_to_ecef,
+    next_grdth_to_ecef,
+)
+# Integrated ("frame trick") geodesic transform: drops absolute azimuth and
+# tracks azimuth RATE instead, yielding a 5-state [s, h, v_s, v_alpha, v_h]
+# representation. Better-conditioned than the raw 6-state [Down,Cross,Up,...]
+# geodesic frame (large down-range becomes a clean quasi-monotonic range s, and
+# the ill-defined-near-origin azimuth is replaced by a rate). Imported under a
+# _frame_trick alias so both geodesic modes coexist (see --geodesic-mode).
+from NEXT_geodesic_frame import (
+    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
+    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
+)
+from torchdiffeq_solver import TorchdiffeqSolver
+from trajectory_helpers import (
+    ACC_SLICE,
+    DOWN_DOT_INDEX,
+    DOWN_INDEX,
+    GR_DOT_INDEX,
+    GR_INDEX,
+    POS_SLICE,
+    THETA_DOT_INDEX,
+    TIME_INDEX,
+    VEL_SLICE,
+    check_time_series,
+    resample_traj_data,
 )
 
-if TYPE_CHECKING:  # pragma: no cover
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
-    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
-        OptimizerWithLossFunction,
-    )
-    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-    from prediction.mlearn.ffnn.model import FFNNModel
-    from prediction.mlearn.neural_ode.ode_solver import ODESolver
 
-DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
+HAVE_HIGH_MEMORY = False
+if psutil.virtual_memory().total > 64e9:
+    HAVE_HIGH_MEMORY = True
+
+HAVE_GPU = False
+if torch.cuda.device_count() != 0:
+    HAVE_GPU = True
+    print("there is a gpu in this node")
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i))
+
+    # --- GPU throughput defaults --------------------------------------------
+    # TF32 gives a large matmul speedup on Ampere+ (A100/P100-no, A100/H100-yes)
+    # at negligible accuracy cost for this regression task. Safe no-op on GPUs
+    # that don't support it.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    # Autotune the best conv/matmul algorithms for the (fixed) tensor shapes we
+    # use; the encoder/decoder/cell shapes are constant across steps so the
+    # one-time tuning cost is amortised immediately.
+    torch.backends.cudnn.benchmark = True
+    # Prefer high-throughput matmul kernels.
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+BUCKET_SIZE = 5000  # [m]
 
 
-# TODO: This needs to move somewhere that is more useful to PCM
-class EarlyStopper:
-    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
-        # TODO: What about a percent rise stopper rather and a absolute value? Both?
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float("inf")
-        self.previous_validation_loss = float("inf")
-        self.metric_name = metric_name
+class ODEfunc(torch.nn.Module):
+    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
+        super(ODEfunc, self).__init__()
+        # aug_dim: is the number of zeros that have been added on to the initial conditions
+        # order_shift_slice: is slice of states that will be shifted left in the output vector. This works for both
+        #   balanced order (e.g. 3 position and 3 velocity) and non-balanced order (e.g. 2 position and 3 velocity).
+        #   For non-balanced order, only the velocity states that relate to the position states should be sliced. This
+        #   does mean that the arrangement of the states in the vector does matter. (e.g. the arrangement for a 2-3
+        #   state must be px,py,vx,vy,vz)
+        self.order_shift_slice = order_shift_slice
+        self.len_of_order_shift_slice = 0
+        if self.order_shift_slice is not None:
+            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
+            self.len_of_order_shift_slice = len(order_indicies)
+        # self.act = torch.nn.ELU(inplace=False)
+        # self.act = torch.nn.ReLU(inplace=False)  # not a smooth function. this lead to slow epochs
+        self.act1 = torch.nn.SiLU(inplace=False)
+        self.act2 = torch.nn.SiLU(inplace=False)
+        # self.act3 = torch.nn.SiLU(inplace=False)
+        # self.act = torch.nn.Tanh()
+        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
+        self.fc2 = torch.nn.Linear(nhidden, nhidden)
+        # self.fc3 = torch.nn.Linear(nhidden, nhidden)
+        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
+        self.nfe = 0
 
-    def early_stop(self, validation_loss: float):
-        # Improvement must beat best by at least min_delta
-        if validation_loss < (self.min_validation_loss - self.min_delta):
-            self.min_validation_loss = validation_loss
-            self.counter = 0
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:  # this is the signature needed by PCM
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:  # this is the signature needed by torchdiffeq
+        if self.order_shift_slice is not None:
+            # Is narrow the best option here? I'm trying to do slicing on the last dimension and have it work in ONNX
+            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
+        self.nfe += 1
+        out = self.fc1(x)  # TODO: swap out this manual MLP with torchvision.ops.MLP
+        out = self.act1(out)
+        out = self.fc2(out)
+        out = self.act2(out)
+        # out = self.fc3(out)  # TODO: why so many layers?
+        # out = self.act(out)
+        out = self.fc4(out)
+        if self.order_shift_slice is not None:
+            return torch.cat((v, out), dim=x.ndim - 1)
+            # return torch.cat((v, out), dim=x.ndim - 1)  # TODO: subtract a small MLP here for dissipation on the acceleration term
         else:
-            # No meaningful improvement (same, tiny change, or worse)
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        self.previous_validation_loss = validation_loss
-        return False
+            return out
 
 
-class ModelCheckpoint:
-    def __init__(self, min_epochs: int, directory: str, model_name: str):
-        self.min_epochs = min_epochs
-        self.directory = directory
-        self.model_name = model_name
-        self.min_metric = float("inf")
+# =====================================================================
+#  GRU-ODE  (De Brouwer et al., NeurIPS 2019 — GRU-ODE-Bayes)
+# ---------------------------------------------------------------------
+#  Continuous-time GRU vector field for the latent state h(t):
+#
+#       dh/dt = (1 - z(t)) ⊙ (g(t) - h(t))            (paper Eq. 3 / App. A)
+#
+#  with the continuous-time gates
+#       r(t) = σ(W_r x + U_r h + b_r)
+#       z(t) = σ(W_z x + U_z h + b_z)
+#       g(t) = tanh(W_h x + U_h (r ⊙ h) + b_h)
+#
+#  Key properties exploited here for chaotic kinematic forecasting:
+#    * Boundedness:   h(0) ∈ [-1,1]  ⇒  h(t) ∈ [-1,1] ∀t  (negative
+#      feedback term -(1-z)⊙h points inward at the boundary). This bounds
+#      long-horizon rollouts and collapses S-curve / phugoid divergence.
+#    * Lipschitz K=2: globally smooth vector field ⇒ adaptive solvers
+#      (DOPRI) stay stable and can take large steps.
+#    * Continuity prior on h(t): a smooth latent flow that regularises the
+#      forecaster, especially valuable in the low-sample regime.
+#
+#  Design note for THIS pipeline: the truth data is resampled onto a uniform
+#  grid and is fully observed (no per-feature mask), so the Bayesian filtering
+#  half of the paper (GRU-Bayes + KL post-jump loss) has nothing to filter at
+#  train time. We therefore use the GRU-ODE *cell* as a bounded latent vector
+#  field and expose the GRU-Bayes jump as an OPT-IN path (GRUODEBayesPredictor)
+#  for when genuinely sporadic/masked observations are available. The autonomous
+#  forecaster below (no continuous input x(t)) is the default — g and z then
+#  depend on h(t) only, exactly the autonomous case described in paper §2.1.
+# =====================================================================
+class FullGRUODECell(torch.nn.Module):
+    """The GRU-ODE vector field dh/dt = (1 - z) ⊙ (g - h).
 
-    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
-        if epoch > self.min_epochs and metric < self.min_metric:
-            self.min_metric = metric
-            model.save(
-                directory=self.directory,
-                model_name=self.model_name,
-            )
-            return True
-        return False
+    Operates on a *latent* state h ∈ R^H. If a continuous control/observation
+    signal x(t) ∈ R^D is supplied it is injected into all three gates; if not,
+    the cell is autonomous (the default for forecasting).
+
+    The forward signature is (t, h) to match torchdiffeq and the existing
+    TorchdiffeqSolver / ONNX export contract used by ODEfunc.
+    """
+
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        # --- OPTIMIZED weight layout -------------------------------------
+        # The r and z gates depend on h directly; g depends on the RESET-GATED
+        # hidden state (r ⊙ h). Computing them in one packed 3H×H matmul forces
+        # the wasted product U_h·h to be computed and then subtracted out. We
+        # instead split into:
+        #   lin_hrz : (2H, H)  -> U_r, U_z      applied to h
+        #   lin_hg  : ( H, H)  -> U_h           applied to (r ⊙ h)
+        # This is two matmuls instead of three, mathematically identical to the
+        # packed-and-correct form (verified to machine precision), and removes
+        # the per-step subtraction. Fewer/larger fused GEMMs also map better to
+        # GPU tensor cores.
+        self.lin_hrz = torch.nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            # Input weights for all three gates: W_r, W_z (for r,z) and W_h (g).
+            self.lin_xrz = torch.nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            # Learnable gate biases so the autonomous field is not pinned to the
+            # origin. Registered as parameters (broadcast over batch).
+            if bias:
+                self.bias_rz = torch.nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = torch.nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        """Return dh/dt with the same trailing-dim layout as h.
+
+        h : (..., H)   latent state (any batch/sequence leading dims)
+        x : (..., D)   optional continuous input aligned on the last dim
+
+        No host-syncing side effects (no nfe counter) so the field is safe for
+        CUDA-graph capture and torch.compile.
+        """
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
 
 
-class NODEPredictor(nn.Module):
-    """Neural Ordinary Differential Equation (NODE) Prediction Model.
+class MinimalGRUODECell(torch.nn.Module):
+    """Minimal GRU-ODE (paper App. G):
 
-    The Neural Ordinary Differential Equation (NODE) is a neural network that
-    parameterizes the derivative of the hidden state instead of specifying a
-    discrete sequence of hidden layers. Essentially, it extends a residual
-    network model [EQ 1], adding more layers and decreasing the step size to the
-    limit to yield an ODE [EQ 2]. This is shown by the equations below:
+        dh/dt = (1 - f) ⊙ (σ(W_h x + U_h (h ⊙ f) + b_h) - h)
 
-            h_t+1 = h_t + f(h_t,Θ_t)          [EQ 1]
-            dh(t)/dt = f(h(t),t,Θ)            [EQ 2]
+    Fewer parameters than the full cell; retains boundedness and the K=2
+    Lipschitz property. Useful when latent H is large or data is scarce.
+    """
 
-    f is a feed-forward neural network. Then, with some given initial
-    conditions, an ODE solver can be used to integrate forward the dynamics
-    captured by the network.
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hf = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_f
+        self.lin_hh = torch.nn.Linear(hidden_size, hidden_size, bias=False)  # U_h
+        if input_size > 0:
+            self.lin_xf = torch.nn.Linear(input_size, hidden_size, bias=bias)
+            self.lin_xh = torch.nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
 
-    For more information, refer to the original paper given below
-    (https://arxiv.org/pdf/1806.07366.pdf)
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_f = self.lin_hf(h)
+        if self.input_size > 0:
+            pre_f = pre_f + self.lin_xf(x)
+        elif self.bias_f is not None:
+            pre_f = pre_f + self.bias_f
+        f = torch.sigmoid(pre_f)
+
+        pre_h = self.lin_hh(f * h)
+        if self.input_size > 0:
+            pre_h = pre_h + self.lin_xh(x)
+        elif self.bias_h is not None:
+            pre_h = pre_h + self.bias_h
+        g = torch.tanh(pre_h)
+
+        dh = (1.0 - f) * (g - h)
+        return dh
+
+
+class GRUODEFunc(torch.nn.Module):
+    """Drop-in replacement for ``ODEfunc`` that integrates a GRU-ODE field in a
+    BOUNDED LATENT SPACE and decodes back to the physical kinematic state.
+
+    Pipeline per integration call (single physical state, autonomous):
+
+        x_phys (..., D)
+           │  encoder (Linear→SiLU→Linear→tanh)        lift to latent
+           ▼
+        h (..., H) ∈ (-1, 1)                            boundedness precondition
+           │  ∫ FullGRUODECell  dt   (handled by the external solver)
+           ▼
+        h(t) (..., H) ∈ (-1, 1)                         stays bounded ∀t
+           │  decoder (Linear→SiLU→Linear)             project to physical
+           ▼
+        x_phys(t) (..., D)
+
+    To keep a SINGLE state vector flowing through the existing solver / ONNX
+    export (which integrate a vector field of fixed dimension), we expose the
+    *augmented* state  s = [x_phys, h]  ∈ R^{D+H}  and define its derivative:
+
+        d/dt [x_phys] = decoder_jacobian-free readout:  ẋ_phys = J·ḣ  ≈  Dec(h+εḣ) trick
+        d/dt [h]      = FullGRUODECell(h)
+
+    In practice, decoding every step is cheap and exact, so we instead carry h
+    as the integrated state and the physical readout is produced by the decoder
+    AFTER integration (see GRUODELatentModel). For ONNX/solver parity we still
+    provide a fixed-dim ``forward(t, s)`` that advances the latent block and
+    holds the physical block via its decoded velocity, supporting the
+    second-order (order_shift_slice) kinematic prior.
+
+    For the common case we recommend using ``GRUODELatentModel`` end-to-end,
+    which the trainer wires up automatically.
     """
 
     def __init__(
         self,
-        architecture: FFNNArchitecture,
-        training_configuration: TrainingConfiguration,
-        solver: ODESolver,
-        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
-        logging_interval: int = 1,  # Default to log every epoch/iteration.
-        early_stopper: EarlyStopper | None = None,
-        checkpoint: ModelCheckpoint | None = None,
-        aug_dim: int = 0,
-    ) -> None:
-        """Initializes a NODE from an input configuration.
-
-        Args:
-            architecture: A configuration defining the underlying node model.
-            training_configuration: The model training hyperparameters.
-            logging_interval: How often to log training epochs or iterations.
-                This is used if verbose is True in the training configuration.
-                Logging statements will be printed to the console every
-                logging_interval epochs or optimizer iterations.
-            solver: The ODESolver used in the NODE.
-            loss_func: The loss function optimized for training the node model.
-        """
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+    ):
         super().__init__()
-        self.architecture: FFNNArchitecture = architecture
-        self.training_configuration: TrainingConfiguration = training_configuration
-        self.logging_interval: int = logging_interval
-        self.solver = solver
-        self.early_stopper = early_stopper
-        self.checkpoint = checkpoint
-        self.aug_dim = aug_dim
-        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
 
-        # Parse parameters from the training configuration.
-        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
-        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
-        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
-        self.verbose: bool = self.training_configuration.verbose
+        # Encoder-input selection. The GRU-ODE dynamics should be (largely)
+        # invariant to ABSOLUTE horizontal position: how velocity evolves in a
+        # glide depends on velocity, altitude, dynamic pressure, flight-path
+        # angle -- NOT on absolute down-range/cross-range coordinate. Feeding
+        # large-magnitude, translation-variant position into the encoder both
+        # pollutes the latent and lets the model overfit position-specific
+        # dynamics (hurting val position via the integrated velocity). Under the
+        # second-order constraint this is doubly safe: position is produced by
+        # integration, so the dynamics genuinely don't need absolute position.
+        #
+        # encoder_input_idx selects which state components feed the encoder.
+        #   None                -> all components (original behaviour)
+        #   [2,3,4,5] (geodesic) -> drop Down,Cross; keep Up(alt)+velocities
+        #   [3,4,5]   (geodesic) -> velocity-only (SME's proposal)
+        # The DECODER still outputs all state_vector_len components unchanged.
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer(
+            "encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long)
+        )
+        enc_in = len(encoder_input_idx)
 
-        # Set the iteration parameter for required optimizers.
-        self.training_metrics: dict[str, list[float]] = {}
-
-        # Setup the model for training and inference.
-        self._initialize_device()
-        self._initialize_losses(loss_func=loss_func)
-        self._initialize_model()
-        self._initialize_optimizer()
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
-
-        Args:
-            x: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-            extra_feat: Extra features used in training.
-                This will be passed to the extra features of the Neural ODE. It
-                should be of shape (len(x), n_extra_features).
-            shuffle: Flag to shuffle the data for batching.
-                The data will not be shuffled when set to False.
-            validation_data: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-
-        Returns:
-            A dictionary of training losses and metrics.
-        """
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
-                    norm_type=2.0,
-                )
-                # # (optional) log the pre‑clip norm so you can monitor it
-                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-                self.optimizer.step()
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    # repeating the above...it should be another function
-                    pool_index_val = list(range(len(validation_data)))
-                    if shuffle:
-                        random.shuffle(pool_index_val)
-
-                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
-                        batch_idx_val = [
-                            pool_index_val.pop(0)
-                            for _ in range(
-                                min(
-                                    len(pool_index_val),
-                                    self.batch_size,
-                                )
-                            )
-                        ]
-                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
-                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                        x_batch_val = float("nan") * torch.ones(
-                            (
-                                len(batch_idx_val),
-                                max_len_val,
-                                x_batch_list_val[0].size(dim=1),
-                            )
-                        )
-                        for i in range(len(x_batch_list_val)):
-                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                        if extra_feat is None:
-                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                        else:
-                            metrics_val = self.batch_loss(
-                                x=x_batch_val.to(self.device),
-                                extra_feat=extra_feat[batch_idx_val],
-                            )
-
-                    for key in metrics_val:
-                        metrics[f"val_{key}"] = metrics_val[key]
-
-                    # update the position and velocity weights only for the loss functions that support this
-                    # and only when looking at the full trajectory
-                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
-                    if hasattr(self.criterion, "wp") and enable_checkpoints:
-                        if epoch % 50 == 0:
-                            if (
-                                metrics["pos_err_scaled"] > self.criterion.delta_pos
-                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
-                            ):
-                                pass
-                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
-                                self.criterion.wp *= 1.2  # amplify position focus
-                                logger.info(
-                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
-                                self.criterion.wv *= 1.2
-                                logger.info(
-                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
-
-            # LR scheduler step 
-            # Only active when train_NEXT assigned a scheduler for this stage. Step on the early-stopper 
-            # metric (val_loss) so the LR drops when validation plateaus. fall back to train loss if val is absent.
-            if self.scheduler is not None:
-                _watch_key = self.early_stopper.metric_name if self.early_stopper is not None else "loss"
-                _watch = metrics.get(_watch_key, metrics.get("loss"))
-                # ReduceLROnPlateau.step wants a python float
-                _watch_val = _watch.item() if hasattr(_watch, "item") else float(_watch)
-                self.scheduler.step(_watch_val)
-                # surface the current LR so it shows up in the logs/metrics
-                _cur_lr = self.optimizer.param_groups[0]["lr"]
-                metrics["lr"] = torch.tensor(_cur_lr)
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-                # and metrics["pos_err"] < 5000
-            ):
-                logger.info(f"Early stopping triggered at {epoch}")
-                break
-
-        return self.training_metrics
-
-    def batch_loss(
-        self,
-        x: torch.Tensor,
-        extra_feat: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Calculates the loss of the batch.
-
-        Args:
-            x: Batch targets time series data.
-                This should be of shape (batch_size, series_length, n_features).
-                The first column x(:,0,:) is used as the initial condition for
-                the ODE solver integration.
-            extra_feat: Batch extra features.
-                This is used as the extra features in the ODE solver
-                integration. It should be of shape (batch_size,
-                n_extra_features).
-
-        Returns:
-            The loss of the batch.
-        """
-        if self.aug_dim == 0:
-            x0 = x[:, 0]
-        else:
-            zeros = torch.zeros((x.shape[0], self.aug_dim)).to(self.device)
-            x0 = torch.cat((x[:, 0, :], zeros), dim=1)
-        batch_size, time_steps, n_features = x.shape
-        if self.solver.adjoint:
-            x_pred = AdjointMethod.apply(
-                self.solver,
-                self.model,
-                x0,
-                time_steps - 1,
-                extra_feat,
-                *tuple(self.model.parameters()),
-            )[:, :, : x.shape[2]]
-        else:
-            x_pred = self.solver.integrate(
-                func=self.model,
-                x0=x0,
-                steps=time_steps - 1,
-                extra_feat=extra_feat,
-            )[:, :, : x.shape[2]]
-
-        x_pred = torch.nan_to_num(x_pred, nan=0)
-        x = torch.nan_to_num(x, nan=0)
-
-        return self.criterion(x_pred, x)
-
-    def infer(
-        self,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Infers on a trained model with a predefined dataset.
-
-        Args:
-            x0: An input tensor with the initial conditions for the ODE Solver.
-                This is a shape (batch_size, n_features).
-            extra_feat: A tensor with the extra features of the NODE.
-                This is of shape (batch_size, n_extra_features).
-            steps: Number of steps the ODE Solver will take.
-
-        Returns:
-            A tensor containing the predicted data from the trained model.
-        """
-        with torch.no_grad():
-            if self.aug_dim != 0:
-                x0 = torch.cat((x0[:, 0], torch.zeros(self.aug_dim)), dim=1)
-            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
-
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
-    ) -> None:
-        """Loads a model from file.
-
-        Args:
-            directory: The directory to load the model from.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when searching
-                for the model file.
-            device_type: The hardware device to use for model loading.
-        """
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-
-    def save(self, directory: str, model_name: str) -> None:
-        """Saves a model to one torch file.
-
-        Args:
-            directory: The directory to save the model to.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when creating
-                the model file.
-        """
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.save(directory, model_name)
-
-    def _initialize_device(self) -> None:
-        """Sets torch device based on whether GPU is available or not."""
-        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
-        self.to(device=self.device)
-
-    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
-        """Initializes the losses for the NODE.
-
-        Args:
-            loss_func: The loss function optimized for training the node model.
-        """
-        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
-
-    def _initialize_model(self) -> None:
-        """Initialize the NODE."""
-        self.model: FFNNModel = self.architecture.get_model().to(self.device)
-
-    def _initialize_optimizer(self) -> None:
-        """Initialize the optimizer for the NODE from the model parameters."""
-        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
-            self.model
+        # Encoder: (selected) physical -> bounded latent. Final tanh guarantees
+        # h in (-1,1), satisfying the GRU-ODE boundedness precondition.
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(enc_in, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, self.latent_dim),
+            torch.nn.Tanh(),
+        )
+        # The continuous-time GRU vector field (autonomous: input_size=0).
+        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
+        # Decoder: bounded latent -> FULL physical state.
+        self.decoder = torch.nn.Sequential(
+            torch.nn.Linear(self.latent_dim, enc_h),
+            torch.nn.SiLU(),
+            torch.nn.Linear(enc_h, state_vector_len),
         )
 
-    def _add_metrics_to_global_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        """Adds metrics generated from training to the global metrics.
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        """Vector field on the LATENT state h (this is what the solver integrates).
 
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
+        Accepts h of shape (..., latent_dim) and returns dh/dt of the same shape.
+        Boundedness is structural, so no clamping is required.
         """
-        # Add losses and metrics to global metrics.
-        for metric, value in metrics.items():
-            if metric not in self.training_metrics:
-                self.training_metrics[metric] = []
-            self.training_metrics[metric].append(value.detach().cpu().numpy())
+        return self.cell(t, h)
 
-    def _log_metrics(
+    # --- convenience maps used by the latent wrapper / ONNX model ---
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        # Select only the dynamically-relevant components before encoding.
+        # x_phys is always the FULL state (..., state_vector_len); we gather the
+        # configured subset on the last dim so every caller stays unchanged.
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+
+# Forward-mode JVP: prefer torch.func (single forward pass) over
+# torch.autograd.functional.jvp (double-backward, ~3x cost and an extra graph).
+try:  # torch >= 2.0
+    from torch.func import jvp as _func_jvp
+
+    def _decoder_jvp(decode_fn, h, dh):
+        # (output, J·dh) in one forward-mode pass — no backward graph built.
+        return _func_jvp(decode_fn, (h,), (dh,))
+except Exception:  # pragma: no cover - older torch fallback
+    def _decoder_jvp(decode_fn, h, dh):
+        return torch.autograd.functional.jvp(decode_fn, h, v=dh, create_graph=True, strict=False)
+
+
+class GRUODELatentModel(torch.nn.Module):
+    """GRU-ODE as a physical-space vector field, drop-in for ODEfunc, with an
+    optional structural second-order constraint dpos/dt = vel.
+
+    New args:
+        pos_idx, vel_idx : paired index lists. xdot[pos_idx[i]] is forced to
+                           x[vel_idx[i]]. If either is None, the constraint is
+                           OFF and the model behaves exactly as before.
+    """
+
+    def __init__(
         self,
-        metrics: dict[str, torch.Tensor],
-        iteration: int,
-        prefix: str = "Epoch",
-    ) -> None:
-        """Logs metrics generated during a training epoch or iteration.
+        func,                 # GRUODEFunc
+        solver=None,
+        aug_dim: int = 0,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,       # StandardScaler scale_ (sigma) for the pos block
+        vel_scale=None,       # StandardScaler scale_ (sigma) for the vel block
+        vel_mean=None,        # StandardScaler mean_ (mu) for the vel block
+        so_correction_alpha: float = 0.0,  # soft-constraint correction magnitude
+        field_method: str = "central",     # "central" matches ONNX/deploy; "jvp" = exact
+        fd_eps: float = 1e-4,              # central-difference step (must match export)
+        dt: float = 0.1,                   # DEPLOYMENT step (seconds) for the Heun term
+        heun_correction: bool = False,     # add the structural 1/2*dt*a position term
+    ):
+        super().__init__()
+        self.func = func
+        self.aug_dim = aug_dim
+        # Deployment timestep and the Heun/midpoint position correction (item A
+        # from the aero review). Single-step Euler on the position channel drops
+        # the 1/2*a*dt^2 curvature term EVERY step, producing a biased,
+        # horizon-accumulating position error. The model already computes the
+        # (scaled) acceleration as xdot[vel_idx]; folding 1/2*dt*a into the
+        # position derivative makes the deployed Euler step second-order accurate
+        # on position, statelessly. See _field for the scaled-space derivation.
+        self.dt = float(dt)
+        self.heun_correction = bool(heun_correction)
+        # Train/deploy field parity: the ONNX export computes the physical
+        # derivative via CENTRAL FINITE DIFFERENCE through the decoder; the
+        # original training path used an exact JVP. Under the soft constraint the
+        # decoder_pos_deriv feeds a saturating tanh, so any systematic
+        # JVP-vs-FD disagreement biases the deployed position integral.
+        # "central" (default) makes the trained field identical to the deployed
+        # field; "jvp" restores the exact train-only derivative for comparison.
+        self.field_method = field_method
+        self.fd_eps = float(fd_eps)
+        # Soft second-order constraint: xdot[pos] = kinematic_term
+        #   + alpha * tanh(decoder_pos_deriv). alpha=0 => HARD constraint
+        #   (pos-deriv fully determined by velocity, original behaviour).
+        #   alpha>0 lets the network add a BOUNDED correction so it can pull
+        #   position back toward truth instead of only riding the velocity
+        #   integral (which is what makes val_pos_err plateau under the hard
+        #   constraint). tanh bounds the correction; alpha caps its magnitude.
+        self.so_correction_alpha = float(so_correction_alpha)
+        # second-order coupling (None => disabled, original behaviour)
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            assert len(pos_idx) == len(vel_idx), "pos_idx and vel_idx must pair up"
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # CRITICAL: the model works in SCALED units, but the kinematic
+            # identity d/dt(pos)=vel holds in PHYSICAL units. With a
+            # StandardScaler (x_s=(x-mu)/sigma), the correct scaled-space
+            # position derivative is
+            #     xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + (mu_vel/sigma_pos)
+            # NOT vel_s. We precompute the per-axis ratio and offset. If no
+            # scaler stats are supplied we assume physical units (ratio=1,
+            # offset=0), recovering the naive constraint.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.so_ratio = None
+                self.so_offset = None
+                self.scaled_space = False
+        else:
+            self.pos_idx = None
+            self.vel_idx = None
 
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-            iteration: The current epoch or optimizer iteration.
-            prefix: The prefix for the logging statement reported to console.
+    def _field(self, t, x_phys: torch.Tensor) -> torch.Tensor:
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(t, h)
+        if self.field_method == "central":
+            # Match the ONNX/deployment field EXACTLY: central finite difference
+            # of the decoder in the dh direction. Same formula and eps as
+            # GRUODEFieldForONNX so the trained field == the deployed field.
+            eps = self.fd_eps
+            x_plus = self.func.decode(h + eps * dh)
+            x_minus = self.func.decode(h - eps * dh)
+            xdot = (x_plus - x_minus) / (2.0 * eps)
+        else:
+            # exact forward-mode JVP (train-only; not reproducible in ONNX export)
+            _, xdot = _decoder_jvp(self.func.decode, h, dh)  # noqa: F821
+        if self.second_order:
+            # Kinematic term: d/dt(pos) = vel, expressed correctly in the model's
+            # units (scaled space => sigma_vel/sigma_pos * vel + mu_vel/sigma_pos).
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+
+            if self.heun_correction:
+                # Heun/midpoint position term (aero review item A). The exact
+                # one-step position increment is v*dt + 1/2*a*dt^2 + O(dt^3);
+                # single-step Euler deployment keeps only v*dt, dropping the
+                # curvature term every step -> accumulating position bias.
+                # The model's own scaled acceleration is xdot[vel_idx]. In scaled
+                # position units the missing contribution to the DERIVATIVE is
+                # 1/2*dt*(sigma_vel/sigma_pos)*accel_s = 1/2*dt*so_ratio*accel_s,
+                # so that Euler advances pos by 1/2*dt^2*a as required. This is
+                # gathered at the SAME (possibly non-contiguous) vel_idx so it
+                # aligns axis-for-axis with pos_idx.
+                accel_s = xdot.index_select(-1, self.vel_idx)
+                if getattr(self, "scaled_space", False):
+                    accel_term = 0.5 * self.dt * self.so_ratio * accel_s
+                else:
+                    accel_term = 0.5 * self.dt * accel_s
+                pos_deriv = pos_deriv + accel_term
+
+            if self.so_correction_alpha > 0.0:
+                # Optional additional BOUNDED learned residual on top of the
+                # kinematic (+ Heun) term. tanh bounds it; alpha caps magnitude.
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+        return xdot
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.func.state_vector_len:
+            x_core = x.narrow(-1, 0, self.func.state_vector_len)
+            xdot_core = self._field(t, x_core)
+            pad = torch.zeros(
+                *xdot_core.shape[:-1], self.aug_dim, dtype=xdot_core.dtype, device=xdot_core.device
+            )
+            return torch.cat((xdot_core, pad), dim=-1)
+        return self._field(t, x)
+
+
+
+class GRUBayes(torch.nn.Module):
+    """OPT-IN Bayesian jump update (paper §2.3, Eq. 4 + App. D fprep).
+
+    Only used when genuinely sporadic / masked observations are present. Given
+    the pre-jump latent h(t-), an observation y[k] and its mask m[k], it
+    produces a discrete update h(t+) = GRU(h(t-), fprep(y, m, h)). Because
+    GRU-ODE keeps h ∈ [-1,1], a standard GRUCell is range-compatible.
+
+    The trainer leaves this dormant for the current uniformly-resampled,
+    fully-observed pipeline; it is provided so the architecture is complete and
+    activates without code changes once masked inputs are wired in.
+    """
+
+    def __init__(self, latent_dim: int, obs_dim: int, prep_hidden: int):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.obs_dim = obs_dim
+        # fprep: per-dimension [θ (mean,logvar), y, (y-μ)/σ] -> prep_hidden, ReLU,
+        # zeroed where unobserved. Implemented as a grouped linear over dims.
+        self.obs_to_theta = torch.nn.Linear(latent_dim, 2 * obs_dim)  # fobs: μ, logσ²
+        self.prep = torch.nn.Linear(4 * obs_dim, prep_hidden * obs_dim)
+        self.gru = torch.nn.GRUCell(prep_hidden * obs_dim, latent_dim)
+
+    def fobs(self, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        theta = self.obs_to_theta(h)
+        mu, logvar = theta.chunk(2, dim=-1)
+        return mu, logvar
+
+    def forward(self, h_minus: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        mu, logvar = self.fobs(h_minus)
+        sigma = torch.exp(0.5 * logvar)
+        norm_err = (y - mu) / (sigma + 1e-6)
+        # Per-dim feature vector q_d = [μ, logσ², y, norm_err], masked.
+        q = torch.cat([mu, logvar, y, norm_err], dim=-1)
+        q = torch.relu(self.prep(q))
+        # Zero out contributions where there was no observation.
+        m_rep = m.repeat_interleave(self.prep.out_features // self.obs_dim, dim=-1)
+        q = q * m_rep
+        h_plus = self.gru(q, h_minus)
+        # Re-bound to the GRU-ODE operating region (defensive; GRUCell ≈ in-range).
+        return torch.tanh(h_plus)
+
+
+# wrap the sklearn StandardScalar
+class Normaliser(torch.nn.Module):
+    def __init__(self, scaler):
+        super().__init__()
+        self.mean = torch.nn.Parameter(torch.tensor(scaler.mean_, dtype=torch.float32), requires_grad=False)
+        self.scale = torch.nn.Parameter(torch.tensor(scaler.scale_, dtype=torch.float32), requires_grad=False)
+
+    def forward(self, x):  # phys → norm
+        return (x - self.mean) / self.scale
+
+    def inverse(self, z):  # norm → phys
+        return z * self.scale + self.mean
+
+
+# -------------------------------------------------
+# 2️⃣  Encoder – maps a short observation window to μ, logσ
+# -------------------------------------------------
+class Encoder(torch.nn.Module):
+    """
+    Input: (B, K, 6)  – K initial time steps per trajectory
+    Output: μ, logσ each of shape (B, latent_dim)
+    """
+
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        # TODO: replace 6 with state size
+        self.rnn = torch.nn.GRU(input_size=6, hidden_size=hidden, batch_first=True, num_layers=1)
+        self.mu_head = torch.nn.Linear(hidden, latent_dim)
+        self.logvar_head = torch.nn.Linear(hidden, latent_dim)
+
+    def forward(self, x):
+        # x already normalised
+        _, h_n = self.rnn(x)  # h_n: (1, B, hidden)
+        h = h_n.squeeze(0)  # (B, hidden)
+        mu = self.mu_head(h)
+        logvar = self.logvar_head(h)
+        return mu, logvar
+
+
+# -------------------------------------------------
+# 3️⃣  Latent ODE dynamics (continuous flow)
+# -------------------------------------------------
+class LatentODEFunc(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, latent_dim),
+        )
+
+    def forward(self, t, z):
+        return self.net(z)
+
+
+# -------------------------------------------------
+# 4️⃣  Decoder – maps latent state back to (p, v)
+# -------------------------------------------------
+class Decoder(torch.nn.Module):
+    def __init__(self, latent_dim=8, hidden=128):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(latent_dim, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, 6),  # TODO: replace 6 with state size
+        )  # output 6-D physical state (still normalised)
+
+    def forward(self, z):
+        return self.net(z)
+
+
+# -------------------------------------------------
+# 5️⃣  Full model wrapper (for a single trajectory)
+# -------------------------------------------------
+from torchdiffeq import odeint_adjoint
+
+
+class LatentNODE(torch.nn.Module):
+    def __init__(self, latent_dim=8):
+        super().__init__()
+        self.encoder = Encoder(latent_dim)
+        self.odefunc = LatentODEFunc(latent_dim)
+        self.decoder = Decoder(latent_dim)
+
+    def forward(self, obs_window_and_times: tuple[torch.Tensor, torch.Tensor]):
         """
-        with torch.no_grad():
-            if self.verbose and iteration % self.logging_interval == 0:
-                metric_comps: list[str] = []
-                for metric, value in metrics.items():
-                    metric_comps.append(f"{metric}: {value.item():.7f}")
+        obs_window : (B, K, 6)  – normalised observations used by encoder
+        t_eval     : (T,)       – times at which we want a reconstruction
+        Returns:
+            recon   : (B, T, 6) – decoded physical state (still normalised)
+            mu, logvar : (B, latent_dim)  – encoder statistics (for KL)
+        """
+        obs_window, t_eval = obs_window_and_times
+        mu, logvar = self.encoder(obs_window)
 
-                metric_str: str = " ".join(metric_comps)
-                logger.info(f"{prefix} {iteration}: {metric_str}")
+        # Reparameterisation trick (sample z₀)
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z0 = mu + eps * std  # (B, latent_dim)
+
+        # Integrate the latent ODE
+        # odeint expects (T, B, latent_dim); we transpose after
+        z_t = odeint_adjoint(self.odefunc, z0, t_eval, atol=1e-5, rtol=1e-5)  # (T, B, latent_dim)
+        z_t = z_t.permute(1, 0, 2)  # (B, T, latent_dim)
+
+        # Decode every latent snapshot
+        recon = self.decoder(z_t)  # (B, T, 6)
+        return recon, mu, logvar
+
+
+def _kl_divergence(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """Standard normal-prior KL term used by VAEs / latent ODEs."""
+    # 0.5 * Σ (1 + logσ² – μ² – σ²)
+    return 0.5 * torch.mean(torch.sum(1 + logvar - mu.pow(2) - torch.exp(logvar), dim=1))
+
+
+def _make_obs_target(
+    traj: torch.Tensor,
+    obs_len: int = 10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns a short observation window (first *obs_len* points) that will be
+    fed to the encoder and the full trajectory (starting at the same first
+    time-step) that will be used as the reconstruction target.
+    """
+    assert traj.shape[0] > obs_len, "trajectory shorter than observation window"
+    obs_window = traj[:obs_len].unsqueeze(0)  # (B=1, K=obs_len, D)
+    target = traj.unsqueeze(0)  # (B=1, T, D)
+    return obs_window, target
+
+
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+):
+    # define initial training configuration
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        # optimizer=ReduceLROnPlateauConfiguration("loss").create_from_optimizer(AdamOptimizer(learning_rate=1e-3)),
+        batch_size=batch_size,
+        num_workers=100,  # is this the parallel control? cpu_count()//2?
+        verbose=True,
+    )
+    # ode_solver = EulerSolver(dt=trajectory_dt)
+    # ode_solver = RK4Solver(dt=trajectory_dt)
+    # Fixed-step RK4 with adjoint=False stores the forward graph for exact, fast
+    # gradients — appropriate here because the GRU-ODE field is K=2 Lipschitz, so
+    # a fixed step is numerically stable. Tradeoffs for GRU-ODE specifically:
+    #   * method="dopri5": adaptive step — fewer evals on smooth stretches, more
+    #     near sharp dynamics; better stability at the cost of variable runtime.
+    #   * adjoint=True: O(1) memory in the number of steps (recompute on the
+    #     backward pass) — switch this on if long horizons OOM the GPU; it trades
+    #     memory for ~2x compute and is the setting the paper uses for big latents.
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
+
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame == "grdth":
+        velocity_indicies = (2, 3, 4)
+    elif frame == "geodesic":
+        # 6-state ("original") geodesic pairs like DCU; 5-state ("integrated"
+        # frame trick) [s,h,v_s,v_alpha,v_h] has GRDTH-like unbalanced layout:
+        # positions s,h at 0,1; "velocities" v_s,v_alpha,v_h at 2,3,4.
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("That frame is not known for what the velocity indicies are")
+    # Define custom loss function.
+    early_stop_metric_name = "val_loss"
+    # loss_func = EnergyMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     energy_fn=mechanical_energy,
+    #     energy_weight=1,
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    # )
+
+    # loss_func = WrappedMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    # )
+
+    # loss_func = PhysicsSplitMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     dt=trajectory_dt,
+    #     pos_weight=1.0,
+    #     vel_weight=2.0,
+    #     physics_weight=0,
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    # )
+
+    loss_func = PhysicsSplitMSELoss(
+        # height_idx: altitude index by frame. DCU/6-state geodesic: 'Up' at 2.
+        # 5-state "integrated" geodesic [s,h,v_s,v_alpha,v_h]: 'h' at 1.
+        # GRDTH [GR,Down,...]: 'Down' at 1. Currently inert (only EnergyMSELoss
+        # consumes it) but set correctly for any future energy term.
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        dt=trajectory_dt,
+        pos_weight=3.0,
+        vel_weight=1.0,        # glide: velocity is the laggard AND now feeds position
+        physics_weight=0.0,    # second-order model makes the soft residual redundant
+        # R2: late-weighted position term. Penalizes accumulated drift (the small
+        # velocity BIAS that integrates into large end-of-trajectory position
+        # error, invisible to flat MSE). Start late_weight~1.0, late_power=2.0
+        # (emphasize the trajectory end); set late_weight=0.0 to A/B against the
+        # current result. Sweep late_weight in {0.5, 1.0, 2.0}.
+        late_weight=1.0,
+        late_power=2.0,
+        # C: velocity DC-bias penalty. Targets the constant velocity offset that
+        # integrates into position drift (same bias the Heun term attacks, from
+        # the loss side). Start ~= pos_weight; set 0.0 to disable. Run the Heun
+        # correction (item A) first for clean attribution, then add this.
+        vel_bias_weight=1.0,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+    )
+
+    # this does have influence, but it is not a hard limit on the given expected values
+    # loss_func = SecondOrderSplitMSELoss(
+    #     height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     vel_weight=1.0,  # TODO: try this set to zero so that only position is used for loss
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    #     pos_expect=1e9,
+    #     vel_expect=1e9,
+    # )
+
+    # more influential, but not a hard limit
+    # loss_func = WeightedHuberLoss(
+    #     delta_pos=1e500,
+    #     delta_vel=1e500,
+    #     # height_idx=1,  # This changes for GRDTH frame
+    #     vel_indices=velocity_indicies,  # This changes for GRDTH frame
+    #     # vel_weight=1.0,
+    #     scaler=scaler_traj if use_scalar else None,
+    #     N_FEATURES=model_states,
+    #     weight_pos=1.0,
+    #     weight_vel=1.0,
+    # )
+    # early_stop_metric_name = "val_loss_unweighted"
+
+    # Define the Neural ODE model
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(
+            layer_channels=[5, 5],  # this doesn't do anything when using ODEfunc
+            # layer_activation=Activation.RELU,
+            # layer_activation=Activation.TANH,
+            layer_activation=Activation.SILU,
+        ),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(10, 0.5, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    # --------------------------------------------------------------------
+    #  Build the requested model
+    # --------------------------------------------------------------------
+    if model_type == "node":
+        # plain NODE (no augmentation, no order-shift)
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "anode":
+        # Augmented NODE – aug_dim comes from the CLI flag
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=aug_dim,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "sonode":
+        # Second-order NODE – shift the velocity slice left
+        # (the slice that selects the velocity components; adjust if you
+        # change the state ordering)
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=slice(3, 6),
+        ).to(node.device)
+    elif model_type in ("gruode", "gruode-min"):
+        # ------------------------------------------------------------
+        #  GRU-ODE forecaster (De Brouwer et al., 2019).
+        #  Bounded latent vector field; encode → ∫GRU-ODE → decode.
+        #  'gruode'     -> full GRU-ODE cell
+        #  'gruode-min' -> minimal GRU-ODE cell (fewer params)
+        # ------------------------------------------------------------
+        minimal = model_type == "gruode-min"
+        # Latent dimension: default to a comfortable lift above the physical
+        # state. nhidden controls the encoder/decoder MLP width.
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+
+        # --- Encoder-input selection (position-invariance experiment) --------
+        # Choose which state components feed the dynamics encoder. Absolute
+        # horizontal position is translation-variant and dynamically irrelevant;
+        # dropping it should improve generalization (and thus val position via
+        # the integrated velocity) without a pos/vel tradeoff.
+        #   "keep_alt"  : drop horizontal position, KEEP altitude + velocity
+        #   "vel_only"  : velocity only (SME proposal)
+        #   "all"       : original behaviour (full state)
+        ENCODER_INPUT_MODE = "all"   # "keep_alt"/"vel_only" tested WORSE than "all"
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            # state = [Down, Cross, Up(alt), dotD, dotC, dotU]
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [2, 3, 4, 5]        # Up + all velocities
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [3, 4, 5]           # velocities only
+            else:
+                enc_in_idx = None                # all 6
+        elif frame == "geodesic" and model_states == 5:
+            # integrated [s, h(alt), v_s, v_alpha, v_h]: keep_alt drops range s.
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        # drop s (range); keep h + rates
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           # rates only
+            else:
+                enc_in_idx = None
+        elif frame == "grdth":
+            # state = [GR, Down, dotGR, dotD, VTheta]; Down is altitude-like.
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        # drop GR (horizontal range)
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           # rates only
+            else:
+                enc_in_idx = None
+        else:
+            enc_in_idx = None
+
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=minimal,
+            encoder_input_idx=enc_in_idx,
+        ).to(node.device)
+        if frame == "dcu":
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 6:
+            # 6-state "original" geodesic pairs like DCU
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            # 5-state "integrated" frame trick [s, h, v_s, v_alpha, v_h]:
+            # s(0) integrates v_s(2); h(1) integrates v_h(4); v_alpha(3) is an
+            # azimuth RATE with no paired position -> left to the network.
+            # Note the NON-CONTIGUOUS vel pairing [2,4]; the constraint code
+            # gathers by index so this is handled correctly.
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]      # idx 4 (VTheta) left to the network
+        else:
+            pos_idx, vel_idx = None, None          # constraint off
+
+        # Scaler stats for the scaled-space second-order correction. The model
+        # operates in StandardScaler-scaled units, so d/dt(pos)=vel must be
+        # expressed as xdot_s[pos] = (sigma_vel/sigma_pos)*vel_s + mu_vel/sigma_pos.
+        # Without these, the constraint is dimensionally wrong (see _field).
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
+        # Soft-constraint correction magnitude. 0.0 = hard constraint (position
+        # is purely the velocity integral -> val_pos_err plateaus once velocity
+        # stops improving). Small positive alpha lets the network add a bounded
+        # position-derivative correction so it can pull position back toward
+        # truth. Start ~0.1 (scaled units); sweep 0.05-0.3. Set 0.0 to A/B
+        # against the current hard-constraint result.
+        SO_CORRECTION_ALPHA = 0.3
+
+        # Train/deploy field parity (reviewer R1). "central" makes the trained
+        # field identical to the ONNX/deployed field (removes the JVP-vs-FD
+        # mismatch on the position-derivative correction). "jvp" = exact,
+        # train-only. Experiment plan: A/B (alpha=0.1, "central") vs
+        # (alpha=0.0, "central") first; the latter is the pure hard constraint
+        # with guaranteed parity.
+        FIELD_METHOD = "central"
+
+        # Heun/midpoint position correction (aero review item A). When True, the
+        # position derivative gets the structural +1/2*dt*a term so the deployed
+        # single-step Euler is second-order accurate on position (kills the
+        # 1/2*a*dt^2 curvature bias that accumulates over the horizon). This is
+        # the principled replacement for the generic alpha*tanh nudge. Experiment
+        # plan: A/B (heun=True, alpha=0.0) vs your current (heun=False,
+        # alpha=0.1). dt here MUST be the DEPLOYMENT step used by the tracker.
+        HEUN_CORRECTION = True
+        DEPLOY_DT = trajectory_dt  # set to the tracker's extrapolation dt if it differs
+
+        node.model = GRUODELatentModel(
+            func=gruode_func, solver=ode_solver, aug_dim=aug_dim,
+            pos_idx=pos_idx, vel_idx=vel_idx,
+            pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
+            so_correction_alpha=SO_CORRECTION_ALPHA,
+            field_method=FIELD_METHOD,
+            dt=DEPLOY_DT,
+            heun_correction=HEUN_CORRECTION,
+        ).to(node.device)
+        # Optional JIT compilation of the field for extra GPU throughput.
+        # Opt-in via NEXT_COMPILE=1 because torch.compile can interact with the
+        # solver's autograd path (especially adjoint) and the forward-mode JVP;
+        # we use mode="reduce-overhead" (CUDA graphs) and fall back silently if
+        # the backend can't trace the graph on this torch/driver combo.
+        if HAVE_GPU and os.environ.get("NEXT_COMPILE", "0") == "1":
+            try:
+                node.model = torch.compile(node.model, mode="reduce-overhead", fullgraph=False)
+                print("torch.compile enabled for GRU-ODE field (reduce-overhead)")
+            except Exception as e:
+                print(f"torch.compile unavailable, running eager: {e}")
+        # The GRU-ODE forecaster outputs a physical-state trajectory directly,
+        # so the existing physical-space loss (WrappedMSELoss, already assigned
+        # to loss_func above) applies unchanged. The structural boundedness of
+        # the latent state supplies the trajectory-stabilisation prior that
+        # otherwise required an explicit boundary penalty.
+        #
+        # Optional: couple a light physical boundary / energy penalty by
+        # swapping loss_func for EnergyMSELoss above — the GRU-ODE recon is a
+        # drop-in target for any of the existing loss wrappers.
+    elif model_type == "latentode":
+        # ------------------------------------------------------------
+        #  Latent-ODE model – a completely different object
+        # ------------------------------------------------------------
+        # Encoder/Decoder expect a *state size* of 6 (or whatever you use).
+        # They are already defined above (Encoder, Decoder, LatentODEFunc,
+        # LatentNODE).  We just instantiate the wrapper.
+        latent_dim = nhidden // 2 if nhidden >= 20 else 8  # a sensible default
+        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
+
+        # For latent ODE we need a **different loss** that adds the KL term.
+        # Keep the same MSE wrapper you already use for the physical states.
+        recon_criterion = WrappedMSELoss(
+            height_idx=1,
+            vel_indices=[3, 4, 5],
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+        )
+
+        def latent_ode_loss_fn(recon, target, mu, logvar):
+            """Reconstruction (MSE) + KL."""
+            recon_loss = recon_criterion(recon, target)
+            kl = _kl_divergence(mu, logvar)
+            # You may weight the KL term; 0.1 works well for many problems.
+            return recon_loss + 0.1 * kl
+
+        # Replace the NODEPredictor's loss with our custom wrapper.
+        # NOTE: NODEPredictor expects a callable that takes (pred, true).
+        # We therefore bind the extra arguments via a lambda.
+        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
+
+    # Train the model if it does not exist
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
+        ]
+        scaled_traj_targets_test_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
+        ]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+    gen_model = False
+    try:
+        # Try loading the specific requested model
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
+        pass
+
+    if gen_model:
+        # did not find a model to load. creating a new one
+
+        # Model file not found. Train and create it
+        # node._log_metrics = new_log_metrics.__get__(node)
+        # try:
+        #     node.model.compile()  # this resulted in slower epochs on cpu
+        #     print("successfully compile the nn")
+        # except Exception as e:
+        #     print("failed to compile the nn due to", e)
+
+        if model_type == "latentode":
+            # Choose a short window (e.g. 10 time-steps).  You can expose this
+            # as another CLI argument if you wish.
+            OBS_WINDOW = 10
+
+            train_data = [
+                _make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel
+            ]  # list of (obs_window, target)
+            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
+            # reshape for NODEPredictor: it expects a list of tensors.
+            # We will pack the tuple into a single tensor where the first two
+            # dimensions are (B, K/ T) and let the model unpack them.
+            # The simplest approach is to keep them as tuples and let the
+            # training loop handle them.
+            # → In the `node.fit` call below replace `fraction_of_data` /
+            #   `fraction_of_data_val` with these lists.
+
+        # length strategies is a trick from NODE literature to initialize the model on shorter time frames
+        #
+        # Early-stopper tuning for the mini-batched (noisy) regime:
+        #   * min_delta must sit ABOVE the val_loss noise floor. With ~2-6
+        #     batches/epoch the val_loss bounces ~+/-0.02-0.05; the old
+        #     min_delta=5e-6 treated a 0.000005 non-improvement as a strike, so
+        #     runs early-stopped on pure noise (the after-run died at ~57 epochs
+        #     while still improving). 1e-2 lets normal bounces pass.
+        #   * patience must be LARGE enough to (a) ride out noisy non-improving
+        #     epochs and (b) exceed the ReduceLROnPlateau patience so the LR gets
+        #     to drop and help BEFORE the stopper fires. The scheduler (applied
+        #     on the 1.0 stages) uses patience = early_stop_patience // 2, so an
+        #     early-stop patience of 60 gives the scheduler (~30) a full cycle
+        #     plus recovery room before stopping.
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-3),
+            # TODO: get rid of this one when the ReduceOnPlateau lr scheduler is working
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+        for len_strat in length_strategies:
+            print("running length strategy", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+            # update the training configuration for the new length strategy
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs,
+                optimizer=AdamOptimizer(learning_rate=learning_rate),
+                # optimizer=ReduceLROnPlateauConfiguration("loss").create_from_optimizer(
+                #     torch.optim.Adam(node.parameters(), learning_rate)
+                # ),
+                # optimizer=torch.optim.lr_scheduler.ReduceLROnPlateau(
+                #     torch.optim.Adam(node.parameters(), learning_rate)
+                # ),
+                batch_size=batch_size,
+                num_workers=2,  # is this the parallel control? cpu_count()//2?
+                verbose=True,
+            )
+
+            # manually re-initialize some of the neural_ode object things. copied from NODEPredictor.__init__
+            # Parse parameters from the training configuration.
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+
+            # Set the iteration parameter for required optimizers.
+            node.training_metrics = {}
+
+            # Setup the model for training and inference.
+            node._initialize_optimizer()
+
+            # reset the early stop check
+            node.early_stopper = early_stopper
+            # node.early_stopper = None
+
+            min_states = 5
+            if math.ceil(scaled_traj_targets_train_posvel[0].shape[0] * data_fraction) < min_states:
+                print("length strategy results in too few states. overriding to maintain stability")
+            if model_type == "latentode":
+                # each element is a tuple (obs_window, target)
+                fraction_of_data = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],  # obs_window
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
+                    )  # target
+                    for (obs, tgt) in train_data
+                ]
+                fraction_of_data_val = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
+                    )
+                    for (obs, tgt) in test_data
+                ]
+            else:
+                # existing behaviour (plain NODE/ANODE/SONODE)
+                fraction_of_data = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_train_posvel
+                ]
+                fraction_of_data_val = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_test_posvel
+                ]
+
+            # torch.autograd.set_detect_anomaly(True)  # the magic command to look into the guts of torch
+            metrics = node.fit(
+                x=fraction_of_data,
+                validation_data=fraction_of_data_val,
+                # validation_data=fraction_of_data,
+                enable_checkpoints=True if data_fraction == 1.0 else False,
+            )
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
+
+    # load the saved checkpoint model
+    node.load(directory=model_save_path, model_name=model_name)
+
+    # disable training mode on the model
+    node.model.train(False)
+    node.model.eval()
+
+    # TODO: move this conversion to a separate script
+    # export the model to ONNX binary (protobuf) format
+    #
+    # For GRU-ODE we export through GRUODEFieldForONNX, which exposes the induced
+    # physical-space field ẋ = f(x) WITHOUT any autograd JVP (it uses a central
+    # finite difference through the decoder). This is required because the
+    # torch.export-based ONNX exporter cannot trace autograd.functional.jvp /
+    # torch.func.jvp (it fails with "unbacked symbol" AssertionErrors). The
+    # adapter takes a single tensor and returns the physical derivative, the
+    # same contract the sim and other NODE exports use.
+    #
+    # Unwrap torch.compile (if enabled) to get the raw module before export.
+    raw_model = getattr(node.model, "_orig_mod", node.model)
+    if isinstance(raw_model, GRUODELatentModel):
+        # Pull the second-order config (and its scaled-space correction stats)
+        # off the constructed model so this works regardless of whether the
+        # model was just built or loaded from disk, and regardless of the local
+        # pos_idx/vel_idx scope.
+        if getattr(raw_model, "second_order", False):
+            _pos_idx = raw_model.pos_idx.tolist()
+            _vel_idx = raw_model.vel_idx.tolist()
+            _pos_scale = raw_model.so_ratio is not None and getattr(raw_model, "scaled_space", False)
+            if getattr(raw_model, "scaled_space", False):
+                # reconstruct the per-block sigma/mu the adapter needs from the
+                # ratio/offset buffers is lossy; instead re-derive from scaler.
+                _ps = scaler_traj.scale_[_pos_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vs = scaler_traj.scale_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+                _vm = scaler_traj.mean_[_vel_idx] if isinstance(scaler_traj, StandardScaler) else None
+            else:
+                _ps = _vs = _vm = None
+        else:
+            _pos_idx = _vel_idx = None
+            _ps = _vs = _vm = None
+        # carry the soft-correction alpha, deployment dt, and Heun flag off the
+        # trained model so the exported field is identical to what was trained
+        _alpha = getattr(raw_model, "so_correction_alpha", 0.0)
+        _dt = getattr(raw_model, "dt", trajectory_dt)
+        _heun = getattr(raw_model, "heun_correction", False)
+        export_model = GRUODEFieldForONNX(
+            raw_model.func, state_vector_len=model_states, aug_dim=aug_dim,
+            pos_idx=_pos_idx, vel_idx=_vel_idx,
+            pos_scale=_ps, vel_scale=_vs, vel_mean=_vm,
+            so_correction_alpha=_alpha,
+            dt=_dt,
+            heun_correction=_heun,
+        ).to(node.device).eval()
+        example_input = torch.cat(
+            (scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))
+        ).to(node.device)
+    elif isinstance(ode_solver, TorchdiffeqSolver):
+        export_model = node.model
+        example_input = (
+            None,
+            torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device),
+        )
+    else:
+        export_model = node.model
+        example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    model_onx = torch.onnx.export(
+        export_model,
+        example_input,
+        os.path.join(model_save_path, model_name + ".onnx"),
+        export_params=True,
+        opset_version=18,  # 18 is the max we can go do right now. 17 is max w/o dynamo. https://onnxruntime.ai/docs/reference/compatibility.html#onnx-opset-support
+        external_data=False,
+        input_names=["input"],
+        output_names=["output"],
+        # dynamo=False,
+    )
+
+    # export the model to ONNX plain text format
+    with open(
+        os.path.join(model_save_path, model_name + "_plain.onnx"),
+        "w",
+    ) as f:
+        f.write(onnx.printer.to_text(model_onx.model_proto))  # This is plain text
+
+    # export the scalar to ONNX format
+    # NOTE: slk2onnx does not support the inverse transform call that NEXT needs
+    # onx = to_onnx(
+    #     scaler_traj,
+    #     traj_targets_train[0].numpy(),
+    #     target_opset=18,
+    # )
+    # print(type(onx))
+    # with open(
+    #     os.path.join(model_save_path, model_name + "_scalar.onnx"),
+    #     "wb",
+    # ) as f:
+    #     f.write(onx.SerializeToString())  # This is a protobuf format
+    # with open(
+    #     os.path.join(model_save_path, model_name + "_scalar_plain.onnx"),
+    #     "w",
+    # ) as f:
+    #     f.write(onnx.printer.to_text(onx))  # This is plain text
+
+    # save a protobuf text file of the scalar
+    if isinstance(scaler_traj, MinMaxScaler):
+        min_input = scaler_traj.min_
+        scale_input = scaler_traj.scale_
+        data_min_input = scaler_traj.data_min_
+        data_max_input = scaler_traj.data_max_
+
+        with open(
+            os.path.join(
+                model_save_path,
+                f"{model_name}_scalar_params_and_test_inputs.txt",
+            ),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            for m, s, dmin, dmax in zip(min_input, scale_input, data_min_input, data_max_input):
+                f.write(f"""InputScaleFactorsMinMaxScaler
+{{
+\tMin: {m}
+\tScale: {s}
+\tDataMin: {dmin}
+\tDataMax: {dmax}
+}}""")
+    elif isinstance(scaler_traj, StandardScaler):
+        scale_input = scaler_traj.scale_
+        mean_input = scaler_traj.mean_
+        var_input = scaler_traj.var_
+
+        with open(
+            os.path.join(
+                model_save_path,
+                f"{model_name}_scalar_params_and_test_inputs.txt",
+            ),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            for s, m, v in zip(scale_input, mean_input, var_input):
+                f.write(f"""InputScaleFactorsStandardScaler
+{{
+\tScale: {s}
+\tMean: {m}
+\tVariance: {v}
+}}""")
+    return node, model_name
+
+
+def prep_trajectory(x):
+    # load_single_truth(x, debug=False), x.name, args.sr, path
+    ecef_data, traj_number, max_sr, trajectory_dt, args = x
+    # keep time, pos, vel. don't need the rest of the columns
+    ecef_data = ecef_data[:, 0:7]
+    print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+
+    # remove launch point based on near zero speed state
+    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        ecef_data = ecef_data[1:]
+
+   
+    sr_ecef_data = np.asarray(
+        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
+        # tuple(x for x in ecef_data if 2500e3 < np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
+        dtype=np.float64,
+    )
+    # TODO: add a min slant range to avoid the origin discontinuity
+    # sr_ecef_data = np.asarray(
+    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
+    #     dtype=np.float64,
+    # )
+
+    # nice idea, but it wasn't the source of the problem
+    # filter the points by only those above the horizon. Work from impact backwards.
+    # def while_gen_backward_up(data):
+    #     for x in reversed(data):
+    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
+    #             yield x
+    #         else:
+    #             break
+
+    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
+
+    # TODO: move this to a trajectory time check helper function file
+    # check the time rate of the data
+    # diff the time column, run unique, print that if there is more than 1 unique
+    if sr_ecef_data.shape[-1] < 5:
+        print(f"{traj_number} does not have enough time stamps for this slant range")
+        return None, None
+    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
+    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
+    if np.any(time_diff < 0):
+        raise ValueError(
+            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
+        )
+
+    # TODO: this resampling needs to move into a function so it can reused
+    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
+    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
+
+    try:
+        resampled_sr_ecef_data = np.hstack(
+            [np.atleast_2d(new_times).T]
+            + [
+                make_interp_spline(
+                    sr_ecef_data[:, 0],
+                    sr_ecef_data[:, 1:],
+                    bc_type="not-a-knot",
+                )(new_times, extrapolate=True)
+            ]
+        )
+        # for when resampling of the truth data is not desired
+        # resampled_sr_ecef_data = sr_ecef_data
+    except Exception as e:
+        print(f"warning: {traj_number} had the error with interpolation")
+        raise e
+
+    if args.frame == "grdth":
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
+
+        # check the inverse transform
+        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
+    elif args.frame == "geodesic":
+        # convert to geodesic frame relative to the impact point
+        next_frame_data = ecef_to_local_geodesic_vec(
+            resampled_sr_ecef_data[:, POS_SLICE],
+            resampled_sr_ecef_data[:, VEL_SLICE],
+            np.zeros_like(
+                resampled_sr_ecef_data[:, VEL_SLICE]
+            ),  # TODO: better handling of acceleration being in the transform functions
+            ref_ecef,
+        )
+        # Prepend time and only include pos and vel
+        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
+        
+    elif args.frame == "dcu":
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
+
+        # check the inverse transform
+        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
+    else:
+        raise NotImplementedError("That frame is not supported yet")
+    # closeness_check
+    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
+    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
+    # print(f"MSE round-trip position: {pos_err:.3e}")
+    # print(f"MSE round-trip velocity: {vel_err:.3e}")
+
+    # add column for traj number
+    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
+
+    # add columns for ECEF reference point (12, 13, 14)
+    # TODO: stop doing this to save some RAM and use a metadata attribute
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
+
+    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
+    #     print(next_frame_data)
+    # np.savetxt(
+    #     "grdth_" + traj_number,
+    #     next_frame_data,
+    #     delimiter=",",
+    #     # header=",".join(header_row),
+    #     comments="",
+    #     fmt="%.8f",
+    # )
+
+    return next_frame_data, traj_number
+
+
+def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
+    # tempory piece of code for the phase SBI modeling
+    boost_ecef = []
+    glide_ecef = []
+    dest_ecef = []
+    target_path = Path(path)
+    for phase in ["boost", "glide", "impact"]:
+        phase_path = target_path / phase
+
+        # create a list of the files that need to be loaded
+        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
+
+        if len(traj_files) == 0:
+            raise ValueError("bad target path", path)
+
+        # create a tuple with the data plus metadata
+        # TODO: Turn this into an object rather than a tuple
+        traj_targets = []  # list of tuples (ecef traj tables data loaded from truth files, traj_number/filename)
+        traj_targets = [
+            load_single_truth(
+                x,
+                debug=False,
+                low_memory=not HAVE_HIGH_MEMORY,
+                memory_map=HAVE_HIGH_MEMORY,
+                min_state_vector_size=7,
+            )
+            for x in traj_files
+        ]
+        if phase == "boost":
+            boost_ecef = traj_targets
+        elif phase == "glide":
+            glide_ecef = traj_targets
+        elif phase == "impact":
+            dest_ecef = traj_targets
+        else:
+            raise NotImplementedError("That phase is not handled yet.")
+
+    if not do_prep:
+        # return data in ECEF frame
+        return list(
+            zip(
+                list(zip(boost_ecef, glide_ecef, dest_ecef)),
+                [x.name for x in traj_files],
+            )
+        )  # this return is here for the temporary SBI support
+        return list(zip(traj_targets, [x.name for x in traj_files]))
+
+    # multiprocessed trajectory prep (the output is ordered like the input)
+    cpu_count = psutil.cpu_count(logical=False)
+    if cpu_count is None:
+        cpu_count = mp.cpu_count()
+    print(f"there are {cpu_count} cpus being used for trajectory prep")
+    with mp.Pool(processes=cpu_count) as pool:
+        tmp_data = pool.map(prep_trajectory, traj_targets)
+    # single threaded, but single line
+    # tmp_data = map(prep_trajectory, traj_targets)
+    # single threaded, but one at a time
+    # tmp_data = []
+    # for x in traj_targets[7:]:
+    #     tmp_data.append(prep_trajectory(x))
+    #     exit(0)
+
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+
+    # check if all of the trajectories are much shorter than the asked for bucket
+    # if not use_grdth:
+    #     if all((np.linalg.norm(x[0, POS_SLICE] - x[-1, POS_SLICE]) < args.sr - BUCKET_SIZE for x, _ in tmp_data)):
+    #         print(
+    #             f"All trajectories are shorter than the SR ({args.sr}) minus bucket size ({BUCKET_SIZE}). Skipping making this model"
+    #         )
+    #         exit()
+
+    print("post-prep. how many made it though prep", len(traj_targets))
+    return tmp_data
+
+
+def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
+    # scale the trajectories
+    def find_traj_targets_minmax(
+        traj_targets: list[torch.Tensor],
+    ) -> np.ndarray:
+        """Finds the main and max values in the list of the trajectories."""
+        traj_targets_min = torch.min(
+            torch.Tensor([torch.min(i, dim=0).values.tolist() for i in traj_targets]),
+            dim=0,
+        ).values.tolist()
+        traj_targets_max = torch.max(
+            torch.Tensor([torch.max(i, dim=0).values.tolist() for i in traj_targets]),
+            dim=0,
+        ).values.tolist()
+        return np.array([traj_targets_min, traj_targets_max])
+
+    # traj_targets_minmax = find_traj_targets_minmax(traj_targets_train_posvel)
+    # scaler_traj = MinMaxScaler(feature_range=(-1, 1))
+    # scaler_traj.fit(traj_targets_minmax)
+    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
+    scaler_traj = StandardScaler().fit(stacked_posvel)
+
+    # pickle the scaler
+    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
+    with open(pickle_scalar_name, "wb") as o:
+        pickle.dump(scaler_traj, o)
+    return scaler_traj
+
+
+def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
+    """
+    Plot the distribution of each column of a 2-D array in its own subplot.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2-D array of shape (n_samples, n_columns).
+    bins : int or sequence, optional
+        Number of histogram bins (default 30).  Pass a sequence to specify
+        custom bin edges for all columns.
+    cmap : str, optional
+        Matplotlib colormap name used to assign a distinct color to each subplot.
+    """
+    if data.ndim != 2:
+        raise ValueError("`data` must be a 2-D array (samples x columns).")
+
+    n_cols = data.shape[1]
+
+    # Choose a layout that keeps subplots readable.
+    # Up to 5 columns → a single row, otherwise wrap to multiple rows.
+    max_per_row = 5
+    n_rows = int(np.ceil(n_cols / max_per_row))
+    n_cols_plot = min(n_cols, max_per_row)
+
+    # Create subplots
+    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
+
+    # If there is only one row, `axes` is 1-D; make it 2-D for consistent indexing.
+    if n_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    colors = plt.get_cmap(cmap).colors
+
+    for idx in range(data.shape[1]):
+        row = idx // max_per_row
+        col = idx % max_per_row
+        ax = axes[row, col]
+
+        # Plot histogram - `density=True` gives a probability density (area = 1)
+        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
+
+        if column_names is None:
+            ax.set_title(f"Column {idx}")
+        else:
+            ax.set_title(column_names[idx])
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Density")
+        # Each axis gets its own y-scale automatically
+
+    # Hide any unused sub-axes (when columns < rows*max_per_row)
+    total_plots = n_rows * n_cols_plot
+    for empty_idx in range(data.shape[1], total_plots):
+        row = empty_idx // max_per_row
+        col = empty_idx % max_per_row
+        fig.delaxes(axes[row, col])
+
+    plt.suptitle("Column-wise Distributions", fontsize=16, y=1.02)
+    # plt.show()
+    plt.savefig(data_path + "_feature_distribution.png")
+
+
+def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
+    """
+    Visualise the correlation matrix of the columns.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        2-D array (samples x columns).
+    method : str, optional
+        Correlation method passed to ``np.corrcoef`` - ``'pearson'`` (default)
+        or ``'spearman'`` (requires scipy.stats.spearmanr).
+    cmap : str, optional
+        Colormap for the heat-map.
+    """
+    if data.ndim != 2:
+        raise ValueError("`data` must be a 2-D array (samples x columns).")
+
+    # ------------------------------------------------------------------
+    # Compute correlation matrix
+    # ------------------------------------------------------------------
+    if method == "pearson":
+        corr = np.corrcoef(data, rowvar=False)  # shape (n_cols, n_cols)
+    elif method == "spearman":
+        from scipy.stats import spearmanr
+
+        corr, _ = spearmanr(data, axis=0)
+    else:
+        raise ValueError("Unsupported method; choose 'pearson' or 'spearman'.")
+
+    # ------------------------------------------------------------------
+    # Plot heat-map
+    # ------------------------------------------------------------------
+    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
+    sns.heatmap(
+        corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5
+    )
+    labels = [f"Col {i}" for i in range(corr.shape[0])]
+    if column_names is not None:
+        labels = column_names
+    plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
+    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.tight_layout()
+    # plt.show()
+    plt.savefig(data_path + "_correlation_matrix.png")
+
+
+def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
+    # input is a tuple of three 2d arrays with columns time, x, y, z, vx, vy, vz
+    # phase_to_transform selects with phase to transform
+    # the impact point is also availble if needed for the transform
+    # if there are mulptiple timestamps, resample the data to align to a common time grid
+    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
+    if timeseries_to_transform.shape[0] < 10:
+        print(
+            "the shape of the timeseries to be transformed seems small. skipping this one",
+            timeseries_to_transform.shape,
+            timeseries_to_transform[-1],
+        )
+        return None
+    new_times = np.arange(
+        timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt
+    )
+    resampled_timeseries = np.hstack(
+        [np.atleast_2d(new_times).T]
+        + [
+            make_interp_spline(
+                timeseries_to_transform[:, TIME_INDEX],
+                timeseries_to_transform[:, 1:],
+                bc_type="not-a-knot",
+            )(new_times, extrapolate=True)
+        ]
+    )
+
+    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
+
+    # Changing the reference frame to be at the end of the desired phase rather than impact
+    if args.ref_ecef == "boost":
+        ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
+    elif args.ref_ecef == "glide":
+        ref_ecef = ecef_data_traj[1][-1, POS_SLICE]
+
+    # now apply a transform
+    if args.frame == "dcu":
+        # convert ecef truth to the training frame
+        timeseries_in_next_frame, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
+
+        # check the inverse transform
+        check_ecef = next_dcu_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading, flip_c)
+    elif args.frame == "grdth":
+        # convert ecef truth to the training frame
+        timeseries_in_next_frame, initial_point_heading = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
+
+        # check the inverse transform
+        check_ecef = next_grdth_to_ecef(timeseries_in_next_frame, ref_ecef, initial_point_heading)
+    elif args.frame == "geodesic":
+        # Two geodesic modes (see --geodesic-mode):
+        #   original   -> 6-state [s, az, h, v_s, v_alpha, v_h] (azimuth in state)
+        #   integrated -> 5-state [s, h, v_s, v_alpha, v_h] (azimuth dropped; the
+        #                 "frame trick": track azimuth RATE, better conditioned)
+        if getattr(args, "geodesic_mode", "original") == "original":
+            timeseries_in_next_frame = ecef_to_local_geodesic_vec(
+                resampled_timeseries[:, POS_SLICE],
+                resampled_timeseries[:, VEL_SLICE],
+                np.zeros_like(
+                    resampled_timeseries[:, VEL_SLICE]
+                ),  # TODO: better handling of acceleration being in the transform functions
+                ref_ecef,  # grab the impact point as the reference ecef point
+            )
+            # Prepend time; keep pos+vel (6 cols). DCU/GRDTH handle time internally.
+            timeseries_in_next_frame = np.hstack(
+                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
+            )
+        else:  # integrated
+            timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
+                resampled_timeseries[:, POS_SLICE],
+                resampled_timeseries[:, VEL_SLICE],
+                ref_ecef,
+            )
+            # 5-state result [s, h, v_s, v_alpha, v_h]; prepend time.
+            timeseries_in_next_frame = np.hstack(
+                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state]
+            )
+        # TODO: add check_ecef
+    else:
+        raise NotImplementedError("haven't gotten to adding this frame transform code for SBI")
+
+    # output is a 2d array with the same columns
+    return timeseries_in_next_frame
+
+
+class GRUODEFieldForONNX(torch.nn.Module):
+    def __init__(
+        self,
+        func,                 # GRUODEFunc
+        state_vector_len: int,
+        aug_dim: int = 0,
+        eps: float = 1e-4,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        so_correction_alpha: float = 0.0,
+        dt: float = 0.1,
+        heun_correction: bool = False,
+    ):
+        super().__init__()
+        self.func = func
+        self.state_vector_len = state_vector_len
+        self.aug_dim = aug_dim
+        self.eps = eps
+        self.so_correction_alpha = float(so_correction_alpha)
+        self.dt = float(dt)
+        self.heun_correction = bool(heun_correction)
+        self.second_order = pos_idx is not None and vel_idx is not None
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            # Must mirror GRUODELatentModel's scaled-space correction exactly,
+            # or the exported field disagrees with the trained field.
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.aug_dim > 0 and x.shape[-1] > self.state_vector_len:
+            x_phys = x.narrow(-1, 0, self.state_vector_len)
+        else:
+            x_phys = x
+        h = self.func.encode(x_phys)
+        dh = self.func.cell(0.0, h)
+        x_plus = self.func.decode(h + self.eps * dh)
+        x_minus = self.func.decode(h - self.eps * dh)
+        xdot = (x_plus - x_minus) / (2.0 * self.eps)
+        if self.second_order:
+            vel_now = x_phys.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            if self.heun_correction:
+                # mirror GRUODELatentModel._field's Heun term exactly
+                accel_s = xdot.index_select(-1, self.vel_idx)
+                if getattr(self, "scaled_space", False):
+                    pos_deriv = pos_deriv + 0.5 * self.dt * self.so_ratio * accel_s
+                else:
+                    pos_deriv = pos_deriv + 0.5 * self.dt * accel_s
+            if self.so_correction_alpha > 0.0:
+                # mirror the soft correction exactly
+                decoder_pos_deriv = xdot.index_select(-1, self.pos_idx)
+                pos_deriv = pos_deriv + self.so_correction_alpha * torch.tanh(decoder_pos_deriv)
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+        return xdot
+
+
+def augment_trajectory_segments(
+    traj_list,
+    segments_per_traj: int = 5,
+    min_segment_len: int = 12,
+    keep_full: bool = True,
+):
+    """Trajectory-segment augmentation for the small-data (few-trajectory) regime.
+
+    From each (T, D) trajectory, emit several sub-trajectories that start at
+    different offsets along it. This multiplies the effective sample count and,
+    more importantly, teaches the dynamics to propagate from MANY initial
+    conditions (arbitrary mid-glide states) rather than only the handful of
+    launch states -- which is what a 96-trajectory training set otherwise
+    limits the model to.
+
+    Design choices (see conversation): SLIDING-WINDOW offsets (deterministic /
+    reproducible, even coverage -- important since the rest of the pipeline is
+    seeded and we want run-to-run comparability), the FULL trajectory always
+    kept (augmentation is purely additive, never destructive), and a minimum
+    segment length so the length-strategy curriculum (which further slices from
+    the front) can't drive a segment below the usable floor.
+
+    Segments stay in the ORIGINAL frame (NOT re-referenced to their own start):
+    a mid-trajectory segment legitimately begins at a large position offset,
+    and batch_loss uses that first point as the true IC -- exactly the
+    "propagate from an arbitrary state" signal we want, and consistent with how
+    the sim integrates.
+
+    IMPORTANT: apply to TRAINING data only. Never augment validation (keep it as
+    held-out full trajectories so val metrics remain comparable across runs).
+    Also fit the scaler on the ORIGINAL (un-augmented) data so overlapping
+    segments don't reweight the normalisation statistics.
+
+    Args:
+        traj_list: list of (T, D) tensors (training trajectories).
+        segments_per_traj: target number of segments per trajectory INCLUDING
+            the full one. ~5-6 is the sweet spot for ~100 trajectories: enough
+            new initial conditions to matter, not so much overlap that highly
+            correlated segments inflate size without diversity.
+        min_segment_len: shortest segment (in timesteps) to emit.
+        keep_full: always include the untouched full trajectory.
+
+    Returns:
+        A new, longer list of (T_i, D) tensors.
+    """
+    out = []
+    for traj in traj_list:
+        T = traj.shape[0]
+        if keep_full:
+            out.append(traj)
+        # how many ADDITIONAL offset segments to add
+        n_extra = max(0, segments_per_traj - (1 if keep_full else 0))
+        if n_extra == 0 or T <= min_segment_len:
+            continue
+        # evenly spaced start offsets across the first ~70% of the trajectory,
+        # so each segment still has a meaningful remaining horizon to learn from.
+        last_start = max(1, int(0.7 * T))
+        # guard: don't start so late the segment is shorter than the minimum
+        last_start = min(last_start, T - min_segment_len)
+        if last_start < 1:
+            continue
+        for k in range(1, n_extra + 1):
+            start = int(round(k / (n_extra + 1) * last_start))
+            if start < 1:
+                start = 1
+            seg = traj[start:]
+            if seg.shape[0] >= min_segment_len:
+                out.append(seg)
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Training script for creating NEXT models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--tgt-data-paths",
+        default=[],
+        type=str,
+        nargs="+",
+        help="A list of directories where training data can be found. Data will be test/train split if validation data is not provided. It is suggested thet the final directory in the path be named for the target. ",
+    )
+    parser.add_argument(
+        "--validation-data-paths",
+        default=[],
+        type=str,
+        nargs="+",
+        help="A list of directories where validation data can be found. Helpful for when the test/train split has already been done. ",
+    )
+    # parser.add_argument("--max-epoch", default=50, type=int)
+    parser.add_argument(
+        "--sr",
+        default=100000,
+        type=int,
+        help="The maximum slant range to trim data at. All data less than this value will be used. [meters]",
+    )
+    parser.add_argument(
+        "-o",
+        default="model_outputs",
+        type=str,
+        help="Directory to place pickles, JSON, checkpoints, ModelProto, and ONNX files related to the model",
+    )
+    parser.add_argument(
+        "--use-scalar",
+        default=False,
+        action="store_true",
+        help="Enable training with a scalar",
+    )
+    parser.add_argument(
+        "--frame",
+        default="dcu",
+        choices=["dcu", "grdth", "geodesic"],
+        help="Select which frame to put the data in for training the model",
+    )
+    parser.add_argument(
+        "--geodesic-mode",
+        default="original",
+        choices=["original", "integrated"],
+        help=(
+            "Geodesic frame mode: 'original' keeps azimuth in state (6-state "
+            "[s,az,h,v_s,v_alpha,v_h]); 'integrated' drops azimuth and tracks "
+            "azimuth rate (5-state [s,h,v_s,v_alpha,v_h], the 'frame trick')."
+        ),
+    )
+    parser.add_argument(
+        "--sbi-phase",
+        default="boost",
+        choices=["boost", "glide"],
+        help="Select which SBI phase to train a model for",
+    )
+    parser.add_argument(
+        "--nhidden",
+        default=200,
+        type=int,
+        help="The size of the hidden layers of the MLP/FFNN",
+    )
+    parser.add_argument(
+        "--aug",
+        default=0,
+        type=int,
+        help="The size of the zeros augmented to the initial states",
+        dest="aug_dim",
+    )
+    parser.add_argument(
+        "--gpuidx",
+        default=0,
+        type=int,
+        help="The index of the gpu to use",
+        dest="gpu_index",
+    )
+    parser.add_argument(
+        "--model-type",
+        default="node",
+        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min"],
+        help="Which ODE architecture to train: regular NODE, Augmented NODE, Second-Order NODE, Latent-ODE, GRU-ODE, or minimal GRU-ODE.",
+    )
+    parser.add_argument(
+        "--dt",
+        default=0.1,
+        type=float,
+        help="The delta time to use for resampling the truth trajectory to align the time grid",
+    )
+    parser.add_argument(
+        "--ref-ecef",
+        default="impact",
+        choices=["boost", "glide", "impact"],
+        help="The reference point for the frame transformations",
+    )
+    
+    args = parser.parse_args()
+
+    model_states = 6  # this is 6 for ImpAntiHeadDCU and 5 for GRDTH
+    if args.frame == "grdth":
+        model_states = 5
+    elif args.frame == "geodesic" and args.geodesic_mode == "integrated":
+        # The "frame trick": integrated geodesic drops absolute azimuth and
+        # tracks azimuth rate -> 5-state [s, h, v_s, v_alpha, v_h]. (This
+        # resolves the long-standing "geodesic should also be 5" TODO.)
+        model_states = 5
+
+    trajectory_dt = args.dt  # [s]
+
+    seed = 47
+    # random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    target_strs = [Path(x).name for x in args.tgt_data_paths]
+    model_name_target_str = "+".join(target_strs)
+    model_path = args.o
+    model_save_path = os.path.join(model_path, model_name_target_str)
+
+    # Batch size trades gradient noise (regularizing, helped escape the original
+    # single-batch plateau) against loss whipsaw (which was tripping the early
+    # stopper prematurely at ~57 epochs). With ~96 training trajectories:
+    #   16 -> ~6 batches/epoch (noisy, whipsaws val_loss)
+    #   48 -> ~2 batches/epoch (smoother, keeps a little regularizing noise)
+    #   96+ -> single full batch (smoothest/deterministic, no noise regulariser)
+    # 48 is the sweet spot for this dataset; raise toward full-batch only if the
+    # loss is still too noisy after the early-stopper change below.
+    batch_size = 16
+    if HAVE_HIGH_MEMORY:
+        batch_size = 16
+
+    # batch_size = 16          # previous: noisier, early-stopped on whipsaw
+    # batch_size = 512  # increase the number when more RAM is available
+    # if HAVE_HIGH_MEMORY:
+    #     batch_size = 1024
+
+    # TODO: make an object to hold the data and the metadata
+    frame_tag = args.frame
+    if args.frame == "geodesic":
+        frame_tag = f"geodesic-{args.geodesic_mode}"
+    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    if args.use_scalar:
+        model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
+
+    # TODO: Move the epoch name string to somewhere else after the callbacks thing
+    model_name = f"{model_name_wo_epochs}"
+
+    # load data
+    traj_targets_train = []
+    traj_targets_test = []
+    # traj_targets = []
+    if len(args.validation_data_paths) == 0:
+        for tgt_data_path in args.tgt_data_paths:
+            traj_targets = load_data_dir(
+                tgt_data_path, trajectory_dt, args, do_prep=False
+            )  # NOTE: do_prep is false for SBI support
+            # this is where the test/train split has been for a while. Move it to in the train_NEXT function?
+            (
+                traj_targets_train_one_tgt,
+                traj_targets_test_one_tgt,
+            ) = train_test_split(traj_targets, test_size=0.2, random_state=26525)
+            traj_targets_train.extend(traj_targets_train_one_tgt)
+            traj_targets_test.extend(traj_targets_test_one_tgt)
+    else:
+        # the split has already been done
+        print("split already done")
+        for tgt_data_path in args.tgt_data_paths:
+            traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+        for tgt_data_path in args.validation_data_paths:
+            traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+
+    print(
+        f"There are {len(traj_targets_train)} training trajs and {len(traj_targets_test)} validation trajs. There will be {(len(traj_targets_train) // batch_size) + 1} batch(es) for training and {(len(traj_targets_test) // batch_size) + 1} for validation"
+    )
+
+    # split the trajectory data from the metadata
+    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
+    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
+    # create a list of all of the trajectories loaded with a notation of which side of the split they were on
+    split_dict = {
+        "train": traj_targets_train_traj_numbers,
+        "test": traj_targets_test_traj_numbers,
+    }
+    os.makedirs(os.path.join(model_path, model_name_target_str), exist_ok=True)
+    with open(
+        os.path.join(
+            model_path,
+            model_name_target_str,
+            f"{model_name_wo_epochs}_train_test_split.json",
+        ),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(split_dict, f)
+
+    # NOTE: For SBI, at this point in the script the traj_targets_train and traj_targets_test variables are a size 3 tuple. The tuple is boost_ecef, glide_ecef, and dest_ecef.
+    # print(traj_targets_train[0])
+    phase_to_model = args.sbi_phase
+    traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
+    traj_targets_test = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_test]
+
+    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
+    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
+
+    # check that each traj has at least 10 points of data. 10 points seems like enough to get a decent model. Doing an FFT might be good.
+    time_series_point_count = [x.shape[0] for x in traj_targets_train + traj_targets_test]
+    if any(x < 10 for x in time_series_point_count):
+        raise ValueError(
+            "Some of the training or test data has less than 10 time series points. Consider changing the trajectory_dt or extending to a further slant range",
+            time_series_point_count,
+        )
+
+    # validate that the derivative of position is close to velocity
+    # if args.use_grdth:
+    #     # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
+    #     # print(np.gradient(traj_targets_train[0][:-3, 1], traj_targets_train[0][:-3, 0]), traj_targets_train[0][:-3, 2])
+    #     # print(np.gradient(traj_targets_train[0][:-3, 1], traj_targets_train[0][:-3, 0]) - traj_targets_train[0][:-3, 2])
+    #     if not all(
+    #         [np.isclose(np.gradient(x[:-3, 1], x[:-3, 0]), x[:-3, 2], atol=5).all() for x in traj_targets_train]
+    #     ):
+    #         raise ValueError("Numerical derivative of ground range is not close to the ground range rate values")
+    #     # print(np.gradient(traj_targets_train[0][:, 4], traj_targets_train[0][:, 0]), traj_targets_train[0][:, 5])
+    #     # print(np.gradient(traj_targets_train[0][:, 4], traj_targets_train[0][:, 0]) - traj_targets_train[0][:, 5])
+    #     if not all(
+    #         [np.isclose(np.gradient(x[:-3, 4], x[:-3, 0]), x[:-3, 5], atol=5).all() for x in traj_targets_train]
+    #     ):
+    #         raise ValueError("Numerical derivative of down is not close to the down rate values")
+    # TODO: try validating that the integral of the velocity is close to the position
+
+    # delete time plus (zero index), the extra state variables/metadata (everything from the last state to the end), convert to float64 data, and covert to tensor
+    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
+    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
+    # print(
+    #     "initial points",
+    #     [x[0, :] for x in traj_targets_train_posvel],
+    #     [x[0, :] for x in traj_targets_test_posvel],
+    # )
+
+    # check if any of the data turned into a NaN in the transforms
+    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any(
+        [torch.isnan(x).any() for x in traj_targets_test_posvel]
+    ):
+        print("traj_targets_train_posvel", traj_targets_train)
+        print("traj_targets_test_posvel", traj_targets_test)
+        raise ValueError(
+            "There are NaN(s) in the training or validation data. See the data dump above for where the NaN(s) are."
+        )
+
+    stacked_posvel = np.vstack(traj_targets_train_posvel)
+    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
+    if args.frame == "grdth":
+        column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
+    elif args.frame == "geodesic":
+        if args.geodesic_mode == "integrated":
+            column_names = ["s", "h", "v_s", "v_alpha", "v_h"]
+        else:  # original 6-state
+            column_names = ["s", "az", "h", "v_s", "v_alpha", "v_h"]
+    plot_column_distributions(
+        stacked_posvel,
+        column_names=column_names,
+        data_path=str(
+            Path(
+                model_path,
+                model_name_target_str,
+                model_name_wo_epochs,
+            )
+        ),
+    )
+    plot_correlation_matrix(
+        stacked_posvel,
+        column_names=column_names,
+        data_path=str(
+            Path(
+                model_path,
+                model_name_target_str,
+                model_name_wo_epochs,
+            )
+        ),
+    )
+
+    # plot up the distribution of each feature
+
+    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+
+    # --- Trajectory-segment augmentation (training only) --------------------
+    # Attacks the core ceiling: only ~96 training trajectories. Emits several
+    # sub-trajectories per trajectory (different start offsets) so the model
+    # learns to propagate from many initial conditions, not just launch states.
+    # Applied AFTER the scaler is fit (so overlapping segments don't reweight
+    # the normalisation stats) and NOT to validation (so val stays comparable).
+    # Set AUGMENT_SEGMENTS = 1 (or keep_full only) to disable.
+    AUGMENT_SEGMENTS = 1  # segments per trajectory incl. the full one; 1 = off
+    if AUGMENT_SEGMENTS > 1:
+        n_before = len(traj_targets_train_posvel)
+        traj_targets_train_posvel = augment_trajectory_segments(
+            traj_targets_train_posvel,
+            segments_per_traj=AUGMENT_SEGMENTS,
+            min_segment_len=12,
+            keep_full=True,
+        )
+        print(
+            f"segment augmentation: {n_before} -> {len(traj_targets_train_posvel)} "
+            f"training trajectories (val left at {len(traj_targets_test_posvel)})"
+        )
+
+    # call training a model on the data
+    # TODO: why does this return the model name? shouldn't that be an input?
+    # train_NEXT(traj_targets_train, traj_targets_test, max_epochs, scaler_traj)
+    (node, model_name) = train_NEXT(
+        model_name,
+        traj_targets_train_posvel,
+        traj_targets_test_posvel,
+        scaler_traj,
+        model_save_path,
+        trajectory_dt,
+        batch_size,
+        args.use_scalar,
+        model_states,
+        args.aug_dim,
+        args.nhidden,
+        args.gpu_index,
+        args.model_type,
+        args.frame,
+    )
+    # NOTE: After this was the whole chain of evaluation functions. Skipping adding that to this unclass side for now. It really should be a separate script.
+
+
+if __name__ == "__main__":
+    main()

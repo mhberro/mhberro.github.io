@@ -1,955 +1,187 @@
-import argparse
-import json
-import math
-import os
-import pickle
-import re
-import traceback
-from copy import deepcopy
-
-import numpy as np
-import pandas as pd
-import torch
-import matplotlib.pyplot as plt
-import onnxruntime
-from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap
-from scipy.signal import resample_poly
-from sklearn.metrics import mean_absolute_error
-
-from coordinate_transform_functions import (
-    ecef_to_ned,
-    ecef_to_ned_velocity,
-    ned_to_dcu,
-    frd_to_dcu,
-    dcu_to_ned,
-    ned_to_ecef_velocity,
-    ned_to_ecef,
-)
-from load_truth import load_single_truth
-from NEXT_training import (
-    ecef_to_next_grdth,
-    next_grdth_to_ecef,
-    ecef_to_next_dcu,
-    next_dcu_to_ecef,
-)
-# Import the geodesic transforms from their AUTHORITATIVE source module.
-# There are TWO geodesic transforms in this repo:
-#   * NEXT_frames.ecef_to_local_geodesic_vec  -> OLD 6-state version. It takes an
-#     acceleration argument, so calling it (p, v, impact) positionally leaves
-#     impact_ecef unfilled ("missing 1 required positional argument"). This is
-#     what NEXT_training re-exports, and what caused the TypeError.
-#   * NEXT_geodesic_frame.ecef_to_local_geodesic_vec -> NEW 5-state "integrated"
-#     (frame-trick) version used by geodesic-integrated models. Signature
-#     (p_ecef, v_ecef, impact_ecef) -> (state_5col [s,h,v_s,v_alpha,v_h],
-#     az_initial_rad); inverse local_geodesic_to_ecef_vec(state_with_time,
-#     impact_ecef, az_initial_rad). The training script imports this same module
-#     (aliased *_frame_trick) for its integrated mode, so this is the match.
-from NEXT_geodesic_frame import (
-    ecef_to_local_geodesic_vec,
-    local_geodesic_to_ecef_vec,
-)
-from ibcs_tools_helpers import multiline, custom_cmap, add_classification_markings, add_lmpi_markings, Classification
-from trajectory_helpers import (
-    check_time_series,
-    resample_traj_data,
-    TIME_INDEX,
-    POS_SLICE,
-    VEL_SLICE,
-    ACC_SLICE,
-    GR_INDEX,
-    GR_DOT_INDEX,
-    THETA_DOT_INDEX,
-    DOWN_INDEX,
-    DOWN_DOT_INDEX,
-)
-
-measurement_dt = 1.0  # [s]
-extrapolation_dt = 1.0  # [s]
-max_traj_states = int(300 / extrapolation_dt)  # total time of 300 seconds
-
-plt.rcParams["axes.formatter.limits"] = [-3, 4]
-plt.rcParams["figure.figsize"] = [6, 5]
-plt.rcParams.update(
-    {
-        "lines.linewidth": 0.5,
-        "axes.formatter.useoffset": False,
-        "savefig.dpi": 200,
-    }
-)
-
-def main():
-    parser = argparse.ArgumentParser(description="")
-    parser.add_argument(
-        "truths",
-        nargs="+",
-        type=str,
-        help="list of files to run the sim with. all output will end up in a single directory",
-    )
-    parser.add_argument("-o", dest="output", required=True, default=None, help="dir to place results")
-    parser.add_argument("-m", dest="model", required=True, default=None, help="onnx file")
-    parser.add_argument(
-        "-s",
-        dest="scalar",
-        required=True,
-        default=None,
-        help="this is currently only the pickled scalar.",
-    )
-    parser.add_argument(
-        "--sr-min",
-        type=int,
-        default=10000,
-        help="run the sim until the target gets near this slant range",
-    )
-    parser.add_argument(
-        "--sr-max",
-        type=int,
-        default=150000,
-        help="start the sim no further than this slant range",
-    )
-    parser.add_argument(
-        "--gruode",
-        action="store_true",
-        help=(
-            "Force the GRU-ODE integrator (RK4 sub-stepped at the training dt). "
-        ),
-    )
-    parser.add_argument(
-        "--max-time",
-        type=float,
-        default=122.0,
-        help=(
-            "Upper bound on truth-trajectory time [s] used both to trim the truth "
-            "states and to cap each extrapolation. Was previously hardcoded to "
-            "122.0, which is tuned for the BOOST phase (0-122 s). GLIDE trajectories "
-            "occur later in flight, so their timestamps can all exceed 122 s, which "
-            "empties the truth array (IndexError). Set this to cover the phase you "
-            "are simulating (e.g. a larger value for glide, or 61.0 for LowE boost)."
-        ),
-    )
-
-    args = parser.parse_args()
-
-    # check that the sr min and max values are reasonable
-    if args.sr_min >= args.sr_max:
-        raise ValueError("sr min must be less than sr max")
-
-    # check if the model file exists
-    if not os.path.exists(args.model):
-        raise ValueError(f"There is no model at {args.model}")
-
-    model_path = os.path.dirname(args.model)
-    # split the file extension off of the model name
-    model_name = ".".join(os.path.basename(args.model).split(".")[:-1])
-    # scalar_path = args.scalar
-
-    # check if there is a train_test split file next to the model
-    # split the number of epochs off of the model name
-    # model_name_wo_epoch = "_".join(model_name.split("_")[:-1])
-    # model_name_wo_bucket = re.sub(r"_\d{1,3}sr_", "_", model_name)
-    train_test_split_file = os.path.join(model_path, model_name + "_train_test_split.json")
-    train_test_trajs = None
-    if os.path.exists(train_test_split_file):
-        with open(train_test_split_file) as f:
-            train_test_trajs = json.load(f)
-
-    # run sim
-    sim_many_truths(args, model_name, train_test_trajs)
-
-
-def sim_many_truths(args, model_name, train_test_trajs):
-    # TODO: Finish the comment
-    # paths is expected to by a list of...i never finished the comment
-    # TODO: Multi-process? Or just let HPC parallel submissions do that for me
-    tgt_metric = []
-    for p in args.truths:
-        print("Running sim for", p, flush=True)
-        t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
-        if t is not None:
-            tgt_metric.append(t)
-
-    # Disabled to avoid filling up the drive
-    # with open(
-    #     os.path.join(args.output, "NEXT_sim_metric_" + model_name + ".txt"), "w"
-    # ) as o:
-    #     o.write(str(np.mean(tgt_metric)))
-
-
-def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
-    # load in the truth data and turn it into ECEF truth states
-    # read in truth in ECEF into array
-    truth = load_single_truth(path_to_truth)
-
-    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, args)
-
-    truth_filename = os.path.basename(path_to_truth)
-    if len(trajs) == 0:
-        print(f"No extrapolations were created for {truth_filename}")
-        return None
-
-    if isinstance(truth_states_sr_cut, int):
-        if all((-1 == x for x in (truth_states_sr_cut, trajs, truth_trajs))):
-            print("skipping bad truth file", path_to_truth)
-            return
-
-    s = f"{model_name}_{truth_filename}"
-
-    if not os.path.exists(output):
-        os.makedirs(output, exist_ok=True)
-    plot_sim_result(
-        truth_states_sr_cut,
-        trajs,
-        args,
-        train_test_trajs,
-        model_name,
-        traj_number=truth_filename,
-        filename=s,
-        save=True,
-        show=False,
-        output=output,
-    )
-    save_sim_result(output, trajs, truth_filename)
-    try:
-        traj_metric = calc_sim_metric(output, trajs, truth_trajs, truth_filename)
-    except Exception:
-        traj_metric = None
-    return traj_metric
-
-
-def calc_sim_metric(output, trajs, truth_trajs, truth_filename):
-    ingress_metric = []
-    for next_traj, truth_traj in zip(trajs, truth_trajs):
-        ingress_metric.append(calc_sim_metric_for_one_pair(truth_traj, next_traj))
-    return np.mean(ingress_metric)
-
-
-def calc_sim_metric_for_one_pair(truth_traj, test_traj):
-    # TODO: remove this when we get DTW
-    # check if the truth needs to be resampled
-    t = truth_traj
-    if len(truth_traj) != len(test_traj):
-        # use scipy to adjust the truth data
-        reduction_factor = np.gcd(len(test_traj), len(truth_traj))
-        t = resample_poly(
-            truth_traj,
-            len(test_traj) / reduction_factor,
-            len(truth_traj) / reduction_factor,
-            padtype="line",
-        )
-    return mean_absolute_error(t[:, POS_SLICE], test_traj[:, POS_SLICE])
-
-
-def save_sim_result(output, trajs, truth_filename):
-    print(f"Saving {len(trajs)} extrapolations to disk")
-    dfs = [None] * len(trajs)
-    for i, traj in enumerate(trajs):
-        # create a df from the numpy array where the columns are time, pos, vel
-        df = pd.DataFrame(
-            traj,
-            columns=(
-                "time",
-                "x_pos_ecef",
-                "y_pos_ecef",
-                "z_pos_ecef",
-                "x_vel_ecef",
-                "y_vel_ecef",
-                "z_vel_ecef",
-                "x_acc_ecef",
-                "y_acc_ecef",
-                "z_acc_ecef",
-            ),
-        )
-
-        # these columns change per traj
-        # curr_time, pred_num, validity_time
-        df["curr_time"] = df["time"][0]
-        df["pred_num"] = i + 1
-        df["validity_time"] = df["time"][0]
-        dfs[i] = df
-
-    # combine the dfs into one larger df
-    big_df = pd.concat(dfs)
-
-    # now add the static columns
-    big_df["system_track_number"] = 1701
-    big_df["threat_id"] = 47
-    big_df["true_object_id"] = 31
-    big_df["hyp_id"] = 1
-    big_df["asset_id"] = 0
-    big_df["threat_genre"] = "HGV"
-    big_df["eng_status"] = "ELIGIBLE"
-    big_df["traj_genre"] = "MRV"
-    big_df["traj_genre_score"] = 0
-    big_df["reach_assess"] = 0
-    big_df["extrap_in_SR"] = "Y"
-
-    # write to file
-    s = f"NEXT_extraps_{truth_filename}"
-    big_df.to_csv(os.path.join(output, f"extrap-dt_{extrapolation_dt}", s), index=False)
-
-
-def plot_sim_result(
-    truth,
-    trajs,
-    args,
-    train_test_trajs,
-    model_name,
-    traj_number="",
-    filename="",
-    save=False,
-    show=False,
-    output=None,
-):
-    if save and not output:
-        raise ValueError("Cannot save figures without an output path")
-    fig, (ax11, ax12) = plt.subplots(2, 1, sharex=True)
-    fig2, ax21 = plt.subplots(1, 1)
-    fig3, ax31 = plt.subplots(1, 1)
-    fig4, (ax41, ax42, ax43) = plt.subplots(1, 3, sharex=True)
-    fig5, (ax51, ax52) = plt.subplots(2, 1, sharex=True)
-
-    impact_ecef = deepcopy(truth[-1, POS_SLICE])
-    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
-    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
-
-    plot_traj_truth = deepcopy(truth)
-    plot_trajs_next = deepcopy(trajs)
-
-    # all of the data inputs are in ecef and have at least time, pos, and vel states
-    for i, traj in enumerate([plot_traj_truth] + plot_trajs_next):
-        # transform the ecef to ned to dcu
-        for j in range(traj.shape[0]):
-            traj[j, POS_SLICE] = ecef_to_ned(traj[j, POS_SLICE], impact_ecef)
-            traj[j, VEL_SLICE] = ecef_to_ned_velocity(traj[j, VEL_SLICE], impact_ecef)
-            # traj[j, ACC_SLICE] = ecef_to_ned_velocity(traj[j, ACC_SLICE], impact_ecef)
-
-            traj[j, POS_SLICE] = ned_to_dcu(traj[j, POS_SLICE], ref_angle)
-            traj[j, VEL_SLICE] = ned_to_dcu(traj[j, VEL_SLICE], ref_angle)
-            # traj[j, ACC_SLICE] = ned_to_dcu(traj[j, ACC_SLICE], ref_angle)
-
-        # TODO: redo this to use multiline
-        axes = (ax11, ax12, ax21, ax31, ax41, ax42, ax43)
-        plot_single_traj(i, traj, axes)
-
-    plot_color_trajs(plot_traj_truth, plot_trajs_next, ax51, ax52)
-
-    # set up variables for the figures
-
-    ax11.legend()
-    ax21.legend()
-    ax31.legend()
-    ax43.legend()
-    ax11.set_xlim([-10, args.sr_max / 1e3])
-    ax11.grid(True)
-    ax12.grid(True)
-    ax21.grid(True)
-    ax31.grid(True)
-    ax41.grid(True)
-    ax42.grid(True)
-    ax43.grid(True)
-    ax51.grid(True)
-    ax52.grid(True)
-    add_classification_markings(fig, Classification.UNCLASSIFIED)
-    add_classification_markings(fig2, Classification.UNCLASSIFIED)
-    add_classification_markings(fig3, Classification.UNCLASSIFIED)
-    add_classification_markings(fig4, Classification.UNCLASSIFIED)
-    add_classification_markings(fig5, Classification.UNCLASSIFIED)
-    add_lmpi_markings(fig)
-    add_lmpi_markings(fig2)
-    add_lmpi_markings(fig3)
-    add_lmpi_markings(fig4)
-    add_lmpi_markings(fig5)
-
-    # give the figure a title
-    title = f"{traj_number}"
-    if train_test_trajs is not None:
-        if title in train_test_trajs["test"]:
-            title = title + " (from test set)"
-        elif title in train_test_trajs["train"]:
-            title = title + " (from train set)"
-        else:
-            title = title + " (outside model scope)"
-    ax11.set_title(title, wrap=True)
-    ax21.set_title(title, wrap=True)
-    ax31.set_title(title, wrap=True)
-    # ax41.set_title(title, wrap=True)
-    ax51.set_title(title, wrap=True)
-    fig4.suptitle(title, wrap=True)
-    fig.canvas.manager.set_window_title(title)
-    fig2.canvas.manager.set_window_title(title)
-    fig3.canvas.manager.set_window_title(title)
-    fig4.canvas.manager.set_window_title(title)
-    fig5.canvas.manager.set_window_title(title)
-
-    # create the directory to place figures
-    figure_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}", "plots")
-    os.makedirs(figure_dir, exist_ok=True)
-
-    if save:
-        # fig.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR.png"), format="png")
-        fig2.savefig(os.path.join(figure_dir, filename + "_sim_Speed.png"), format="png")
-        fig3.savefig(os.path.join(figure_dir, filename + "_sim_Accel.png"), format="png")
-        fig4.savefig(os.path.join(figure_dir, filename + "_sim_Vel.png"), format="png")
-        fig5.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR_color.png"), format="png")
-
-    if show:
-        plt.show()
-        input("press enter to continue")
-    plt.close("all")
-
-
-def plot_single_traj(i, traj, axes):
-    # TODO: Fix the axis labels
-    # TODO: Split this out into plotting functions like I do in IBCS Tools
-    (ax11, ax12, ax21, ax31, ax41, ax42, ax43) = axes
-    if i == 0:
-        color = "k"
-        lw = 1
-        label = "Truth"
-        zorder = 8
-    elif i == 1:
-        color = "tab:orange"
-        lw = 0.5
-        label = "NEXT"
-        zorder = None
-    else:
-        color = "tab:orange"
-        lw = 0.5
-        label = "_nolegend_"
-        zorder = None
-
-    # DR-UP
-    ax11.plot(
-        traj[:, 1] / 1e3,
-        traj[:, 3] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # DR-CR
-    ax12.plot(
-        traj[:, 1] / 1e3,
-        traj[:, 2] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Speed
-    ax21.plot(
-        traj[1:, 3] / 1e3,
-        np.linalg.norm(traj[1:, VEL_SLICE], axis=1),
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Acceleration
-    ax31.plot(
-        traj[1:, 3] / 1e3,
-        np.linalg.norm(traj[1:, ACC_SLICE], axis=1),
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Speed
-    ax41.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 4],
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-    ax42.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 5],
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-    ax43.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 6],
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # label the axes
-    ax11.set_ylabel("Up [km]")
-    ax12.set_xlabel("Down [km]")
-    ax12.set_ylabel("Cross [km]")
-
-    ax21.set_xlabel("Up [km]")
-    ax21.set_ylabel("Speed [m/s]")
-
-    ax31.set_xlabel("Up [km]")
-    ax31.set_ylabel("Acceleration Magnitude [m/s/s]")
-
-    ax41.set_xlabel("Up [km]")
-    ax42.set_xlabel("Up [km]")
-    ax43.set_xlabel("Up [km]")
-    ax41.set_ylabel("Velocity [m/s]")
-    ax41.set_title("Down")
-    ax42.set_title("Cross")
-    ax43.set_title("Up")
-
-
-def plot_color_trajs(truth, extraps, ax51, ax52):
-    # plot the truth
-    color = "lime"
-    linestyle = "--"
-    lw = 1
-    label = "Truth"
-    zorder = 8
-    ax51.plot(
-        truth[:, 1] / 1e3,
-        truth[:, 3] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-        linestyle=linestyle,
-    )
-    ax52.plot(
-        truth[:, 1] / 1e3,
-        truth[:, 2] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-        linestyle=linestyle,
-    )
-
-    tall = []
-    dall = []
-    call = []
-    uall = []
-    for i in range(len(extraps)):
-        ex = extraps[i]
-        t, d, c, u, *_ = ex.T
-        tall.append(t)
-        dall.append(d / 1e3)
-        call.append(c / 1e3)
-        uall.append(u / 1e3)
-
-    init_times = tuple(x[0][0] for x in extraps)
-    plot = multiline(dall, uall, init_times, ax=ax51, cmap="plasma", lw=0.5, label="NEXT")
-    multiline(dall, call, init_times, ax=ax52, cmap="plasma", lw=0.5)
-
-    cbar = ax51.get_figure().colorbar(plot, ax=[ax51, ax52])
-    cbar.set_label(label="Trajectory Initial Point Validity Time")
-
-    ax51.set_xlabel("Down [km]")
-    ax51.set_ylabel("Up [km]")
-    ax52.set_ylabel("Cross [km]")
-
-
-def sim_ingress(truth_states, args):
-    # truth states are expected to be an array of format
-    # seconds from launch, position x3, velocity x3, acceleration x3
-
-    # define guide point at truth impact
-    impact_ecef = deepcopy(truth_states[-1, POS_SLICE])
-    impact_time = truth_states[-1, 0]
-
-    # cut truth at firm track range
-    # truth_states_sr_cut = np.asarray(
-    #     tuple(
-    #         x
-    #         for x in truth_states
-    #         if np.linalg.norm(x[POS_SLICE] - impact_ecef) < args.sr_max and not np.allclose(x[VEL_SLICE], [0, 0, 0])
-    #     ),
-    #     dtype=np.float64,
-    # )
-
-    # NOTE: the time ceiling used to be hardcoded to 122.0 (boost-phase tuned).
-    # It is now --max-time so glide (later-in-flight, timestamps > 122 s) is not
-    # filtered down to an empty array. Default preserves the old boost behaviour.
-    truth_states_sr_cut = np.asarray(
-        tuple(x for x in truth_states if x[TIME_INDEX] < args.max_time and not np.allclose(x[VEL_SLICE], [0, 0, 0])),
-        dtype=np.float64,
-    )
-
-    # Fail loudly and helpfully if the trim removed everything, rather than
-    # crashing with an opaque IndexError on the next line.
-    if truth_states_sr_cut.shape[0] == 0:
-        t_min = float(truth_states[:, TIME_INDEX].min())
-        t_max = float(truth_states[:, TIME_INDEX].max())
-        raise ValueError(
-            f"No truth states survived the --max-time={args.max_time}s trim. "
-            f"This truth file spans t=[{t_min:.1f}, {t_max:.1f}]s. If you are "
-            f"simulating the glide phase, raise --max-time above {t_max:.1f}."
-        )
-
-    # start sim clock at truth firm track range
-    firm_track_time = truth_states_sr_cut[0][0]
-    sim_time = deepcopy(firm_track_time)
-    trajs = []
-    truth_trajs = []
-
-    # sim to the end of the truth
-    while sim_time <= impact_time - measurement_dt:
-        # print("sim time step", sim_time, impact_time, measurement_dt)
-        # grab the current target state
-        tgt_state_ecef_index = np.where(truth_states_sr_cut[:, 0] == sim_time)
-        tgt_state_ecef_index_forward = np.where(truth_states_sr_cut[:, 0] >= sim_time)
-        if len(tgt_state_ecef_index[0]) == 0:
-            # missed a truth point at that time. grab the next one in the chain and update sim time for that step
-            try:
-                tgt_state_ecef_index = np.array(tgt_state_ecef_index_forward[0][0])
-            except IndexError:
-                # ran out of states in the truth
-                return truth_states_sr_cut, trajs, truth_trajs
-            sim_time = truth_states_sr_cut[tgt_state_ecef_index].squeeze()[0]
-        tgt_state_ecef = truth_states_sr_cut[tgt_state_ecef_index]
-        truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
-
-        x0 = tgt_state_ecef.squeeze()
-        traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, args)
-        if traj is not None:
-            if isinstance(traj, int) and traj == -1:
-                # got a stop sim signal for the algorithm under test
-                break
-            trajs.append(traj)
-            truth_trajs.append(truth_traj_forward)
-        # step sim time by measurement dt and repeat
-        sim_time += measurement_dt
-    return truth_states_sr_cut, trajs, truth_trajs
-
-
-def bound(low, high, x):
-    return max(low, min(high, x))
-
-
-def round_to(x, base):
-    return base * round(x / base)
-
-
-ort_sess_stash = None  # TODO: Stop cheating with a global variable. Only used for GRDTH models
-
-
-def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, args):
-    # initial state ecef is expected to be a 1d vector for time in seconds, position x3, and velocity x3 in ECEF
-    # guide point ecef is expected to be...
-
-    # check if target is too close
-    initial_state_slant_range = np.linalg.norm(initial_state_ecef[POS_SLICE] - guide_point_ecef)
-    if initial_state_slant_range < args.sr_min:
-        print("target too close", initial_state_slant_range, args.sr_min)
-        return -1
-
-    # transform into NEXT frame
-    # NOTE: detection must match the frame token that NEXT_training writes into
-    # the model filename. This is a prefix of the frame name, and the suffix has
-    # varied across model generations:
-    #   "_geodesic_"             (original)
-    #   "_geodesic-integrated_"  (newer, e.g. geodesic-integrated glide models)
-    #   "_geod_"                 (legacy)
-    # The original check looked only for "_geod_"/"_geodesic_" and so silently
-    # fell through to the DCU branch for the "geodesic-integrated" variant. We
-    # match on the "_geodesic" prefix (bounded by a leading underscore) so all
-    # geodesic frame variants are caught, while "_grdth_" stays exact.
-    model_basename = os.path.basename(args.model)
-    use_grdth = "_grdth_" in model_basename
-    use_geodesic = ("_geodesic" in model_basename) or ("_geod_" in model_basename)
-    global ort_sess_stash
-    if use_grdth:
-        initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
-        initial_state_slant_range = np.hypot(initial_state_NEXT_frame[GR_INDEX], initial_state_NEXT_frame[DOWN_INDEX])
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            # load NEXT model
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    elif use_geodesic:
-        _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
-        # GEODESIC-INTEGRATED (5-state) frame [s, h, v_s, v_alpha, v_h].
-        # ecef_to_local_geodesic_vec takes (p_ecef, v_ecef, impact_ecef) and
-        # returns (state_5col, az_initial_rad). Azimuth is DROPPED from the state
-        # (the "frame trick": we track azimuth RATE v_alpha, not absolute az), so
-        # the inverse transform later needs az_initial_rad to reconstruct ECEF.
-        # We must capture and carry it.
-        geodesic_state, az_initial_rad = ecef_to_local_geodesic_vec(
-            np.atleast_2d(initial_state_ecef[POS_SLICE]),
-            np.atleast_2d(initial_state_ecef[VEL_SLICE]),
-            guide_point_ecef,
-        )
-        # Prepend time; keep the full 5-state (do NOT slice to 6 - this frame is
-        # already 5-wide). Result: [time, s, h, v_s, v_alpha, v_h].
-        initial_state_NEXT_frame = np.hstack(
-            [np.atleast_2d(initial_state_ecef[TIME_INDEX]), geodesic_state]
-        )[0]
-        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            # load NEXT model
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    else:
-        initial_state_NEXT_frame, initial_point_heading, flip_c = ecef_to_next_dcu(initial_state_ecef, guide_point_ecef)
-        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
-        bucket_range = 100000
-        rounded_sr = int(bound(bucket_range, args.sr_max, round_to(initial_state_slant_range, bucket_range)) / 1e3)
-        model_name_to_load = re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", args.model)
-        scalar_name_to_load = os.path.join(
-            os.path.dirname(args.scalar), re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", os.path.basename(args.scalar))
-        )
-        args.scalar = scalar_name_to_load
-        ort_sess = onnxruntime.InferenceSession(model_name_to_load)
-
-    # call the extrapolator
-    try:
-        NEXT_extrap = NEXT_extrapolation(
-            initial_state_NEXT_frame, dt, n_steps, initial_point_heading, use_grdth, args, ort_sess,
-            use_geodesic=use_geodesic,
-        )
-    except ValueError as e:
-        print("Extrap failed", traceback.format_exc())
-        return None
-
-    # get back to ECEF
-    if use_grdth:
-        NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
-    elif use_geodesic:
-        # Inverse of the 5-state integrated frame. local_geodesic_to_ecef_vec
-        # expects the state WITH time as column 0 ([time, s, h, v_s, v_alpha,
-        # v_h]) because it integrates the azimuth RATE (v_alpha) over the time
-        # vector to reconstruct absolute azimuth - an inherently whole-trajectory
-        # operation. It also needs az_initial_rad captured at ingress. It returns
-        # (N,6) = [p_ecef(3), v_ecef(3)]; we prepend time back on.
-        # NEXT_extrap is already [time, s, h, v_s, v_alpha, v_h].
-        ecef_posvel = local_geodesic_to_ecef_vec(
-            NEXT_extrap, guide_point_ecef, az_initial_rad
-        )
-        NEXT_extrap_ecef = np.hstack(
-            [NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_posvel]
-        )
-    else:
-        NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
-
-    # use numpy gradient (second order inner. first order on boundary) for a numerical derivative
-    a = np.gradient(NEXT_extrap_ecef[:, VEL_SLICE], axis=0)
-
-    # TODO: move this to outside the model loop
-    def get_acc(x):
-        a = np.zeros_like(x)
-        # TODO: Fix this
-        # for j in range(3):
-        #     # inner points
-        #     a[1:-1, j] = (x[2:, j] - x[:2, j]) / 2
-        #     # boundary points
-        #     a[0, j] = x[1, j] - x[0, j]
-        #     a[-1, j] = x[-1, j] - x[-2, j]
-        return a
-
-    a_test = get_acc(NEXT_extrap_ecef[:, VEL_SLICE])
-    # if not np.allclose(a, a_test):
-    #     print("WOAH! Numerical method did not work")
-
-    NEXT_extrap_ecef = np.hstack([NEXT_extrap_ecef, a])
-
-    # output ECEF traj
-    return NEXT_extrap_ecef
-
-
-def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
-    m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
-    if m:
-        try:
-            return float(m[-1])
-        except ValueError:
-            pass
-    return default
-
-
-def _field_eval(ort_sess, state_phys_scaled, model_augmentation_dim, state_size):
-
-    out = ort_sess.run(["output"], {"input": state_phys_scaled.astype(np.float32)})[-1].reshape(-1)
-    # Only the physical-state derivative is integrated; any extra (aug) outputs
-    # are not part of the physical trajectory.
-    return out[:state_size]
-
-
-def _integrate_one_step(
-    ort_sess,
-    x_scaled,
-    out_dt: float,
-    sub_dt: float,
-    integrator: str,
-    model_augmentation_dim: int,
-    state_size: int,
-):
-
-    # Number of sub-steps to cover one output dt at ~sub_dt resolution.
-    n_sub = max(1, int(round(out_dt / sub_dt)))
-    h = out_dt / n_sub  # actual sub-step size (divides out_dt exactly)
-
-    x = np.asarray(x_scaled, dtype=np.float64).reshape(-1)[:state_size].copy()
-
-    def f(state_phys):
-        # Build the model input: physical state (+ zero augmentation if the
-        # model was trained with it, so the input width matches).
-        if model_augmentation_dim > 0:
-            inp = np.concatenate([state_phys, np.zeros(model_augmentation_dim)])
-        else:
-            inp = state_phys
-        return _field_eval(ort_sess, inp, model_augmentation_dim, state_size)
-
-    for _ in range(n_sub):
-        if integrator == "euler":
-            x = x + h * f(x)
-        else:  # rk4
-            k1 = f(x)
-            k2 = f(x + 0.5 * h * k1)
-            k3 = f(x + 0.5 * h * k2)
-            k4 = f(x + h * k3)
-            x = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    return x
-
-
-def NEXT_extrapolation(
-    initial_state_next_frame,
-    dt: float,
-    n_steps: int,
-    ref_angle,
-    use_grdth: bool,
-    args,
-    ort_sess: onnxruntime.InferenceSession,
-    use_geodesic: bool = False,
-):
-    # print("initial_state_next_frame", initial_state_next_frame)
-
-    # ort_sess_scalar = onnxruntime.InferenceSession(args.scalar)  # switch to using ONNX for scalar (update: can't)
-    use_scalar = "_scalarOn" in os.path.basename(args.model)
-    NEXT_scalar = None
-    if use_scalar:
-        with open(args.scalar, "rb") as scalar_pickle:
-            NEXT_scalar = pickle.load(scalar_pickle)
-
-    # State size determines how many components we slice out of the trajectory
-    # and hand to the model/scaler each step. Historically this was hardcoded by
-    # frame (grdth -> 5, else 6), but that assumption breaks for models whose
-    # frame carries a reduced state. For example the "geodesic-integrated" glide
-    # models trained with a "pos3" (5-element: 3 pos + 2 vel) state expect 5
-    # features, not 6, and a hardcoded 6 crashes the scaler ("X has 6 features,
-    # but StandardScaler is expecting 5").
-    #
-    # The fitted scaler is the ground truth: it was fit on exactly the features
-    # the model consumes. When a scaler is present, derive state_size from it so
-    # the sim matches the model automatically. Fall back to the old frame-based
-    # default only when there is no scaler to ask.
-    if NEXT_scalar is not None and hasattr(NEXT_scalar, "n_features_in_"):
-        state_size = int(NEXT_scalar.n_features_in_)
-    else:
-        state_size = 5 if use_grdth else 6
-
-
-    model_basename = os.path.basename(args.model)
-
-    is_gruode = (
-        getattr(args, "gruode", False)
-        or ("_gruode_" in model_basename)
-        or ("_gruode-min_" in model_basename)
-    )
-    if is_gruode:
-        integrator = "rk4"
-        sub_dt = _infer_training_dt(model_basename, default=0.1)
-        print(f"GRU-ODE detected: integrating with RK4, sub-step ~{sub_dt}s over output dt {dt}s")
-    else:
-        integrator = "euler"
-        sub_dt = dt  # one step == original behaviour
-
-    # infer at extrapolation dt
-    # keep going until the termination criteria is met
-    # the initial point will be the initial state
-    model_augmentation_dim = int(re.findall(r"_(\d)aug_", args.model)[-1])
-    extrap = np.array([np.hstack([initial_state_next_frame])])
-    validity_time = deepcopy(initial_state_next_frame[0])
-
-    # n_steps = 5
-    temp_iter = 0
-
-    while temp_iter < n_steps and float(validity_time) < args.max_time:
-        temp_iter = temp_iter + 1
-        validity_time += dt
-
-        if use_scalar:
-            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
-            scaled_pos_vel = NEXT_scalar.transform(pos_vel)[0]  # (state_size,)
-            # Integrate in SCALED space (the model was trained in scaled space).
-            next_scaled = _integrate_one_step(
-                ort_sess,
-                scaled_pos_vel,
-                out_dt=dt,
-                sub_dt=sub_dt,
-                integrator=integrator,
-                model_augmentation_dim=model_augmentation_dim,
-                state_size=state_size,
-            )
-            next_state = NEXT_scalar.inverse_transform(
-                next_scaled.reshape(1, -1)
-            )  # skl2onnx does not support inverse_transform; do it in numpy
-            if os.environ.get("NEXT_DEBUG") and temp_iter == 1:
-                # First-step sanity print: distinguishes a bad model field from
-                # an integration/termination problem. If the per-second deltas
-                # here are physically implausible, the issue is the model/export,
-                # not the integrator.
-                start_phys = np.asarray(extrap[0][1 : state_size + 1], dtype=np.float64)
-                print(
-                    f"[debug] step1 geodesic frame: start={start_phys} "
-                    f"-> next={next_state.reshape(-1)}  delta/sec={next_state.reshape(-1) - start_phys}",
-                    flush=True,
-                )
-        else:
-            cur_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
-            next_phys = _integrate_one_step(
-                ort_sess,
-                cur_phys,
-                out_dt=dt,
-                sub_dt=sub_dt,
-                integrator=integrator,
-                model_augmentation_dim=model_augmentation_dim,
-                state_size=state_size,
-            )
-            next_state = next_phys.reshape(1, -1)
-
-        next_state = np.insert(next_state, 0, validity_time)
-        temp_extrap = np.vstack([extrap, next_state])
-
-        # TODO: What if I scaled the ending criteria so that the extrap can be entirly done in the scalared space?
-        if use_grdth and (temp_extrap[-1, DOWN_INDEX] > 0 or temp_extrap[-1, GR_INDEX] < 2600e3):
-            print("grdth below the ground", temp_extrap[-1, DOWN_INDEX])
-            break
-        elif use_geodesic:
-
-            if not np.all(np.isfinite(temp_extrap[-1, POS_SLICE])) or \
-               np.linalg.norm(temp_extrap[-1, POS_SLICE]) > 1e8:
-                print("geodesic trajectory diverged", temp_extrap[-1, POS_SLICE])
-                break
-        # elif not use_grdth and (temp_extrap[-1, 3] < 0 or np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 250e3):
-        elif not use_grdth and (np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 2600e3):
-            print("dcu below the ground", temp_extrap[-1, 3])
-            break
-        extrap = np.vstack([extrap, next_state])
-
-    if extrap.shape[0] < 3:
-        raise ValueError(f"Extrap was too short {extrap.shape}")
-
-    return extrap
-
-
-if __name__ == "__main__":
-    main()
-
-# dump the buffer at the end of the run
-print("", end="", flush=True)
+(.venv) e471302@usmk2tqq3hkk2 next % NEXT_DEBUG=1 python Simple_Sim_glide.py trajectory_library/phases/HighE_HGV/glide/* -o simple_sim_output/SBI/GRUODE_mo_cl_heun/GEODESIC/glide/HighE_HGV -m model_outputs/SBI/GRUODE_mo_cl_ref_loss_NoAug_Bsize16_SO.1_pos3_LateW0_new_agent_grdth/GEODESIC/boost/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100sr_0.1sec_100hid_0aug_16_scalarOn.onnx -s model_outputs/SBI/GRUODE_mo_cl_ref_loss_NoAug_Bsize16_SO.1_pos3_LateW0_new_agent_grdth/GEODESIC/boost/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100sr_0.1sec_100hid_0aug_16_scalarOn_scalar.pickle --gruode --max-time 800
+Running sim for trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.59203218e+06  8.37548723e+04 -5.78074438e+03  1.12294861e-03
+  7.92717179e+02] -> next=[ 1.58712177e+06  8.29755640e+04 -5.78791047e+03  1.13014262e-03
+  7.88415974e+02]  delta/sec=[-4.91041053e+03 -7.79308276e+02 -7.16608793e+00  7.19401135e-06
+ -4.30120465e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.58633015e+06  8.30942280e+04 -5.78136040e+03  1.13067580e-03
+  7.82814916e+02] -> next=[ 1.58145474e+06  8.23164745e+04 -5.78846038e+03  1.13785406e-03
+  7.78691138e+02]  delta/sec=[-4.87541830e+03 -7.77753498e+02 -7.09997563e+00  7.17825893e-06
+ -4.12377806e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.58062879e+06  8.24290125e+04 -5.78194756e+03  1.13848699e-03
+  7.72908594e+02] -> next=[ 1.57579188e+06  8.16536745e+04 -5.78898112e+03  1.14577003e-03
+  7.68942836e+02]  delta/sec=[-4.83691090e+03 -7.75338057e+02 -7.03356842e+00  7.28304616e-06
+ -3.96575775e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.57492810e+06  8.17592257e+04 -5.78250554e+03  1.14638334e-03
+  7.62998238e+02] -> next=[ 1.57012756e+06  8.09862404e+04 -5.78941633e+03  1.15364927e-03
+  7.59180798e+02]  delta/sec=[-4.80054119e+03 -7.72985336e+02 -6.91078848e+00  7.26592406e-06
+ -3.81744035e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.56922809e+06  8.10848673e+04 -5.78303404e+03  1.15436609e-03
+  7.53083879e+02] -> next=[ 1.56446831e+06  8.03115090e+04 -5.78984832e+03  1.16164845e-03
+  7.49446638e+02]  delta/sec=[-4.75977370e+03 -7.73358375e+02 -6.81427657e+00  7.28236132e-06
+ -3.63724163e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.56352877e+06  8.04059373e+04 -5.78353274e+03  1.16243645e-03
+  7.43165552e+02] -> next=[ 1.55880761e+06  7.96352546e+04 -5.79027117e+03  1.16976059e-03
+  7.39686099e+02]  delta/sec=[-4.72116596e+03 -7.70682722e+02 -6.73842475e+00  7.32413914e-06
+ -3.47945231e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.55783016e+06  7.97224355e+04 -5.78400131e+03  1.17059568e-03
+  7.33243296e+02] -> next=[ 1.55314453e+06  7.89551705e+04 -5.79065355e+03  1.17794105e-03
+  7.29934801e+02]  delta/sec=[-4.68563339e+03 -7.67265014e+02 -6.65224283e+00  7.34537047e-06
+ -3.30849453e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.55213228e+06  7.90343619e+04 -5.78443941e+03  1.17884506e-03
+  7.23317158e+02] -> next=[ 1.54749758e+06  7.82653324e+04 -5.79096120e+03  1.18619728e-03
+  7.20176618e+02]  delta/sec=[-4.63470011e+03 -7.69029514e+02 -6.52178919e+00  7.35221932e-06
+ -3.14054009e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.54643513e+06  7.83417165e+04 -5.78484671e+03  1.18718586e-03
+  7.13387189e+02] -> next=[ 1.54183965e+06  7.75742941e+04 -5.79126387e+03  1.19453671e-03
+  7.10424768e+02]  delta/sec=[-4.59547751e+03 -7.67422422e+02 -6.41716087e+00  7.35084951e-06
+ -2.96242060e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.54073873e+06  7.76444994e+04 -5.78522284e+03  1.19561942e-03
+  7.03453452e+02] -> next=[ 1.53618988e+06  7.68796912e+04 -5.79149450e+03  1.20296274e-03
+  7.00665686e+02]  delta/sec=[-4.54885828e+03 -7.64808228e+02 -6.27165513e+00  7.34331582e-06
+ -2.78776646e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.53504310e+06  7.69427108e+04 -5.78556745e+03  1.20414707e-03
+  6.93516022e+02] -> next=[ 1.53053882e+06  7.61779591e+04 -5.79171278e+03  1.21152189e-03
+  6.90909147e+02]  delta/sec=[-4.50427975e+03 -7.64751638e+02 -6.14533352e+00  7.37482039e-06
+ -2.60687468e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.52934825e+06  7.62363508e+04 -5.78588016e+03  1.21277016e-03
+  6.83574985e+02] -> next=[ 1.52488537e+06  7.54734816e+04 -5.79187969e+03  1.22008061e-03
+  6.81121741e+02]  delta/sec=[-4.46288115e+03 -7.62869255e+02 -5.99953266e+00  7.31044143e-06
+ -2.45324377e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.52365419e+06  7.55254200e+04 -5.78616059e+03  1.22149009e-03
+  6.73630439e+02] -> next=[ 1.51924317e+06  7.47632645e+04 -5.79202923e+03  1.22874163e-03
+  6.71371024e+02]  delta/sec=[-4.41102076e+03 -7.62155455e+02 -5.86863642e+00  7.25154145e-06
+ -2.25941462e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.51796094e+06  7.48099186e+04 -5.78640834e+03  1.23030825e-03
+  6.63682496e+02] -> next=[ 1.51359281e+06  7.40507431e+04 -5.79211421e+03  1.23755568e-03
+  6.61600277e+02]  delta/sec=[-4.36812834e+03 -7.59175547e+02 -5.70586473e+00  7.24743222e-06
+ -2.08221919e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.51226852e+06  7.40898473e+04 -5.78662301e+03  1.23922607e-03
+  6.53731287e+02] -> next=[ 1.50795634e+06  7.33305784e+04 -5.79214854e+03  1.24645090e-03
+  6.51858145e+02]  delta/sec=[-4.31217512e+03 -7.59268915e+02 -5.52553195e+00  7.22483102e-06
+ -1.87314250e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.50657694e+06  7.33652068e+04 -5.78680416e+03  1.24824500e-03
+  6.43776964e+02] -> next=[ 1.50231197e+06  7.26059801e+04 -5.79216825e+03  1.25541778e-03
+  6.42077783e+02]  delta/sec=[-4.26496451e+03 -7.59226697e+02 -5.36408834e+00  7.17277995e-06
+ -1.69918145e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.50088622e+06  7.26359980e+04 -5.78695137e+03  1.25736653e-03
+  6.33819707e+02] -> next=[ 1.49666477e+06  7.18807578e+04 -5.79213115e+03  1.26451808e-03
+  6.32305575e+02]  delta/sec=[-4.22144799e+03 -7.55240207e+02 -5.17977101e+00  7.15154856e-06
+ -1.51413121e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.49519637e+06  7.19022221e+04 -5.78706418e+03  1.26659214e-03
+  6.23859725e+02] -> next=[ 1.49102467e+06  7.11471247e+04 -5.79204030e+03  1.27365054e-03
+  6.22563681e+02]  delta/sec=[-4.17169818e+03 -7.55097387e+02 -4.97612179e+00  7.05840452e-06
+ -1.29604457e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.48950742e+06  7.11638805e+04 -5.78714211e+03  1.27592335e-03
+  6.13897266e+02] -> next=[ 1.48538577e+06  7.04087048e+04 -5.79191178e+03  1.28291463e-03
+  6.12806371e+02]  delta/sec=[-4.12165199e+03 -7.55175663e+02 -4.76966886e+00  6.99128588e-06
+ -1.09089529e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.48381938e+06  7.04209748e+04 -5.78718465e+03  1.28536171e-03
+  6.03932614e+02] -> next=[ 1.47974278e+06  6.96668336e+04 -5.79174418e+03  1.29232286e-03
+  6.03045713e+02]  delta/sec=[-4.07660138e+03 -7.54141184e+02 -4.55952672e+00  6.96115118e-06
+ -8.86901097e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.47813228e+06  6.96735070e+04 -5.78719130e+03  1.29490878e-03
+  5.93966099e+02] -> next=[ 1.47410439e+06  6.89207545e+04 -5.79152150e+03  1.30180898e-03
+  5.93296823e+02]  delta/sec=[-4.02788725e+03 -7.52752444e+02 -4.33020003e+00  6.90019642e-06
+ -6.69276495e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.47244612e+06  6.89214793e+04 -5.78716150e+03  1.30456615e-03
+  5.83998100e+02] -> next=[ 1.46846995e+06  6.81691501e+04 -5.79124879e+03  1.31133827e-03
+  5.83527735e+02]  delta/sec=[-3.97617307e+03 -7.52329243e+02 -4.08729681e+00  6.77212328e-06
+ -4.70364841e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.46676093e+06  6.81648946e+04 -5.78709470e+03  1.31433544e-03
+  5.74029012e+02] -> next=[ 1.46283392e+06  6.74133321e+04 -5.79095784e+03  1.32104181e-03
+  5.73801223e+02]  delta/sec=[-3.92700695e+03 -7.51562528e+02 -3.86313520e+00  6.70637471e-06
+ -2.27789655e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.46107673e+06  6.74037561e+04 -5.78699038e+03  1.32421828e-03
+  5.64059261e+02] -> next=[ 1.45719508e+06  6.66535780e+04 -5.79059172e+03  1.33082055e-03
+  5.64066654e+02]  delta/sec=[-3.88164893e+03 -7.50178114e+02 -3.60134281e+00  6.60227238e-06
+  7.39276780e-03]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.45539354e+06  6.66380675e+04 -5.78684790e+03  1.33421635e-03
+  5.54089386e+02] -> next=[ 1.45156618e+06  6.58854715e+04 -5.79017904e+03  1.34069466e-03
+  5.54323413e+02]  delta/sec=[-3.82735230e+03 -7.52596054e+02 -3.33113879e+00  6.47830854e-06
+  2.34027300e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.44971137e+06  6.58678332e+04 -5.78666663e+03  1.34433131e-03
+  5.44119991e+02] -> next=[ 1.44592714e+06  6.51162807e+04 -5.78972521e+03  1.35073976e-03
+  5.44611379e+02]  delta/sec=[-3.78423572e+03 -7.51552512e+02 -3.05857366e+00  6.40845048e-06
+  4.91388022e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.44403026e+06  6.50930580e+04 -5.78644589e+03  1.35456488e-03
+  5.34151758e+02] -> next=[ 1.44029707e+06  6.43430218e+04 -5.78920475e+03  1.36083293e-03
+  5.34904897e+02]  delta/sec=[-3.73319474e+03 -7.50036171e+02 -2.75885533e+00  6.26804951e-06
+  7.53138198e-01]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.43835022e+06  6.43137476e+04 -5.78618497e+03  1.36491877e-03
+  5.24185466e+02] -> next=[ 1.43466307e+06  6.35652931e+04 -5.78864603e+03  1.37105874e-03
+  5.25194579e+02]  delta/sec=[-3.68714858e+03 -7.48454485e+02 -2.46105528e+00  6.13997618e-06
+  1.00911278e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.43267128e+06  6.35299086e+04 -5.78588311e+03  1.37539472e-03
+  5.14222007e+02] -> next=[ 1.42902520e+06  6.27798652e+04 -5.78803397e+03  1.38136758e-03
+  5.15505114e+02]  delta/sec=[-3.64607539e+03 -7.50043440e+02 -2.15085934e+00  5.97286471e-06
+  1.28310724e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.42699345e+06  6.27415487e+04 -5.78553950e+03  1.38599449e-03
+  5.04262400e+02] -> next=[ 1.42339391e+06  6.19915487e+04 -5.78736821e+03  1.39189681e-03
+  5.05839832e+02]  delta/sec=[-3.59954636e+03 -7.49999957e+02 -1.82871005e+00  5.90232180e-06
+  1.57743176e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.42131677e+06  6.19486766e+04 -5.78515329e+03  1.39671985e-03
+  4.94307813e+02] -> next=[ 1.41775504e+06  6.11996604e+04 -5.78663949e+03  1.40245437e-03
+  4.96176335e+02]  delta/sec=[-3.56172424e+03 -7.49016210e+02 -1.48619588e+00  5.73452543e-06
+  1.86852201e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.41564125e+06  6.11513025e+04 -5.78472356e+03  1.40757258e-03
+  4.84359574e+02] -> next=[ 1.41213028e+06  6.04015158e+04 -5.78586149e+03  1.41318040e-03
+  4.86527041e+02]  delta/sec=[-3.51096860e+03 -7.49786676e+02 -1.13792632e+00  5.60782216e-06
+  2.16746712e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.40996692e+06  6.03494379e+04 -5.78424933e+03  1.41855448e-03
+  4.74419191e+02] -> next=[ 1.40649026e+06  5.95990375e+04 -5.78503640e+03  1.42402259e-03
+  4.76916791e+02]  delta/sec=[-3.47666464e+03 -7.50400444e+02 -7.87074341e-01  5.46810600e-06
+  2.49760037e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.40429381e+06  5.95430961e+04 -5.78372954e+03  1.42966735e-03
+  4.64488368e+02] -> next=[ 1.40085718e+06  5.87938797e+04 -5.78414053e+03  1.43496903e-03
+  4.67331811e+02]  delta/sec=[-3.43662838e+03 -7.49216401e+02 -4.10987533e-01  5.30167950e-06
+  2.84344326e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.39862195e+06  5.87322918e+04 -5.78316308e+03  1.44091300e-03
+  4.54569022e+02] -> next=[ 1.39521265e+06  5.79806252e+04 -5.78317621e+03  1.44609208e-03
+  4.57747219e+02]  delta/sec=[-3.40929512e+03 -7.51666618e+02 -1.31338928e-02  5.17908547e-06
+  3.17819701e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.39295135e+06  5.79170423e+04 -5.78254873e+03  1.45229324e-03
+  4.44663336e+02] -> next=[ 1.38957794e+06  5.71678887e+04 -5.78216320e+03  1.45729494e-03
+  4.48218795e+02]  delta/sec=[-3.37340538e+03 -7.49153601e+02  3.85531393e-01  5.00170069e-06
+  3.55545921e+00]
+GRU-ODE detected: integrating with RK4, sub-step ~0.1s over output dt 1.0s
+[debug] step1 geodesic frame: start=[ 1.38728205e+06  5.70973674e+04 -5.78188518e+03  1.46380986e-03
+  4.34773842e+02] -> next=[ 1.38393622e+06  5.63453620e+04 -5.78107671e+03  1.46867390e-03
+  4.38712108e+02]  delta/sec=[-3.34582891e+03 -7.52005409e+02  8.08472252e-01  4.86403918e-06
+  3.93826588e+00]

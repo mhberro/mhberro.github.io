@@ -1,197 +1,104 @@
-# loss_functions.py
-"""Loss functions for a Neural Ordinary Differential Equation model."""
+BEFORE
 
-from __future__ import annotations
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_mo_cl_heun_HighE/GEODESIC/glide --frame geodesic --geodesic-mode integrated --model-type gruode --sbi-phase glide --ref-ecef glide
+There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
+the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
+  3.33451128e+03  2.49174647e+03  3.30483557e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
+ -2.11725726e+02  3.46356979e+03  2.44161046e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
+ -2.53746866e+03  3.40224301e+03  2.13890946e+03]
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x13fca0770>, 0.0001)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 120.6152039 pos_err: 8428.1220703 vel_err: 359.5161743 val_loss: 117.6491241 val_pos_err: 8410.4140625 val_vel_err: 431.9768372
+[INFO] Saved checkpoint at 5
+[INFO] Saved checkpoint at 6
+[INFO] Saved checkpoint at 7
+[INFO] Saved checkpoint at 8
+[INFO] Saved checkpoint at 9
+[INFO] Epoch 10: loss: 42.5995522 pos_err: 5335.9228516 vel_err: 387.1570740 val_loss: 52.0272446 val_pos_err: 5626.8110352 val_vel_err: 484.0093079
+[INFO] Saved checkpoint at 10
+[INFO] Saved checkpoint at 11
+[INFO] Saved checkpoint at 12
+[INFO] Saved checkpoint at 13
+[INFO] Epoch 15: loss: 127.7483597 pos_err: 11444.9453125 vel_err: 618.4227905 val_loss: 39.7899933 val_pos_err: 5200.2905273 val_vel_err: 411.5651550
+[INFO] Saved checkpoint at 15
+[INFO] Saved checkpoint at 16
+[INFO] Saved checkpoint at 17
+[INFO] Saved checkpoint at 18
+[INFO] Saved checkpoint at 19
+[INFO] Epoch 20: loss: 39.0460320 pos_err: 3168.4814453 vel_err: 412.1259155 val_loss: 34.7684135 val_pos_err: 4031.3637695 val_vel_err: 410.7690735
+[INFO] Saved checkpoint at 20
+[INFO] Saved checkpoint at 22
+[INFO] Saved checkpoint at 23
+[INFO] Epoch 25: loss: 36.4717598 pos_err: 3589.2429199 vel_err: 416.9801025 val_loss: 33.7874031 val_pos_err: 3571.2561035 val_vel_err: 420.5375366
+[INFO] Saved checkpoint at 28
+[INFO] Epoch 30: loss: 61.6541176 pos_err: 5644.2089844 vel_err: 572.1845093 val_loss: 33.9273376 val_pos_err: 3385.9990234 val_vel_err: 413.5917969
+[INFO] Saved checkpoint at 31
+[INFO] Epoch 35: loss: 74.3593979 pos_err: 5682.4272461 vel_err: 574.8893433 val_loss: 31.8341846 val_pos_err: 3558.6203613 val_vel_err: 390.6980896
+[INFO] Epoch 40: loss: 32.5261192 pos_err: 2600.2316895 vel_err: 365.4540710 val_loss: 30.8807964 val_pos_err: 3437.8625488 val_vel_err: 390.7370911
+[INFO] Saved checkpoint at 40
+[INFO] Epoch 45: loss: 61.9579391 pos_err: 5362.8750000 vel_err: 588.1857910 val_loss: 31.4497986 val_pos_err: 3371.4921875 val_vel_err: 403.3362732
+[INFO] Epoch 50: loss: 40.5622597 pos_err: 3688.5312500 vel_err: 403.7871094 val_loss: 31.6802158 val_pos_err: 3328.4382324 val_vel_err: 402.3098145
+[INFO] Saved checkpoint at 51
+[INFO] Epoch 55: loss: 43.2906189 pos_err: 4606.8041992 vel_err: 448.3654480 val_loss: 31.3198299 val_pos_err: 3500.5209961 val_vel_err: 383.9215088
+[INFO] Epoch 60: loss: 43.8274765 pos_err: 3838.3911133 vel_err: 469.9898071 val_loss: 30.4710140 val_pos_err: 3473.2856445 val_vel_err: 388.6359863
+[INFO] Saved checkpoint at 60
+[INFO] Epoch 65: loss: 53.6568642 pos_err: 4118.3940430 vel_err: 475.0586243 val_loss: 30.7085056 val_pos_err: 3271.2084961 val_vel_err: 391.2063904
+[INFO] Saved checkpoint at 69
+[INFO] Epoch 70: loss: 36.7522049 pos_err: 3185.4313965 vel_err: 462.1711426 val_loss: 31.2570744 val_pos_err: 3084.5524902 val_vel_err: 425.6160889
+[INFO] Saved checkpoint at 71
+[INFO] Epoch 75: loss: 47.0033531 pos_err: 3640.3225098 vel_err: 425.6206055 val_loss: 30.4988136 val_pos_err: 3196.0793457 val_vel_err: 401.3493958
+[INFO] Epoch 80: loss: 101.3694763 pos_err: 8213.5908203 vel_err: 607.3827515 val_loss: 30.7499256 val_pos_err: 2905.1306152 val_vel_err: 435.4840088
+[INFO] Epoch 85: loss: 31.7010212 pos_err: 2636.6569824 vel_err: 422.7032471 val_loss: 29.9749756 val_pos_err: 2962.0415039 val_vel_err: 420.3902588
+[INFO] Saved checkpoint at 86
+[INFO] Epoch 90: loss: 66.8460236 pos_err: 3965.9909668 vel_err: 539.5515137 val_loss: 29.7309265 val_pos_err: 3021.6794434 val_vel_err: 416.6364136
+[INFO] Saved checkpoint at 94
+[INFO] Epoch 95: loss: 74.8982773 pos_err: 7627.5170898 vel_err: 537.4134521 val_loss: 29.4795513 val_pos_err: 3128.8139648 val_vel_err: 404.2210999
+[INFO] Epoch 100: loss: 50.4707451 pos_err: 3681.5048828 vel_err: 459.6820374 val_loss: 29.4016075 val_pos_err: 3246.7485352 val_vel_err: 392.5379944
 
-from typing import Callable
+AFTER
 
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
-
-
-class WrappedMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int] | tuple[int, ...],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        position_loss_weight: float = 80.0,
-        velocity_loss_weight: float = 5.0,  # Controlled velocity weight addition
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
-        """Initializes WrappedMSELoss."""
-        super().__init__(reduction="none")
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.position_loss_weight = position_loss_weight
-        self.velocity_loss_weight = velocity_loss_weight
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
-
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a structural reference to evaluate explicit parameter decay penalties."""
-        self.model_ref = model
-
-    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
-        
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct the scale-space weight matrix across physical domains
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        
-        # Injected velocity channel priority
-        for v_idx in self.vel_indices:
-            weights[v_idx] = self.velocity_loss_weight
-            
-        # Isolate cross-track angular rates under 5-state configurations
-        if self.N_FEATURES == 5 and len(self.vel_indices) == 3:
-            weights[3] = self.velocity_loss_weight * 2.0
-            
-        weights_view = weights.view(1, 1, -1)
-        
-        # 4. Scale-Neutral Quadratic Temporal Weighting
-        if self.temporal_weighting:
-            t_linear = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            t_quad = torch.pow(t_linear, 2)
-            # Unit-mean normalization eliminates global gradient volume inflation
-            t_weights = t_quad / (t_quad.mean() + 1e-8)
-            combined_weights = weights_view * t_weights
-        else:
-            combined_weights = weights_view
-            
-        # 5. High-Gain Normalization: Retains unnormalized elements denominator invariant
-        masked_loss = elementwise_loss * combined_weights * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
-
-        # 6. Apply L2 Regularization parameter penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
-
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
-            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
-
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-=================
-==================
-
-# neural_ode_mod.py
-# [Intercepting lines 140-150 and lines 205-215 within NODEPredictor.fit]
-
-                self.optimizer.zero_grad()
-                metrics["loss"].backward()
-                
-                # Stabilized clipping ceiling to handle high-gain parameter updates
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=0.75,  
-                    norm_type=2.0,
-                )
-                self.optimizer.step()
-
-# ... [Validation loop execution remains untouched] ...
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-                
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-            ):
-                logger.info(f"Early stopping triggered at {epoch}. Rolling back to validation minimum.")
-                if enable_checkpoints and self.checkpoint is not None:
-                    # Non-destructive reload of best parameters before exiting stage
-                    self.load(directory=self.checkpoint.directory, model_name=self.checkpoint.model_name)
-                break
-
-================
-=============
-
-# NEXT_training.py
-# [Modifying the curriculum routing inside train_NEXT]
-
-        # Interleaved Reactivation Curriculum
-        length_strategies = [
-            (0.1, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
-            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 8e-5),  # Lifted to prevent stagnation
-            (0.5, 3000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 6e-5),  
-            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 4e-5),  
-            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-3),
-            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-4),
-            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-5),
-            (1.0, 5000, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-7),
-        ]
-
-        for len_strat in length_strategies:
-            print("running length strategy", len_strat)
-            data_fraction, epochs, early_stopper, learning_rate = len_strat
-            
-            # ... [Training parameter allocations remain untouched] ...
-
-            # Changed from conditional evaluation to True across all stages
-            metrics = node.fit(
-                x=fraction_of_data,
-                validation_data=fraction_of_data_val,
-                enable_checkpoints=True,
-            )
-            
-            # Synchronize parameter weights to the best caught checkpoint state
-            print(f"Curriculum transition complete for fraction {data_fraction}. Synchronizing optimal states.")
-            node.load(directory=model_save_path, model_name=model_name + ".checkpoint")
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_mo_cl_heun_HighE/GEODESIC/glide --frame geodesic --geodesic-mode integrated --model-type gruode --sbi-phase glide --ref-ecef glide
+There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
+the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
+  3.33451128e+03  2.49174647e+03  3.30483557e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
+ -2.11725726e+02  3.46356979e+03  2.44161046e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
+ -2.53746866e+03  3.40224301e+03  2.13890946e+03]
+running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x324ca6870>, 0.0001)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 50.9976997 pos_err: 16617.0800781 vel_err: 715.9642334 val_loss: 12.5589104 val_pos_err: 8345.2851562 val_vel_err: 454.6502075
+[INFO] Saved checkpoint at 5
+[INFO] Saved checkpoint at 6
+[INFO] Saved checkpoint at 7
+[INFO] Saved checkpoint at 8
+[INFO] Saved checkpoint at 9
+[INFO] Epoch 10: loss: 4.7191029 pos_err: 4368.9360352 vel_err: 447.7337036 val_loss: 4.6048493 val_pos_err: 5008.3149414 val_vel_err: 537.3084106
+[INFO] Saved checkpoint at 11
+[INFO] Saved checkpoint at 12
+[INFO] Saved checkpoint at 13
+[INFO] Saved checkpoint at 14
+[INFO] Epoch 15: loss: 4.4631443 pos_err: 4063.6237793 vel_err: 552.1212769 val_loss: 3.3923664 val_pos_err: 4201.1416016 val_vel_err: 473.5566406
+[INFO] Saved checkpoint at 15
+[INFO] Saved checkpoint at 16
+[INFO] Saved checkpoint at 18
+[INFO] Epoch 20: loss: 7.8481126 pos_err: 6152.3750000 vel_err: 721.9981689 val_loss: 3.0870061 val_pos_err: 3728.6064453 val_vel_err: 458.8136597
+[INFO] Saved checkpoint at 22
+[INFO] Saved checkpoint at 23
+[INFO] Epoch 25: loss: 3.2695806 pos_err: 2907.4318848 vel_err: 518.2028198 val_loss: 2.7694936 val_pos_err: 3311.9645996 val_vel_err: 445.0335388
+[INFO] Saved checkpoint at 25
+[INFO] Saved checkpoint at 28
+[INFO] Saved checkpoint at 29
+[INFO] Epoch 30: loss: 4.4360509 pos_err: 2957.1750488 vel_err: 572.8406372 val_loss: 2.8317764 val_pos_err: 3043.6940918 val_vel_err: 449.7382507
+[INFO] Saved checkpoint at 31
+[INFO] Epoch 35: loss: 1.6231257 pos_err: 2079.5805664 vel_err: 307.9708557 val_loss: 2.6611195 val_pos_err: 2904.9880371 val_vel_err: 443.3456726
+[INFO] Epoch 40: loss: 4.8340302 pos_err: 3758.2294922 vel_err: 460.4561768 val_loss: 2.5791032 val_pos_err: 2859.9919434 val_vel_err: 440.0628357
+[INFO] Saved checkpoint at 40
+[INFO] Epoch 45: loss: 22.5316105 pos_err: 8596.8574219 vel_err: 584.7694092 val_loss: 2.7053361 val_pos_err: 2938.0668945 val_vel_err: 444.3777771
+[INFO] Epoch 50: loss: 3.3110046 pos_err: 2875.4331055 vel_err: 437.4063416 val_loss: 2.7272198 val_pos_err: 2917.2319336 val_vel_err: 442.4247742

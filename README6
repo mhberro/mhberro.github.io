@@ -17,11 +17,12 @@ class WrappedMSELoss(MSELoss):
     def __init__(
         self,
         height_idx: int,
-        vel_indices: list[int],
+        vel_indices: list[int] | tuple[int, ...],
         scaler: MinMaxScaler | None = None,
         N_FEATURES: int = 6,
-        position_loss_weight: float = 20.0,
+        position_loss_weight: float = 80.0,
         l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
     ) -> None:
         """Initializes WrappedMSELoss."""
         super().__init__(reduction="none")
@@ -31,32 +32,40 @@ class WrappedMSELoss(MSELoss):
         self.N_FEATURES = N_FEATURES
         self.position_loss_weight = position_loss_weight
         self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
         self.model_ref = None
 
     def set_model(self, model: torch.nn.Module) -> None:
         """Saves a structural reference to evaluate explicit parameter decay penalties."""
         self.model_ref = model
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
+    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
         
-        # 1. Generate a broadcastable valid mask to isolate padding noise
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
         valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
         
-        # 2. Compute unreduced elementwise loss
+        # 2. Compute elementwise unreduced normalized loss
         elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
         
-        # 3. Apply scale-space position prioritization
+        # 3. Construct the scale-space weight matrix across physical domains
         pos_end_idx = self.vel_indices[0]
         weights = torch.ones(self.N_FEATURES, device=pred.device)
         weights[:pos_end_idx] = self.position_loss_weight
         weights_view = weights.view(1, 1, -1)
         
-        # 4. Filter loss computation to exclude padded steps
-        masked_loss = elementwise_loss * weights_view * valid_mask
+        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        # 5. High-Gain Normalization: Retains high gradient magnitudes to exploit clipped steps
+        masked_loss = elementwise_loss * combined_weights * valid_mask
         loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
 
-        # 5. Inject optimizer-agnostic L2 Parameter Regularization
+        # 6. Apply L2 Regularization parameter penalty
         if self.model_ref is not None and self.l2_reg > 0:
             l2_penalty = 0.0
             for param in self.model_ref.parameters():
@@ -86,8 +95,11 @@ class WrappedMSELoss(MSELoss):
             vel_pred = pred_unscaled[..., self.vel_indices]
             vel_target = target_unscaled[..., self.vel_indices]
 
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
+            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
 
         return {
             "loss": loss_data,
@@ -258,6 +270,7 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             vel_target_u = target_unscaled[..., self.vel_indices]
             avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_target_u)
             avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_target_u)
+
 
         pos_pred = pred[..., : self.n_pos]
         pos_target = target[..., : self.n_pos]
@@ -524,10 +537,15 @@ class WeightedHuberLoss(torch.nn.Module):
         if scaler is not None:
             # self.compute_normalised_deltas(scaler, delta_pos, delta_vel)
             sigma = scaler.scale_
+            # simple average, or keep per‑axis
             self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
             self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
 
     def forward(self, pred, target):
+        """
+        pred_norm / target_norm : (T,6) tensors in normalised space
+        Returns a scalar loss (mean over all time steps and components)
+        """
         n_timesteps = pred.size(1)
 
         pos_pred_scaled = pred[..., : self.vel_indices[0]]
@@ -535,6 +553,7 @@ class WeightedHuberLoss(torch.nn.Module):
         vel_pred_scaled = pred[..., self.vel_indices]
         vel_target_scaled = target[..., self.vel_indices]
 
+        # Compute metrics.
         with torch.no_grad():
             if self.scaler is not None:
                 pred_unscaled = torch.from_numpy(
@@ -565,6 +584,8 @@ class WeightedHuberLoss(torch.nn.Module):
         loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
         loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
 
+        # sum over dimensions, then mean over time steps
+        # total_loss = (self.wp * loss_pos.sum(dim=1) + self.wv * loss_vel.sum(dim=1)).mean()
         total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
         total_loss_unweighted = loss_pos + loss_vel
         return {

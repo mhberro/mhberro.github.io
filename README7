@@ -1,4 +1,5 @@
 # loss_functions.py
+
 """Loss functions for a Neural Ordinary Differential Equation model."""
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ class WrappedMSELoss(MSELoss):
         position_loss_weight: float = 80.0,
         l2_reg: float = 1e-4,
     ) -> None:
-        """Initializes WrappedMSELoss with scale-space focus and L2 regularization."""
+        """Initializes WrappedMSELoss with scale-space weighting and L2 tracking parameters."""
         super().__init__(reduction="none")
         self.height_idx = height_idx
         self.vel_indices = list(vel_indices)
@@ -45,7 +46,7 @@ class WrappedMSELoss(MSELoss):
         # 2. Compute unreduced elementwise loss
         elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
         
-        # 3. Apply scale-space position prioritization
+        # 3. Apply scale-space position prioritization (Fix B)
         pos_end_idx = self.vel_indices[0]
         weights = torch.ones(self.N_FEATURES, device=pred.device)
         weights[:pos_end_idx] = self.position_loss_weight
@@ -55,7 +56,7 @@ class WrappedMSELoss(MSELoss):
         masked_loss = elementwise_loss * weights_view * valid_mask
         loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
 
-        # 5. Inject optimizer-agnostic L2 Parameter Regularization
+        # 5. Inject optimizer-agnostic L2 Parameter Regularization (Fix C)
         if self.model_ref is not None and self.l2_reg > 0:
             l2_penalty = 0.0
             for param in self.model_ref.parameters():
@@ -109,7 +110,6 @@ class SecondOrderSplitMSELoss(torch.nn.Module):
         pos_expect: float = "inf",
         vel_expect: float = "inf",
     ) -> None:
-        """Initializes SecondOrderSplitMSELoss."""
         super().__init__()
         self.height_idx = height_idx
         self.vel_indices = list(vel_indices)
@@ -168,7 +168,7 @@ class PhysicsSplitMSELoss(torch.nn.Module):
     def __init__(
         self,
         height_idx: int,
-        vel_indices: list[int],
+        vel_indices: list[int] | tuple[int, ...],
         dt: float,
         pos_weight: float = 1.0,
         vel_weight: float = 1.0,
@@ -178,7 +178,10 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         vel_bias_weight: float = 0.0,
         scaler: MinMaxScaler | None = None,
         N_FEATURES: int = 6,
+        position_loss_weight: float = 80.0,
+        l2_reg: float = 1e-4,
     ) -> None:
+        """Initializes PhysicsSplitMSELoss with structural scale-space corrections and regularization."""
         super().__init__()
         self.height_idx = height_idx
         self.vel_indices = list(vel_indices)
@@ -191,7 +194,11 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         self.late_power = late_power
         self.scaler = scaler
         self.N_FEATURES = N_FEATURES
+        self.position_loss_weight = position_loss_weight
+        self.l2_reg = l2_reg
+        self.model_ref = None
         self.n_pos = self.vel_indices[0]
+        
         if scaler is not None and physics_weight > 0.0:
             scale = torch.as_tensor(getattr(scaler, "scale_"), dtype=torch.float32)
             self.register_buffer("pos_scale", scale[: self.n_pos].clone())
@@ -200,21 +207,29 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             self.pos_scale = None
             self.vel_scale = None
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Saves a structural reference to evaluate explicit parameter decay penalties."""
+        self.model_ref = model
 
+    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+
+        # 1. Generate a broadcastable valid mask to isolate padding noise
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+
+        # --- physical-unit L1 metrics (no grad), matching the other losses ---
         with torch.no_grad():
             if self.scaler is not None:
                 pred_unscaled = torch.from_numpy(
                     self.scaler.inverse_transform(
                         pred.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
                     ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
+                ).to(pred.device)
                 target_unscaled = torch.from_numpy(
                     self.scaler.inverse_transform(
                         target.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
                     ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
+                ).to(target.device)
             else:
                 pred_unscaled = pred.detach()
                 target_unscaled = target.detach()
@@ -223,18 +238,29 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             pos_target_u = target_unscaled[..., : self.n_pos]
             vel_pred_u = pred_unscaled[..., self.vel_indices]
             vel_target_u = target_unscaled[..., self.vel_indices]
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_target_u)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_target_u)
+            
+            pos_diff_u = torch.abs(pos_pred_u - pos_target_u) * valid_mask
+            vel_diff_u = torch.abs(vel_pred_u - vel_target_u) * valid_mask
+            
+            avg_pos_diff = pos_diff_u.sum() / (valid_mask.sum() * pos_pred_u.shape[-1] + 1e-8)
+            avg_vel_diff = vel_diff_u.sum() / (valid_mask.sum() * vel_pred_u.shape[-1] + 1e-8)
 
+        # 2. Extract normalized components for optimization
         pos_pred = pred[..., : self.n_pos]
         pos_target = target[..., : self.n_pos]
         vel_pred = pred[..., self.vel_indices]
         vel_target = target[..., self.vel_indices]
 
-        pos_loss = torch.nn.functional.mse_loss(pos_pred, pos_target)
-        vel_loss = torch.nn.functional.mse_loss(vel_pred, vel_target)
+        # 3. Apply position over-weighting prioritization factor (Fix B)
+        elementwise_pos = torch.nn.functional.mse_loss(pos_pred, pos_target, reduction="none") * self.position_loss_weight
+        elementwise_vel = torch.nn.functional.mse_loss(vel_pred, vel_target, reduction="none")
+        
+        # 4. Filter baseline tracking loss through the mask
+        pos_loss = (elementwise_pos * valid_mask).sum() / (valid_mask.sum() * self.n_pos + 1e-8)
+        vel_loss = (elementwise_vel * valid_mask).sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
         total_loss = self.pos_weight * pos_loss + self.vel_weight * vel_loss
 
+        # 5. Process interior kinematic checks under sequence restrictions
         if self.physics_weight > 0.0 and n_timesteps >= 2:
             if self.pos_scale is not None:
                 pos_phys = pos_pred * self.pos_scale.to(pos_pred.device)
@@ -248,12 +274,14 @@ class PhysicsSplitMSELoss(torch.nn.Module):
                 resid = (dpos_dt - vel_mid) / self.pos_scale.to(pos_pred.device)
             else:
                 resid = dpos_dt - vel_mid
-            physics_loss = torch.mean(resid**2)
+                
+            step_mask = valid_mask[:, :-1, :]
+            physics_loss = (resid**2 * step_mask).sum() / (step_mask.sum() * self.n_pos + 1e-8)
             total_loss = total_loss + self.physics_weight * physics_loss
 
         if self.late_weight > 0.0 and n_timesteps >= 2:
             se = (pos_pred - pos_target) ** 2
-            per_t = se.mean(dim=(0, 2))
+            per_t = (se * valid_mask).sum(dim=(0, 2)) / (valid_mask.sum(dim=0).squeeze(-1) * self.n_pos + 1e-8)
             k = torch.arange(n_timesteps, device=pos_pred.device, dtype=pos_pred.dtype)
             w = (k / (n_timesteps - 1)) ** self.late_power
             w = w / (w.mean() + 1e-8)
@@ -261,10 +289,18 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             total_loss = total_loss + self.late_weight * late_loss
 
         if self.vel_bias_weight > 0.0 and n_timesteps >= 2:
-            r = vel_pred - vel_target
-            bias = r.mean(dim=1)
+            r = (vel_pred - vel_target) * valid_mask
+            bias = r.sum(dim=1) / (valid_mask.sum(dim=1) + 1e-8)
             bias_loss = torch.mean(bias**2)
             total_loss = total_loss + self.vel_bias_weight * bias_loss
+
+        # 6. Apply Non-Invasive L2 regularizer penalty (Fix C)
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            total_loss = total_loss + self.l2_reg * l2_penalty
 
         return {
             "loss": total_loss,
@@ -283,7 +319,6 @@ class EnergyMSELoss(MSELoss):
         scaler: MinMaxScaler | None = None,
         N_FEATURES: int = 6,
     ) -> None:
-        """Initializes EnergyMSELoss."""
         super().__init__()
         self.height_idx = height_idx
         self.vel_indices = list(vel_indices)
@@ -335,7 +370,6 @@ class EnergyMSELoss(MSELoss):
 
 class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
     def __init__(self) -> None:
-        """Initializes ReverseLinearWeightingLoss."""
         super().__init__()
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:

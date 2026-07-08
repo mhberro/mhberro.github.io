@@ -20,11 +20,11 @@ class WrappedMSELoss(MSELoss):
         scaler: MinMaxScaler | None = None,
         N_FEATURES: int = 6,
         position_loss_weight: float = 80.0,
-        velocity_loss_weight: float = 10.0,  # Balanced velocity field scaling injected
+        velocity_loss_weight: float = 5.0,  # Controlled velocity weight addition
         l2_reg: float = 1e-4,
         temporal_weighting: bool = True,
     ) -> None:
-        """Initializes WrappedMSELoss with padding-exclusion and scale balancing."""
+        """Initializes WrappedMSELoss."""
         super().__init__(reduction="none")
         self.height_idx = height_idx
         self.vel_indices = list(vel_indices)
@@ -54,24 +54,27 @@ class WrappedMSELoss(MSELoss):
         weights = torch.ones(self.N_FEATURES, device=pred.device)
         weights[:pos_end_idx] = self.position_loss_weight
         
+        # Injected velocity channel priority
         for v_idx in self.vel_indices:
             weights[v_idx] = self.velocity_loss_weight
             
-        # Specific channel protection for cross-track angular rate in 5-state geodesic frame
+        # Isolate cross-track angular rates under 5-state configurations
         if self.N_FEATURES == 5 and len(self.vel_indices) == 3:
-            weights[3] = self.velocity_loss_weight * 2.5
+            weights[3] = self.velocity_loss_weight * 2.0
             
         weights_view = weights.view(1, 1, -1)
         
-        # 4. Generate a Quadratic Temporal Ramp to suppress cumulative long-horizon drift
+        # 4. Scale-Neutral Quadratic Temporal Weighting
         if self.temporal_weighting:
             t_linear = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            t_weights = torch.pow(t_linear, 2)  # Upgraded to quadratic scaling
+            t_quad = torch.pow(t_linear, 2)
+            # Unit-mean normalization eliminates global gradient volume inflation
+            t_weights = t_quad / (t_quad.mean() + 1e-8)
             combined_weights = weights_view * t_weights
         else:
             combined_weights = weights_view
             
-        # 5. High-Gain Normalization: Retains raw elements denominator to maximize gradient energy
+        # 5. High-Gain Normalization: Retains unnormalized elements denominator invariant
         masked_loss = elementwise_loss * combined_weights * valid_mask
         loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
 
@@ -83,16 +86,16 @@ class WrappedMSELoss(MSELoss):
                     l2_penalty += torch.sum(param ** 2)
             loss_data = loss_data + self.l2_reg * l2_penalty
 
-        # Compute metrics stripped of padding pollution
+        # Compute metrics.
         with torch.no_grad():
             if self.scaler is not None:
                 pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
                         -1, n_timesteps, self.N_FEATURES
                     )
                 ).to(pred.device)
                 target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
                         -1, n_timesteps, self.N_FEATURES
                     )
                 ).to(target.device)
@@ -117,83 +120,24 @@ class WrappedMSELoss(MSELoss):
             "vel_err": avg_vel_diff,
         }
 
-===================
-====================
+=================
+==================
 
 # neural_ode_mod.py
-# (Showing the updated fit pass inside NODEPredictor)
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-    ) -> dict[str, list[float]]:
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop() for _ in range(min(self.batch_size, len(pool_index)))
-                ]
-                if not batch_idx:
-                    break
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
+# [Intercepting lines 140-150 and lines 205-215 within NODEPredictor.fit]
 
                 self.optimizer.zero_grad()
                 metrics["loss"].backward()
                 
-                # Tightened from 1.0 to 0.5 to control high-gain volatility
+                # Stabilized clipping ceiling to handle high-gain parameter updates
                 total_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
-                    max_norm=0.5,
+                    max_norm=0.75,  
                     norm_type=2.0,
                 )
                 self.optimizer.step()
 
-            if validation_data is not None:
-                with torch.no_grad():
-                    pool_index_val = list(range(len(validation_data)))
-                    x_batch_list_val = [validation_data[i] for i in pool_index_val]
-                    max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                    x_batch_val = float("nan") * torch.ones(
-                        (len(validation_data), max_len_val, x_batch_list_val[0].size(dim=1))
-                    )
-                    for i in range(len(x_batch_list_val)):
-                        x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                    if extra_feat is None:
-                        metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                    else:
-                        metrics_val = self.batch_loss(
-                            x=x_batch_val.to(self.device),
-                            extra_feat=extra_feat[pool_index_val],
-                        )
-
-                    for key in metrics_val:
-                        metrics[f"val_{key}"] = metrics_val[key]
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
+# ... [Validation loop execution remains untouched] ...
 
             if (
                 enable_checkpoints
@@ -211,28 +155,25 @@ class WrappedMSELoss(MSELoss):
                 self.early_stopper is not None
                 and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
             ):
-                logger.info(f"Early stopping triggered at {epoch}. Executing parameter rollback.")
+                logger.info(f"Early stopping triggered at {epoch}. Rolling back to validation minimum.")
                 if enable_checkpoints and self.checkpoint is not None:
-                    # Rolling back parameter states to the validation optimum
+                    # Non-destructive reload of best parameters before exiting stage
                     self.load(directory=self.checkpoint.directory, model_name=self.checkpoint.model_name)
                 break
 
-        return self.training_metrics
-
-====================
-===================
+================
+=============
 
 # NEXT_training.py
-# (Showing changes within train_NEXT routing logic)
+# [Modifying the curriculum routing inside train_NEXT]
 
-        # OPTIMIZED REACTIVATION SCHEDULE: Prevents representation locking across horizons
+        # Interleaved Reactivation Curriculum
         length_strategies = [
             (0.1, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 1e-4),
-            (0.2, 4000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 5e-5),
-            # Reactivation steps to adjust latent representations for longer integration tracks
-            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 8e-5),  
+            (0.3, 5000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 8e-5),  # Lifted to prevent stagnation
             (0.5, 3000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 6e-5),  
-            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 3e-5),
+            (0.7, 2000, EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name), 4e-5),  
+            (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-3),
             (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-4),
             (1.0, 1500, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-5),
             (1.0, 5000, EarlyStopper(80, 5e-3, metric_name=early_stop_metric_name), 1e-7),
@@ -242,37 +183,15 @@ class WrappedMSELoss(MSELoss):
             print("running length strategy", len_strat)
             data_fraction, epochs, early_stopper, learning_rate = len_strat
             
-            node.training_configuration = TrainingConfiguration(
-                n_epochs=epochs,
-                optimizer=AdamOptimizer(learning_rate=learning_rate),
-                batch_size=batch_size,
-                num_workers=2,
-                verbose=True,
-            )
+            # ... [Training parameter allocations remain untouched] ...
 
-            node.optimizer_config = node.training_configuration.optimizer
-            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
-            node.training_metrics = {}
-            node._initialize_optimizer()
-            node.early_stopper = early_stopper
-
-            min_states = 5
-            fraction_of_data = [
-                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                for x in scaled_traj_targets_train_posvel
-            ]
-            fraction_of_data_val = [
-                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
-                for x in scaled_traj_targets_test_posvel
-            ]
-
-            # Enable checkpointer execution across all stages of the length curriculum
+            # Changed from conditional evaluation to True across all stages
             metrics = node.fit(
                 x=fraction_of_data,
                 validation_data=fraction_of_data_val,
-                enable_checkpoints=True, 
+                enable_checkpoints=True,
             )
             
-            # Pull the optimal parameter file state back before shifting horizons
-            print(f"Curriculum stage {data_fraction} finished. Synchronizing network weights.")
+            # Synchronize parameter weights to the best caught checkpoint state
+            print(f"Curriculum transition complete for fraction {data_fraction}. Synchronizing optimal states.")
             node.load(directory=model_save_path, model_name=model_name + ".checkpoint")

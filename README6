@@ -1,17 +1,356 @@
-Traceback (most recent call last):
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_heun.py", line 758, in <module>
-    main()
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_heun.py", line 750, in main
-    node, model_name = train_NEXT(
-                       ^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/NEXT_training_cl_heun.py", line 461, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 349, in fit
-    self.load(directory=self.checkpoint.directory, model_name=self.checkpoint.model_name)
-  File "/home/jovyan/lm_cm_repos/next/neural_ode_mod.py", line 582, in load
-    loader = TorchModelLoader(directory, model_name, device_type)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/jovyan/lm_cm_repos/next/.venv/lib/python3.12/site-packages/lm_ai_torch_training/model_management.py", line 95, in __init__
-    raise ValueError(message)
-ValueError: There is no torch model at the filepath model_outputs/SBI/GRUODE_cl_heun/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_10000sr_0.1sec_200hid_0aug_16_scalarOn.checkpoint.pt.
+# neural_od_mod.py
+
+# Copyright 2026 Lockheed Martin Corporation
+# Lockheed Martin Proprietary Information
+
+"""Base training class for a Neural Ordinary Differential Equation model."""
+
+from __future__ import annotations
+
+import math
+import os
+import random
+from typing import TYPE_CHECKING
+
+import torch
+from torch import nn
+
+from cm_utilities.logger import logger
+from lm_ai_torch_training.device_type import DeviceType
+from lm_ai_torch_training.hyperparameters import TrainingParam
+from lm_ai_torch_training.model_management import (
+    TorchModelLoader,
+    TorchModelSaver,
+)
+from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
+from prediction.mlearn.neural_ode.loss_functions import (
+    ReverseLinearWeightingLoss,
+)
+
+if TYPE_CHECKING:  # pragma: no cover
+    from lm_ai_torch_training.configuration import TrainingConfiguration
+    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
+    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
+        OptimizerWithLossFunction,
+    )
+    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+    from prediction.mlearn.ffnn.model import FFNNModel
+    from prediction.mlearn.neural_ode.ode_solver import ODESolver
+
+DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
+
+
+class EarlyStopper:
+    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float("inf")
+        self.previous_validation_loss = float("inf")
+        self.metric_name = metric_name
+
+    def early_stop(self, validation_loss: float):
+        if validation_loss < (self.min_validation_loss - self.min_delta):
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        self.previous_validation_loss = validation_loss
+        return False
+
+
+class ModelCheckpoint:
+    def __init__(self, min_epochs: int, directory: str, model_name: str):
+        self.min_epochs = min_epochs
+        self.directory = directory
+        self.model_name = model_name
+        self.min_metric = float("inf")
+
+    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
+        if epoch > self.min_epochs and metric < self.min_metric:
+            self.min_metric = metric
+            model.save(
+                directory=self.directory,
+                model_name=self.model_name,
+            )
+            return True
+        return False
+
+
+class NODEPredictor(nn.Module):
+    def __init__(
+        self,
+        architecture: FFNNArchitecture,
+        training_configuration: TrainingConfiguration,
+        solver: ODESolver,
+        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
+        logging_interval: int = 1,
+        early_stopper: EarlyStopper | None = None,
+        checkpoint: ModelCheckpoint | None = None,
+        aug_dim: int = 0,
+    ) -> None:
+        super().__init__()
+        self.architecture: FFNNArchitecture = architecture
+        self.training_configuration: TrainingConfiguration = training_configuration
+        self.logging_interval: int = logging_interval
+        self.solver = solver
+        self.early_stopper = early_stopper
+        self.checkpoint = checkpoint
+        self.aug_dim = aug_dim
+        self.scheduler: torch.optim.lr_scheduler.LRScheduler | None = None
+
+        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
+        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
+        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
+        self.verbose: bool = self.training_configuration.verbose
+
+        self.training_metrics: dict[str, list[float]] = {}
+
+        self._initialize_device()
+        self._initialize_losses(loss_func=loss_func)
+        self._initialize_model()
+        self._initialize_optimizer()
+
+    def fit(
+        self,
+        x: list[torch.Tensor],
+        extra_feat: torch.Tensor | None = None,
+        *,
+        shuffle: bool = True,
+        validation_data: list[torch.Tensor] | None = None,
+        enable_checkpoints: bool = False,
+    ) -> dict[str, list[float]]:
+        if extra_feat is not None:
+            extra_feat = extra_feat.to(self.device)
+
+        for epoch in range(1, self.n_epochs + 1):
+            pool_index = list(range(len(x)))
+            if shuffle:
+                random.shuffle(pool_index)
+            for _ in range(math.ceil(len(x) / self.batch_size)):
+                batch_idx = [
+                    pool_index.pop(0)
+                    for _ in range(
+                        min(
+                            len(pool_index),
+                            self.batch_size,
+                        )
+                    )
+                ]
+                x_batch_list = [x[i] for i in batch_idx]
+                max_len = max([i.size(dim=0) for i in x_batch_list])
+                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
+                for i in range(len(x_batch_list)):
+                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
+
+                if extra_feat is None:
+                    metrics = self.batch_loss(x=x_batch.to(self.device))
+                else:
+                    metrics = self.batch_loss(
+                        x=x_batch.to(self.device),
+                        extra_feat=extra_feat[batch_idx],
+                    )
+
+                self.optimizer.zero_grad()
+                metrics["loss"].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=1.0,
+                    norm_type=2.0,
+                )
+                self.optimizer.step()
+
+            if validation_data is not None:
+                with torch.no_grad():
+                    pool_index_val = list(range(len(validation_data)))
+                    if shuffle:
+                        random.shuffle(pool_index_val)
+
+                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
+                        batch_idx_val = [
+                            pool_index_val.pop(0)
+                            for _ in range(
+                                min(
+                                    len(pool_index_val),
+                                    self.batch_size,
+                                )
+                            )
+                        ]
+                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
+                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
+                        x_batch_val = float("nan") * torch.ones(
+                            (
+                                len(batch_idx_val),
+                                max_len_val,
+                                x_batch_list_val[0].size(dim=1),
+                            )
+                        )
+                        for i in range(len(x_batch_list_val)):
+                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
+
+                        if extra_feat is None:
+                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
+                        else:
+                            metrics_val = self.batch_loss(
+                                x=x_batch_val.to(self.device),
+                                extra_feat=extra_feat[batch_idx_val],
+                            )
+
+                    for key in metrics_val:
+                        metrics[f"val_{key}"] = metrics_val[key]
+
+                    if hasattr(self.criterion, "wp") and enable_checkpoints:
+                        if epoch % 50 == 0:
+                            if (
+                                metrics["pos_err_scaled"] > self.criterion.delta_pos
+                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
+                            ):
+                                pass
+                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
+                                self.criterion.wp *= 1.2
+                                logger.info(
+                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
+                                )
+                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
+                                self.criterion.wv *= 1.2
+                                logger.info(
+                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
+                                )
+
+            self._add_metrics_to_global_metrics(metrics)
+            self._log_metrics(metrics, iteration=epoch)
+
+            if self.scheduler is not None:
+                _watch_key = self.early_stopper.metric_name if self.early_stopper is not None else "loss"
+                _watch = metrics.get(_watch_key, metrics.get("loss"))
+                _watch_val = _watch.item() if hasattr(_watch, "item") else float(_watch)
+                self.scheduler.step(_watch_val)
+                _cur_lr = self.optimizer.param_groups[0]["lr"]
+                metrics["lr"] = torch.tensor(_cur_lr)
+
+            if (
+                enable_checkpoints
+                and validation_data is not None
+                and self.checkpoint is not None
+                and self.checkpoint.save_on_min(
+                    self,
+                    epoch,
+                    metrics[self.early_stopper.metric_name],
+                )
+            ):
+                logger.info(f"Saved checkpoint at {epoch}")
+            if (
+                self.early_stopper is not None
+                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
+            ):
+                logger.info(f"Early stopping triggered at {epoch}")
+                break
+
+        # Guard reload sequence against missing early-curriculum checkpoint files
+        if self.checkpoint is not None:
+            checkpoint_path = os.path.join(self.checkpoint.directory, self.checkpoint.model_name + ".pt")
+            if os.path.exists(checkpoint_path):
+                self.load(directory=self.checkpoint.directory, model_name=self.checkpoint.model_name)
+            else:
+                logger.info(f"No checkpoint file found at {checkpoint_path}, retaining last active epoch parameters.")
+
+        return self.training_metrics
+
+    def batch_loss(
+        self,
+        x: torch.Tensor,
+        extra_feat: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if self.aug_dim == 0:
+            x0 = x[:, 0]
+        else:
+            zeros = torch.zeros((x.shape[0], self.aug_dim)).to(self.device)
+            x0 = torch.cat((x[:, 0, :], zeros), dim=1)
+        batch_size, time_steps, n_features = x.shape
+        if self.solver.adjoint:
+            x_pred = AdjointMethod.apply(
+                self.solver,
+                self.model,
+                x0,
+                time_steps - 1,
+                extra_feat,
+                *tuple(self.model.parameters()),
+            )[:, :, : x.shape[2]]
+        else:
+            x_pred = self.solver.integrate(
+                func=self.model,
+                x0=x0,
+                steps=time_steps - 1,
+                extra_feat=extra_feat,
+            )[:, :, : x.shape[2]]
+
+        x_pred = torch.nan_to_num(x_pred, nan=0)
+        x = torch.nan_to_num(x, nan=0)
+
+        return self.criterion(x_pred, x)
+
+    def infer(
+        self,
+        x0: torch.Tensor,
+        steps: int = 1,
+        extra_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            if self.aug_dim != 0:
+                x0 = torch.cat((x0[:, 0], torch.zeros(self.aug_dim)), dim=1)
+            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
+
+    def load(
+        self,
+        directory: str,
+        model_name: str,
+        device_type: DeviceType = DeviceType.CPU,
+    ) -> None:
+        loader = TorchModelLoader(directory, model_name, device_type)
+        loader.load(name="model", component=self.model)
+
+    def save(self, directory: str, model_name: str) -> None:
+        model_saver = TorchModelSaver()
+        model_saver.add_component(name="model", component=self.model)
+        model_saver.save(directory, model_name)
+
+    def _initialize_device(self) -> None:
+        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
+        self.to(device=self.device)
+
+    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
+        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
+
+    def _initialize_model(self) -> None:
+        self.model: FFNNModel = self.architecture.get_model().to(self.device)
+
+    def _initialize_optimizer(self) -> None:
+        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
+            self.model
+        )
+
+    def _add_metrics_to_global_metrics(
+        self,
+        metrics: dict[str, torch.Tensor],
+    ) -> None:
+        for metric, value in metrics.items():
+            if metric not in self.training_metrics:
+                self.training_metrics[metric] = []
+            self.training_metrics[metric].append(value.detach().cpu().numpy())
+
+    def _log_metrics(
+        self,
+        metrics: dict[str, torch.Tensor],
+        iteration: int,
+        prefix: str = "Epoch",
+    ) -> None:
+        with torch.no_grad():
+            if self.verbose and iteration % self.logging_interval == 0:
+                metric_comps: list[str] = []
+                for metric, value in metrics.items():
+                    metric_comps.append(f"{metric}: {value.item():.7f}")
+
+                metric_str: str = " ".join(metric_comps)
+                logger.info(f"{prefix} {iteration}: {metric_str}")

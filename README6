@@ -1,129 +1,107 @@
-# loss_functions.py
-"""Loss functions for a Neural Ordinary Differential Equation model."""
-
-from __future__ import annotations
-
-from typing import Callable
-
 import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
+from torch import nn
 
-
-class WrappedMSELoss(MSELoss):
+class GRUODEPredictorModelStateless(nn.Module):
     def __init__(
         self,
-        height_idx: int,
-        vel_indices: list[int] | tuple[int, ...],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        position_loss_weight: float = 80.0,
-        velocity_loss_weight: float = 8.0,  # Focus priority on velocity fields
-        stiffness_regularization: float = 1e-3, # Controls Jacobian eigenvalues for explicit solvers
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
-        """Initializes WrappedMSELoss with padding-exclusion and scale balancing."""
-        super().__init__(reduction="none")
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.position_loss_weight = position_loss_weight
-        self.velocity_loss_weight = velocity_loss_weight
-        self.stiffness_regularization = stiffness_regularization
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
-
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a structural reference to evaluate explicit parameter decay penalties."""
-        self.model_ref = model
-
-    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
+        func: GRUODEFunc,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        """Stateless vector field wrapper. Latent state h(t) is managed directly 
+        by the ODE solver as part of the continuous integration state tensor.
+        """
+        super().__init__()
+        self.func = func
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
         
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct the scale-space weight matrix across physical domains
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        
-        for v_idx in self.vel_indices:
-            weights[v_idx] = self.velocity_loss_weight
-            
-        # Isolate cross-track angular rates under 5-state configurations
-        if self.N_FEATURES == 5 and len(self.vel_indices) == 3:
-            weights[3] = self.velocity_loss_weight * 2.5
-            
-        weights_view = weights.view(1, 1, -1)
-        
-        # 4. Scale-Neutral Quadratic Temporal Weighting
-        if self.temporal_weighting:
-            t_linear = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            t_quad = torch.pow(t_linear, 2)
-            # Unit-mean normalization eliminates global gradient volume inflation
-            t_weights = t_quad / (t_quad.mean() + 1e-8)
-            combined_weights = weights_view * t_weights
-        else:
-            combined_weights = weights_view
-            
-        # 5. Mask and calculate base state loss
-        masked_loss = elementwise_loss * combined_weights * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
-
-        # 6. Smoothness Guard: Suppresses high-frequency volatility to protect explicit solvers
-        if self.stiffness_regularization > 0.0 and n_timesteps > 1:
-            pred_diff = torch.diff(pred, dim=1)
-            # Penalize rapid fluctuations along the velocity vector grid
-            vel_volatility = torch.pow(pred_diff[..., self.vel_indices], 2) * valid_mask[:, 1:, :]
-            loss_data = loss_data + self.stiffness_regularization * (vel_volatility.sum() / (valid_mask[:, 1:, :].sum() + 1e-8))
-
-        # 7. Apply L2 Regularization parameter penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
-
-        # Compute metrics.
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                offset = (torch.as_tensor(vel_mean, dtype=torch.float32) / torch.as_tensor(pos_scale, dtype=torch.float32)
+                          if vel_mean is not None else torch.zeros_like(ratio))
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
             else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+                self.scaled_space = False
 
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+        
+        # Unpack the absolute physical and latent partitions directly from solver state
+        y_read = state[..., : self.n_features]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
-            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
+        # Enforce analytical bounding constraints
+        h = torch.tanh(h)
+        
+        # Compute latent and physical derivatives
+        dh = self.func.cell(t, h)
+        xdot = self.func.decode(h)
 
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
+        # Apply kinematic second-order identity constraints
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
 
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
+        return torch.cat((xdot, dh), dim=-1)
+
+===============
+==============
+
+def batch_loss(
+        self,
+        x: torch.Tensor,
+        extra_feat: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Calculates loss using stateless, pre-seeded latent vectors."""
+        batch_size, time_steps, n_features = x.shape
+        
+        # Isolate initial true physical states
+        x0_phys = x[:, 0, :n_features]
+        
+        if self.aug_dim == 0:
+            x0 = x0_phys
+        else:
+            # Seed the absolute latent state space outside the integration loop
+            if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
+                # Path for GRU-ODE architectures
+                h0 = self.model.func.encode(x0_phys)
+            else:
+                # Fallback path for standard ANODE architectures
+                h0 = torch.zeros((batch_size, self.aug_dim), device=self.device)
+            
+            x0 = torch.cat((x0_phys, h0), dim=-1)
+
+        # Execute pure stateless integration
+        if self.solver.adjoint:
+            x_pred = AdjointMethod.apply(
+                self.solver,
+                self.model,
+                x0,
+                time_steps - 1,
+                extra_feat,
+                *tuple(self.model.parameters()),
+            )[:, :, :n_features]
+        else:
+            x_pred = self.solver.integrate(
+                func=self.model,
+                x0=x0,
+                steps=time_steps - 1,
+                extra_feat=extra_feat,
+            )[:, :, :n_features]
+
+        x_pred = torch.nan_to_num(x_pred, nan=0.0)
+        x = torch.nan_to_num(x, nan=0.0)
+
+        return self.criterion(x_pred, x)

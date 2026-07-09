@@ -1,474 +1,321 @@
-# loss_functions.py
-"""Loss functions for a Neural Ordinary Differential Equation model."""
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+):
+    # define initial training configuration
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=100,  
+        verbose=True,
+    )
+    
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
 
-from __future__ import annotations
-
-from typing import Callable
-
-import torch
-from sklearn.preprocessing import MinMaxScaler
-from torch import Tensor
-from torch.nn import MSELoss
-from tslearn.metrics import SoftDTWLossPyTorch
-
-
-class WrappedMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int] | tuple[int, ...],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        position_loss_weight: float = 80.0,
-        l2_reg: float = 1e-4,
-    ) -> None:
-        """Initializes WrappedMSELoss with scale-space focus and L2 regularization."""
-        super().__init__(reduction="none")
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.position_loss_weight = position_loss_weight
-        self.l2_reg = l2_reg
-        self.model_ref = None
-
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a structural reference to evaluate explicit parameter decay penalties."""
-        self.model_ref = model
-
-    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame == "grdth":
+        velocity_indicies = (2, 3, 4)
+    elif frame == "geodesic":
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("That frame is not known for what the velocity indicies are")
         
-        # 1. Generate a broadcastable valid mask to isolate padding noise
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute unreduced elementwise loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Apply scale-space position prioritization
-        pos_end_idx = self.vel_indices[0]
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[:pos_end_idx] = self.position_loss_weight
-        weights_view = weights.view(1, 1, -1)
-        
-        # 4. Filter loss computation to exclude padded steps
-        masked_loss = elementwise_loss * weights_view * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+    early_stop_metric_name = "val_loss"
 
-        # 5. Inject optimizer-agnostic L2 Parameter Regularization
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
+    # Default fallback loss function configuration
+    loss_func = WrappedMSELoss(
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+        position_loss_weight=80.0,
+        l2_reg=1e-4,
+    )
 
-        # 6. Compute absolute physical metrics stripped of padding pollution
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
+    # Define the Neural ODE wrapper model
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(
+            layer_channels=[5, 5],  
+            layer_activation=Activation.SILU,
+        ),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+    
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    # --------------------------------------------------------------------
+    #  Build the requested model architecture
+    # --------------------------------------------------------------------
+    if model_type == "node":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "anode":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=aug_dim,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "sonode":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=slice(3, 6),
+        ).to(node.device)
+    elif model_type in ("gruode", "gruode-min"):
+        minimal = model_type == "gruode-min"
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+
+        ENCODER_INPUT_MODE = "all"   
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [2, 3, 4, 5]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [3, 4, 5]           
             else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
-            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
-
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-
-class SecondOrderSplitMSELoss(torch.nn.Module):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        vel_weight: float | None = 1.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        pos_expect: float = "inf",
-        vel_expect: float = "inf",
-    ) -> None:
-        """Initializes SecondOrderSplitMSELoss."""
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.vel_weight = vel_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.pos_expect = pos_expect
-        self.vel_expect = vel_expect
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-
-        if self.scaler is not None:
-            pred_unscaled = torch.from_numpy(
-                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                    -1, n_timesteps, self.N_FEATURES
-                )
-            )
-            target_unscaled = torch.from_numpy(
-                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                    -1, n_timesteps, self.N_FEATURES
-                )
-            )
+                enc_in_idx = None                
+        elif frame == "geodesic" and model_states == 5:
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           
+            else:
+                enc_in_idx = None
+        elif frame == "grdth":
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           
+            else:
+                enc_in_idx = None
         else:
-            pred_unscaled = pred.detach()
-            target_unscaled = target.detach()
+            enc_in_idx = None
 
-        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
-        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
-        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
-        vel_target_unscaled = target_unscaled[..., self.vel_indices]
-
-        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
-        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
-
-        pos_pred = pred[..., : self.vel_indices[0]]
-        pos_target = target[..., : self.vel_indices[0]]
-        vel_pred = pred[..., self.vel_indices]
-        vel_target = target[..., self.vel_indices]
-
-        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
-        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
-
-        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
-        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
-        total_loss = pos_loss + vel_loss
-
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-
-class PhysicsSplitMSELoss(torch.nn.Module):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        dt: float,
-        pos_weight: float = 1.0,
-        vel_weight: float = 1.0,
-        physics_weight: float = 0.0,
-        late_weight: float = 0.0,
-        late_power: float = 1.0,
-        vel_bias_weight: float = 0.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-    ) -> None:
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.dt = float(dt)
-        self.pos_weight = pos_weight
-        self.vel_weight = vel_weight
-        self.physics_weight = physics_weight
-        self.vel_bias_weight = vel_bias_weight
-        self.late_weight = late_weight
-        self.late_power = late_power
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.n_pos = self.vel_indices[0]
-        if scaler is not None and physics_weight > 0.0:
-            scale = torch.as_tensor(getattr(scaler, "scale_"), dtype=torch.float32)
-            self.register_buffer("pos_scale", scale[: self.n_pos].clone())
-            self.register_buffer("vel_scale", scale[self.vel_indices].clone())
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=minimal,
+            encoder_input_idx=enc_in_idx,
+            encoder_dropout=0.1,
+        ).to(node.device)
+        
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
         else:
-            self.pos_scale = None
-            self.vel_scale = None
+            pos_idx, vel_idx = None, None
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
 
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(
-                        pred.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
-                    ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(
-                        target.detach().cpu().numpy().reshape(-1, self.N_FEATURES)
-                    ).reshape(-1, n_timesteps, self.N_FEATURES)
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+        node.model = GRUODEPredictorModel(
+            func=gruode_func,
+            pos_idx=pos_idx,
+            vel_idx=vel_idx,
+            pos_scale=so_pos_scale,
+            vel_scale=so_vel_scale,
+            vel_mean=so_vel_mean,
+        ).to(node.device)
+        
+        node.aug_dim = latent_dim
+        aug_dim = latent_dim
 
-            pos_pred_u = pred_unscaled[..., : self.n_pos]
-            pos_target_u = target_unscaled[..., : self.n_pos]
-            vel_pred_u = pred_unscaled[..., self.vel_indices]
-            vel_target_u = target_unscaled[..., self.vel_indices]
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_u, pos_target_u)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_u, vel_target_u)
+        # Strategy B Integration: Establish the physics-informed metric engine for GRU-ODE tracking
+        loss_func = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            vel_indices=velocity_indicies,
+            dt=trajectory_dt,
+            pos_weight=80.0,       
+            vel_weight=1.0,
+            physics_weight=0.5,    
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-4,
+            temporal_weighting=True,
+        )
+        node._initialize_losses(loss_func)
+        
+    elif model_type == "latentode":
+        latent_dim = nhidden // 2 if nhidden >= 20 else 8  
+        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
 
-        pos_pred = pred[..., : self.n_pos]
-        pos_target = target[..., : self.n_pos]
-        vel_pred = pred[..., self.vel_indices]
-        vel_target = target[..., self.vel_indices]
+        recon_criterion = WrappedMSELoss(
+            height_idx=1,
+            vel_indices=[3, 4, 5],
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+        )
 
-        pos_loss = torch.nn.functional.mse_loss(pos_pred, pos_target)
-        vel_loss = torch.nn.functional.mse_loss(vel_pred, vel_target)
-        total_loss = self.pos_weight * pos_loss + self.vel_weight * vel_loss
+        def latent_ode_loss_fn(recon, target, mu, logvar):
+            recon_loss = recon_criterion(recon, target)
+            kl = _kl_divergence(mu, logvar)
+            return recon_loss + 0.1 * kl
 
-        if self.physics_weight > 0.0 and n_timesteps >= 2:
-            if self.pos_scale is not None:
-                pos_phys = pos_pred * self.pos_scale.to(pos_pred.device)
-                vel_phys = vel_pred * self.vel_scale.to(vel_pred.device)
-            else:
-                pos_phys = pos_pred
-                vel_phys = vel_pred
-            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_mid = vel_phys[:, :-1, :]
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pos_pred.device)
-            else:
-                resid = dpos_dt - vel_mid
-            physics_loss = torch.mean(resid**2)
-            total_loss = total_loss + self.physics_weight * physics_loss
+        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
-        if self.late_weight > 0.0 and n_timesteps >= 2:
-            se = (pos_pred - pos_target) ** 2
-            per_t = se.mean(dim=(0, 2))
-            k = torch.arange(n_timesteps, device=pos_pred.device, dtype=pos_pred.dtype)
-            w = (k / (n_timesteps - 1)) ** self.late_power
-            w = w / (w.mean() + 1e-8)
-            late_loss = torch.mean(w * per_t)
-            total_loss = total_loss + self.late_weight * late_loss
+    # Set parameter reference hooks before launching training strategies
+    if hasattr(node.criterion, "set_model"):
+        node.criterion.set_model(node.model)
 
-        if self.vel_bias_weight > 0.0 and n_timesteps >= 2:
-            r = vel_pred - vel_target
-            bias = r.mean(dim=1)
-            bias_loss = torch.mean(bias**2)
-            total_loss = total_loss + self.vel_bias_weight * bias_loss
+    # Convert training targets into target sequence tensors
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
+        ]
+        scaled_traj_targets_test_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
+        ]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+        
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
 
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
+    if gen_model:
+        if model_type == "latentode":
+            OBS_WINDOW = 10
+            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]  
+            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
 
+        # Strategy A Integration: Fine-tuned multi-stage delta optimization thresholds
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-3),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 1e-5, metric_name=early_stop_metric_name), 1e-7),
+        ]
 
-class EnergyMSELoss(MSELoss):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
-        energy_weight: float | None = 1.0,
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-    ) -> None:
-        """Initializes EnergyMSELoss."""
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.energy_fn = energy_fn
-        self.energy_weight = energy_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
+        for len_strat in length_strategies:
+            print("running length strategy", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+            
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs,
+                optimizer=AdamOptimizer(learning_rate=learning_rate),
+                batch_size=batch_size,
+                num_workers=2,  
+                verbose=True,
+            )
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-        loss_data = super().forward(pred, target)
-        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
-        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
-        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
 
-        total_loss = loss_data + loss_energy
-
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
+            min_states = 5
+            if math.ceil(scaled_traj_targets_train_posvel[0].shape[0] * data_fraction) < min_states:
+                print("length strategy results in too few states. overriding to maintain stability")
+                
+            if model_type == "latentode":
+                fraction_of_data = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],  
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
+                    )  
+                    for (obs, tgt) in train_data
+                ]
+                fraction_of_data_val = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
                     )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
+                    for (obs, tgt) in test_data
+                ]
             else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+                fraction_of_data = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_train_posvel
+                ]
+                fraction_of_data_val = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_test_posvel
+                ]
 
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
+            metrics = node.fit(
+                x=fraction_of_data,
+                validation_data=fraction_of_data_val,
+                enable_checkpoints=True if data_fraction == 1.0 else False,
+            )
+            
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
 
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+    # Load final trained weights setup
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.train(False)
+    node.model.eval()
 
-        return {
-            "loss": total_loss,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            "energy_loss": loss_energy,
-        }
+    # Model compilation export structures
+    example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    model_onx = torch.onnx.export(
+        node.model,
+        example_input,
+        os.path.join(model_save_path, model_name + ".onnx"),
+        export_params=True,
+        opset_version=18,  
+        external_data=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
 
+    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
+        f.write(onnx.printer.to_text(model_onx.model_proto))  
 
-class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
-    def __init__(self) -> None:
-        """Initializes ReverseLinearWeightingLoss."""
-        super().__init__()
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        batch_size, time_steps, n_features = pred.shape
-        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
-        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
-        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
-        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
-
-
-class SoftDTWLossWrapper(SoftDTWLossPyTorch):
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int],
-        scaler: MinMaxScaler | None = None,
-        N_FEATURES: int = 6,
-        gamma=1,
-        normalize=False,
-        dist_func=None,
-    ):
-        super().__init__(gamma, normalize, dist_func)
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        n_timesteps = pred.size(1)
-        loss_data = super().forward(pred, target)
-
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-
-class WeightedHuberLoss(torch.nn.Module):
-    def __init__(
-        self,
-        delta_pos,
-        delta_vel,
-        vel_indices: list[int],
-        weight_pos=1.0,
-        weight_vel=1.0,
-        scaler=None,
-        N_FEATURES: int = 6,
-    ):
-        super().__init__()
-        self.delta_pos = delta_pos
-        self.delta_vel = delta_vel
-        self.delta_pos_unsacled = delta_pos
-        self.delta_vel_unsacled = delta_vel
-        self.vel_indices = list(vel_indices)
-        self.wp = weight_pos
-        self.wv = weight_vel
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        if scaler is not None:
-            sigma = scaler.scale_
-            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
-            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
-
-    def forward(self, pred, target):
-        n_timesteps = pred.size(1)
-
-        pos_pred_scaled = pred[..., : self.vel_indices[0]]
-        pos_target_scaled = target[..., : self.vel_indices[0]]
-        vel_pred_scaled = pred[..., self.vel_indices]
-        vel_target_scaled = target[..., self.vel_indices]
-
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                )
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
-            pos_target = target_unscaled[..., : self.vel_indices[0]]
-            vel_pred = pred_unscaled[..., self.vel_indices]
-            vel_target = target_unscaled[..., self.vel_indices]
-
-            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
-            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
-
-            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
-            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
-
-        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
-        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
-
-        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
-        total_loss_unweighted = loss_pos + loss_vel
-        return {
-            "loss": total_loss,
-            "loss_unweighted": total_loss_unweighted,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-            "pos_err_scaled": avg_pos_diff_scaled,
-            "vel_err_scaled": avg_vel_diff_scaled,
-        }
+    if isinstance(scaler_traj, MinMaxScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
+                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
+    elif isinstance(scaler_traj, StandardScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
+                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
+                
+    return node, model_name

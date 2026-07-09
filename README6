@@ -1,152 +1,226 @@
-class PhysicsSplitMSELoss(torch.nn.Module):
-    """Position/velocity-weighted MSE tied with a continuous-time kinematic identity constraint.
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+):
+    # define initial training configuration
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=100,  
+        verbose=True,
+    )
     
-    Incorporates broadcastable valid-sequence padding masking to protect derivative fields
-    and normalizes scale-space weights to eliminate directional gradient distortions.
-    """
-    def __init__(
-        self,
-        height_idx: int,
-        vel_indices: list[int] | tuple[int, ...],
-        dt: float,
-        pos_weight: float = 80.0,
-        vel_weight: float = 1.0,
-        physics_weight: float = 0.5,
-        scaler: StandardScaler | None = None,
-        N_FEATURES: int = 6,
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
-        super().__init__()
-        self.height_idx = height_idx
-        self.vel_indices = list(vel_indices)
-        self.dt = float(dt)
-        self.pos_weight = pos_weight
-        self.vel_weight = vel_weight
-        self.physics_weight = physics_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
-        self.n_pos = self.vel_indices[0]
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
 
-        if scaler is not None and hasattr(scaler, "scale_"):
-            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
-            self.register_buffer("pos_scale", scale[: self.n_pos].clone())
-            self.register_buffer("vel_scale", scale[self.vel_indices].clone())
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame == "grdth":
+        velocity_indicies = (2, 3, 4)
+    elif frame == "geodesic":
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("That frame is not known for what the velocity indicies are")
+        
+    early_stop_metric_name = "val_loss"
+
+    # Default fallback loss function configuration
+    loss_func = WrappedMSELoss(
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+        position_loss_weight=80.0,
+        l2_reg=1e-4,
+    )
+
+    # Define the Neural ODE wrapper model
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(
+            layer_channels=[5, 5],  
+            layer_activation=Activation.SILU,
+        ),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+    
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    # --------------------------------------------------------------------
+    #  Build the requested model architecture
+    # --------------------------------------------------------------------
+    if model_type == "node":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "anode":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=aug_dim,
+            order_shift_slice=None,
+        ).to(node.device)
+    elif model_type == "sonode":
+        node.model = ODEfunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            aug_dim=0,
+            order_shift_slice=slice(3, 6),
+        ).to(node.device)
+    elif model_type in ("gruode", "gruode-min"):
+        minimal = model_type == "gruode-min"
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+
+        ENCODER_INPUT_MODE = "all"   
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [2, 3, 4, 5]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [3, 4, 5]           
+            else:
+                enc_in_idx = None                
+        elif frame == "geodesic" and model_states == 5:
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           
+            else:
+                enc_in_idx = None
+        elif frame == "grdth":
+            if ENCODER_INPUT_MODE == "keep_alt":
+                enc_in_idx = [1, 2, 3, 4]        
+            elif ENCODER_INPUT_MODE == "vel_only":
+                enc_in_idx = [2, 3, 4]           
+            else:
+                enc_in_idx = None
         else:
-            self.pos_scale = None
-            self.vel_scale = None
+            enc_in_idx = None
 
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a structural reference to evaluate explicit parameter decay penalties."""
-        self.model_ref = model
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=minimal,
+            encoder_input_idx=enc_in_idx,
+            encoder_dropout=0.1,
+        ).to(node.device)
         
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct mathematically normalized scale-space mapping weights
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[: self.n_pos] = self.pos_weight
-        weights[self.vel_indices] = self.vel_weight
-        
-        # Normalization step: Prevents artificial gradient magnitude amplification
-        weights = weights / weights.mean()
-        weights_view = weights.view(1, 1, -1)
-        
-        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
-        if self.temporal_weighting:
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            combined_weights = weights_view * t_weights
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
         else:
-            combined_weights = weights_view
-            
-        masked_loss = elementwise_loss * combined_weights * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+            pos_idx, vel_idx = None, None
 
-        # 5. Kinematic Identity Constraint Loss Step (d/dt(pos) = vel)
-        if self.physics_weight > 0.0 and n_timesteps >= 2:
-            pos_pred = pred[..., : self.n_pos]
-            vel_pred = pred[..., self.vel_indices]
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
 
-            # Convert to physical space variables for identity comparison
-            if self.pos_scale is not None:
-                pos_phys = pos_pred * self.pos_scale.to(pred.device)
-                vel_phys = vel_pred * self.vel_scale.to(pred.device)
-            else:
-                pos_phys = pos_pred
-                vel_phys = vel_pred
+        node.model = GRUODEPredictorModel(
+            func=gruode_func,
+            pos_idx=pos_idx,
+            vel_idx=vel_idx,
+            pos_scale=so_pos_scale,
+            vel_scale=so_vel_scale,
+            vel_mean=so_vel_mean,
+        ).to(node.device)
+        
+        node.aug_dim = latent_dim
+        aug_dim = latent_dim
 
-            # Forward finite difference along time coordinate
-            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_mid = vel_phys[:, :-1, :]
+        # Strategy B Integration: Establish the physics-informed metric engine for GRU-ODE tracking
+        loss_func = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            vel_indices=velocity_indicies,
+            dt=trajectory_dt,
+            pos_weight=80.0,       
+            vel_weight=1.0,
+            physics_weight=0.5,    
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-4,
+            temporal_weighting=True,
+        )
+        node._initialize_losses(loss_func)
+        
+    elif model_type == "latentode":
+        latent_dim = nhidden // 2 if nhidden >= 20 else 8  
+        node.model = LatentNODE(latent_dim=latent_dim).to(node.device)
 
-            # Re-normalize residual back to scaled spaces to keep physics_weight balanced
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pred.device)
-            else:
-                resid = dpos_dt - vel_mid
+        recon_criterion = WrappedMSELoss(
+            height_idx=1,
+            vel_indices=[3, 4, 5],
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+        )
 
-            # Apply midpoints slice valid sequence mask to drop padded boundaries
-            valid_mask_mid = valid_mask[:, :-1, : self.n_pos]
-            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() + 1e-8)
-            
-            loss_data = loss_data + self.physics_weight * physics_loss
+        def latent_ode_loss_fn(recon, target, mu, logvar):
+            recon_loss = recon_criterion(recon, target)
+            kl = _kl_divergence(mu, logvar)
+            return recon_loss + 0.1 * kl
 
-        # 6. Apply L2 Regularization parameter decay penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
+        node.loss_func = lambda pred, true: latent_ode_loss_fn(pred[0], true, pred[1], pred[2])
+    else:
+        raise ValueError(f"Unsupported model_type: {model_type}")
 
-        # 7. Unscaled physical evaluation logs (No gradients calculated)
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
+    # Set parameter reference hooks before launching training strategies
+    if hasattr(node.criterion, "set_model"):
+        node.criterion.set_model(node.model)
 
-            pos_pred_u = pred_unscaled[..., : self.n_pos]
-            pos_target_u = target_unscaled[..., : self.n_pos]
-            vel_pred_u = pred_unscaled[..., self.vel_indices]
-            vel_target_u = target_unscaled[..., self.vel_indices]
+    # Convert training targets into target sequence tensors
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
+        ]
+        scaled_traj_targets_test_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
+        ]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+        
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
 
-            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask[:, :, : self.n_pos]
-            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask[:, :, self.vel_indices]
+    if gen_model:
+        if model_type == "latentode":
+            OBS_WINDOW = 10
+            train_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_train_posvel]  
+            test_data = [_make_obs_target(traj, obs_len=OBS_WINDOW) for traj in scaled_traj_targets_test_posvel]
 
-            avg_pos_diff = pos_diff.sum() / (valid_mask[:, :, : self.n_pos].sum() + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask[:, :, self.vel_indices].sum() + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
-
-================
-==================
-
-# Strategy A: Multi-stage training curriculum with fine-grained delta checking.
-        # Decreases min_delta threshold boundaries to match well-conditioned loss levels.
+        # Strategy A Integration: Fine-tuned multi-stage delta optimization thresholds
         length_strategies = [
             (0.1, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
             (0.3, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
@@ -158,20 +232,90 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             (1.0, 5000, EarlyStopper(80, 1e-5, metric_name=early_stop_metric_name), 1e-7),
         ]
 
-===================
-====================
+        for len_strat in length_strategies:
+            print("running length strategy", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+            
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs,
+                optimizer=AdamOptimizer(learning_rate=learning_rate),
+                batch_size=batch_size,
+                num_workers=2,  
+                verbose=True,
+            )
 
-# Force structural scale-space loss selection with continuous physics constraints
-        loss_func = PhysicsSplitMSELoss(
-            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
-            vel_indices=velocity_indicies,
-            dt=trajectory_dt,
-            pos_weight=80.0,       # Symmetrically enforce positional tracking priority
-            vel_weight=1.0,
-            physics_weight=0.5,    # Links states together via kinematic derivative constraints
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-            l2_reg=1e-4,
-            temporal_weighting=True,
-        )
-        node._initialize_losses(loss_func)
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
+
+            min_states = 5
+            if math.ceil(scaled_traj_targets_train_posvel[0].shape[0] * data_fraction) < min_states:
+                print("length strategy results in too few states. overriding to maintain stability")
+                
+            if model_type == "latentode":
+                fraction_of_data = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],  
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
+                    )  
+                    for (obs, tgt) in train_data
+                ]
+                fraction_of_data_val = [
+                    (
+                        obs[: max(math.ceil(obs.shape[0] * data_fraction), min_states)],
+                        tgt[: max(math.ceil(tgt.shape[0] * data_fraction), min_states)],
+                    )
+                    for (obs, tgt) in test_data
+                ]
+            else:
+                fraction_of_data = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_train_posvel
+                ]
+                fraction_of_data_val = [
+                    x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                    for x in scaled_traj_targets_test_posvel
+                ]
+
+            metrics = node.fit(
+                x=fraction_of_data,
+                validation_data=fraction_of_data_val,
+                enable_checkpoints=True if data_fraction == 1.0 else False,
+            )
+            
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
+
+    # Load final trained weights setup
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.train(False)
+    node.model.eval()
+
+    # Model compilation export structures
+    example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    model_onx = torch.onnx.export(
+        node.model,
+        example_input,
+        os.path.join(model_save_path, model_name + ".onnx"),
+        export_params=True,
+        opset_version=18,  
+        external_data=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
+
+    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
+        f.write(onnx.printer.to_text(model_onx.model_proto))  
+
+    if isinstance(scaler_traj, MinMaxScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
+                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
+    elif isinstance(scaler_traj, StandardScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
+                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
+                
+    return node, model_name

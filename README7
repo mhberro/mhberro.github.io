@@ -1,75 +1,161 @@
+class PhysicsSplitMSELoss(torch.nn.Module):
+    """Position/velocity-weighted MSE tied with a cross-target kinematic constraint.
+    
+    Forces the predicted position derivatives to align directly with the true velocity 
+    targets, anchoring velocity features without causing optimization multi-task gridlock.
+    """
+    def __init__(
+        self,
+        height_idx: int,
+        pos_indices: list[int] | tuple[int, ...],
+        vel_indices: list[int] | tuple[int, ...],
+        dt: float,
+        pos_weight: float = 80.0,
+        vel_weight: float = 0.0,
+        physics_weight: float = 0.5,
+        scaler: StandardScaler | None = None,
+        N_FEATURES: int = 6,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        super().__init__()
+        self.height_idx = height_idx
+        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
+        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+        else:
+            self.pos_scale = None
+            self.vel_scale = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        self.model_ref = model
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # 2. Compute elementwise unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # 3. Construct mathematically normalized scale-space mapping weights across coordinates
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[self.pos_indices] = self.pos_weight
+        weights[self.vel_indices] = self.vel_weight
+        
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # 5. Cross-Residual Physics: Match predicted position updates against TRUE target velocities
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            pos_pred_phys = pred[..., self.pos_indices]
+            vel_true_phys = target[..., self.vel_indices]  # Anchor using the actual target states
+
+            # Convert to physical space variables for valid identity checking
+            if self.pos_scale is not None:
+                pos_phys = pos_pred_phys * self.pos_scale.to(pred.device)
+                vel_phys = vel_true_phys * self.vel_scale.to(pred.device)
+            else:
+                pos_phys = pos_pred_phys
+                vel_phys = vel_true_phys
+
+            # Compute forward finite difference on predictions vs raw target fields
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_true_mid = vel_phys[:, :-1, :]
+
+            # Re-normalize residual back to scaled spaces
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_true_mid) / self.pos_scale.to(pred.device)
+            else:
+                resid = dpos_dt - vel_true_mid
+
+            valid_mask_mid = valid_mask[:, :-1, :]
+            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
+            
+            loss_data = loss_data + self.physics_weight * physics_loss
+
+        # 6. Apply L2 Regularization parameter decay penalty
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # 7. Unscaled physical evaluation metrics (No gradients tracked)
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred_u = pred_unscaled[..., self.pos_indices]
+            pos_target_u = target_unscaled[..., self.pos_indices]
+            vel_pred_u = pred_unscaled[..., self.vel_indices]
+            vel_target_u = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask
+            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
 
 
-AFTER
+=============
+=============
 
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_mo_cl_heun_HighE/GEODESIC/glide --frame geodesic --geodesic-mode integrated --model-type gruode --sbi-phase glide --dt 1
-There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
-running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x335267fb0>, 0.0001)
-length strategy results in too few states. overriding to maintain stability
-[INFO] Epoch 5: loss: 2.0325930 pos_err: 12295.8593750 vel_err: 845.2360840 val_loss: 0.7481078 val_pos_err: 8526.1904297 val_vel_err: 683.8579102
-[INFO] Epoch 10: loss: 0.0446397 pos_err: 2843.1921387 vel_err: 1035.3898926 val_loss: 0.0428362 val_pos_err: 2739.9233398 val_vel_err: 918.2634277
-[INFO] Epoch 15: loss: 0.0294876 pos_err: 2847.9970703 vel_err: 919.6358032 val_loss: 0.0314819 val_pos_err: 2532.1970215 val_vel_err: 925.4688110
-[INFO] Epoch 20: loss: 0.0268581 pos_err: 2923.4020996 vel_err: 1059.7418213 val_loss: 0.0282015 val_pos_err: 2537.2976074 val_vel_err: 863.5544434
-[INFO] Epoch 25: loss: 0.0076179 pos_err: 1725.3421631 vel_err: 893.8826294 val_loss: 0.0229348 val_pos_err: 1888.3643799 val_vel_err: 641.0715942
-[INFO] Epoch 30: loss: 0.0131503 pos_err: 2134.2333984 vel_err: 975.1063843 val_loss: 0.0255604 val_pos_err: 2239.8908691 val_vel_err: 910.2779541
-[INFO] Epoch 35: loss: 0.0097278 pos_err: 1942.0671387 vel_err: 1061.9006348 val_loss: 0.0139751 val_pos_err: 1805.7375488 val_vel_err: 751.5413208
-[INFO] Epoch 40: loss: 0.0445027 pos_err: 4796.3144531 vel_err: 1201.3081055 val_loss: 0.0161313 val_pos_err: 1971.5433350 val_vel_err: 851.5177002
-[INFO] Epoch 45: loss: 0.0207128 pos_err: 2448.6359863 vel_err: 1114.5114746 val_loss: 0.0093324 val_pos_err: 1888.6142578 val_vel_err: 886.9490356
-[INFO] Epoch 50: loss: 0.0399975 pos_err: 2403.7128906 vel_err: 882.2625122 val_loss: 0.0111624 val_pos_err: 1665.5932617 val_vel_err: 816.6621094
-[INFO] Epoch 55: loss: 0.0052002 pos_err: 1979.7465820 vel_err: 937.3347778 val_loss: 0.0090587 val_pos_err: 1606.0830078 val_vel_err: 786.6508789
-[INFO] Epoch 60: loss: 0.0066327 pos_err: 1786.3931885 vel_err: 1100.8726807 val_loss: 0.0105746 val_pos_err: 1611.9865723 val_vel_err: 914.6746826
-[INFO] Epoch 65: loss: 0.0137016 pos_err: 1835.7595215 vel_err: 1112.7059326 val_loss: 0.0118121 val_pos_err: 1746.8161621 val_vel_err: 903.9793091
-[INFO] Epoch 70: loss: 0.0081651 pos_err: 1667.9003906 vel_err: 931.9394531 val_loss: 0.0105224 val_pos_err: 1388.0434570 val_vel_err: 775.3318481
-[INFO] Epoch 75: loss: 0.0228631 pos_err: 2035.6370850 vel_err: 1029.4575195 val_loss: 0.0077409 val_pos_err: 1535.7781982 val_vel_err: 890.3151855
-[INFO] Epoch 80: loss: 0.0070946 pos_err: 1605.9705811 vel_err: 998.3921509 val_loss: 0.0068574 val_pos_err: 1456.0886230 val_vel_err: 898.8878174
-[INFO] Epoch 85: loss: 0.0074440 pos_err: 1403.0751953 vel_err: 1009.6516113 val_loss: 0.0121989 val_pos_err: 1491.2438965 val_vel_err: 893.5798340
-[INFO] Epoch 90: loss: 0.0238043 pos_err: 3610.6113281 vel_err: 1342.1828613 val_loss: 0.0063445 val_pos_err: 1199.1881104 val_vel_err: 851.7952881
-[INFO] Epoch 95: loss: 0.0351910 pos_err: 2373.0380859 vel_err: 1130.9748535 val_loss: 0.0044326 val_pos_err: 1278.2659912 val_vel_err: 767.9866943
-[INFO] Epoch 100: loss: 0.0183902 pos_err: 2187.4719238 vel_err: 1077.4378662 val_loss: 0.0044243 val_pos_err: 955.7352905 val_vel_err: 830.7214966
-[INFO] Epoch 105: loss: 0.0041901 pos_err: 1254.7354736 vel_err: 816.9224243 val_loss: 0.0047653 val_pos_err: 1242.6363525 val_vel_err: 843.5873413
-[INFO] Epoch 110: loss: 0.0047774 pos_err: 1621.8010254 vel_err: 977.3648071 val_loss: 0.0064041 val_pos_err: 1337.7943115 val_vel_err: 917.1110229
-[INFO] Epoch 115: loss: 0.0143481 pos_err: 1674.8997803 vel_err: 1112.0888672 val_loss: 0.0081203 val_pos_err: 1287.7845459 val_vel_err: 918.0982666
-[INFO] Epoch 120: loss: 0.0347323 pos_err: 2103.2751465 vel_err: 973.8156738 val_loss: 0.0081778 val_pos_err: 1099.8710938 val_vel_err: 734.2329102
-[INFO] Epoch 125: loss: 0.0087752 pos_err: 1660.3933105 vel_err: 1019.2424316 val_loss: 0.0051007 val_pos_err: 1058.9014893 val_vel_err: 892.5515137
-[INFO] Epoch 130: loss: 0.0059349 pos_err: 1232.8250732 vel_err: 1057.8945312 val_loss: 0.0060324 val_pos_err: 1277.1528320 val_vel_err: 858.0059814
-[INFO] Epoch 135: loss: 0.0537963 pos_err: 2975.4792480 vel_err: 1115.8321533 val_loss: 0.0063479 val_pos_err: 1136.3693848 val_vel_err: 843.1286621
-[INFO] Epoch 140: loss: 0.0031608 pos_err: 1032.6248779 vel_err: 713.7058105 val_loss: 0.0051014 val_pos_err: 1108.9495850 val_vel_err: 933.1773682
-[INFO] Epoch 145: loss: 0.0060694 pos_err: 1713.3787842 vel_err: 989.6057739 val_loss: 0.0039609 val_pos_err: 1061.6148682 val_vel_err: 846.1860352
-[INFO] Epoch 150: loss: 0.0035168 pos_err: 777.1723633 vel_err: 736.4293823 val_loss: 0.0081898 val_pos_err: 1324.9289551 val_vel_err: 970.9846191
-[INFO] Epoch 155: loss: 0.0028832 pos_err: 870.1840820 vel_err: 815.8868408 val_loss: 0.0057996 val_pos_err: 1014.5647583 val_vel_err: 987.2946167
-[INFO] Epoch 160: loss: 0.0055493 pos_err: 1097.2121582 vel_err: 824.5380249 val_loss: 0.0095586 val_pos_err: 1041.9569092 val_vel_err: 804.9417725
-[INFO] Epoch 165: loss: 0.0047413 pos_err: 1346.1510010 vel_err: 1123.2307129 val_loss: 0.0030761 val_pos_err: 1048.0782471 val_vel_err: 772.6499634
-[INFO] Epoch 170: loss: 0.0040837 pos_err: 1121.1788330 vel_err: 630.9567261 val_loss: 0.0069932 val_pos_err: 1173.0064697 val_vel_err: 914.9990234
-[INFO] Epoch 175: loss: 0.0100387 pos_err: 1105.1413574 vel_err: 762.1027222 val_loss: 0.0045266 val_pos_err: 1017.6246338 val_vel_err: 925.8585205
-[INFO] Epoch 180: loss: 0.0022474 pos_err: 695.8379517 vel_err: 830.8311768 val_loss: 0.0038429 val_pos_err: 883.3128052 val_vel_err: 863.4133911
-[INFO] Epoch 185: loss: 0.0069544 pos_err: 1718.5793457 vel_err: 973.0588989 val_loss: 0.0055721 val_pos_err: 958.9268188 val_vel_err: 906.1193237
-[INFO] Epoch 190: loss: 0.0031645 pos_err: 1199.0511475 vel_err: 978.0637207 val_loss: 0.0031527 val_pos_err: 871.4317627 val_vel_err: 793.6149292
-[INFO] Epoch 195: loss: 0.0142253 pos_err: 1553.7592773 vel_err: 963.1696167 val_loss: 0.0040599 val_pos_err: 972.2290649 val_vel_err: 881.4334106
-[INFO] Epoch 200: loss: 0.0027179 pos_err: 1019.6541748 vel_err: 992.0956421 val_loss: 0.0039611 val_pos_err: 967.6082153 val_vel_err: 847.2874756
-[INFO] Epoch 205: loss: 0.0103901 pos_err: 1419.4000244 vel_err: 1017.1179199 val_loss: 0.0053640 val_pos_err: 1087.2697754 val_vel_err: 828.1860352
-[INFO] Epoch 210: loss: 0.0024710 pos_err: 658.2093506 vel_err: 801.2015991 val_loss: 0.0094250 val_pos_err: 1041.4788818 val_vel_err: 843.5117798
-[INFO] Epoch 215: loss: 0.0013734 pos_err: 448.1844788 vel_err: 750.4282227 val_loss: 0.0067106 val_pos_err: 874.3640137 val_vel_err: 781.7852173
-[INFO] Epoch 220: loss: 0.0126483 pos_err: 1414.1264648 vel_err: 886.7254639 val_loss: 0.0115080 val_pos_err: 1010.0170898 val_vel_err: 855.4743652
-[INFO] Epoch 225: loss: 0.0090660 pos_err: 1269.1534424 vel_err: 916.7958374 val_loss: 0.0087631 val_pos_err: 1017.6470947 val_vel_err: 883.6677856
-[INFO] Epoch 230: loss: 0.0045667 pos_err: 1288.3927002 vel_err: 1070.3609619 val_loss: 0.0045603 val_pos_err: 978.4653320 val_vel_err: 787.7666626
-[INFO] Epoch 235: loss: 0.0063765 pos_err: 785.0046997 vel_err: 900.6394653 val_loss: 0.0046364 val_pos_err: 1023.8998413 val_vel_err: 917.0143433
-[INFO] Epoch 240: loss: 0.0083606 pos_err: 1545.5289307 vel_err: 1157.7297363 val_loss: 0.0036858 val_pos_err: 882.5987549 val_vel_err: 827.5429688
-[INFO] Epoch 245: loss: 0.0047285 pos_err: 1428.9957275 vel_err: 885.3338623 val_loss: 0.0075687 val_pos_err: 902.5693970 val_vel_err: 855.1574707
-[INFO] Epoch 250: loss: 0.0770559 pos_err: 2291.9980469 vel_err: 1241.6557617 val_loss: 0.0053528 val_pos_err: 833.6060791 val_vel_err: 767.9696655
-[INFO] Epoch 255: loss: 0.0123962 pos_err: 1442.0440674 vel_err: 931.6924438 val_loss: 0.0051054 val_pos_err: 720.9871826 val_vel_err: 760.7675781
-[INFO] Epoch 260: loss: 0.0031074 pos_err: 806.2860107 vel_err: 911.1053467 val_loss: 0.0030595 val_pos_err: 719.8425293 val_vel_err: 746.5364990
-[INFO] Epoch 265: loss: 0.0052606 pos_err: 1579.3599854 vel_err: 1310.0312500 val_loss: 0.0077371 val_pos_err: 1012.5902710 val_vel_err: 924.2305908
-[INFO] Epoch 270: loss: 0.0035761 pos_err: 1269.8017578 vel_err: 931.3670044 val_loss: 0.0035607 val_pos_err: 761.8930054 val_vel_err: 890.7611084
-[INFO] Epoch 275: loss: 0.0021675 pos_err: 994.0597534 vel_err: 1040.2703857 val_loss: 0.0066991 val_pos_err: 954.4469604 val_vel_err: 921.3307495
-[INFO] Epoch 280: loss: 0.0039567 pos_err: 623.8272095 vel_err: 646.6903687 val_loss: 0.0042763 val_pos_err: 827.0637817 val_vel_err: 869.2019043
-[INFO] Epoch 285: loss: 0.0272303 pos_err: 1973.6230469 vel_err: 1213.7073975 val_loss: 0.0066210 val_pos_err: 972.2313232 val_vel_err: 925.5264282
-[INFO] Epoch 290: loss: 0.0072448 pos_err: 1078.2020264 vel_err: 1005.8690796 val_loss: 0.0020968 val_pos_err: 844.9255981 val_vel_err: 810.1694336
-[INFO] Epoch 295: loss: 0.0044241 pos_err: 980.4570312 vel_err: 1086.3518066 val_loss: 0.0088807 val_pos_err: 1098.6398926 val_vel_err: 917.0755005
-[INFO] Epoch 300: loss: 0.0062615 pos_err: 868.1610718 vel_err: 668.3055420 val_loss: 0.0058364 val_pos_err: 1039.9816895 val_vel_err: 838.7355957
-[INFO] Early stopping triggered at 301
+# Force structural scale-space loss selection with cross-residual targets
+        loss_func = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            pos_indices=pos_idx,   
+            vel_indices=vel_idx,   
+            dt=trajectory_dt,
+            pos_weight=80.0,       
+            vel_weight=0.0,        # Leave zeroed out to prioritize the position trajectory
+            physics_weight=1.5,    # Increase weight slightly to force velocity vector cross-alignment
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-4,
+            temporal_weighting=True,
+        )
+        node._initialize_losses(loss_func)

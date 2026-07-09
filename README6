@@ -1,25 +1,146 @@
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py", line 1351, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py", line 1331, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py", line 482, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 199, in fit
-    metrics = self.batch_loss(x=x_batch.to(self.device))
-              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 345, in batch_loss
-    return self.criterion(x_pred, x)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.12/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.12/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/loss_functions.py", line 271, in forward
-    resid = (dpos_dt - vel_mid) / self.pos_scale.to(pred.device)
-             ~~~~~~~~^~~~~~~~~
-RuntimeError: The size of tensor a (2) must match the size of tensor b (3) at non-singleton dimension 2
+class PhysicsSplitMSELoss(torch.nn.Module):
+    """Position/velocity-weighted MSE tied with a continuous-time kinematic identity constraint.
+    
+    Explicitly pairs matching coordinate dimensions to elegantly support unbalanced, 
+    non-sequential coordinate frameworks like the 5-state integrated Geodesic frame.
+    """
+    def __init__(
+        self,
+        height_idx: int,
+        pos_indices: list[int] | tuple[int, ...],
+        vel_indices: list[int] | tuple[int, ...],
+        dt: float,
+        pos_weight: float = 80.0,
+        vel_weight: float = 1.0,
+        physics_weight: float = 0.5,
+        scaler: StandardScaler | None = None,
+        N_FEATURES: int = 6,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        super().__init__()
+        self.height_idx = height_idx
+        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
+        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            # Pull only the scales that correspond to the paired physical dimensions
+            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+        else:
+            self.pos_scale = None
+            self.vel_scale = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Saves a structural reference to evaluate explicit parameter decay penalties."""
+        self.model_ref = model
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # 2. Compute elementwise unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # 3. Construct mathematically normalized scale-space mapping weights across coordinates
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[self.pos_indices] = self.pos_weight
+        weights[self.vel_indices] = self.vel_weight
+        
+        # Normalization step: Prevents artificial gradient magnitude amplification
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # 5. Kinematic Identity Constraint Loss Step (d/dt(pos) = vel) using explicit matching pairs
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            # Extract out exclusively the paired physics channels
+            pos_pred_phys = pred[..., self.pos_indices]
+            vel_pred_phys = pred[..., self.vel_indices]
+
+            # Convert to physical space variables for valid identity comparison
+            if self.pos_scale is not None:
+                pos_phys = pos_pred_phys * self.pos_scale.to(pred.device)
+                vel_phys = vel_pred_phys * self.vel_scale.to(pred.device)
+            else:
+                pos_phys = pos_pred_phys
+                vel_phys = vel_pred_phys
+
+            # Forward finite difference along time coordinate
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_mid = vel_phys[:, :-1, :]
+
+            # Re-normalize residual back to scaled spaces to keep physics_weight balanced
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pred.device)
+            else:
+                resid = dpos_dt - vel_mid
+
+            # Apply midpoints slice valid sequence mask to drop padded boundaries
+            valid_mask_mid = valid_mask[:, :-1, :]
+            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
+            
+            loss_data = loss_data + self.physics_weight * physics_loss
+
+        # 6. Apply L2 Regularization parameter decay penalty
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # 7. Unscaled physical evaluation logs (No gradients calculated)
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred_u = pred_unscaled[..., self.pos_indices]
+            pos_target_u = target_unscaled[..., self.pos_indices]
+            vel_pred_u = pred_unscaled[..., self.vel_indices]
+            vel_target_u = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask
+            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }

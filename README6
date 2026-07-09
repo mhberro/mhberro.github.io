@@ -1,87 +1,177 @@
-BEFORE
+class PhysicsSplitMSELoss(torch.nn.Module):
+    """Position/velocity-weighted MSE tied with a continuous-time kinematic identity constraint.
+    
+    Incorporates broadcastable valid-sequence padding masking to protect derivative fields
+    and normalizes scale-space weights to eliminate directional gradient distortions.
+    """
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int] | tuple[int, ...],
+        dt: float,
+        pos_weight: float = 80.0,
+        vel_weight: float = 1.0,
+        physics_weight: float = 0.5,
+        scaler: StandardScaler | None = None,
+        N_FEATURES: int = 6,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+        self.n_pos = self.vel_indices[0]
 
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_mo_cl_heun_HighE/GEODESIC/glide --frame geodesic --geodesic-mode integrated --model-type gruode --sbi-phase glide
-There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
-running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x14468b080>, 0.0001)
-[INFO] Epoch 5: loss: 31.8399162 pos_err: 15099.5937500 vel_err: 667.0904541 val_loss: 12.0951052 val_pos_err: 9547.0097656 val_vel_err: 472.9953308
-[INFO] Epoch 10: loss: 1.4855015 pos_err: 2468.4167480 vel_err: 590.9224243 val_loss: 1.3375130 val_pos_err: 3186.6979980 val_vel_err: 508.6713867
-[INFO] Epoch 15: loss: 3.7284679 pos_err: 8299.4843750 vel_err: 780.9476929 val_loss: 1.4368920 val_pos_err: 3338.7243652 val_vel_err: 584.8067017
-[INFO] Epoch 20: loss: 1.9467291 pos_err: 3752.8642578 vel_err: 725.8132324 val_loss: 1.3075674 val_pos_err: 3520.1748047 val_vel_err: 477.4205933
-[INFO] Epoch 25: loss: 1.8938863 pos_err: 3670.7033691 vel_err: 698.1772461 val_loss: 1.3367231 val_pos_err: 2708.7785645 val_vel_err: 539.9984741
-[INFO] Epoch 30: loss: 1.4518039 pos_err: 3429.9143066 vel_err: 562.5686646 val_loss: 1.3324420 val_pos_err: 2977.4240723 val_vel_err: 504.6660461
-[INFO] Epoch 35: loss: 1.2912463 pos_err: 1625.5124512 vel_err: 550.0495605 val_loss: 1.0831500 val_pos_err: 2354.4455566 val_vel_err: 476.6691895
-[INFO] Epoch 40: loss: 1.4775828 pos_err: 3984.1699219 vel_err: 504.4450989 val_loss: 0.9500520 val_pos_err: 2572.3339844 val_vel_err: 454.0755005
-[INFO] Epoch 45: loss: 1.2397525 pos_err: 3230.7172852 vel_err: 568.3750000 val_loss: 0.9637448 val_pos_err: 2180.8847656 val_vel_err: 471.4528809
-[INFO] Epoch 50: loss: 1.4411913 pos_err: 4115.6992188 vel_err: 599.7501221 val_loss: 1.1292760 val_pos_err: 2472.9658203 val_vel_err: 505.3095093
-[INFO] Epoch 55: loss: 1.4089060 pos_err: 1781.5299072 vel_err: 596.7243652 val_loss: 1.2948664 val_pos_err: 2563.9470215 val_vel_err: 567.4087524
-[INFO] Epoch 60: loss: 1.6793034 pos_err: 3436.5534668 vel_err: 637.6100464 val_loss: 0.9196102 val_pos_err: 2214.7346191 val_vel_err: 467.9787598
-[INFO] Epoch 65: loss: 1.2981608 pos_err: 2222.7153320 vel_err: 561.4125366 val_loss: 0.9907951 val_pos_err: 2209.3129883 val_vel_err: 449.2029724
-[INFO] Epoch 70: loss: 1.1304594 pos_err: 2589.8212891 vel_err: 546.7971191 val_loss: 1.3233987 val_pos_err: 2831.8381348 val_vel_err: 563.8244629
-[INFO] Epoch 75: loss: 0.9592007 pos_err: 2489.0983887 vel_err: 478.4053345 val_loss: 1.0106597 val_pos_err: 1841.1888428 val_vel_err: 493.7955627
-[INFO] Epoch 80: loss: 1.3371471 pos_err: 2864.1098633 vel_err: 589.8055420 val_loss: 1.1758679 val_pos_err: 2154.0920410 val_vel_err: 540.7984009
-[INFO] Epoch 85: loss: 2.1270666 pos_err: 5132.3950195 vel_err: 730.5667114 val_loss: 1.0056041 val_pos_err: 2269.2287598 val_vel_err: 470.7639160
-[INFO] Epoch 90: loss: 2.2315433 pos_err: 4315.1142578 vel_err: 683.9951782 val_loss: 0.8703434 val_pos_err: 1803.1003418 val_vel_err: 451.6830444
-[INFO] Epoch 95: loss: 1.0022819 pos_err: 2977.9367676 vel_err: 471.7488708 val_loss: 1.1604280 val_pos_err: 2238.9240723 val_vel_err: 538.5994873
-[INFO] Epoch 100: loss: 2.5840394 pos_err: 6491.8901367 vel_err: 719.2203369 val_loss: 0.8520723 val_pos_err: 1815.4008789 val_vel_err: 451.7661133
-[INFO] Epoch 105: loss: 1.3167870 pos_err: 2601.8017578 vel_err: 581.6587524 val_loss: 1.0877686 val_pos_err: 2381.9826660 val_vel_err: 529.1043701
-[INFO] Epoch 110: loss: 1.0719830 pos_err: 2721.7609863 vel_err: 524.2332764 val_loss: 1.0244465 val_pos_err: 1794.5649414 val_vel_err: 510.4311218
-[INFO] Epoch 115: loss: 1.2595192 pos_err: 1584.9223633 vel_err: 568.6755981 val_loss: 0.9254815 val_pos_err: 2144.2600098 val_vel_err: 474.3612976
-[INFO] Epoch 120: loss: 1.7621509 pos_err: 4292.1357422 vel_err: 617.2866821 val_loss: 0.9362782 val_pos_err: 2200.3852539 val_vel_err: 449.4132080
-[INFO] Epoch 125: loss: 1.1763016 pos_err: 1588.8703613 vel_err: 535.6344604 val_loss: 0.9483405 val_pos_err: 1872.5346680 val_vel_err: 485.1492615
-[INFO] Epoch 130: loss: 0.9007524 pos_err: 1911.8717041 vel_err: 486.6677551 val_loss: 1.1576749 val_pos_err: 2483.5576172 val_vel_err: 526.3789062
-[INFO] Epoch 135: loss: 1.8376343 pos_err: 3590.7661133 vel_err: 674.1369629 val_loss: 1.2786428 val_pos_err: 2033.3464355 val_vel_err: 564.7965698
-[INFO] Epoch 140: loss: 0.9900556 pos_err: 2722.7031250 vel_err: 512.7290039 val_loss: 0.9930715 val_pos_err: 1916.8088379 val_vel_err: 492.9964600
-[INFO] Epoch 145: loss: 1.9405597 pos_err: 4044.5119629 vel_err: 735.2668457 val_loss: 0.8788390 val_pos_err: 2142.0046387 val_vel_err: 445.6591492
-[INFO] Epoch 150: loss: 1.0127177 pos_err: 2521.1940918 vel_err: 497.2876892 val_loss: 1.1581738 val_pos_err: 2104.2675781 val_vel_err: 549.6189575
-[INFO] Epoch 155: loss: 1.5404056 pos_err: 3043.8315430 vel_err: 651.7050781 val_loss: 0.9415016 val_pos_err: 2152.1948242 val_vel_err: 499.6698608
-[INFO] Epoch 160: loss: 0.9177358 pos_err: 2175.8513184 vel_err: 490.5794678 val_loss: 0.8394631 val_pos_err: 1712.2799072 val_vel_err: 434.1819763
-[INFO] Epoch 165: loss: 1.5311451 pos_err: 2161.8225098 vel_err: 622.9671631 val_loss: 1.2860059 val_pos_err: 2177.7741699 val_vel_err: 574.8552246
-[INFO] Epoch 170: loss: 1.6168118 pos_err: 3632.1899414 vel_err: 664.3691406 val_loss: 1.0723279 val_pos_err: 2464.1030273 val_vel_err: 525.2367554
-[INFO] Epoch 175: loss: 0.8660309 pos_err: 1018.6240234 vel_err: 471.3137512 val_loss: 0.9597163 val_pos_err: 2485.8791504 val_vel_err: 471.2994385
-[INFO] Epoch 180: loss: 0.9767444 pos_err: 1685.6577148 vel_err: 507.6824341 val_loss: 0.9872168 val_pos_err: 2224.7224121 val_vel_err: 496.0380554
-[INFO] Epoch 185: loss: 0.6796368 pos_err: 1606.7901611 vel_err: 421.5118408 val_loss: 1.0588256 val_pos_err: 2051.2578125 val_vel_err: 505.2988281
-[INFO] Epoch 190: loss: 1.1920958 pos_err: 2951.0419922 vel_err: 561.5294800 val_loss: 1.0779233 val_pos_err: 2296.2167969 val_vel_err: 512.1704712
-[INFO] Epoch 195: loss: 1.5481281 pos_err: 2515.8925781 vel_err: 600.6962891 val_loss: 1.1079038 val_pos_err: 2336.6176758 val_vel_err: 517.8565674
-[INFO] Epoch 200: loss: 1.7812768 pos_err: 3850.5207520 vel_err: 689.2399292 val_loss: 0.9966190 val_pos_err: 2028.2485352 val_vel_err: 497.8936462
-[INFO] Epoch 205: loss: 1.4511658 pos_err: 3034.6770020 vel_err: 590.9792480 val_loss: 1.1396354 val_pos_err: 1928.7807617 val_vel_err: 528.8514404
-[INFO] Epoch 210: loss: 0.8669505 pos_err: 2234.8854980 vel_err: 464.1858826 val_loss: 1.1036927 val_pos_err: 2239.7224121 val_vel_err: 518.2968750
-[INFO] Epoch 215: loss: 2.2159727 pos_err: 5633.4125977 vel_err: 747.4318848 val_loss: 1.1786071 val_pos_err: 2574.4106445 val_vel_err: 508.1567688
-[INFO] Early stopping triggered at 217
-running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x126d7d430>, 0.0001)
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            self.register_buffer("pos_scale", scale[: self.n_pos].clone())
+            self.register_buffer("vel_scale", scale[self.vel_indices].clone())
+        else:
+            self.pos_scale = None
+            self.vel_scale = None
 
-AFTER
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Saves a structural reference to evaluate explicit parameter decay penalties."""
+        self.model_ref = model
 
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training_mo_cl_ref_loss_new_agent_grdth_heun.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --use-scalar --aug 0 --nhidden 200 -o model_outputs/SBI/GRUODE_mo_cl_heun_HighE/GEODESIC/glide --frame geodesic --geodesic-mode integrated --model-type gruode --sbi-phase glide
-There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
-running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x32ff116a0>, 0.0001)
-[INFO] Epoch 5: loss: 0.9859734 pos_err: 9846.2695312 vel_err: 453.8559265 val_loss: 0.8489242 val_pos_err: 8837.6357422 val_vel_err: 492.6601257
-[INFO] Epoch 10: loss: 0.4019898 pos_err: 5494.2470703 vel_err: 694.2833252 val_loss: 0.1521247 val_pos_err: 3172.7924805 val_vel_err: 564.7568970
-[INFO] Epoch 15: loss: 0.1203172 pos_err: 3595.0048828 vel_err: 546.7726440 val_loss: 0.1119466 val_pos_err: 3058.5434570 val_vel_err: 526.8310547
-[INFO] Epoch 20: loss: 0.1452435 pos_err: 3297.1457520 vel_err: 587.6861572 val_loss: 0.1057673 val_pos_err: 3043.0480957 val_vel_err: 477.0433960
-[INFO] Epoch 25: loss: 0.1325275 pos_err: 3166.5988770 vel_err: 621.1862183 val_loss: 0.1013311 val_pos_err: 2869.4489746 val_vel_err: 456.9412231
-[INFO] Epoch 30: loss: 0.1568317 pos_err: 4355.6972656 vel_err: 650.8499146 val_loss: 0.1118737 val_pos_err: 3088.3666992 val_vel_err: 496.0499268
-[INFO] Epoch 35: loss: 0.0947172 pos_err: 2373.1931152 vel_err: 484.0408020 val_loss: 0.0892352 val_pos_err: 2585.1042480 val_vel_err: 417.4541626
-[INFO] Epoch 40: loss: 0.3107995 pos_err: 8136.6313477 vel_err: 756.2752686 val_loss: 0.0970205 val_pos_err: 2543.3540039 val_vel_err: 507.8307495
-[INFO] Epoch 45: loss: 0.0981718 pos_err: 1932.0812988 vel_err: 412.5104980 val_loss: 0.0966071 val_pos_err: 2749.6574707 val_vel_err: 505.1416626
-[INFO] Epoch 50: loss: 0.0987439 pos_err: 1931.8260498 vel_err: 409.0160522 val_loss: 0.1049728 val_pos_err: 2951.9992676 val_vel_err: 532.5350342
-[INFO] Epoch 55: loss: 0.1044526 pos_err: 2143.7316895 vel_err: 490.8818054 val_loss: 0.0986574 val_pos_err: 2634.6577148 val_vel_err: 476.7023926
-[INFO] Epoch 60: loss: 0.1048328 pos_err: 3298.9709473 vel_err: 534.2189331 val_loss: 0.1005169 val_pos_err: 2775.4589844 val_vel_err: 516.3095703
-[INFO] Epoch 65: loss: 0.0791357 pos_err: 1740.1074219 vel_err: 397.6861877 val_loss: 0.1063153 val_pos_err: 2820.7348633 val_vel_err: 511.8980713
-[INFO] Epoch 70: loss: 0.1132676 pos_err: 3243.9443359 vel_err: 554.3601685 val_loss: 0.0935010 val_pos_err: 2091.2426758 val_vel_err: 511.9912720
-[INFO] Epoch 75: loss: 0.1114042 pos_err: 3081.2802734 vel_err: 534.4720459 val_loss: 0.0911989 val_pos_err: 1913.6540527 val_vel_err: 495.7397461
-[INFO] Epoch 80: loss: 0.1043572 pos_err: 1738.9862061 vel_err: 512.1155396 val_loss: 0.1139307 val_pos_err: 2903.8786621 val_vel_err: 511.5385742
-[INFO] Epoch 85: loss: 0.1332237 pos_err: 3809.5925293 vel_err: 619.2194214 val_loss: 0.1105134 val_pos_err: 2650.2519531 val_vel_err: 558.4464722
-[INFO] Early stopping triggered at 89
-running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x33108b1a0>, 0.0001)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # 2. Compute elementwise unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # 3. Construct mathematically normalized scale-space mapping weights
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[: self.n_pos] = self.pos_weight
+        weights[self.vel_indices] = self.vel_weight
+        
+        # Normalization step: Prevents artificial gradient magnitude amplification
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # 5. Kinematic Identity Constraint Loss Step (d/dt(pos) = vel)
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            pos_pred = pred[..., : self.n_pos]
+            vel_pred = pred[..., self.vel_indices]
+
+            # Convert to physical space variables for identity comparison
+            if self.pos_scale is not None:
+                pos_phys = pos_pred * self.pos_scale.to(pred.device)
+                vel_phys = vel_pred * self.vel_scale.to(pred.device)
+            else:
+                pos_phys = pos_pred
+                vel_phys = vel_pred
+
+            # Forward finite difference along time coordinate
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_mid = vel_phys[:, :-1, :]
+
+            # Re-normalize residual back to scaled spaces to keep physics_weight balanced
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pred.device)
+            else:
+                resid = dpos_dt - vel_mid
+
+            # Apply midpoints slice valid sequence mask to drop padded boundaries
+            valid_mask_mid = valid_mask[:, :-1, : self.n_pos]
+            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() + 1e-8)
+            
+            loss_data = loss_data + self.physics_weight * physics_loss
+
+        # 6. Apply L2 Regularization parameter decay penalty
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # 7. Unscaled physical evaluation logs (No gradients calculated)
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred_u = pred_unscaled[..., : self.n_pos]
+            pos_target_u = target_unscaled[..., : self.n_pos]
+            vel_pred_u = pred_unscaled[..., self.vel_indices]
+            vel_target_u = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask[:, :, : self.n_pos]
+            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask[:, :, self.vel_indices]
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask[:, :, : self.n_pos].sum() + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask[:, :, self.vel_indices].sum() + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+================
+==================
+
+# Strategy A: Multi-stage training curriculum with fine-grained delta checking.
+        # Decreases min_delta threshold boundaries to match well-conditioned loss levels.
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-3),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 1e-5, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+===================
+====================
+
+# Force structural scale-space loss selection with continuous physics constraints
+        loss_func = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            vel_indices=velocity_indicies,
+            dt=trajectory_dt,
+            pos_weight=80.0,       # Symmetrically enforce positional tracking priority
+            vel_weight=1.0,
+            physics_weight=0.5,    # Links states together via kinematic derivative constraints
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-4,
+            temporal_weighting=True,
+        )
+        node._initialize_losses(loss_func)

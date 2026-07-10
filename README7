@@ -1,8 +1,8 @@
 class PhysicsSplitMSELoss(torch.nn.Module):
     """Position/velocity-weighted MSE tied with a cross-target kinematic constraint.
     
-    Forces the predicted position derivatives to align directly with the true velocity 
-    targets, anchoring velocity features without causing optimization multi-task gridlock.
+    Protects gradients from numerical scale drowning by evaluating velocity residuals 
+    relative to velocity-domain standard deviations, fully adjusted for mean shifts.
     """
     def __init__(
         self,
@@ -11,7 +11,7 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         vel_indices: list[int] | tuple[int, ...],
         dt: float,
         pos_weight: float = 80.0,
-        vel_weight: float = 0.0,
+        vel_weight: float = 1.0,
         physics_weight: float = 0.5,
         scaler: StandardScaler | None = None,
         N_FEATURES: int = 6,
@@ -34,11 +34,18 @@ class PhysicsSplitMSELoss(torch.nn.Module):
 
         if scaler is not None and hasattr(scaler, "scale_"):
             scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            mean = torch.as_tensor(scaler.mean_, dtype=torch.float32)
+            
+            # Register both standard deviation scales and tracking mean parameters
             self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
+            self.register_buffer("pos_mean", mean[list(pos_indices)].clone().view(1, 1, -1))
             self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_mean", mean[list(vel_indices)].clone().view(1, 1, -1))
         else:
             self.pos_scale = None
+            self.pos_mean = None
             self.vel_scale = None
+            self.vel_mean = None
 
     def set_model(self, model: torch.nn.Module) -> None:
         self.model_ref = model
@@ -72,24 +79,24 @@ class PhysicsSplitMSELoss(torch.nn.Module):
 
         # 5. Cross-Residual Physics: Match predicted position updates against TRUE target velocities
         if self.physics_weight > 0.0 and n_timesteps >= 2:
-            pos_pred_phys = pred[..., self.pos_indices]
-            vel_true_phys = target[..., self.vel_indices]  # Anchor using the actual target states
+            pos_pred_scaled = pred[..., self.pos_indices]
+            vel_true_scaled = target[..., self.vel_indices]
 
-            # Convert to physical space variables for valid identity checking
+            # Reconstruct true physical units using complete scale and mean descriptors
             if self.pos_scale is not None:
-                pos_phys = pos_pred_phys * self.pos_scale.to(pred.device)
-                vel_phys = vel_true_phys * self.vel_scale.to(pred.device)
+                pos_phys = pos_pred_scaled * self.pos_scale.to(pred.device) + self.pos_mean.to(pred.device)
+                vel_true_phys = vel_true_scaled * self.vel_scale.to(pred.device) + self.vel_mean.to(pred.device)
             else:
-                pos_phys = pos_pred_phys
-                vel_phys = vel_true_phys
+                pos_phys = pos_pred_scaled
+                vel_true_phys = vel_true_scaled
 
             # Compute forward finite difference on predictions vs raw target fields
             dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_true_mid = vel_phys[:, :-1, :]
+            vel_true_mid = vel_true_phys[:, :-1, :]
 
-            # Re-normalize residual back to scaled spaces
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_true_mid) / self.pos_scale.to(pred.device)
+            # CRITICAL FIX: Normalize the error using velocity scales to maintain proper gradient weighting
+            if self.vel_scale is not None:
+                resid = (dpos_dt - vel_true_mid) / self.vel_scale.to(pred.device)
             else:
                 resid = dpos_dt - vel_true_mid
 
@@ -140,19 +147,18 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             "vel_err": avg_vel_diff,
         }
 
+======================
+====================
 
-=============
-=============
-
-# Force structural scale-space loss selection with cross-residual targets
+# Force structural scale-space loss selection with corrected cross-residual units
         loss_func = PhysicsSplitMSELoss(
             height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
             pos_indices=pos_idx,   
             vel_indices=vel_idx,   
             dt=trajectory_dt,
-            pos_weight=80.0,       
-            vel_weight=0.0,        # Leave zeroed out to prioritize the position trajectory
-            physics_weight=1.5,    # Increase weight slightly to force velocity vector cross-alignment
+            pos_weight=80.0,       # Retain strong positional tracking priority
+            vel_weight=1.0,        # Balanced anchor prevents target gridlock while controlling drift
+            physics_weight=1.0,    # Active penalty forces velocity track convergence
             scaler=scaler_traj if use_scalar else None,
             N_FEATURES=model_states,
             l2_reg=1e-4,

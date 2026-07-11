@@ -1,118 +1,61 @@
-# loss_functions.py (Modified Segment)
+# torchdiffeq_solver.py (Modified Segment)
 
-class PhysicsSplitMSELoss(torch.nn.Module):
-    def __init__(
+class TorchdiffeqSolver(ODESolver):
+    # ... Keep existing __init__ implementation untouched ...
+    pass
+
+    def integrate(
         self,
-        height_idx: int,
-        pos_indices: list[int] | tuple[int, ...],
-        vel_indices: list[int] | tuple[int, ...],
-        dt: float,
-        pos_weight: float = 80.0,
-        vel_weight: float = 0.0,
-        physics_weight: float = 0.5,
-        scaler: StandardScaler | None = None,
-        N_FEATURES: int = 6,
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
-        super().__init__()
-        self.height_idx = height_idx
-        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
-        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
-        self.dt = float(dt)
-        self.pos_weight = pos_weight
-        self.vel_weight = vel_weight
-        self.physics_weight = physics_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
-
-        if scaler is not None and hasattr(scaler, "scale_"):
-            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
-            mean = torch.as_tensor(scaler.mean_, dtype=torch.float32)
-            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
-            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
-            self.register_buffer("vel_mean", mean[list(vel_indices)].clone().view(1, 1, -1))
-        else:
-            self.pos_scale = None
-            self.vel_scale = None
-            self.vel_mean = None
-
-    def set_model(self, model: torch.nn.Module) -> None:
-        self.model_ref = model
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
-        
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[self.pos_indices] = self.pos_weight
-        weights[self.vel_indices] = self.vel_weight
-        weights = weights / weights.mean()
-        weights_view = weights.view(1, 1, -1)
-        
-        if self.temporal_weighting:
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            combined_weights = weights_view * t_weights
-        else:
-            combined_weights = weights_view
+        func: torch.nn.Module,
+        x0: torch.Tensor,
+        steps: int = 1,
+        extra_feat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if extra_feat is not None:
+            raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
             
-        masked_loss = elementwise_loss * combined_weights * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+        epsilon = 1e-10
+        
+        if self.substeps == 1:
+            # FIXED: Instantiated directly on target hardware device with matching model data type
+            times = torch.arange(
+                0, self.dt * steps + self.dt - epsilon, self.dt, 
+                dtype=x0.dtype, device=x0.device
+            )
+            x = self.odeint(func, x0, times, method=self.method)
+            return torch.permute(x, (1, 0, 2))
 
-        # Cross-Residual Physics: Fixed to properly incorporate scale-space means
-        if self.physics_weight > 0.0 and n_timesteps >= 2:
-            pos_pred_phys = pred[..., self.pos_indices]
-            vel_true_phys = target[..., self.vel_indices]
+        fine_dt = self.dt / self.substeps
+        n_fine = steps * self.substeps
+        
+        # FIXED: Instantiated directly on target hardware device with matching model data type
+        times = torch.arange(
+            0, fine_dt * n_fine + fine_dt - epsilon, fine_dt, 
+            dtype=x0.dtype, device=x0.device
+        )
+        x = self.odeint(func, x0, times, method=self.method)
+        x = x[:: self.substeps]
+        return torch.permute(x, (1, 0, 2))
 
-            if self.pos_scale is not None:
-                pos_phys = pos_pred_phys * self.pos_scale
-                # FIXED: Added mean offset to correctly construct physical velocity tracking targets
-                vel_phys = vel_true_phys * self.vel_scale + self.vel_mean
-            else:
-                pos_phys = pos_pred_phys
-                vel_phys = vel_true_phys
+===================
+=====================
 
-            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_true_mid = vel_phys[:, :-1, :]
+# NEXT_training.py (Modified Segment)
 
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_true_mid) / self.pos_scale
-            else:
-                resid = dpos_dt - vel_true_mid
+# ... Inside train_NEXT function ...
 
-            valid_mask_mid = valid_mask[:, :-1, :]
-            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
-            
-            loss_data = loss_data + self.physics_weight * physics_loss
-
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = sum(torch.sum(p ** 2) for p in self.model_ref.parameters() if p.requires_grad)
-            loss_data = loss_data + self.l2_reg * l2_penalty
-
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_diff = torch.abs(pred_unscaled[..., self.pos_indices] - target_unscaled[..., self.pos_indices]) * valid_mask
-            vel_diff = torch.abs(pred_unscaled[..., self.vel_indices] - target_unscaled[..., self.vel_indices]) * valid_mask
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
-
-        return {"loss": loss_data, "pos_err": avg_pos_diff, "vel_err": avg_vel_diff}
+# Strategy B Integration: Establish the physics-informed metric engine for GRU-ODE tracking
+loss_func = PhysicsSplitMSELoss(
+    height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+    pos_indices=pos_idx,
+    vel_indices=vel_idx,
+    dt=trajectory_dt,
+    pos_weight=80.0,       
+    vel_weight=15.0,        # OPTIMIZED: Anchors velocity tracking accuracy
+    physics_weight=10.0,    # OPTIMIZED: Penalizes structural derivative errors
+    scaler=scaler_traj if use_scalar else None,
+    N_FEATURES=model_states,
+    l2_reg=1e-6,
+    temporal_weighting=True,
+)
+node._initialize_losses(loss_func)

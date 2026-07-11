@@ -1,88 +1,62 @@
-#torchdiffeq_solver.py
-from __future__ import annotations
+# gru_ode.py (Modified Segment)
 
-from typing import Callable
+class GRUBayesCell(nn.Module):
+    # ... Keep existing implementation untouched ...
+    pass
 
-import torch
-from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-try:
-    import torchdiffeq as tde
-
-except ModuleNotFoundError:
-    tde = None
-
-
-class TorchdiffeqSolver(ODESolver):
-    """ODE Solver that wraps torchdiffeq"""
-
-    def __init__(self, dt=1, *, adjoint=False, method="dopri5", substeps: int = 1):
-        super().__init__(dt, adjoint=False)  # torchdiffeq provides an adjoint method
-        self.method = method
-        # substeps: number of internal integration steps taken per data interval.
-        if substeps < 1:
-            raise ValueError(f"substeps must be >= 1, got {substeps}")
-        self.substeps = int(substeps)
-        if tde is None:
-            raise ImportError("Prediction Core is not able to use torchdiffeq. Please install torchdiffeq")
-        self.odeint = tde.odeint
-        if adjoint:
-            self.odeint = tde.odeint_adjoint
-
-    def integrate(
+class GRUODEPredictorModel(nn.Module):
+    def __init__(
         self,
-        func: torch.nn.Module,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Solves an ODE by integrating it from the initial conditions.
+        func: GRUODEFunc,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        self.func = func
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+        
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
 
-        Euler's Method uses the ODE evaluated at a given point and the
-        approximation that with a small step size, the function is almost
-        linear to solve the ODE. The update step can be written as follows:
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+        
+        # Unpack the absolute physical and latent partitions directly from the solver state
+        y_read = state[..., : self.n_features]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-        x_i+1 = x_i + dt*f(x_i)
+        # REMOVED: h = torch.tanh(h) 
+        # The ODE solver now integrates the native state variable directly, eliminating 
+        # derivative-state mismatch. Boundedness is preserved via the cell's design.
+        dh = self.func.cell(t, h)
+        xdot = self.func.decode(h)
 
-        where x_i is the given state, x_i+1 is the next state, dt is the step
-        size, and f(x_i) is the ODE evaluated at the given state.
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
 
-        Args:
-            func: Function to be integrated.
-                This should be a Callable with a single torch tensor as an
-                input. It can represent a physical system or in general be
-                anything.
-            x0: A tensor containing the initial conditions.
-                This is expected to be of shape (batch_size, n_features).
-            steps: The number of steps to integrate forward.
-            extra_feat: Optional extra features to include.
-                It is concatenated to the initial conditions and each subsequent
-                step. It can contain "scenario specific" information. It is of
-                shape (batch_size, n_extra_features).
-
-        Returns:
-            The solution to the ODE as a torch tensor.
-                The shape will be (batch_size, steps + 1, n_features).
-        """
-        if extra_feat is not None:
-            raise Warning("Prediction Core torchdiffeq wrapper does not implement extra_feat")
-        # subtract epsilon from the end values because torch has inconsistent arange behavior (see torch docs)
-        epsilon = 1e-10
-        if self.substeps == 1:
-            # original behavior: integrate directly on the data grid
-            times = torch.arange(0, self.dt * steps + self.dt - epsilon, self.dt, dtype=torch.float64).to(x0.device)
-            x = self.odeint(func, x0, times, method=self.method)
-            x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
-            return x
-
-        # sub-stepped integration. build a grid substeps times finer so the
-        # solver takes smaller (more accurate) internal steps
-        fine_dt = self.dt / self.substeps
-        n_fine = steps * self.substeps  # number of fine intervals
-        times = torch.arange(
-            0, fine_dt * n_fine + fine_dt - epsilon, fine_dt, dtype=torch.float64
-        ).to(x0.device)
-        x = self.odeint(func, x0, times, method=self.method)
-        x = x[:: self.substeps]
-        x = torch.permute(x, (1, 0, 2))  # swap axis to match PCM order
-        return x
+        return torch.cat((xdot, dh), dim=-1)

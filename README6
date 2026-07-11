@@ -1,146 +1,222 @@
-class PhysicsSplitMSELoss(torch.nn.Module):
-    """Position/velocity-weighted MSE tied with a continuous-time kinematic identity constraint.
-    
-    Explicitly pairs matching coordinate dimensions to elegantly support unbalanced, 
-    non-sequential coordinate frameworks like the 5-state integrated Geodesic frame.
-    """
+# gru_ode.py
+"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting."""
+
+from __future__ import annotations
+
+import torch
+from torch import nn
+
+
+class FullGRUODECell(nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            if bias:
+                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
+
+
+class MinimalGRUODECell(nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hf = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.lin_hh = nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xf = nn.Linear(input_size, hidden_size, bias=bias)
+            self.lin_xh = nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_f = self.lin_hf(h)
+        if self.input_size > 0:
+            pre_f = pre_f + self.lin_xf(x)
+        elif self.bias_f is not None:
+            pre_f = pre_f + self.bias_f
+        f = torch.sigmoid(pre_f)
+
+        pre_h = self.lin_hh(f * h)
+        if self.input_size > 0:
+            pre_h = pre_h + self.lin_xh(x)
+        elif self.bias_h is not None:
+            pre_h = pre_h + self.bias_h
+        g = torch.tanh(pre_h)
+
+        return (1.0 - f) * (g - h)
+
+
+class GRUBayesCell(nn.Module):
+    def __init__(self, hidden_size: int, obs_dim: int, prep_hidden: int = 4, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.obs_dim = obs_dim
+        self.prep_hidden = prep_hidden
+        self.w_prep = nn.Parameter(0.01 * torch.randn(obs_dim, 4, prep_hidden))
+        self.b_prep = nn.Parameter(torch.zeros(obs_dim, prep_hidden))
+        self.gru = nn.GRUCell(obs_dim * prep_hidden, hidden_size, bias=bias)
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        y: torch.Tensor,
+        mask: torch.Tensor,
+        mu: torch.Tensor,
+        logvar: torch.Tensor,
+    ) -> torch.Tensor:
+        sigma = torch.exp(0.5 * logvar)
+        error = (y - mu) / (sigma + 1e-6)
+        feats = torch.stack([mu, sigma, y, error], dim=-1)
+        prepped = torch.relu(torch.einsum("boi,oih->boh", feats, self.w_prep) + self.b_prep)
+        prepped = prepped * mask.unsqueeze(-1)
+        prepped = prepped.reshape(prepped.shape[0], -1)
+        return self.gru(prepped, h)
+
+
+class GRUODEFunc(nn.Module):
+    ORDER = "y_first"
+
     def __init__(
         self,
-        height_idx: int,
-        pos_indices: list[int] | tuple[int, ...],
-        vel_indices: list[int] | tuple[int, ...],
-        dt: float,
-        pos_weight: float = 80.0,
-        vel_weight: float = 1.0,
-        physics_weight: float = 0.5,
-        scaler: StandardScaler | None = None,
-        N_FEATURES: int = 6,
-        l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
-    ) -> None:
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+        encoder_dropout: float = 0.1,
+    ):
         super().__init__()
-        self.height_idx = height_idx
-        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
-        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
-        self.dt = float(dt)
-        self.pos_weight = pos_weight
-        self.vel_weight = vel_weight
-        self.physics_weight = physics_weight
-        self.scaler = scaler
-        self.N_FEATURES = N_FEATURES
-        self.l2_reg = l2_reg
-        self.temporal_weighting = temporal_weighting
-        self.model_ref = None
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
 
-        if scaler is not None and hasattr(scaler, "scale_"):
-            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
-            # Pull only the scales that correspond to the paired physical dimensions
-            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
-            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
+        enc_in = len(encoder_input_idx)
+
+        # Expose active dropout on the initial mapping layer to satisfy Fix C
+        if encoder_dropout > 0.0:
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Dropout(p=encoder_dropout),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
         else:
-            self.pos_scale = None
-            self.vel_scale = None
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
+        self.encoder_dropout = float(encoder_dropout)
 
-    def set_model(self, model: torch.nn.Module) -> None:
-        """Saves a structural reference to evaluate explicit parameter decay penalties."""
-        self.model_ref = model
+        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, enc_h),
+            nn.SiLU(),
+            nn.Linear(enc_h, state_vector_len),
+        )
+        self.nfe = 0
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch_size, n_timesteps, _ = pred.shape
-        
-        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
-        # 2. Compute elementwise unreduced normalized loss
-        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # 3. Construct mathematically normalized scale-space mapping weights across coordinates
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
-        weights[self.pos_indices] = self.pos_weight
-        weights[self.vel_indices] = self.vel_weight
-        
-        # Normalization step: Prevents artificial gradient magnitude amplification
-        weights = weights / weights.mean()
-        weights_view = weights.view(1, 1, -1)
-        
-        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
-        if self.temporal_weighting:
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
-            combined_weights = weights_view * t_weights
-        else:
-            combined_weights = weights_view
-            
-        masked_loss = elementwise_loss * combined_weights * valid_mask
-        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        return self.cell(t, h)
 
-        # 5. Kinematic Identity Constraint Loss Step (d/dt(pos) = vel) using explicit matching pairs
-        if self.physics_weight > 0.0 and n_timesteps >= 2:
-            # Extract out exclusively the paired physics channels
-            pos_pred_phys = pred[..., self.pos_indices]
-            vel_pred_phys = pred[..., self.vel_indices]
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
 
-            # Convert to physical space variables for valid identity comparison
-            if self.pos_scale is not None:
-                pos_phys = pos_pred_phys * self.pos_scale.to(pred.device)
-                vel_phys = vel_pred_phys * self.vel_scale.to(pred.device)
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+
+class GRUODEPredictorModel(nn.Module):
+    def __init__(
+        self,
+        func: GRUODEFunc,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        """Production wrapper implementing a stateless continuous integration field."""
+        super().__init__()
+        self.func = func
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+        
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
             else:
-                pos_phys = pos_pred_phys
-                vel_phys = vel_pred_phys
+                self.scaled_space = False
 
-            # Forward finite difference along time coordinate
-            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
-            vel_mid = vel_phys[:, :-1, :]
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+        
+        # Unpack the absolute physical and latent partitions directly from the solver state
+        y_read = state[..., : self.n_features]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-            # Re-normalize residual back to scaled spaces to keep physics_weight balanced
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_mid) / self.pos_scale.to(pred.device)
-            else:
-                resid = dpos_dt - vel_mid
+        # Enforce analytical bounding constraints cleanly on every evaluation step
+        h = torch.tanh(h)
+        dh = self.func.cell(t, h)
+        xdot = self.func.decode(h)
 
-            # Apply midpoints slice valid sequence mask to drop padded boundaries
-            valid_mask_mid = valid_mask[:, :-1, :]
-            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
-            
-            loss_data = loss_data + self.physics_weight * physics_loss
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
 
-        # 6. Apply L2 Regularization parameter decay penalty
-        if self.model_ref is not None and self.l2_reg > 0:
-            l2_penalty = 0.0
-            for param in self.model_ref.parameters():
-                if param.requires_grad:
-                    l2_penalty += torch.sum(param ** 2)
-            loss_data = loss_data + self.l2_reg * l2_penalty
-
-        # 7. Unscaled physical evaluation logs (No gradients calculated)
-        with torch.no_grad():
-            if self.scaler is not None:
-                pred_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(pred.device)
-                target_unscaled = torch.from_numpy(
-                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
-                        -1, n_timesteps, self.N_FEATURES
-                    )
-                ).to(target.device)
-            else:
-                pred_unscaled = pred.detach()
-                target_unscaled = target.detach()
-
-            pos_pred_u = pred_unscaled[..., self.pos_indices]
-            pos_target_u = target_unscaled[..., self.pos_indices]
-            vel_pred_u = pred_unscaled[..., self.vel_indices]
-            vel_target_u = target_unscaled[..., self.vel_indices]
-
-            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask
-            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask
-
-            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
-            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
-
-        return {
-            "loss": loss_data,
-            "pos_err": avg_pos_diff,
-            "vel_err": avg_vel_diff,
-        }
+        return torch.cat((xdot, dh), dim=-1)

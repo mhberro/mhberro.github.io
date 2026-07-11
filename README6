@@ -1,462 +1,118 @@
-#neural_ode_mod.py
+# loss_functions.py (Modified Segment)
 
-"""Base training class for a Neural Ordinary Differential Equation model."""
-
-from __future__ import annotations
-
-import math
-import random
-from typing import TYPE_CHECKING
-
-import torch
-from torch import nn
-
-from cm_utilities.logger import logger
-from lm_ai_torch_training.device_type import DeviceType
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
-)
-from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
-from prediction.mlearn.neural_ode.loss_functions import (
-    ReverseLinearWeightingLoss,
-)
-
-if TYPE_CHECKING:  # pragma: no cover
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
-    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
-        OptimizerWithLossFunction,
-    )
-    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-    from prediction.mlearn.ffnn.model import FFNNModel
-    from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
-
-
-# TODO: This needs to move somewhere that is more useful to PCM
-class EarlyStopper:
-    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
-        # TODO: What about a percent rise stopper rather and a absolute value? Both?
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float("inf")
-        self.previous_validation_loss = float("inf")
-        self.metric_name = metric_name
-
-    def early_stop(self, validation_loss: float):
-        # Improvement must beat best by at least min_delta
-        if validation_loss < (self.min_validation_loss - self.min_delta):
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        else:
-            # No meaningful improvement (same, tiny change, or worse)
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        self.previous_validation_loss = validation_loss
-        return False
-
-class ModelCheckpoint:
-    def __init__(self, min_epochs: int, directory: str, model_name: str):
-        self.min_epochs = min_epochs
-        self.directory = directory
-        self.model_name = model_name
-        self.min_metric = float("inf")
-
-    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
-        if epoch > self.min_epochs and metric < self.min_metric:
-            self.min_metric = metric
-            model.save(
-                directory=self.directory,
-                model_name=self.model_name,
-            )
-            return True
-        return False
-
-
-class NODEPredictor(nn.Module):
-    """Neural Ordinary Differential Equation (NODE) Prediction Model.
-
-    The Neural Ordinary Differential Equation (NODE) is a neural network that
-    parameterizes the derivative of the hidden state instead of specifying a
-    discrete sequence of hidden layers. Essentially, it extends a residual
-    network model [EQ 1], adding more layers and decreasing the step size to the
-    limit to yield an ODE [EQ 2]. This is shown by the equations below:
-
-            h_t+1 = h_t + f(h_t,Θ_t)          [EQ 1]
-            dh(t)/dt = f(h(t),t,Θ)            [EQ 2]
-
-    f is a feed-forward neural network. Then, with some given initial
-    conditions, an ODE solver can be used to integrate forward the dynamics
-    captured by the network.
-
-    For more information, refer to the original paper given below
-    (https://arxiv.org/pdf/1806.07366.pdf)
-    """
-
+class PhysicsSplitMSELoss(torch.nn.Module):
     def __init__(
         self,
-        architecture: FFNNArchitecture,
-        training_configuration: TrainingConfiguration,
-        solver: ODESolver,
-        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
-        logging_interval: int = 1,  # Default to log every epoch/iteration.
-        early_stopper: EarlyStopper | None = None,
-        checkpoint: ModelCheckpoint | None = None,
-        aug_dim: int = 0,
+        height_idx: int,
+        pos_indices: list[int] | tuple[int, ...],
+        vel_indices: list[int] | tuple[int, ...],
+        dt: float,
+        pos_weight: float = 80.0,
+        vel_weight: float = 0.0,
+        physics_weight: float = 0.5,
+        scaler: StandardScaler | None = None,
+        N_FEATURES: int = 6,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
     ) -> None:
-        """Initializes a NODE from an input configuration.
-
-        Args:
-            architecture: A configuration defining the underlying node model.
-            training_configuration: The model training hyperparameters.
-            logging_interval: How often to log training epochs or iterations.
-                This is used if verbose is True in the training configuration.
-                Logging statements will be printed to the console every
-                logging_interval epochs or optimizer iterations.
-            solver: The ODESolver used in the NODE.
-            loss_func: The loss function optimized for training the node model.
-        """
         super().__init__()
-        self.architecture: FFNNArchitecture = architecture
-        self.training_configuration: TrainingConfiguration = training_configuration
-        self.logging_interval: int = logging_interval
-        self.solver = solver
-        self.early_stopper = early_stopper
-        self.checkpoint = checkpoint
-        self.aug_dim = aug_dim
+        self.height_idx = height_idx
+        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
+        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
 
-        # Parse parameters from the training configuration.
-        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
-        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
-        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
-        self.verbose: bool = self.training_configuration.verbose
-
-        # Set the iteration parameter for required optimizers.
-        self.training_metrics: dict[str, list[float]] = {}
-
-        # Setup the model for training and inference.
-        self._initialize_device()
-        self._initialize_losses(loss_func=loss_func)
-        self._initialize_model()
-        self._initialize_optimizer()
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
-
-        Args:
-            x: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-            extra_feat: Extra features used in training.
-                This will be passed to the extra features of the Neural ODE. It
-                should be of shape (len(x), n_extra_features).
-            shuffle: Flag to shuffle the data for batching.
-                The data will not be shuffled when set to False.
-            validation_data: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-
-        Returns:
-            A dictionary of training losses and metrics.
-        """
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
-                    norm_type=2.0,
-                )
-                # # (optional) log the pre‑clip norm so you can monitor it
-                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-                self.optimizer.step()
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    # repeating the above...it should be another function
-                    pool_index_val = list(range(len(validation_data)))
-                    if shuffle:
-                        random.shuffle(pool_index_val)
-
-                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
-                        batch_idx_val = [
-                            pool_index_val.pop(0)
-                            for _ in range(
-                                min(
-                                    len(pool_index_val),
-                                    self.batch_size,
-                                )
-                            )
-                        ]
-                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
-                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                        x_batch_val = float("nan") * torch.ones(
-                            (
-                                len(batch_idx_val),
-                                max_len_val,
-                                x_batch_list_val[0].size(dim=1),
-                            )
-                        )
-                        for i in range(len(x_batch_list_val)):
-                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                        if extra_feat is None:
-                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                        else:
-                            metrics_val = self.batch_loss(
-                                x=x_batch_val.to(self.device),
-                                extra_feat=extra_feat[batch_idx_val],
-                            )
-
-                    for key in metrics_val:
-                        metrics[f"val_{key}"] = metrics_val[key]
-
-                    # update the position and velocity weights only for the loss functions that support this
-                    # and only when looking at the full trajectory
-                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
-                    if hasattr(self.criterion, "wp") and enable_checkpoints:
-                        if epoch % 50 == 0:
-                            if (
-                                metrics["pos_err_scaled"] > self.criterion.delta_pos
-                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
-                            ):
-                                pass
-                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
-                                self.criterion.wp *= 1.2  # amplify position focus
-                                logger.info(
-                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
-                                self.criterion.wv *= 1.2
-                                logger.info(
-                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-                # and metrics["pos_err"] < 5000
-            ):
-                logger.info(f"Early stopping triggered at {epoch}")
-                break
-
-        return self.training_metrics
-
-    def batch_loss(
-        self,
-        x: torch.Tensor,
-        extra_feat: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Calculates the loss of the batch using stateless latent seeding."""
-        batch_size, time_steps, n_features = x.shape
-        x0_phys = x[:, 0, :]
-
-        if self.aug_dim == 0:
-            x0 = x0_phys
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            mean = torch.as_tensor(scaler.mean_, dtype=torch.float32)
+            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_mean", mean[list(vel_indices)].clone().view(1, 1, -1))
         else:
-            # Check if the underlying model is a GRU-ODE network exposing an encode mechanism
-            if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                h0 = self.model.func.encode(x0_phys)
-            else:
-                # Fallback path for standard zero-augmented ANODE structures
-                h0 = torch.zeros((batch_size, self.aug_dim), device=self.device)
+            self.pos_scale = None
+            self.vel_scale = None
+            self.vel_mean = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        self.model_ref = model
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[self.pos_indices] = self.pos_weight
+        weights[self.vel_indices] = self.vel_weight
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
             
-            x0 = torch.cat((x0_phys, h0), dim=-1)
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
 
-        if self.solver.adjoint:
-            x_pred = AdjointMethod.apply(
-                self.solver,
-                self.model,
-                x0,
-                time_steps - 1,
-                extra_feat,
-                *tuple(self.model.parameters()),
-            )[:, :, : n_features]
-        else:
-            x_pred = self.solver.integrate(
-                func=self.model,
-                x0=x0,
-                steps=time_steps - 1,
-                extra_feat=extra_feat,
-            )[:, :, : n_features]
+        # Cross-Residual Physics: Fixed to properly incorporate scale-space means
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            pos_pred_phys = pred[..., self.pos_indices]
+            vel_true_phys = target[..., self.vel_indices]
 
-        x_pred = torch.nan_to_num(x_pred, nan=0.0)
-        x = torch.nan_to_num(x, nan=0.0)
+            if self.pos_scale is not None:
+                pos_phys = pos_pred_phys * self.pos_scale
+                # FIXED: Added mean offset to correctly construct physical velocity tracking targets
+                vel_phys = vel_true_phys * self.vel_scale + self.vel_mean
+            else:
+                pos_phys = pos_pred_phys
+                vel_phys = vel_true_phys
 
-        return self.criterion(x_pred, x)
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_true_mid = vel_phys[:, :-1, :]
 
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_true_mid) / self.pos_scale
+            else:
+                resid = dpos_dt - vel_true_mid
 
-    def infer(
-        self,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Infers on a trained model with a predefined dataset.
+            valid_mask_mid = valid_mask[:, :-1, :]
+            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
+            
+            loss_data = loss_data + self.physics_weight * physics_loss
 
-        Args:
-            x0: An input tensor with the initial conditions for the ODE Solver.
-                This is a shape (batch_size, n_features).
-            extra_feat: A tensor with the extra features of the NODE.
-                This is of shape (batch_size, n_extra_features).
-            steps: Number of steps the ODE Solver will take.
+        if self.model_ref is not None and self.l2_reg > 0:
+            l2_penalty = sum(torch.sum(p ** 2) for p in self.model_ref.parameters() if p.requires_grad)
+            loss_data = loss_data + self.l2_reg * l2_penalty
 
-        Returns:
-            A tensor containing the predicted data from the trained model.
-        """
         with torch.no_grad():
-            if self.aug_dim != 0:
-                x0 = torch.cat((x0[:, 0], torch.zeros(self.aug_dim)), dim=1)
-            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
 
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
-    ) -> None:
-        """Loads a model from file.
+            pos_diff = torch.abs(pred_unscaled[..., self.pos_indices] - target_unscaled[..., self.pos_indices]) * valid_mask
+            vel_diff = torch.abs(pred_unscaled[..., self.vel_indices] - target_unscaled[..., self.vel_indices]) * valid_mask
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
 
-        Args:
-            directory: The directory to load the model from.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when searching
-                for the model file.
-            device_type: The hardware device to use for model loading.
-        """
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-
-    def save(self, directory: str, model_name: str) -> None:
-        """Saves a model to one torch file.
-
-        Args:
-            directory: The directory to save the model to.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when creating
-                the model file.
-        """
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.save(directory, model_name)
-
-    def _initialize_device(self) -> None:
-        """Sets torch device based on whether GPU is available or not."""
-        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
-        self.to(device=self.device)
-
-    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
-        """Initializes the losses for the NODE.
-
-        Args:
-            loss_func: The loss function optimized for training the node model.
-        """
-        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
-
-    def _initialize_model(self) -> None:
-        """Initialize the NODE."""
-        self.model: FFNNModel = self.architecture.get_model().to(self.device)
-
-    def _initialize_optimizer(self) -> None:
-        """Initialize the optimizer for the NODE from the model parameters."""
-        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
-            self.model
-        )
-
-    def _add_metrics_to_global_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        """Adds metrics generated from training to the global metrics.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-        """
-        # Add losses and metrics to global metrics.
-        for metric, value in metrics.items():
-            if metric not in self.training_metrics:
-                self.training_metrics[metric] = []
-            self.training_metrics[metric].append(value.detach().cpu().numpy())
-
-    def _log_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-        iteration: int,
-        prefix: str = "Epoch",
-    ) -> None:
-        """Logs metrics generated during a training epoch or iteration.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-            iteration: The current epoch or optimizer iteration.
-            prefix: The prefix for the logging statement reported to console.
-        """
-        with torch.no_grad():
-            if self.verbose and iteration % self.logging_interval == 0:
-                metric_comps: list[str] = []
-                for metric, value in metrics.items():
-                    metric_comps.append(f"{metric}: {value.item():.7f}")
-
-                metric_str: str = " ".join(metric_comps)
-                logger.info(f"{prefix} {iteration}: {metric_str}")
+        return {"loss": loss_data, "pos_err": avg_pos_diff, "vel_err": avg_vel_diff}

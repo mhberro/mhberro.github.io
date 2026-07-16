@@ -49,6 +49,10 @@ from trajectory_helpers import (
     DOWN_INDEX,
     DOWN_DOT_INDEX,
 )
+from NEXT_geodesic_frame import (
+      ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_ft,
+      local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_ft,
+  )
 
 measurement_dt = 1.0  # [s]
 extrapolation_dt = 1.0  # [s]
@@ -63,6 +67,41 @@ plt.rcParams.update(
         "savefig.dpi": 200,
     }
 )
+
+def _gruode_latent_dim(model_basename: str, state_size: int) -> int:
+    """Recover the GRU-ODE latent width from the model filename.
+
+    Must match NEXT_training exactly:
+        latent_dim = max(2 * state_size, nhidden // 2 if nhidden >= 20 else 16)
+    The filename carries `_{nhidden}hid_`.
+    """
+    m = re.findall(r"_(\d+)hid_", model_basename)
+    if not m:
+        raise ValueError(
+            f"Could not find `_<nhidden>hid_` token in model name '{model_basename}'. "
+            "GRU-ODE latent width cannot be recovered."
+        )
+    nhidden = int(m[-1])
+    return max(2 * state_size, nhidden // 2 if nhidden >= 20 else 16)
+
+
+_encoder_sess_stash = {}
+
+
+def _load_encoder_session(model_path: str):
+    """Load (and cache) the companion `<model>_encoder.onnx` next to the field graph."""
+    enc_path = re.sub(r"\.onnx$", "_encoder.onnx", model_path)
+    if enc_path in _encoder_sess_stash:
+        return _encoder_sess_stash[enc_path]
+    if not os.path.exists(enc_path):
+        raise FileNotFoundError(
+            f"GRU-ODE requires an encoder graph to seed the latent state, but "
+            f"'{enc_path}' was not found. Re-export the model with the updated "
+            "NEXT_training (it writes `<model>_encoder.onnx` alongside the field graph)."
+        )
+    sess = onnxruntime.InferenceSession(enc_path)
+    _encoder_sess_stash[enc_path] = sess
+    return sess
 
 def main():
     parser = argparse.ArgumentParser(description="")
@@ -98,6 +137,20 @@ def main():
         action="store_true",
         help=(
             "Force the GRU-ODE integrator (RK4 sub-stepped at the training dt). "
+        ),
+    )
+    parser.add_argument(
+        "--time-cutoff",
+        type=float,
+        default=None,
+        help=(
+            "Absolute-time ceiling [s] applied to truth rows and to the "
+            "extrapolation stop. The original code hard-coded 122.0, which "
+            "assumes trajectories starting near t=0. Pre-segmented glide files "
+            "start much later (e.g. 439 s), so the default is None = no "
+            "absolute cut (row filtering then relies on the velocity!=0 test "
+            "and the slant-range/ground checks). Pass a value only if you have "
+            "full-trajectory files that genuinely need an early-time cut."
         ),
     )
 
@@ -525,6 +578,29 @@ def plot_color_trajs(truth, extraps, ax51, ax52):
     ax52.set_ylabel("Cross [km]")
 
 
+def _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE):
+    """Build truth_states_sr_cut with an OPTIONAL absolute-time ceiling.
+
+    Returns the filtered array (possibly empty; caller must guard).
+    """
+    import numpy as np
+
+    time_cutoff = getattr(args, "time_cutoff", None)
+    if time_cutoff is None:
+        # No absolute cut: keep every moving row. This is correct for
+        # pre-segmented glide files whose timestamps start well past any
+        # boost-era ceiling.
+        rows = tuple(
+            x for x in truth_states
+            if not np.allclose(x[VEL_SLICE], [0, 0, 0])
+        )
+    else:
+        rows = tuple(
+            x for x in truth_states
+            if x[TIME_INDEX] < time_cutoff and not np.allclose(x[VEL_SLICE], [0, 0, 0])
+        )
+    return np.asarray(rows, dtype=np.float64)
+
 def sim_ingress(truth_states, args):
     # truth states are expected to be an array of format
     # seconds from launch, position x3, velocity x3, acceleration x3
@@ -544,10 +620,18 @@ def sim_ingress(truth_states, args):
     # )
 
     # NOTE: Change the 122.0 to 61.0 for the LowE
-    truth_states_sr_cut = np.asarray(
-        tuple(x for x in truth_states if x[TIME_INDEX] < 122.0 and not np.allclose(x[VEL_SLICE], [0, 0, 0])),
-        dtype=np.float64,
-    )
+    truth_states_sr_cut = _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE)
+
+    # Guard: nothing survived the filter -> skip this file cleanly using the
+    # existing (-1, -1, -1) "bad file" sentinel that sim_single_truth handles.
+    if truth_states_sr_cut.shape[0] == 0:
+        print(
+            f"[skip] no moving truth rows"
+            + ("" if getattr(args, 'time_cutoff', None) is None
+               else f" below t={args.time_cutoff}s")
+            + " -- check --time-cutoff / file segmentation"
+        )
+        return -1, -1, -1
 
     # start sim clock at truth firm track range
     firm_track_time = truth_states_sr_cut[0][0]
@@ -616,7 +700,10 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
     # (and still accept a legacy "_geod_" token if any old models use it).
     model_basename = os.path.basename(args.model)
     use_grdth = "_grdth_" in model_basename
-    use_geodesic = ("_geodesic_" in model_basename) or ("_geod_" in model_basename)
+    use_geodesic = ("_geodesic_" in model_basename) or ("_geod_" in model_basename) \
+                    or ("_geodesic-integrated_" in model_basename) \
+                    or ("_geodesic-original_" in model_basename)
+    use_geodesic_integrated = "_geodesic-integrated_" in model_basename
     global ort_sess_stash
     if use_grdth:
         initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
@@ -629,19 +716,36 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
             ort_sess_stash = ort_sess
     elif use_geodesic:
         _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
-        initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
-            np.atleast_2d(initial_state_ecef[POS_SLICE]),
-            np.atleast_2d(initial_state_ecef[VEL_SLICE]),
-            np.zeros_like(
-                np.atleast_2d(initial_state_ecef[VEL_SLICE])
-            ),  # TODO: better handling of acceleration being in the transform functions
-            guide_point_ecef,
-        )
-        # Prepend time and only include pos and vel
-        initial_state_NEXT_frame = np.hstack(
-            [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
-        )[0]
-        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+        if use_geodesic_integrated:
+            # Integrated frame trick -> 5-state [s, h, v_s, v_alpha, v_h].
+            state5, initial_azimuth = ecef_to_local_geodesic_vec_ft(
+                np.atleast_2d(initial_state_ecef[POS_SLICE]),
+                np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+                guide_point_ecef,
+            )
+            state5 = np.atleast_2d(state5)[0]           # (5,)
+            initial_state_NEXT_frame = np.hstack(
+                [np.atleast_1d(initial_state_ecef[TIME_INDEX]), state5]
+            )                                            # (6,) = time + 5
+            # slant range in the integrated frame: s and h are indices 1 and 2.
+            initial_state_slant_range = np.hypot(
+                initial_state_NEXT_frame[1], initial_state_NEXT_frame[2]
+            )
+            # stash azimuth so the reverse transform can rebuild cross-track heading
+            initial_point_heading = (initial_point_heading, float(np.ravel(initial_azimuth)[0]))
+        else:
+            # original 6-state geodesic (unchanged)
+            initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+                np.atleast_2d(initial_state_ecef[POS_SLICE]),
+                np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+                np.zeros_like(np.atleast_2d(initial_state_ecef[VEL_SLICE])),
+                guide_point_ecef,
+            )
+            initial_state_NEXT_frame = np.hstack(
+                [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
+            )[0]
+            initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+
         if ort_sess_stash:
             ort_sess = ort_sess_stash
         else:
@@ -674,14 +778,24 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
     if use_grdth:
         NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
     elif use_geodesic:
-        NEXT_extrap_ecef = np.hstack(
-            [
-                NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
-                local_geodesic_to_ecef_vec(
-                    np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]), guide_point_ecef
-                ),
-            ],
-        )[:, :7]
+        if use_geodesic_integrated:
+            heading, init_az = initial_point_heading  # unpack the tuple set in EDIT 3
+            # NEXT_extrap columns: [time, s, h, v_s, v_alpha, v_h]
+            state5 = NEXT_extrap[:, 1:6]
+            ecef_pos_vel = local_geodesic_to_ecef_vec_ft(state5, guide_point_ecef, init_az)
+            NEXT_extrap_ecef = np.hstack(
+                [NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel]
+            )[:, :7]
+        else:
+            NEXT_extrap_ecef = np.hstack(
+                [
+                    NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+                    local_geodesic_to_ecef_vec(
+                        np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]),
+                        guide_point_ecef,
+                    ),
+                ],
+            )[:, :7]
     else:
         NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
 
@@ -720,49 +834,52 @@ def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
     return default
 
 
-def _field_eval(ort_sess, state_phys_scaled, model_augmentation_dim, state_size):
+def _field_eval(ort_sess, state_full_scaled, state_size):
+    """Evaluate the ODE field on the FULL state vector.
 
-    out = ort_sess.run(["output"], {"input": state_phys_scaled.astype(np.float32)})[-1].reshape(-1)
-    # Only the physical-state derivative is integrated; any extra (aug) outputs
-    # are not part of the physical trajectory.
-    return out[:state_size]
+    state_full_scaled is [y, h] for GRU-ODE (width state_size + latent_dim) or
+    [y, zeros(aug)] for ANODE-style models. The field returns a derivative of
+    the same width; the caller decides which components to integrate.
+    """
+    out = ort_sess.run(["output"], {"input": state_full_scaled.astype(np.float32)})[-1].reshape(-1)
+    return out
 
 
 def _integrate_one_step(
     ort_sess,
-    x_scaled,
+    x_full_scaled,
     out_dt: float,
     sub_dt: float,
     integrator: str,
-    model_augmentation_dim: int,
     state_size: int,
 ):
+    """Advance the FULL state [y, h] by one output dt.
 
-    # Number of sub-steps to cover one output dt at ~sub_dt resolution.
+    Unlike the original, this integrates every component of the field output
+    (both physical y and latent h), so the latent evolves continuously and the
+    coupled cell sees a consistent h at each evaluation -- exactly as in
+    training. For ANODE-style models the "latent" partition is the augmentation
+    the model was trained to carry (or zeros of width aug), which is likewise
+    integrated rather than reset.
+    """
     n_sub = max(1, int(round(out_dt / sub_dt)))
-    h = out_dt / n_sub  # actual sub-step size (divides out_dt exactly)
+    h_step = out_dt / n_sub
 
-    x = np.asarray(x_scaled, dtype=np.float64).reshape(-1)[:state_size].copy()
+    x = np.asarray(x_full_scaled, dtype=np.float64).reshape(-1).copy()
 
-    def f(state_phys):
-        # Build the model input: physical state (+ zero augmentation if the
-        # model was trained with it, so the input width matches).
-        if model_augmentation_dim > 0:
-            inp = np.concatenate([state_phys, np.zeros(model_augmentation_dim)])
-        else:
-            inp = state_phys
-        return _field_eval(ort_sess, inp, model_augmentation_dim, state_size)
+    def f(state_full):
+        return _field_eval(ort_sess, state_full, state_size)
 
     for _ in range(n_sub):
         if integrator == "euler":
-            x = x + h * f(x)
+            x = x + h_step * f(x)
         else:  # rk4
             k1 = f(x)
-            k2 = f(x + 0.5 * h * k1)
-            k3 = f(x + 0.5 * h * k2)
-            k4 = f(x + h * k3)
-            x = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-    return x
+            k2 = f(x + 0.5 * h_step * k1)
+            k3 = f(x + 0.5 * h_step * k2)
+            k4 = f(x + h_step * k3)
+            x = x + (h_step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return x  # full [y, h]
 
 
 def NEXT_extrapolation(
@@ -775,16 +892,61 @@ def NEXT_extrapolation(
     ort_sess: onnxruntime.InferenceSession,
     use_geodesic: bool = False,
 ):
-    # print("initial_state_next_frame", initial_state_next_frame)
+    import pickle
+    from copy import deepcopy
 
-    # ort_sess_scalar = onnxruntime.InferenceSession(args.scalar)  # switch to using ONNX for scalar (update: can't)
+    from trajectory_helpers import (
+        TIME_INDEX,
+        POS_SLICE,
+        GR_INDEX,
+        DOWN_INDEX,
+    )
+
+    def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
+        m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
+        if m:
+            try:
+                return float(m[-1])
+            except ValueError:
+                pass
+        return default
+
     use_scalar = "_scalarOn" in os.path.basename(args.model)
     if use_scalar:
         with open(args.scalar, "rb") as scalar_pickle:
             NEXT_scalar = pickle.load(scalar_pickle)
-    state_size = 6
-    if use_grdth:
-        state_size = 5
+
+    model_basename = os.path.basename(args.model)
+    is_gruode = (
+        getattr(args, "gruode", False)
+        or ("_gruode_" in model_basename)
+        or ("_gruode-min_" in model_basename)
+    )
+
+    if is_gruode:
+        # Load the encoder first; its input width is the authoritative
+        # physical-state dimension (5 for geodesic-integrated / grdth,
+        # 6 for dcu / 6-state geodesic). This removes all per-frame guessing.
+        enc_sess = _load_encoder_session(args.model)
+        enc_in_shape = enc_sess.get_inputs()[0].shape   # e.g. [5]
+        # shape entries can be strings (dynamic) or ints; take the last int.
+        state_size = int([d for d in enc_in_shape if isinstance(d, int)][-1])
+        integrator = "rk4"
+        sub_dt = _infer_training_dt(model_basename, default=0.1)
+        latent_dim = _gruode_latent_dim(model_basename, state_size)
+        aug_width = latent_dim
+        print(
+            f"GRU-ODE detected: RK4 sub-step ~{sub_dt}s over output dt {dt}s; "
+            f"state_size={state_size}, latent_dim={latent_dim}; "
+            f"seeding h0 from encoder graph"
+        )
+    else:
+        # Legacy ANODE/LatentNODE: keep the original frame-based width.
+        state_size = 5 if use_grdth else 6
+        integrator = "euler"
+        sub_dt = dt
+        aug_width = int(re.findall(r"_(\d)aug_", args.model)[-1])
+        enc_sess = None
 
 
     model_basename = os.path.basename(args.model)
@@ -794,85 +956,115 @@ def NEXT_extrapolation(
         or ("_gruode_" in model_basename)
         or ("_gruode-min_" in model_basename)
     )
+
     if is_gruode:
         integrator = "rk4"
         sub_dt = _infer_training_dt(model_basename, default=0.1)
-        print(f"GRU-ODE detected: integrating with RK4, sub-step ~{sub_dt}s over output dt {dt}s")
+        # GRU-ODE carries a latent h of width latent_dim (NOT the single-digit
+        # aug token). Recover it from the filename and seed h0 via the encoder.
+        latent_dim = _gruode_latent_dim(model_basename, state_size)
+        aug_width = latent_dim
+        enc_sess = _load_encoder_session(args.model)
+        print(
+            f"GRU-ODE detected: RK4 sub-step ~{sub_dt}s over output dt {dt}s; "
+            f"latent_dim={latent_dim}; seeding h0 from encoder graph"
+        )
     else:
         integrator = "euler"
-        sub_dt = dt  # one step == original behaviour
+        sub_dt = dt
+        # Legacy ANODE/LatentNODE: width comes from the aug token, seeded to zero.
+        aug_width = int(re.findall(r"_(\d)aug_", args.model)[-1])
+        enc_sess = None
 
-    # infer at extrapolation dt
-    # keep going until the termination criteria is met
-    # the initial point will be the initial state
-    model_augmentation_dim = int(re.findall(r"_(\d)aug_", args.model)[-1])
     extrap = np.array([np.hstack([initial_state_next_frame])])
     validity_time = deepcopy(initial_state_next_frame[0])
 
-    # n_steps = 5
-    temp_iter = 0
+    # ------------------------------------------------------------------
+    # Seed the augmented/latent partition ONCE from the initial condition.
+    # For GRU-ODE this is h0 = encode(y0_scaled); for ANODE it is zeros.
+    # ------------------------------------------------------------------
+    y0_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
+    if use_scalar:
+        y0_seed = NEXT_scalar.transform(np.asarray([y0_phys]))[0]
+    else:
+        y0_seed = y0_phys
 
-    while temp_iter < n_steps and float(validity_time) < 122.0:
-        temp_iter = temp_iter + 1
+    if is_gruode:
+        # The encoder graph was exported with a 1-D example input, so its input
+        # rank is fixed to 1. Feed a flat (state_size,) vector, NOT (1, state_size).
+        h_current = enc_sess.run(
+            ["h0"], {"y0": y0_seed.astype(np.float32).reshape(-1)}
+        )[-1].reshape(-1)
+        if h_current.shape[0] != latent_dim:
+            raise ValueError(
+                f"Encoder produced h0 of width {h_current.shape[0]} but filename "
+                f"implies latent_dim={latent_dim}. Filename/model mismatch."
+            )
+    else:
+        h_current = np.zeros(aug_width, dtype=np.float64)
+
+    temp_iter = 0
+    # Stop either at n_steps, or -- if an absolute --time-cutoff was given --
+    # when validity_time passes it. With no cutoff (default, correct for
+    # glide), the ground/slant-range/divergence checks inside the loop are
+    # what terminate the extrapolation.
+    _abs_cut = getattr(args, "time_cutoff", None)
+    _abs_cut = float("inf") if _abs_cut is None else _abs_cut
+    while temp_iter < n_steps and float(validity_time) < _abs_cut:
+        temp_iter += 1
         validity_time += dt
 
+        cur_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
+
         if use_scalar:
-            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
-            scaled_pos_vel = NEXT_scalar.transform(pos_vel)[0]  # (state_size,)
-            # Integrate in SCALED space (the model was trained in scaled space).
-            next_scaled = _integrate_one_step(
-                ort_sess,
-                scaled_pos_vel,
-                out_dt=dt,
-                sub_dt=sub_dt,
-                integrator=integrator,
-                model_augmentation_dim=model_augmentation_dim,
-                state_size=state_size,
-            )
-            next_state = NEXT_scalar.inverse_transform(
-                next_scaled.reshape(1, -1)
-            )  # skl2onnx does not support inverse_transform; do it in numpy
+            cur_scaled = NEXT_scalar.transform(np.asarray([cur_phys]))[0]
+        else:
+            cur_scaled = cur_phys
+
+        # Assemble the FULL state the field was trained on: [y_scaled, h].
+        x_full = np.concatenate([cur_scaled, h_current])
+
+        next_full = _integrate_one_step(
+            ort_sess,
+            x_full,
+            out_dt=dt,
+            sub_dt=sub_dt,
+            integrator=integrator,
+            state_size=state_size,
+        )
+
+        next_scaled = next_full[:state_size]
+        # CARRY the evolved latent forward -- this is the whole point.
+        h_current = next_full[state_size : state_size + aug_width]
+
+        if use_scalar:
+            next_state = NEXT_scalar.inverse_transform(next_scaled.reshape(1, -1))
             if os.environ.get("NEXT_DEBUG") and temp_iter == 1:
-                # First-step sanity print: distinguishes a bad model field from
-                # an integration/termination problem. If the per-second deltas
-                # here are physically implausible, the issue is the model/export,
-                # not the integrator.
                 start_phys = np.asarray(extrap[0][1 : state_size + 1], dtype=np.float64)
                 print(
                     f"[debug] step1 geodesic frame: start={start_phys} "
-                    f"-> next={next_state.reshape(-1)}  delta/sec={next_state.reshape(-1) - start_phys}",
+                    f"-> next={next_state.reshape(-1)}  "
+                    f"delta/sec={next_state.reshape(-1) - start_phys}",
                     flush=True,
                 )
         else:
-            cur_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
-            next_phys = _integrate_one_step(
-                ort_sess,
-                cur_phys,
-                out_dt=dt,
-                sub_dt=sub_dt,
-                integrator=integrator,
-                model_augmentation_dim=model_augmentation_dim,
-                state_size=state_size,
-            )
-            next_state = next_phys.reshape(1, -1)
+            next_state = next_scaled.reshape(1, -1)
 
         next_state = np.insert(next_state, 0, validity_time)
         temp_extrap = np.vstack([extrap, next_state])
 
-        # TODO: What if I scaled the ending criteria so that the extrap can be entirly done in the scalared space?
         if use_grdth and (temp_extrap[-1, DOWN_INDEX] > 0 or temp_extrap[-1, GR_INDEX] < 2600e3):
             print("grdth below the ground", temp_extrap[-1, DOWN_INDEX])
             break
         elif use_geodesic:
-
             if not np.all(np.isfinite(temp_extrap[-1, POS_SLICE])) or \
                np.linalg.norm(temp_extrap[-1, POS_SLICE]) > 1e8:
                 print("geodesic trajectory diverged", temp_extrap[-1, POS_SLICE])
                 break
-        # elif not use_grdth and (temp_extrap[-1, 3] < 0 or np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 250e3):
         elif not use_grdth and (np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 2600e3):
             print("dcu below the ground", temp_extrap[-1, 3])
             break
+
         extrap = np.vstack([extrap, next_state])
 
     if extrap.shape[0] < 3:

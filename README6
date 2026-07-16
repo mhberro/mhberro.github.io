@@ -1,17 +1,5 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python simple_sim_cont_time_gruode.py trajectory_library/phases/HighE_HGV/glide/* -o simple_sim_output/SBI/GRUODE_heun_1/GEODESIC/glide/HighE -m model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_encoder.onnx -s model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_scalar.pickle --gruode               
-Running sim for trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 963, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 165, in main
-    sim_many_truths(args, model_name, train_test_trajs)
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 175, in sim_many_truths
-    t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 191, in sim_single_truth
-    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, args)
-                                              ^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 588, in sim_ingress
-    firm_track_time = truth_states_sr_cut[0][0]
-                      ~~~~~~~~~~~~~~~~~~~^^^
-IndexError: index 0 is out of bounds for axis 0 with size 0
+head -3 trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
+python -c "import numpy as np; from load_truth import load_single_truth; \
+t=load_single_truth('trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv'); \
+print('shape', t.shape); print('time min/max', t[:,0].min(), t[:,0].max()); \
+print('first row', t[0]); print('n vel nonzero', np.sum(~np.all(t[:,4:7]==0,axis=1)))"

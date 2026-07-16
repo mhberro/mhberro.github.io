@@ -1,13 +1,191 @@
-GRU-ODE detected: RK4 sub-step ~1.0s over output dt 1.0s; state_size=5, latent_dim=100; seeding h0 from encoder graph
-GRU-ODE detected: RK4 sub-step ~1.0s over output dt 1.0s; latent_dim=100; seeding h0 from encoder graph
-Extrap failed Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 745, in NEXT_tactical_interface
-    NEXT_extrap = NEXT_extrapolation(
-                  ^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_cont_time_gruode.py", line 1020, in NEXT_extrapolation
-    temp_extrap = np.vstack([extrap, next_state])
-                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/shape_base.py", line 290, in vstack
-    return _nx.concatenate(arrs, 0, dtype=dtype, casting=casting)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-ValueError: all the input array dimensions except for the concatenation axis must match exactly, but along dimension 1, the array at index 0 has size 7 and the array at index 1 has size 6
+# -*- coding: utf-8 -*-
+r"""
+Integrated-geodesic FRAME patch for simple_sim_cont_time_gruode.py
+==================================================================
+
+SYMPTOM
+    ValueError: all input array dimensions except for the concatenation axis
+    must match exactly, but along dimension 1, the array at index 0 has size 7
+    and the array at index 1 has size 6
+    at  temp_extrap = np.vstack([extrap, next_state])
+
+ROOT CAUSE (the real one -- a FRAME mismatch, not just a width bug)
+    Your model was trained on the INTEGRATED geodesic frame:
+        5-state [s, h, v_s, v_alpha, v_h]   (azimuth dropped; azimuth-RATE tracked)
+    produced in NEXT_training by:
+        from NEXT_geodesic_frame import ecef_to_local_geodesic_vec  (frame-trick)
+        timeseries_state, initial_azimuth = <that>(pos, vel, ref_ecef)   # 5 wide
+
+    But simple_sim builds the ORIGINAL geodesic frame:
+        from NEXT_training import ecef_to_local_geodesic_vec           # 6-component
+        initial_state_NEXT_frame = hstack([time, geo[:, :6]])          # 7 wide (time+6)
+    So the seed row is 7 wide (time + 6 phys) while every integrated step the
+    model produces is 6 wide (time + 5 phys). They cannot vstack -- and even if
+    they could, the sim would be feeding a 6-state frame into a 5-state model,
+    i.e. integrating the WRONG physics. The vstack error is the frame mismatch
+    surfacing; do NOT paper over it with a slice.
+
+FIX
+    Make the sim use the SAME integrated (frame-trick) transforms as training,
+    for BOTH directions:
+      * forward  : ecef -> 5-state [s,h,v_s,v_alpha,v_h]   (+ initial azimuth)
+      * backward : 5-state -> ecef  (needs the initial azimuth to reconstruct
+                   the dropped cross-track heading downstream)
+    These live in NEXT_geodesic_frame, the module training imports.
+
+    This patch only applies to the integrated geodesic mode. The original
+    6-state geodesic path is left untouched (guarded by the filename token).
+
+------------------------------------------------------------------------------
+APPLY THESE EDITS to simple_sim_cont_time_gruode.py
+------------------------------------------------------------------------------
+"""
+
+# =====================================================================
+# EDIT 1 -- imports (top of file). Add the integrated transforms and keep the
+# originals for the non-integrated path.
+# =====================================================================
+#
+#   from NEXT_geodesic_frame import (
+#       ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_ft,
+#       local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_ft,
+#   )
+#
+# (Leave the existing `from NEXT_training import ... ecef_to_local_geodesic_vec,
+#  local_geodesic_to_ecef_vec ...` line as-is; those stay for the original
+#  6-state geodesic mode.)
+
+
+# =====================================================================
+# EDIT 2 -- detect the integrated mode from the model filename.
+# NEXT_training writes frame_tag = "geodesic-integrated" into the name, so the
+# token "_geodesic-integrated_" is the authoritative signal.
+# =====================================================================
+#
+# In NEXT_tactical_interface(), where use_geodesic is set:
+#
+#   model_basename = os.path.basename(args.model)
+#   use_grdth = "_grdth_" in model_basename
+#   use_geodesic = ("_geodesic_" in model_basename) or ("_geod_" in model_basename) \
+#                  or ("_geodesic-integrated_" in model_basename) \
+#                  or ("_geodesic-original_" in model_basename)
+#   use_geodesic_integrated = "_geodesic-integrated_" in model_basename
+
+
+# =====================================================================
+# EDIT 3 -- forward transform in NEXT_tactical_interface() (the use_geodesic
+# branch). Use the frame-trick transform for the integrated model and CARRY the
+# initial azimuth out for the reverse transform later.
+# =====================================================================
+#
+# OLD (inside `elif use_geodesic:`):
+#   _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+#   initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+#       np.atleast_2d(initial_state_ecef[POS_SLICE]),
+#       np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+#       np.zeros_like(np.atleast_2d(initial_state_ecef[VEL_SLICE])),
+#       guide_point_ecef,
+#   )
+#   initial_state_NEXT_frame = np.hstack(
+#       [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
+#   )[0]
+#   initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+#
+# NEW:
+#   _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+#   if use_geodesic_integrated:
+#       # Integrated frame trick -> 5-state [s, h, v_s, v_alpha, v_h].
+#       state5, initial_azimuth = ecef_to_local_geodesic_vec_ft(
+#           np.atleast_2d(initial_state_ecef[POS_SLICE]),
+#           np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+#           guide_point_ecef,
+#       )
+#       state5 = np.atleast_2d(state5)[0]           # (5,)
+#       initial_state_NEXT_frame = np.hstack(
+#           [np.atleast_1d(initial_state_ecef[TIME_INDEX]), state5]
+#       )                                            # (6,) = time + 5
+#       # slant range in the integrated frame: s and h are indices 1 and 2.
+#       initial_state_slant_range = np.hypot(
+#           initial_state_NEXT_frame[1], initial_state_NEXT_frame[2]
+#       )
+#       # stash azimuth so the reverse transform can rebuild cross-track heading
+#       initial_point_heading = (initial_point_heading, float(np.ravel(initial_azimuth)[0]))
+#   else:
+#       # original 6-state geodesic (unchanged)
+#       initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+#           np.atleast_2d(initial_state_ecef[POS_SLICE]),
+#           np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+#           np.zeros_like(np.atleast_2d(initial_state_ecef[VEL_SLICE])),
+#           guide_point_ecef,
+#       )
+#       initial_state_NEXT_frame = np.hstack(
+#           [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
+#       )[0]
+#       initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+#
+# (the ort_sess load lines below this stay unchanged)
+#
+# NOTE ON ecef_to_local_geodesic_vec_ft SIGNATURE:
+#   Training calls it as (pos, vel, ref_ecef) and unpacks (state5, azimuth).
+#   Match training exactly. If your NEXT_geodesic_frame version returns only the
+#   state (no azimuth), drop the tuple-unpack and set initial_azimuth via the
+#   module's dedicated azimuth helper -- but per NEXT_training line ~993 it
+#   returns (timeseries_state, initial_azimuth), so the unpack above is correct.
+
+
+# =====================================================================
+# EDIT 4 -- reverse transform (getting the extrapolation back to ECEF), in
+# NEXT_tactical_interface() after NEXT_extrapolation returns.
+# =====================================================================
+#
+# OLD (inside `elif use_geodesic:` of the back-to-ECEF block):
+#   NEXT_extrap_ecef = np.hstack(
+#       [
+#           NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+#           local_geodesic_to_ecef_vec(
+#               np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]),
+#               guide_point_ecef,
+#           ),
+#       ],
+#   )[:, :7]
+#
+# NEW:
+#   if use_geodesic_integrated:
+#       heading, init_az = initial_point_heading  # unpack the tuple set in EDIT 3
+#       # NEXT_extrap columns: [time, s, h, v_s, v_alpha, v_h]
+#       state5 = NEXT_extrap[:, 1:6]
+#       ecef_pos_vel = local_geodesic_to_ecef_vec_ft(state5, guide_point_ecef, init_az)
+#       NEXT_extrap_ecef = np.hstack(
+#           [NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel]
+#       )[:, :7]
+#   else:
+#       NEXT_extrap_ecef = np.hstack(
+#           [
+#               NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+#               local_geodesic_to_ecef_vec(
+#                   np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]),
+#                   guide_point_ecef,
+#               ),
+#           ],
+#       )[:, :7]
+#
+# IMPORTANT: match local_geodesic_to_ecef_vec_ft's ACTUAL signature. Training's
+# reverse call is the counterpart of the forward frame-trick transform; check
+# NEXT_geodesic_frame for whether it takes (state5, ref_ecef, initial_azimuth)
+# or (state5, initial_azimuth, ref_ecef) and order the args to match. The
+# azimuth is REQUIRED because the integrated frame dropped absolute heading;
+# without it the cross-track reconstruction is undefined.
+
+
+# =====================================================================
+# WHY THE BANNER PRINTED TWICE (worth checking)
+# =====================================================================
+# Your latest run showed the "GRU-ODE detected..." line TWICE -- once with
+# state_size=5 (your new Option-A block) and once WITHOUT state_size (an older
+# block). That strongly suggests either:
+#   (a) two NEXT_extrapolation definitions exist in the file (a stale copy), or
+#   (b) the print appears in two places.
+# Grep the file:  grep -n "GRU-ODE detected" simple_sim_cont_time_gruode.py
+# and:            grep -n "def NEXT_extrapolation" simple_sim_cont_time_gruode.py
+# Keep exactly ONE definition (the patched one). A leftover duplicate will keep
+# reintroducing the state_size=6 / wrong-frame behavior no matter what you edit.

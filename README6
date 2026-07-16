@@ -1,13 +1,139 @@
-(.venv) e471302@usmk2tqq3hkk2 next % head -3 trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
-python -c "import numpy as np; from load_truth import load_single_truth; \
-t=load_single_truth('trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv'); \
-print('shape', t.shape); print('time min/max', t[:,0].min(), t[:,0].max()); \
-print('first row', t[0]); print('n vel nonzero', np.sum(~np.all(t[:,4:7]==0,axis=1)))"
-time,x,y,z,vx,vy,vz
-439.000000000005,5878.44774675591,-5556047.56772764,3332953.56209128,-6051.78222369773,741.796605325226,-34.5797510835603
-440.000000000005,-173.282835215337,-5555301.27024207,3332916.53820649,-6051.67724137277,750.798570033743,-39.4682391376753
-shape (315, 7)
-time min/max 439.000000000005 752.068117423759
-first row [ 4.39000000e+02  5.87844775e+03 -5.55604757e+06  3.33295356e+06
- -6.05178222e+03  7.41796605e+02 -3.45797511e+01]
-n vel nonzero 315
+# -*- coding: utf-8 -*-
+r"""
+Time-cutoff / empty-truth patch for simple_sim_cont_time_gruode.py
+==================================================================
+
+SYMPTOM
+    IndexError: index 0 is out of bounds for axis 0 with size 0
+    at  firm_track_time = truth_states_sr_cut[0][0]
+
+ROOT CAUSE
+    sim_ingress() filters truth rows with a HARD-CODED absolute-time ceiling:
+
+        truth_states_sr_cut = np.asarray(
+            tuple(x for x in truth_states
+                  if x[TIME_INDEX] < 122.0 and not np.allclose(x[VEL_SLICE], [0,0,0])),
+            dtype=np.float64,
+        )
+
+    That 122.0 s ceiling assumes trajectories that START near t=0 (full/boost-
+    inclusive). The phase library's glide files are PRE-SEGMENTED to the glide
+    portion, which begins deep into flight -- e.g. Albuqurque_lp10 runs
+    t=439..752 s. Every row is > 122, so the filter empties the array and the
+    next line indexes [0] on nothing.
+
+    The same 122.0 ceiling is also used as the extrapolation stop condition in
+    NEXT_extrapolation ("while temp_iter < n_steps and float(validity_time) <
+    122.0"), which would stop a glide extrap immediately for the same reason.
+
+FIX
+    Replace the absolute ceiling with one anchored to the file's own start
+    time, exposed as a CLI arg so nothing is silently hard-coded. Default
+    behavior for glide is "no early time cut" (the velocity!=0 filter and the
+    slant-range / ground checks already bound the trajectory). Also add an
+    empty-array guard so a genuinely empty file is skipped, matching the
+    existing (-1,-1,-1) "bad file" sentinel that sim_single_truth handles.
+
+------------------------------------------------------------------------------
+APPLY THESE THREE EDITS to simple_sim_cont_time_gruode.py
+------------------------------------------------------------------------------
+"""
+
+# =====================================================================
+# EDIT 1 -- add a CLI arg (in main(), next to the other add_argument calls)
+# =====================================================================
+#
+#     parser.add_argument(
+#         "--time-cutoff",
+#         type=float,
+#         default=None,
+#         help=(
+#             "Absolute-time ceiling [s] applied to truth rows and to the "
+#             "extrapolation stop. The original code hard-coded 122.0, which "
+#             "assumes trajectories starting near t=0. Pre-segmented glide files "
+#             "start much later (e.g. 439 s), so the default is None = no "
+#             "absolute cut (row filtering then relies on the velocity!=0 test "
+#             "and the slant-range/ground checks). Pass a value only if you have "
+#             "full-trajectory files that genuinely need an early-time cut."
+#         ),
+#     )
+
+
+# =====================================================================
+# EDIT 2 -- replace the row filter + firm-track line in sim_ingress()
+# =====================================================================
+#
+# OLD:
+#     # NOTE: Change the 122.0 to 61.0 for the LowE
+#     truth_states_sr_cut = np.asarray(
+#         tuple(x for x in truth_states if x[TIME_INDEX] < 122.0 and not np.allclose(x[VEL_SLICE], [0, 0, 0])),
+#         dtype=np.float64,
+#     )
+#
+#     # start sim clock at truth firm track range
+#     firm_track_time = truth_states_sr_cut[0][0]
+#
+# NEW:
+def _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE):
+    """Build truth_states_sr_cut with an OPTIONAL absolute-time ceiling.
+
+    Returns the filtered array (possibly empty; caller must guard).
+    """
+    import numpy as np
+
+    time_cutoff = getattr(args, "time_cutoff", None)
+    if time_cutoff is None:
+        # No absolute cut: keep every moving row. This is correct for
+        # pre-segmented glide files whose timestamps start well past any
+        # boost-era ceiling.
+        rows = tuple(
+            x for x in truth_states
+            if not np.allclose(x[VEL_SLICE], [0, 0, 0])
+        )
+    else:
+        rows = tuple(
+            x for x in truth_states
+            if x[TIME_INDEX] < time_cutoff and not np.allclose(x[VEL_SLICE], [0, 0, 0])
+        )
+    return np.asarray(rows, dtype=np.float64)
+
+
+# In sim_ingress(), the block becomes:
+#
+#     truth_states_sr_cut = _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE)
+#
+#     # Guard: nothing survived the filter -> skip this file cleanly using the
+#     # existing (-1, -1, -1) "bad file" sentinel that sim_single_truth handles.
+#     if truth_states_sr_cut.shape[0] == 0:
+#         print(
+#             f"[skip] no moving truth rows"
+#             + ("" if getattr(args, 'time_cutoff', None) is None
+#                else f" below t={args.time_cutoff}s")
+#             + " -- check --time-cutoff / file segmentation"
+#         )
+#         return -1, -1, -1
+#
+#     # start sim clock at truth firm track range
+#     firm_track_time = truth_states_sr_cut[0][0]
+
+
+# =====================================================================
+# EDIT 3 -- the extrapolation stop condition in NEXT_extrapolation()
+# =====================================================================
+#
+# OLD:
+#     while temp_iter < n_steps and float(validity_time) < 122.0:
+#
+# NEW (anchor the stop to the file's start time, or disable when no cutoff):
+#
+#     # Stop either at n_steps, or -- if an absolute --time-cutoff was given --
+#     # when validity_time passes it. With no cutoff (default, correct for
+#     # glide), the ground/slant-range/divergence checks inside the loop are
+#     # what terminate the extrapolation.
+#     _abs_cut = getattr(args, "time_cutoff", None)
+#     _abs_cut = float("inf") if _abs_cut is None else _abs_cut
+#     while temp_iter < n_steps and float(validity_time) < _abs_cut:
+#
+# NOTE: NEXT_extrapolation must be able to see `args`. It already receives
+# `args` in its signature in your file (it's used for args.model / args.scalar),
+# so `getattr(args, "time_cutoff", None)` works directly.

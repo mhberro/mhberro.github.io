@@ -1,8 +1,17 @@
-(.venv) e471302@usmk2tqq3hkk2 next % NEXT_DEBUG=1 python simple_sim_cont_time_gruode.py trajectory_library/phases/HighE_HGV/glide/* -o simple_sim_output/SBI/GRUODE_heun_1/GEODESIC/glide/HighE -m model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn.onnx -s model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_scalar.pickle --gruode 
-Running sim for trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
-[debug] forward state5 width = (5,), azimuth = 1.7685723701692713
-GRU-ODE detected: RK4 sub-step ~1.0s over output dt 1.0s; state_size=5, latent_dim=100; seeding h0 from encoder graph
-[debug] step1 geodesic frame: start=[ 1.59203218e+06  8.37548723e+04 -5.78074438e+03  1.12294861e-03
-  7.92717179e+02] -> next=[ 1.58624151e+06  8.40701567e+04 -5.80030378e+03  1.34177255e-03
- -1.24491975e+02]  delta/sec=[-5.79066514e+03  3.15284357e+02 -1.95593972e+01  2.18823936e-04
- -9.17209154e+02]
+elif use_geodesic:
+        if use_geodesic_integrated:
+            heading, init_az = initial_point_heading  # unpack the tuple set in EDIT 3
+            # NEXT_extrap columns: [time, s, h, v_s, v_alpha, v_h].
+            # The reverse transform expects TIME as column 0: it strips it
+            # internally (state = state[:, 1:]) and integrates v_alpha over that
+            # time vector to rebuild azimuth. So pass the FULL 6-col array, not
+            # the 5 physical columns -- passing [:, 1:6] made it strip 's' as if
+            # it were time, leaving 4 cols and crashing on state[:, 4].
+            ecef_pos_vel = local_geodesic_to_ecef_vec_ft(
+                NEXT_extrap[:, 0:6], guide_point_ecef, init_az
+            )
+            # Returns [p_ecef(3), v_ecef(3)]; prepend our own time column.
+            NEXT_extrap_ecef = np.hstack(
+                [NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel]
+            )[:, :7]
+        else:

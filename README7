@@ -1,17 +1,1 @@
-elif use_geodesic:
-        if use_geodesic_integrated:
-            heading, init_az = initial_point_heading  # unpack the tuple set in EDIT 3
-            # NEXT_extrap columns: [time, s, h, v_s, v_alpha, v_h].
-            # The reverse transform expects TIME as column 0: it strips it
-            # internally (state = state[:, 1:]) and integrates v_alpha over that
-            # time vector to rebuild azimuth. So pass the FULL 6-col array, not
-            # the 5 physical columns -- passing [:, 1:6] made it strip 's' as if
-            # it were time, leaving 4 cols and crashing on state[:, 4].
-            ecef_pos_vel = local_geodesic_to_ecef_vec_ft(
-                NEXT_extrap[:, 0:6], guide_point_ecef, init_az
-            )
-            # Returns [p_ecef(3), v_ecef(3)]; prepend our own time column.
-            NEXT_extrap_ecef = np.hstack(
-                [NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel]
-            )[:, :7]
-        else:
+NEXT_DEBUG=1 python simple_sim_cont_time_gruode.py trajectory_library/phases/HighE_HGV/glide/* -o simple_sim_output/SBI/GRUODE_heun_1/GEODESIC/glide/HighE -m model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn.onnx -s model_outputs/SBI/GRUODE_mo_cl_heun_HighE7/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_scalar.pickle --gruode

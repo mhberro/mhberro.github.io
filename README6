@@ -153,12 +153,27 @@ def main():
             "full-trajectory files that genuinely need an early-time cut."
         ),
     )
+    parser.add_argument(
+        "--sub-steps",
+        type=int,
+        default=4,
+        help=(
+            "RK4 sub-steps per training data interval for GRU-ODE models. "
+            "Training integrated each interval with TorchdiffeqSolver "
+            "substeps=4, so the default matches training. The filename dt token "
+            "is the DATA grid, not the solver step: without this a _1.0sec_ "
+            "model would take ONE RK4 step per second (4x coarser than "
+            "training) while a _0.1sec_ model accidentally took 10."
+        ),
+    )
 
     args = parser.parse_args()
 
     # check that the sr min and max values are reasonable
     if args.sr_min >= args.sr_max:
         raise ValueError("sr min must be less than sr max")
+    if args.sub_steps <= 0:
+        raise ValueError("--sub-steps must be positive")
 
     # check if the model file exists
     if not os.path.exists(args.model):
@@ -201,12 +216,39 @@ def sim_many_truths(args, model_name, train_test_trajs):
     #     o.write(str(np.mean(tgt_metric)))
 
 
+def load_phase_guide_point(path_to_truth, truth):
+    """Guide/reference point for the frame transforms.
+
+    Training sets ref_ecef from the IMPACT phase file (ecef_data_traj[2][-1]),
+    NOT from the end of the glide segment. The sim must use the same origin or
+    the geodesic frame (s, h) -- and therefore the encoder's h0 seed -- is
+    computed around a shifted reference, so the model sees states outside the
+    distribution it was scaled and trained on.
+
+    Phase library layout: <target>/<phase>/<file> with a sibling
+    <target>/impact/<file>. Falls back to the truth's own last row when no
+    impact file exists (e.g. full-trajectory files, where they coincide).
+    """
+    phase_dir = os.path.dirname(path_to_truth)
+    target_dir = os.path.dirname(phase_dir)
+    impact_path = os.path.join(target_dir, "impact", os.path.basename(path_to_truth))
+    if os.path.exists(impact_path):
+        try:
+            impact_truth = load_single_truth(impact_path)
+            return deepcopy(impact_truth[-1, POS_SLICE])
+        except Exception as e:
+            print(f"[warn] could not load impact guide point {impact_path}: {e}; "
+                  "falling back to the truth's last row")
+    return deepcopy(truth[-1, POS_SLICE])
+
+
 def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
     # load in the truth data and turn it into ECEF truth states
     # read in truth in ECEF into array
     truth = load_single_truth(path_to_truth)
+    guide_point_ecef = load_phase_guide_point(path_to_truth, truth)
 
-    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, args)
+    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, guide_point_ecef, args)
 
     truth_filename = os.path.basename(path_to_truth)
     if len(trajs) == 0:
@@ -601,12 +643,15 @@ def _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE):
         )
     return np.asarray(rows, dtype=np.float64)
 
-def sim_ingress(truth_states, args):
+
+def sim_ingress(truth_states, guide_point_ecef, args):
     # truth states are expected to be an array of format
     # seconds from launch, position x3, velocity x3, acceleration x3
 
-    # define guide point at truth impact
-    impact_ecef = deepcopy(truth_states[-1, POS_SLICE])
+    # Guide point comes from the impact phase file (matches training's
+    # ref_ecef); the truth's own end time bounds every extrapolation so no
+    # forecast integrates past the trained regime.
+    impact_ecef = deepcopy(guide_point_ecef)
     impact_time = truth_states[-1, 0]
 
     # cut truth at firm track range
@@ -619,7 +664,6 @@ def sim_ingress(truth_states, args):
     #     dtype=np.float64,
     # )
 
-    # NOTE: Change the 122.0 to 61.0 for the LowE
     truth_states_sr_cut = _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE)
 
     # Guard: nothing survived the filter -> skip this file cleanly using the
@@ -657,7 +701,9 @@ def sim_ingress(truth_states, args):
         truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
 
         x0 = tgt_state_ecef.squeeze()
-        traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, args)
+        traj = NEXT_tactical_interface(
+            x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, impact_time, args
+        )
         if traj is not None:
             if isinstance(traj, int) and traj == -1:
                 # got a stop sim signal for the algorithm under test
@@ -680,7 +726,9 @@ def round_to(x, base):
 ort_sess_stash = None  # TODO: Stop cheating with a global variable. Only used for GRDTH models
 
 
-def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, args):
+def NEXT_tactical_interface(
+    initial_state_ecef, guide_point_ecef, dt, n_steps, extrap_stop_time, args
+):
     # initial state ecef is expected to be a 1d vector for time in seconds, position x3, and velocity x3 in ECEF
     # guide point ecef is expected to be...
 
@@ -724,7 +772,8 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
                 guide_point_ecef,
             )
             state5 = np.atleast_2d(state5)[0]           # (5,)
-            print(f"[debug] forward state5 width = {state5.shape}, azimuth = {initial_azimuth}")
+            if os.environ.get("NEXT_DEBUG"):
+                print(f"[debug] forward state5 width = {state5.shape}, azimuth = {initial_azimuth}")
             initial_state_NEXT_frame = np.hstack(
                 [np.atleast_1d(initial_state_ecef[TIME_INDEX]), state5]
             )                                            # (6,) = time + 5
@@ -768,7 +817,8 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
     # call the extrapolator
     try:
         NEXT_extrap = NEXT_extrapolation(
-            initial_state_NEXT_frame, dt, n_steps, initial_point_heading, use_grdth, args, ort_sess,
+            initial_state_NEXT_frame, dt, n_steps, extrap_stop_time,
+            initial_point_heading, use_grdth, args, ort_sess,
             use_geodesic=use_geodesic,
         )
     except ValueError as e:
@@ -780,7 +830,7 @@ def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, a
         NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
     elif use_geodesic:
         if use_geodesic_integrated:
-            heading, init_az = initial_point_heading  # unpack the tuple set in EDIT 3
+            heading, init_az = initial_point_heading  # unpack the tuple set above
             # NEXT_extrap columns: [time, s, h, v_s, v_alpha, v_h].
             # The reverse transform expects TIME as column 0: it strips it
             # internally (state = state[:, 1:]) and integrates v_alpha over that
@@ -894,6 +944,7 @@ def NEXT_extrapolation(
     initial_state_next_frame,
     dt: float,
     n_steps: int,
+    extrap_stop_time: float,
     ref_angle,
     use_grdth: bool,
     args,
@@ -910,21 +961,13 @@ def NEXT_extrapolation(
         DOWN_INDEX,
     )
 
-    def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
-        m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
-        if m:
-            try:
-                return float(m[-1])
-            except ValueError:
-                pass
-        return default
-
     use_scalar = "_scalarOn" in os.path.basename(args.model)
     if use_scalar:
         with open(args.scalar, "rb") as scalar_pickle:
             NEXT_scalar = pickle.load(scalar_pickle)
 
     model_basename = os.path.basename(args.model)
+    use_geodesic_integrated = "_geodesic-integrated_" in model_basename
     is_gruode = (
         getattr(args, "gruode", False)
         or ("_gruode_" in model_basename)
@@ -940,7 +983,11 @@ def NEXT_extrapolation(
         # shape entries can be strings (dynamic) or ints; take the last int.
         state_size = int([d for d in enc_in_shape if isinstance(d, int)][-1])
         integrator = "rk4"
-        sub_dt = _infer_training_dt(model_basename, default=0.1) / 4
+        # Training integrated each data interval with TorchdiffeqSolver
+        # substeps=4; the filename dt token is the DATA grid, not the solver
+        # step. Without dividing, a _1.0sec_ model gets ONE RK4 step per second
+        # (4x coarser than training) while a _0.1sec_ model accidentally gets 10.
+        sub_dt = _infer_training_dt(model_basename, default=0.1) / max(1, int(getattr(args, "sub_steps", 4)))
         latent_dim = _gruode_latent_dim(model_basename, state_size)
         aug_width = latent_dim
         print(
@@ -955,8 +1002,6 @@ def NEXT_extrapolation(
         sub_dt = dt
         aug_width = int(re.findall(r"_(\d)aug_", args.model)[-1])
         enc_sess = None
-
-
 
     extrap = np.array([np.hstack([initial_state_next_frame])])
     validity_time = deepcopy(initial_state_next_frame[0])
@@ -986,13 +1031,16 @@ def NEXT_extrapolation(
         h_current = np.zeros(aug_width, dtype=np.float64)
 
     temp_iter = 0
-    # Stop either at n_steps, or -- if an absolute --time-cutoff was given --
-    # when validity_time passes it. With no cutoff (default, correct for
-    # glide), the ground/slant-range/divergence checks inside the loop are
-    # what terminate the extrapolation.
+    # Stop at n_steps OR at the truth phase's end time. Extrapolations must
+    # never integrate past the trained regime: post-impact flight exists in no
+    # training data and sits outside the scaler's fitted range, and integrating
+    # there is what produced the runaway fans. An explicit --time-cutoff, if
+    # given, tightens the bound further but never loosens it.
+    _stop = float(extrap_stop_time)
     _abs_cut = getattr(args, "time_cutoff", None)
-    _abs_cut = float("inf") if _abs_cut is None else _abs_cut
-    while temp_iter < n_steps and float(validity_time) < _abs_cut:
+    if _abs_cut is not None:
+        _stop = min(_stop, float(_abs_cut))
+    while temp_iter < n_steps and float(validity_time) < _stop:
         temp_iter += 1
         validity_time += dt
 
@@ -1039,8 +1087,11 @@ def NEXT_extrapolation(
             print("grdth below the ground", temp_extrap[-1, DOWN_INDEX])
             break
         elif use_geodesic:
-            if temp_extrap[-1, 2] <= 0.0:
-                print("geodesic reached the ground", temp_extrap[-1,2])
+            # Integrated row layout: [time, s, h, v_s, v_alpha, v_h] -> h is
+            # column 2. At/below the reference surface = impact; stop. This is
+            # the belt-and-suspenders second stop alongside extrap_stop_time.
+            if use_geodesic_integrated and temp_extrap[-1, 2] <= 0.0:
+                print("geodesic reached the ground", temp_extrap[-1, 2])
                 break
             if not np.all(np.isfinite(temp_extrap[-1, POS_SLICE])) or \
                np.linalg.norm(temp_extrap[-1, POS_SLICE]) > 1e8:

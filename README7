@@ -1,972 +1,1000 @@
-# Simple_Sim.py
+# NEXT_frames.py
 
-import argparse
-import json
-import math
-import os
-import pickle
-import re
-import traceback
+# Built-ins
 from copy import deepcopy
 
+# 3rd party
 import numpy as np
 import pandas as pd
-import torch
-import matplotlib.pyplot as plt
-import onnxruntime
-from matplotlib.collections import LineCollection
-from matplotlib.colors import LinearSegmentedColormap
-from scipy.signal import resample_poly
-from sklearn.metrics import mean_absolute_error
+import scipy
+from geographiclib.geodesic import Geodesic
+from scipy.interpolate import make_interp_spline  # TODO: cubic hermite spline?
 
 from coordinate_transform_functions import (
+    dcu_to_ned,
     ecef_to_ned,
     ecef_to_ned_velocity,
-    ned_to_dcu,
     frd_to_dcu,
-    dcu_to_ned,
-    ned_to_ecef_velocity,
+    ned_to_dcu,
     ned_to_ecef,
+    ned_to_ecef_velocity,
 )
-from load_truth import load_single_truth
-from NEXT_training import (
-    ecef_to_next_grdth,
-    next_grdth_to_ecef,
-    ecef_to_next_dcu,
-    next_dcu_to_ecef,
-    ecef_to_local_geodesic_vec,
-    local_geodesic_to_ecef_vec,
-    ecef_to_avfor,
-    avfor_to_ecef,
-    ecef_to_local_ned_hvuh,
-    local_ned_hvuh_to_ecef,
-)
-from ibcs_tools_helpers import multiline, custom_cmap, add_classification_markings, add_lmpi_markings, Classification
 from trajectory_helpers import (
-    check_time_series,
-    resample_traj_data,
-    TIME_INDEX,
-    POS_SLICE,
-    VEL_SLICE,
-    ACC_SLICE,
-    GR_INDEX,
-    GR_DOT_INDEX,
-    THETA_DOT_INDEX,
-    DOWN_INDEX,
     DOWN_DOT_INDEX,
+    DOWN_INDEX,
+    GR_DOT_INDEX,
+    GR_INDEX,
+    POS_SLICE,
+    THETA_DOT_INDEX,
+    TIME_INDEX,
+    VEL_SLICE,
 )
 
-measurement_dt = 1.0  # [s]
-extrapolation_dt = 1.0  # [s]
-max_traj_states = int(300 / extrapolation_dt)  # total time of 300 seconds
 
-plt.rcParams["axes.formatter.limits"] = [-3, 4]
-plt.rcParams["figure.figsize"] = [6, 5]
-plt.rcParams.update(
-    {
-        "lines.linewidth": 0.5,
-        "axes.formatter.useoffset": False,
-        "savefig.dpi": 200,
-    }
-)
+def next_grdth_to_ecef(grdth_data, ref_ecef, ref_heading):
+    """Convert from grdth frame to ECEF.
 
-# test commands
-# python Simple_Sim.py datasets/all/PrSM/* -o simple_sim_output/test_001/ -m model_outputs/PrSM/NEXT_dcu_100sr_0.5sec_PrSM_6_100_200_200_100_6_128.onnx -s model_outputs/PrSM/NEXT_dcu_100sr_0.5sec_PrSM_6_100_200_200_100_6_128_scalar.pickle
-# python Simple_Sim.py datasets/all/PrSM/* -o simple_sim_output/test_grdth-noScalar/ -m model_outputs/PrSM/NEXT_grdth_100sr_0.5sec_PrSM_6_100_200_200_100_6_128.onnx -s model_outputs/PrSM/NEXT_dcu_100sr_0.5sec_PrSM_6_100_200_200_100_6_128_scalar.pickle
-# python Simple_Sim.py datasets/all/simple_ballistic_trajs/traj.data.1* -o simple_sim_output/test_dcu-noScalar/ -m model_outputs/simple_ballistic_trajs/NEXT_dcu_100sr_0.5sec_simple_ballistic_trajs_6_100_200_200_100_6_128.onnx -s model_outputs/simple_ballistic_trajs/NEXT_dcu_100sr_0.5sec_simple_ballistic_trajs_6_100_200_200_100_6_128_scalar.pickle --sr-min 80000 --sr-max 120000
-# python Simple_Sim.py datasets/all/simple_ballistic_trajs/traj.data.1* -o simple_sim_output/test_grdth-noScalar/ -m model_outputs/simple_ballistic_trajs/NEXT_grdth_100sr_0.5sec_simple_ballistic_trajs_5_100_200_200_100_5_128.onnx -s model_outputs/simple_ballistic_trajs/NEXT_grdth_100sr_0.5sec_simple_ballistic_trajs_5_100_200_200_100_5_128_scalar.pickle --sr-min 80000 --sr-max 120000
-# python Simple_Sim.py datasets/mini/simple_ballistic_trajs/* -o simple_sim_output/test_grdth-scalarOn/ -m model_outputs/simple_ballistic_trajs/NEXT_grdth_300sr_0.5sec_simple_ballistic_trajs_5_100_200_200_100_5_128_scalarOn.onnx -s model_outputs/simple_ballistic_trajs/NEXT_grdth_300sr_0.5sec_simple_ballistic_trajs_5_100_200_200_100_5_128_scalarOn_scalar.pickle --sr-min 280000 --sr-max 320000
-# python Simple_Sim.py datasets/mini/simple_ballistic_trajs/* -o simple_sim_output/test_anode/ -m model_outputs/simple_ballistic_trajs/NEXT_simple_ballistic_trajs_grdth_100sr_0.01sec_200hid_5aug_128_scalarOn.onnx -s model_outputs/simple_ballistic_trajs/NEXT_simple_ballistic_trajs_grdth_100sr_0.01sec_200hid_5aug_128_scalarOn_scalar.pickle --sr-min 80000 --sr-max 120000
-# python Simple_Sim.py datasets/mini/PrSM/* -o simple_sim_output/test_anode/ -m model_outputs/PrSM_mini_grdth_anode/PrSM/NEXT_PrSM_grdth_100sr_0.1sec_200hid_5aug_128_scalarOn.onnx -s model_outputs/PrSM_mini_grdth_anode/PrSM/NEXT_PrSM_grdth_100sr_0.1sec_200hid_5aug_128_scalarOn_scalar.pickle --sr-min 80000 --sr-max 120000
-# python Simple_Sim.py datasets/mini/PrSM/* -o simple_sim_output/test_20260420_WeightedHuberLoss/ -m model_outputs/PrSM_001_WeightedHuberLoss/PrSM/NEXT_PrSM_grdth_300sr_0.1sec_100hid_0aug_64_scalarOn.onnx -s model_outputs/PrSM_001_WeightedHuberLoss/PrSM/NEXT_PrSM_grdth_300sr_0.1sec_100hid_0aug_64_scalarOn_scalar.pickle --sr-min 80000 --sr-max 320000
-# python Simple_Sim.py datasets/mini/PrSM/* -o simple_sim_output/test_20260420_MSE/ -m model_outputs/PrSM_002_MSE/PrSM/NEXT_PrSM_grdth_300sr_0.1sec_100hid_0aug_64_scalarOn.onnx -s model_outputs/PrSM_002_MSE/PrSM/NEXT_PrSM_grdth_300sr_0.1sec_100hid_0aug_64_scalarOn_scalar.pickle --sr-min 80000 --sr-max 320000
-
-
-def main():
-    parser = argparse.ArgumentParser(description="")
-    parser.add_argument(
-        "truths",
-        nargs="+",
-        type=str,
-        help="list of files to run the sim with. all output will end up in a single directory",
-    )
-    parser.add_argument("-o", dest="output", required=True, default=None, help="dir to place results")
-    parser.add_argument("-m", dest="model", required=True, default=None, help="onnx file")
-    parser.add_argument(
-        "-s",
-        dest="scalar",
-        required=True,
-        default=None,
-        help="this is currently only the pickled scalar.",
-    )
-    parser.add_argument(
-        "--sr-min",
-        type=int,
-        default=10000,
-        help="run the sim until the target gets near this slant range",
-    )
-    parser.add_argument(
-        "--sr-max",
-        type=int,
-        default=150000,
-        help="start the sim no further than this slant range",
-    )
-    parser.add_argument(
-        "--sbi-phase",
-        default="boost",
-        choices=["boost", "glide"],
-        help="phase being simulated; glide applies altitude-based extrapolation stops",
-    )
-    parser.add_argument(
-        "--glide-alt-min",
-        type=float,
-        default=15000.0,
-        help="stop glide extrapolations below this altitude [m]",
-    )
-    parser.add_argument(
-        "--glide-alt-max",
-        type=float,
-        default=100000.0,
-        help="stop glide extrapolations above this altitude [m]",
+    grdth_data: array of size (n_states,5),
+    ref_ecef: the impact point in ecef,
+    ref_heading: target initial point heading from impact
+    """
+    # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
+    # get theta from thetadot
+    # TODO: What about cumulative_simpson? only in scipy>=1.12.0
+    theta = (
+        scipy.integrate.cumulative_trapezoid(
+            np.divide(grdth_data[:, THETA_DOT_INDEX], grdth_data[:, GR_INDEX]),
+            grdth_data[:, TIME_INDEX],
+            initial=0,
+        )
+        + ref_heading
     )
 
-    args = parser.parse_args()
+    theta = scipy.integrate.cumulative_simpson(
+        np.divide(grdth_data[:, THETA_DOT_INDEX], grdth_data[:, GR_INDEX]),  # omega = V_theta / rho
+        x=grdth_data[:, TIME_INDEX],
+        initial=ref_heading,
+    )
 
-    # check that the sr min and max values are reasonable
-    if args.sr_min >= args.sr_max:
-        raise ValueError("sr min must be less than sr max")
+    # now from grdth to NED
+    ned_data = np.empty((grdth_data.shape[0], 7))
+    # take care of time, down, and downdot in single lines
+    ned_data[:, TIME_INDEX] = grdth_data[:, TIME_INDEX]
+    ned_data[:, 3] = grdth_data[:, DOWN_INDEX]
+    ned_data[:, 6] = grdth_data[:, DOWN_DOT_INDEX]
+    # now the math from cylindrical to cartesian
+    # position
+    C_theta = np.cos(theta)
+    S_theta = np.sin(theta)
+    ned_data[:, 1] = grdth_data[:, GR_INDEX] * C_theta
+    ned_data[:, 2] = grdth_data[:, GR_INDEX] * S_theta
+    # gr_dot_ortho = grdth_data[:, GR_INDEX] * grdth_data[:, THETA_DOT_INDEX]  # radius * omega
+    gr_dot_ortho = grdth_data[:, THETA_DOT_INDEX]  # V_theta
+    for i in range(grdth_data.shape[0]):
+        # velocity
+        # TODO: this needs to be a rotation about R3. use an einsum when taking away the for loop
+        ned_data[i, 4:6] = np.matmul(
+            np.array(((C_theta[i], -S_theta[i]), (S_theta[i], C_theta[i]))),
+            np.array((grdth_data[i, GR_DOT_INDEX], gr_dot_ortho[i])),
+        )
+        # gr_dot = grdth_data[i, 2]
+        # vel_north = (
+        #     C_theta[i] * gr_dot - S_theta[i] * gr_dot_ortho[i]
+        #     # + (  # ignore this correction term. there are better ways to do this
+        #     #     grdth_data[i, 0]
+        #     #     * (
+        #     #         np.gradient(grdth_data[:, 2], grdth_data[:, 0])[i]
+        #     #         - (2 * grdth_data[i, 3] * gr_dot * S_theta[i])
+        #     #         - (
+        #     #             np.gradient(grdth_data[:, 3], grdth_data[:, 0])[i]
+        #     #             * grdth_data[i, 1]
+        #     #             * S_theta[i]
+        #     #         )
+        #     #         - ((grdth_data[i, 3] ** 2) * grdth_data[i, 1] * C_theta[i])
+        #     #     )
+        #     # )
+        # )
+        # vel_east = S_theta[i] * gr_dot + C_theta[i] * gr_dot_ortho[i]
+        # ned_data[i, 4] = vel_north
+        # ned_data[i, 5] = vel_east
 
-    # check if the model file exists
-    if not os.path.exists(args.model):
-        raise ValueError(f"There is no model at {args.model}")
-
-    model_path = os.path.dirname(args.model)
-    # split the file extension off of the model name
-    model_name = ".".join(os.path.basename(args.model).split(".")[:-1])
-    # scalar_path = args.scalar
-
-    # check if there is a train_test split file next to the model
-    # split the number of epochs off of the model name
-    # model_name_wo_epoch = "_".join(model_name.split("_")[:-1])
-    # model_name_wo_bucket = re.sub(r"_\d{1,3}sr_", "_", model_name)
-    train_test_split_file = os.path.join(model_path, model_name + "_train_test_split.json")
-    train_test_trajs = None
-    if os.path.exists(train_test_split_file):
-        with open(train_test_split_file) as f:
-            train_test_trajs = json.load(f)
-
-    # run sim
-    sim_many_truths(args, model_name, train_test_trajs)
+    # NED to ECEF
+    ecef_data = np.empty_like(ned_data)
+    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]  # time
+    for i in range(ecef_data.shape[0]):
+        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
+        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
+    return ecef_data
 
 
-def sim_many_truths(args, model_name, train_test_trajs):
-    # TODO: Finish the comment
-    # paths is expected to by a list of...i never finished the comment
-    # TODO: Multi-process? Or just let HPC parallel submissions do that for me
-    tgt_metric = []
-    for p in args.truths:
-        print("Running sim for", p, flush=True)
-        t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
-        if t is not None:
-            tgt_metric.append(t)
+def ecef_to_next_grdth(ecef_data, ref_ecef):
+    # ecef_data: expected to be [time, pos x3, vel x3]
+    # get the input point as the ECEF reference point
+    # careful with the pointers
+    ref_point = deepcopy(ref_ecef)
+    ecef_data = np.atleast_2d(ecef_data)
 
-    # Disabled to avoid filling up the drive
-    # with open(
-    #     os.path.join(args.output, "NEXT_sim_metric_" + model_name + ".txt"), "w"
-    # ) as o:
-    #     o.write(str(np.mean(tgt_metric)))
+    # convert all of the ECEF data to local NED relative to the reference point
+    ned_data = deepcopy(ecef_data)
+    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+    for i in range(ecef_data.shape[0]):
+        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
+        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
+        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
+        #     ecef_data[i, acc_slice], ref_point
+        # )
+    # print("please be ned", ned_data)
+
+    # TODO: throw away the velocity data and do a numpy gradient to recreate it.
+
+    # convert traj from NED to GRDTH
+    gr = np.linalg.norm(ned_data[:, 1:3], axis=1)
+    # print("gr", gr)
+    # 2d orthogonal vector. same thing as <N,E,0> cross <0,0,1>, but with fewer operations?
+    gr_orthogonal = np.array([-ned_data[:, 2], ned_data[:, 1]]).T
+    grdth_data = np.empty((ned_data.shape[0], 6))  # time plus GRDTH has 5 channels
+    # fill in the table for GRDTH frame
+    # [Time, GroundRange, GroundRangeDot, ThetaDot, Down, DownDot]
+    grdth_data[:, TIME_INDEX] = ned_data[:, 0]  # time
+    grdth_data[:, GR_INDEX] = gr  # ground range
+    gr_speed = np.linalg.norm(ned_data[:, 4:6], axis=1)
+    # global theta_pre
+    theta_initial = np.arctan2(ned_data[0, 2], ned_data[0, 1])
+    # the einsums are doing the dot product of each row pair of vectors from each array
+    # C_theta = np.cos(theta_pre)
+    # S_theta = np.sin(theta_pre)
+    # for i in range(ned_data.shape[0]):
+    #     if gr[i] != 0:
+    #         grdth_data[i, 2] = np.dot(ned_data[i, 4:6], ned_data[i, 1:3]) / gr[i]
+    #         grdth_data[i, 3] = np.dot(ned_data[i, 4:6], gr_orthogonal[i]) / (gr[i] ** 2)
+    #     else:
+    #         grdth_data[i, 2] = gr_speed[i]
+    #         grdth_data[i, 3] = 0
+
+    grdth_data[:, GR_DOT_INDEX] = np.divide(
+        np.einsum("ij,ij->i", ned_data[:, 4:6], ned_data[:, 1:3]),
+        gr,
+        out=np.ones_like(gr) * gr_speed,  # force the data to come to the center
+        # where=gr != 0,
+        where=gr >= np.finfo(gr.dtype).eps,
+    ).squeeze()  # ground range dot
+    grdth_data[:, THETA_DOT_INDEX] = np.divide(
+        np.einsum("ij,ij->i", ned_data[:, 4:6], gr_orthogonal),
+        # gr**2,  # squared b/c V_orth = r*omega
+        gr,  # squared b/c V_orth = r*omega
+        # out=np.full_like(gr, np.finfo(gr.dtype).eps),
+        out=np.zeros_like(gr),  # no radial movement when close in
+        # where=gr != 0,
+        where=gr >= np.finfo(gr.dtype).eps,
+    ).squeeze()  # theta dot
+    grdth_data[:, DOWN_INDEX] = ned_data[:, 3]  # Down
+    grdth_data[:, DOWN_DOT_INDEX] = ned_data[:, 6]  # Downdot
+    # print("please be grdth", grdth_data.squeeze())
+    return grdth_data.squeeze(), theta_initial
 
 
-def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
-    # load in the truth data and turn it into ECEF truth states
-    # read in truth in ECEF into array
-    truth = load_single_truth(path_to_truth)
-    guide_point_ecef = load_phase_guide_point(path_to_truth, truth)
+def ecef_to_next_dcu(ecef_data, ref_ecef):
+    # get the input point as the ECEF reference point
+    # careful with the pointers
+    ref_point = deepcopy(ref_ecef)
+    # print("ecef to next grdth ref ecef", ref_point)
+    ecef_data = np.atleast_2d(ecef_data)
+
+    # convert all of the ECEF data to local NED relative to the reference point
+    ned_data = deepcopy(ecef_data)
+    ned_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+    for i in range(ecef_data.shape[0]):
+        ned_data[i, POS_SLICE] = ecef_to_ned(ecef_data[i, POS_SLICE], ref_point)
+        ned_data[i, VEL_SLICE] = ecef_to_ned_velocity(ecef_data[i, VEL_SLICE], ref_point)
+        # ned_data[:, acc_slice] = ecef_to_ned_velocity(
+        #     ecef_data[i, acc_slice], ref_point
+        # )
+
+    # threat anti-heading
+    # ref_heading = (np.arctan2(ned_data[0, 5], ned_data[0, 4])) % (2 * np.pi)
+    # threat position heading
+    ref_heading = (np.arctan2(ned_data[0, 2], ned_data[0, 1])) % (2 * np.pi)
+
+    # NED to DCU
+    dcu_data = np.empty_like(ned_data)
+    dcu_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
+    for i in range(ned_data.shape[0]):
+        dcu_data[i, POS_SLICE] = ned_to_dcu(ned_data[i, POS_SLICE], ref_heading)
+        dcu_data[i, VEL_SLICE] = ned_to_dcu(ned_data[i, VEL_SLICE], ref_heading)
+
+    # check for flip_c
+    do_flip_c = dcu_data[0, 2] < 0
+    if do_flip_c:
+        dcu_data = flip_c(dcu_data)
+
+    return dcu_data.squeeze(), ref_heading, do_flip_c
+
+
+def flip_c(dcu_state):
+    # change the sign of the cross range position and velocity
+    dcu_state[..., 2::3] = -dcu_state[..., 2::3]
+    return dcu_state
+
+
+def next_dcu_to_ecef(dcu_data, ref_ecef, ref_heading, do_flip_c):
+    if do_flip_c:
+        dcu_data = flip_c(dcu_data)
+
+    # DCU to NED
+    ned_data = np.empty_like(dcu_data)
+    ned_data[:, TIME_INDEX] = dcu_data[:, TIME_INDEX]
+    for i in range(dcu_data.shape[0]):
+        ned_data[i, POS_SLICE] = dcu_to_ned(dcu_data[i, POS_SLICE], ref_heading)
+        ned_data[i, VEL_SLICE] = dcu_to_ned(dcu_data[i, VEL_SLICE], ref_heading)
+
+    # NED to ECEF
+    ecef_data = np.empty_like(ned_data)
+    ecef_data[:, TIME_INDEX] = ned_data[:, TIME_INDEX]
+    for i in range(ned_data.shape[0]):
+        ecef_data[i, POS_SLICE] = ned_to_ecef(ned_data[i, POS_SLICE], ref_ecef)
+        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(ned_data[i, VEL_SLICE], ref_ecef)
+    return ecef_data.squeeze()
+
+
+# ----------------------------------------------------------------------
+# Global ellipsoid (WGS-84)
+# ----------------------------------------------------------------------
+WGS84 = Geodesic.WGS84
+a = WGS84.a  # semi-major axis (m)
+f = WGS84.f  # flattening
+b = a * (1 - f)  # semi-minor axis (m)
+
+
+# ----------------------------------------------------------------------
+# Simple helpers
+# ----------------------------------------------------------------------
+def deg2rad(x):
+    return np.deg2rad(x)
+
+
+def rad2deg(x):
+    return np.rad2deg(x)
+
+
+# ----------------------------------------------------------------------
+# 0. Geodetic ↔ ECEF (scalar - called inside vectorised loops)
+# ----------------------------------------------------------------------
+def ecef_to_geodetic(x, y, z):
+    """Scalar conversion using GeographicLib's exact algorithm."""
+    # lat, lon, h = Geodesic.WGS84._LatLonFromXYZ(x, y, z)
+    # return lat, lon, h
+    # TODO: Vermeille has a better method that Karney suggested updates to and then Vermeille updated in 2011. Update to using that rather than this Bowrank-like iterative method.
+    from coordinate_transform_functions import _ecef_to_lla
+
+    lat, lon, h, _ = _ecef_to_lla(np.hstack([x, y, z]), deg=True)
+
+    return lat, lon, h
+
+
+def geodetic_to_ecef(lat, lon, h):
+    """Scalar conversion (deg, deg, m) → (x, y, z) in metres."""
+    lat_rad = deg2rad(lat)
+    lon_rad = deg2rad(lon)
+
+    sin_phi = np.sin(lat_rad)
+    cos_phi = np.cos(lat_rad)
+    sin_lam = np.sin(lon_rad)
+    cos_lam = np.cos(lon_rad)
+
+    N = a / np.sqrt(1 - (2 * f - f**2) * sin_phi**2)
+    x = (N + h) * cos_phi * cos_lam
+    y = (N + h) * cos_phi * sin_lam
+    z = ((1 - f) ** 2 * N + h) * sin_phi
+    return x, y, z
+
+
+# ----------------------------------------------------------------------
+# 1. ENU rotation matrix (scalar - reused for a whole batch)
+# ----------------------------------------------------------------------
+def enu_rotation_matrix(lat0_rad, lon0_rad):
+    """Scalar rotation matrix from ECEF → ENU at (lat0,lon0) [radians]."""
+    sin_phi = np.sin(lat0_rad)
+    cos_phi = np.cos(lat0_rad)
+    sin_lam = np.sin(lon0_rad)
+    cos_lam = np.cos(lon0_rad)
+
+    R = np.array(
+        [
+            [-sin_lam, cos_lam, 0.0],
+            [-sin_phi * cos_lam, -sin_phi * sin_lam, cos_phi],
+            [cos_phi * cos_lam, cos_phi * sin_lam, sin_phi],
+        ]
+    )
+    return R
+
+
+# ----------------------------------------------------------------------
+# 2. Vectorised ENU conversion
+# ----------------------------------------------------------------------
+def _apply_rotation(R, vec):
+    """
+    Apply the same (3×3) rotation matrix `R` to an (N,3) array `vec`.
+    """
+    # Using @ works with both (3,3) @ (3,) and (3,3) @ (N,3).T
+    return (R @ vec.T).T
+
+
+def ecef_to_enu_vec(p_ecef, impact_ecef, lat0_deg, lon0_deg):
+    """
+    Convert an (N,3) array of ECEF positions to ENU centred at the impact point.
+    Returns an (N,3) array.
+    """
+    lat0 = deg2rad(lat0_deg)
+    lon0 = deg2rad(lon0_deg)
+    R = enu_rotation_matrix(lat0, lon0)
+
+    delta = np.asarray(p_ecef) - np.asarray(impact_ecef)  # (N,3)
+    return _apply_rotation(R, delta)
+
+
+def ecef_vel_acc_to_enu_vec(v_ecef, a_ecef, lat0_deg, lon0_deg):
+    """
+    Convert (N,3) velocity and (N,3) acceleration arrays to ENU.
+    Returns two (N,3) arrays: (v_enu, a_enu).
+    """
+    lat0 = deg2rad(lat0_deg)
+    lon0 = deg2rad(lon0_deg)
+    R = enu_rotation_matrix(lat0, lon0)
+
+    v_enu = _apply_rotation(R, v_ecef)
+    a_enu = _apply_rotation(R, a_ecef)
+    return v_enu, a_enu
+
+
+def enu_to_ecef_vec(p_enu, impact_ecef, lat0_deg, lon0_deg):
+    """
+    Inverse ENU → ECEF for an (N,3) array.
+    """
+    lat0 = deg2rad(lat0_deg)
+    lon0 = deg2rad(lon0_deg)
+    R = enu_rotation_matrix(lat0, lon0)
+    # Inverse rotation = transpose because R is orthogonal
+    return impact_ecef + _apply_rotation(R.T, p_enu)
+
+
+# ----------------------------------------------------------------------
+# 3. Geodesic helpers (scalar)
+# ----------------------------------------------------------------------
+def inverse_geodesic(lat0, lon0, lat, lon):
+    """
+    Scalar inverse geodesic. Returns distance (m), forward azimuth (deg),
+    reverse azimuth (deg), reduced length m12 (m), geodesic scale M12 (-).
+    """
+    mask = Geodesic.DISTANCE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
+    inv = WGS84.Inverse(lat0, lon0, lat, lon, outmask=mask)
+    return inv["s12"], inv["azi1"], inv["azi2"], inv["m12"], inv["M12"]
+
+
+def forward_geodesic(lat0, lon0, s, azi):
+    """
+    Scalar forward geodesic. Returns destination lat, lon, reverse azimuth,
+    reduced length, geodesic scale.
+    """
+    mask = Geodesic.LATITUDE | Geodesic.LONGITUDE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
+    dirc = WGS84.Direct(lat0, lon0, azi, s, outmask=mask)
+    return dirc["lat2"], dirc["lon2"], dirc["azi2"], dirc["m12"], dirc["M12"]
+
+
+# ----------------------------------------------------------------------
+# 4. Vectorised geodesic-based state conversion
+# ----------------------------------------------------------------------
+def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef):
+    """
+    Vectorised conversion of whole trajectories.
+
+    Parameters
+    ----------
+    p_ecef : (N,3) array of positions (m)
+    v_ecef : (N,3) array of velocities (m/s)
+    a_ecef : (N,3) array of accelerations (m/s²)
+    impact_ecef : (3,) array - impact point in ECEF
+    lat0_deg, lon0_deg : impact latitude/longitude (deg)
+    h0 : impact height above ellipsoid (m) - usually 0
+
+    Returns
+    -------
+    A dictionary where each entry is an (N,) NumPy array:
+        s   - geodesic distance from impact (m)
+        h   - relative height (m)   (trajectory h - h0)
+        az  - forward azimuth from impact (rad)
+        v_s - along-track speed (m/s)
+        v_α - azimuth rate (rad/s)
+        v_h - vertical speed (m/s)
+        a_s - along-track accel (m/s²)
+        a_α - azimuth accel (rad/s²)
+        a_h - vertical accel (m/s²)
+    """
+    N = p_ecef.shape[0]
+
+    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
+
+    # ------------------------------------------------------------------
+    # 1) Convert positions to lat/lon/h (scalar loop - cheap)
+    # ------------------------------------------------------------------
+    lat = np.empty(N)
+    lon = np.empty(N)
+    h = np.empty(N)
+
+    for i in range(N):
+        lat[i], lon[i], h[i] = ecef_to_geodetic(*p_ecef[i])
+
+    # ------------------------------------------------------------------
+    # 2) Inverse geodesic for each point (scalar loop - still fast)
+    # ------------------------------------------------------------------
+    s = np.empty(N)
+    az_deg = np.empty(N)  # forward azimuth (deg)
+    m12 = np.empty(N)
+    M12 = np.empty(N)
+
+    for i in range(N):
+        s[i], az_deg[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
+
+    # ------------------------------------------------------------------
+    # 3) Build ENU rotation matrix once (same for whole trajectory)
+    # ------------------------------------------------------------------
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+
+    # ------------------------------------------------------------------
+    # 4) Rotate velocities & accelerations to ENU (vectorised)
+    # ------------------------------------------------------------------
+    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
+    a_enu = _apply_rotation(R, a_ecef)  # (N,3)
+
+    # Split ENU components for readability
+    v_east, v_north, v_up = v_enu[:, 0], v_enu[:, 1], v_enu[:, 2]
+    a_east, a_north, a_up = a_enu[:, 0], a_enu[:, 1], a_enu[:, 2]
+
+    # ------------------------------------------------------------------
+    # 5) Build unit vectors that follow each geodesic direction
+    # ------------------------------------------------------------------
+    az_rad = deg2rad(az_deg)  # (N,)
+
+    # Tangent (east-north) unit vector along the geodesic
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
+
+    # Lateral unit vector (perpendicular to t_hat in the ENU plane)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
+
+    # Up unit vector - same for all rows
+    up_hat = np.array([0.0, 0.0, 1.0])
+
+    # ------------------------------------------------------------------
+    # 6) Velocity decomposition
+    # ------------------------------------------------------------------
+    v_s = np.einsum("ij,ij->i", t_hat, v_enu)  # dot product (N,)
+    v_l = np.einsum("ij,ij->i", l_hat, v_enu)  # lateral component
+    v_h = v_up  # vertical
+
+    # Azimuth rate (rad/s), guarding against division by zero
+    v_alpha = np.where(s > 0.0, (M12 / s) * v_l, 0.0)
+
+    # ------------------------------------------------------------------
+    # 7) Acceleration decomposition
+    # ------------------------------------------------------------------
+    a_s = np.einsum("ij,ij->i", t_hat, a_enu)
+    a_l = np.einsum("ij,ij->i", l_hat, a_enu)
+    a_h = a_up
+
+    a_alpha = np.where(s > 0.0, (M12 / s) * a_l - (v_s * v_alpha) / s, 0.0)
+
+    # ------------------------------------------------------------------
+    # 8) Assemble results
+    # ------------------------------------------------------------------
+    out = pd.DataFrame(
+        {
+            "s": s,
+            "az": az_rad,
+            "h": h - h0,
+            "v_s": v_s,
+            "v_α": v_alpha,
+            "v_h": v_h,
+            "a_s": a_s,
+            "a_α": a_alpha,
+            "a_h": a_h,
+        }
+    ).values
+    return out
+
+
+# ----------------------------------------------------------------------
+# 5. Vectorised inverse conversion (local → ECEF)
+# ----------------------------------------------------------------------
+def local_geodesic_to_ecef_vec(state, impact_ecef):
+    """
+    Convert a batch of geodesic-based states (as returned by
+    `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
+    accelerations.
+
+    Parameters
+    ----------
+    state : dict of (N,) arrays
+        ["s", "az(rad)", "h", "v_s", "v_α", "v_h", "a_s", "a_α", "a_h"]
+          0    1     2    3      4      5      6      7      8
+    impact_ecef : (3,) array
+    lat0_deg, lon0_deg : impact latitude/longitude (deg)
+    h0 : impact height (m) - usually 0
+
+    Returns
+    -------
+    p_ecef, v_ecef, a_ecef : each an (N,3) array
+    """
+    N = state.shape[0]
+
+    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
+
+    # ------------------------------------------------------------------
+    # 1) Destination lat/lon for each sample (scalar loop)
+    # ------------------------------------------------------------------
+    lat = np.empty(N)
+    lon = np.empty(N)
+
+    for i in range(N):
+        lat[i], lon[i], _, _, _ = forward_geodesic(lat0_deg, lon0_deg, state[i, 0], rad2deg(state[i, 1]))
+
+    # ------------------------------------------------------------------
+    # 2) Build ENU rotation matrix (same for whole batch)
+    # ------------------------------------------------------------------
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+
+    # ------------------------------------------------------------------
+    # 3) Assemble ENU velocity / acceleration from geodesic components
+    # ------------------------------------------------------------------
+    az_rad = state[:, 1]
+    s = state[:, 0]
+    # Need the differential scale M12 for each point - get it with another
+    # scalar inverse geodesic call.
+    M12 = np.empty(N)
+    for i in range(N):
+        _, _, _, _, M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
+
+    # Unit vectors per sample (same definitions as in the forward routine)
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
+    up_hat = np.array([0.0, 0.0, 1.0])
+
+    # ENU velocity
+    v_enu = (
+        (state[:, 3][:, None] * t_hat) + ((state[:, 4] * s / M12)[:, None] * l_hat) + (state[:, 5][:, None] * up_hat)
+    )
+
+    # ENU acceleration
+    a_enu = (
+        (state[:, 6][:, None] * t_hat) + ((state[:, 7] * s / M12)[:, None] * l_hat) + (state[:, 8][:, None] * up_hat)
+    )
+
+    # ------------------------------------------------------------------
+    # 4) Transform ENU → ECEF (vectorised) and add impact offset
+    # ------------------------------------------------------------------
+    p_ecef = np.empty((N, 3))
+    for i in range(N):
+        p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + state[i, 2])
+
+    v_ecef = _apply_rotation(R.T, v_enu)
+    a_ecef = _apply_rotation(R.T, a_enu)
+
+    # Add impact offset to positions (the geodetic conversion already gives
+    # absolute coordinates, so no extra offset is needed)
+    # (If you had stored the impact point in ECEF already you could also do:)
+    # p_ecef += impact_ecef   # <-- not required here
+
+    return np.hstack([p_ecef, v_ecef, a_ecef])
+
+
+def _local_heading_from_guide(origin_ecef, guide_ecef=None, fallback_vel_ecef=None):
+    if guide_ecef is not None:
+        lat0, lon0, _ = ecef_to_geodetic(*origin_ecef)
+        lat_guide, lon_guide, _ = ecef_to_geodetic(*guide_ecef)
+        dist, azi, _, _, _ = inverse_geodesic(lat0, lon0, lat_guide, lon_guide)
+        if dist > 0:
+            return deg2rad(azi)
+
+    if fallback_vel_ecef is None:
+        return 0.0
+    vel_ned = ecef_to_ned_velocity(fallback_vel_ecef, origin_ecef)
+    return np.arctan2(vel_ned[1], vel_ned[0])
+
+
+def ecef_to_local_ned_hvuh(ecef_data, guide_ecef=None):
+    ecef_data = np.atleast_2d(ecef_data)
+    origin = ecef_data[0, POS_SLICE]
+    lat0, lon0, _ = ecef_to_geodetic(*origin)
+    heading0 = _local_heading_from_guide(origin, guide_ecef, ecef_data[0, VEL_SLICE])
+
+    lned = np.empty((ecef_data.shape[0], 7))  # time, forward, right, altitude, v_forward, v_right, v_up
+    lned[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+
+    for i, state in enumerate(ecef_data):
+        lat, lon, hae = ecef_to_geodetic(*state[POS_SLICE])
+        dist, azi, _, _, _ = inverse_geodesic(lat0, lon0, lat, lon)
+        vel_ned = ecef_to_ned_velocity(state[VEL_SLICE], origin)
+        north = dist * np.cos(deg2rad(azi))
+        east = dist * np.sin(deg2rad(azi))
+
+        lned[i, 1] = north * np.cos(heading0) + east * np.sin(heading0)
+        lned[i, 2] = -north * np.sin(heading0) + east * np.cos(heading0)
+        lned[i, 3] = hae
+        lned[i, 4] = vel_ned[0] * np.cos(heading0) + vel_ned[1] * np.sin(heading0)
+        lned[i, 5] = -vel_ned[0] * np.sin(heading0) + vel_ned[1] * np.cos(heading0)
+        lned[i, 6] = -vel_ned[2]
+
+    return lned
+
+
+def local_ned_hvuh_to_ecef(lned_data, initial_state_ecef, guide_ecef=None):
+    lned_data = np.atleast_2d(lned_data)
+    initial_state_ecef = np.asarray(initial_state_ecef)
+    origin = initial_state_ecef[POS_SLICE]
+    lat0, lon0, _ = ecef_to_geodetic(*origin)
+    heading0 = _local_heading_from_guide(origin, guide_ecef, initial_state_ecef[VEL_SLICE])
+
+    ecef_data = np.empty((lned_data.shape[0], 7))
+    ecef_data[:, TIME_INDEX] = lned_data[:, TIME_INDEX]
+
+    for i, state in enumerate(lned_data):
+        north = state[1] * np.cos(heading0) - state[2] * np.sin(heading0)
+        east = state[1] * np.sin(heading0) + state[2] * np.cos(heading0)
+        dist = np.hypot(north, east)
+        azi = rad2deg(np.arctan2(east, north))
+        lat, lon, _, _, _ = forward_geodesic(lat0, lon0, dist, azi)
+        vel_ned = np.array(
+            [
+                state[4] * np.cos(heading0) - state[5] * np.sin(heading0),
+                state[4] * np.sin(heading0) + state[5] * np.cos(heading0),
+                -state[6],
+            ]
+        )
+
+        ecef_data[i, POS_SLICE] = geodetic_to_ecef(lat, lon, state[3])
+        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(vel_ned, origin)
+
+    return ecef_data
+
+
+def prep_trajectory(x):
+    # load_single_truth(x, debug=False), x.name, args.sr, path
+    ecef_data, traj_number, max_sr, trajectory_dt, use_grdth = x
+    # keep time, pos, vel. don't need the rest of the columns
+    ecef_data = ecef_data[:, 0:7]
+    # print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+
+    # remove launch point based on near zero speed state
+    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        ecef_data = ecef_data[1:]
 
     # begin PrSM data mods
-    # frd_data = truth
-    # # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
+    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
     # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
     # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
     # # covert to impact frame
-    # frd_data[:, POS_SLICE] = frd_data[:, POS_SLICE] - frd_data[-1, POS_SLICE]
+    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
 
     # # FRD to DCU to NED to ECEF
-    # new_ecef_data = np.empty_like(frd_data)
-    # new_ecef_data[:, TIME_INDEX] = frd_data[:, TIME_INDEX]
-    # for i in range(frd_data.shape[0]):
-    #     p_dcu = frd_to_dcu(frd_data[i, POS_SLICE])
+    # new_ecef_data = np.empty_like(ecef_data)
+    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+    # for i in range(ecef_data.shape[0]):
+    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
     #     p_ned = dcu_to_ned(p_dcu, ref_heading)
     #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
     #     new_ecef_data[i, POS_SLICE] = p_ecef
 
-    #     v_dcu = frd_to_dcu(frd_data[i, VEL_SLICE])
+    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
     #     v_ned = dcu_to_ned(v_dcu, ref_heading)
     #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
     #     new_ecef_data[i, VEL_SLICE] = v_ecef
-    # truth = new_ecef_data
+    # ecef_data = new_ecef_data
     # end PrSM data mods
 
-    truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, guide_point_ecef, args)
-
-    truth_filename = os.path.basename(path_to_truth)
-    if len(trajs) == 0:
-        print(f"No extrapolations were created for {truth_filename}")
-        return None
-
-    if isinstance(truth_states_sr_cut, int):
-        if all((-1 == x for x in (truth_states_sr_cut, trajs, truth_trajs))):
-            print("skipping bad truth file", path_to_truth)
-            return
-
-    s = f"{model_name}_{truth_filename}"
-
-    if not os.path.exists(output):
-        os.makedirs(output, exist_ok=True)
-    plot_sim_result(
-        truth_states_sr_cut,
-        trajs,
-        args,
-        train_test_trajs,
-        model_name,
-        traj_number=truth_filename,
-        filename=s,
-        save=True,
-        show=False,
-        output=output,
-    )
-    save_sim_result(output, trajs, truth_filename)
-    try:
-        traj_metric = calc_sim_metric(output, trajs, truth_trajs, truth_filename)
-    except Exception:
-        traj_metric = None
-    return traj_metric
-
-
-def load_phase_guide_point(path_to_truth, truth):
-    phase_dir = os.path.dirname(path_to_truth)
-    target_dir = os.path.dirname(phase_dir)
-    impact_path = os.path.join(target_dir, "impact", os.path.basename(path_to_truth))
-    if os.path.exists(impact_path):
-        try:
-            impact_truth = load_single_truth(impact_path)
-            return deepcopy(impact_truth[-1, POS_SLICE])
-        except Exception:
-            pass
-    return deepcopy(truth[-1, POS_SLICE])
-
-
-def calc_sim_metric(output, trajs, truth_trajs, truth_filename):
-    ingress_metric = []
-    for next_traj, truth_traj in zip(trajs, truth_trajs):
-        ingress_metric.append(calc_sim_metric_for_one_pair(truth_traj, next_traj))
-    return np.mean(ingress_metric)
-
-
-def calc_sim_metric_for_one_pair(truth_traj, test_traj):
-    # TODO: remove this when we get DTW
-    # check if the truth needs to be resampled
-    t = truth_traj
-    if len(truth_traj) != len(test_traj):
-        # use scipy to adjust the truth data
-        reduction_factor = np.gcd(len(test_traj), len(truth_traj))
-        t = resample_poly(
-            truth_traj,
-            len(test_traj) / reduction_factor,
-            len(truth_traj) / reduction_factor,
-            padtype="line",
-        )
-    return mean_absolute_error(t[:, POS_SLICE], test_traj[:, POS_SLICE])
-
-
-def truth_at_extrap_times(truth, extrap):
-    truth_at_times = np.empty((extrap.shape[0], truth.shape[1]))
-    truth_at_times[:, TIME_INDEX] = extrap[:, TIME_INDEX]
-    for col in range(1, truth.shape[1]):
-        truth_at_times[:, col] = np.interp(extrap[:, TIME_INDEX], truth[:, TIME_INDEX], truth[:, col])
-    return truth_at_times
-
-
-def save_sim_result(output, trajs, truth_filename):
-    # this was written to support the file format that originated from THADD Pitch Black. POET uses it as well.
-    print(f"Saving {len(trajs)} extrapolations to disk")
-    dfs = [None] * len(trajs)
-    for i, traj in enumerate(trajs):
-        # create a df from the numpy array where the columns are time, pos, vel
-        df = pd.DataFrame(
-            traj,
-            columns=(
-                "time",
-                "x_pos_ecef",
-                "y_pos_ecef",
-                "z_pos_ecef",
-                "x_vel_ecef",
-                "y_vel_ecef",
-                "z_vel_ecef",
-                "x_acc_ecef",
-                "y_acc_ecef",
-                "z_acc_ecef",
-            ),
-        )
-
-        # these columns change per traj
-        # curr_time, pred_num, validity_time
-        df["curr_time"] = df["time"][0]
-        df["pred_num"] = i + 1
-        df["validity_time"] = df["time"][0]
-        dfs[i] = df
-
-    # combine the dfs into one larger df
-    big_df = pd.concat(dfs)
-
-    # now add the static columns
-    big_df["system_track_number"] = 1701
-    big_df["threat_id"] = 47
-    big_df["true_object_id"] = 31
-    big_df["hyp_id"] = 1
-    big_df["asset_id"] = 0
-    big_df["threat_genre"] = "HGV"
-    big_df["eng_status"] = "ELIGIBLE"
-    big_df["traj_genre"] = "MRV"
-    big_df["traj_genre_score"] = 0
-    big_df["reach_assess"] = 0
-    big_df["extrap_in_SR"] = "Y"
-
-    # write to file
-    s = f"NEXT_extraps_{truth_filename}"
-    big_df.to_csv(os.path.join(output, f"extrap-dt_{extrapolation_dt}", s), index=False)
-
-
-def plot_sim_result(
-    truth,
-    trajs,
-    args,
-    train_test_trajs,
-    model_name,
-    traj_number="",
-    filename="",
-    save=False,
-    show=False,
-    output=None,
-):
-    if save and not output:
-        raise ValueError("Cannot save figures without an output path")
-    fig, (ax11, ax12) = plt.subplots(2, 1, sharex=True)
-    fig2, ax21 = plt.subplots(1, 1)
-    fig3, ax31 = plt.subplots(1, 1)
-    fig4, (ax41, ax42, ax43) = plt.subplots(1, 3, sharex=True)
-    fig5, (ax51, ax52) = plt.subplots(2, 1, sharex=True)
-
-    impact_ecef = deepcopy(truth[-1, POS_SLICE])
-    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
-    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
-
-    plot_traj_truth = deepcopy(truth)
-    plot_trajs_next = deepcopy(trajs)
-
-    # all of the data inputs are in ecef and have at least time, pos, and vel states
-    for i, traj in enumerate([plot_traj_truth] + plot_trajs_next):
-        # transform the ecef to ned to dcu
-        for j in range(traj.shape[0]):
-            traj[j, POS_SLICE] = ecef_to_ned(traj[j, POS_SLICE], impact_ecef)
-            traj[j, VEL_SLICE] = ecef_to_ned_velocity(traj[j, VEL_SLICE], impact_ecef)
-            # traj[j, ACC_SLICE] = ecef_to_ned_velocity(traj[j, ACC_SLICE], impact_ecef)
-
-            traj[j, POS_SLICE] = ned_to_dcu(traj[j, POS_SLICE], ref_angle)
-            traj[j, VEL_SLICE] = ned_to_dcu(traj[j, VEL_SLICE], ref_angle)
-            # traj[j, ACC_SLICE] = ned_to_dcu(traj[j, ACC_SLICE], ref_angle)
-
-        # TODO: redo this to use multiline
-        axes = (ax11, ax12, ax21, ax31, ax41, ax42, ax43)
-        plot_single_traj(i, traj, axes)
-
-    plot_color_trajs(plot_traj_truth, plot_trajs_next, ax51, ax52)
-
-    # set up variables for the figures
-    # TODO: Replace this with IBCS Tools helper functions
-    ax11.legend()
-    ax21.legend()
-    ax31.legend()
-    ax43.legend()
-    ax11.set_xlim([-10, args.sr_max / 1e3])
-    ax11.grid(True)
-    ax12.grid(True)
-    ax21.grid(True)
-    ax31.grid(True)
-    ax41.grid(True)
-    ax42.grid(True)
-    ax43.grid(True)
-    ax51.grid(True)
-    ax52.grid(True)
-    add_classification_markings(fig, Classification.UNCLASSIFIED)
-    add_classification_markings(fig2, Classification.UNCLASSIFIED)
-    add_classification_markings(fig3, Classification.UNCLASSIFIED)
-    add_classification_markings(fig4, Classification.UNCLASSIFIED)
-    add_classification_markings(fig5, Classification.UNCLASSIFIED)
-    add_lmpi_markings(fig)
-    add_lmpi_markings(fig2)
-    add_lmpi_markings(fig3)
-    add_lmpi_markings(fig4)
-    add_lmpi_markings(fig5)
-
-    # give the figure a title
-    title = f"{traj_number}"
-    if train_test_trajs is not None:
-        if title in train_test_trajs["test"]:
-            title = title + " (from test set)"
-        elif title in train_test_trajs["train"]:
-            title = title + " (from train set)"
-        else:
-            title = title + " (outside model scope)"
-    ax11.set_title(title, wrap=True)
-    ax21.set_title(title, wrap=True)
-    ax31.set_title(title, wrap=True)
-    # ax41.set_title(title, wrap=True)
-    ax51.set_title(title, wrap=True)
-    fig4.suptitle(title, wrap=True)
-    fig.canvas.manager.set_window_title(title)
-    fig2.canvas.manager.set_window_title(title)
-    fig3.canvas.manager.set_window_title(title)
-    fig4.canvas.manager.set_window_title(title)
-    fig5.canvas.manager.set_window_title(title)
-
-    # create the directory to place figures
-    figure_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}", "plots")
-    os.makedirs(figure_dir, exist_ok=True)
-
-    if save:
-        # fig.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR.png"), format="png")
-        fig2.savefig(os.path.join(figure_dir, filename + "_sim_Speed.png"), format="png")
-        fig3.savefig(os.path.join(figure_dir, filename + "_sim_Accel.png"), format="png")
-        fig4.savefig(os.path.join(figure_dir, filename + "_sim_Vel.png"), format="png")
-        fig5.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR_color.png"), format="png")
-        plot_position_error_downrange(
-            truth,
-            trajs,
-            os.path.join(figure_dir, filename + "_sim_PosErr_Downrange.png"),
-            title=title,
-        )
-
-    if show:
-        plt.show()
-        input("press enter to continue")
-    plt.close("all")
-
-
-def plot_single_traj(i, traj, axes):
-    # TODO: Fix the axis labels
-    # TODO: Split this out into plotting functions like I do in IBCS Tools
-    (ax11, ax12, ax21, ax31, ax41, ax42, ax43) = axes
-    if i == 0:
-        color = "k"
-        lw = 1
-        label = "Truth"
-        zorder = 8
-    elif i == 1:
-        color = "tab:orange"
-        lw = 0.5
-        label = "NEXT"
-        zorder = None
-    else:
-        color = "tab:orange"
-        lw = 0.5
-        label = "_nolegend_"
-        zorder = None
-
-    # DR-UP
-    ax11.plot(
-        traj[:, 1] / 1e3,
-        traj[:, 3] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # DR-CR
-    ax12.plot(
-        traj[:, 1] / 1e3,
-        traj[:, 2] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Speed
-    ax21.plot(
-        traj[1:, 3] / 1e3,
-        np.linalg.norm(traj[1:, VEL_SLICE], axis=1),
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Acceleration
-    ax31.plot(
-        traj[1:, 3] / 1e3,
-        np.linalg.norm(traj[1:, ACC_SLICE], axis=1),
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # UP-Speed
-    ax41.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 4],
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-    ax42.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 5],
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-    ax43.plot(
-        traj[:, 3] / 1e3,
-        traj[:, 6],
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-    )
-
-    # label the axes
-    ax11.set_ylabel("Up [km]")
-    ax12.set_xlabel("Down [km]")
-    ax12.set_ylabel("Cross [km]")
-
-    ax21.set_xlabel("Up [km]")
-    ax21.set_ylabel("Speed [m/s]")
-
-    ax31.set_xlabel("Up [km]")
-    ax31.set_ylabel("Acceleration Magnitude [m/s/s]")
-
-    ax41.set_xlabel("Up [km]")
-    ax42.set_xlabel("Up [km]")
-    ax43.set_xlabel("Up [km]")
-    ax41.set_ylabel("Velocity [m/s]")
-    ax41.set_title("Down")
-    ax42.set_title("Cross")
-    ax43.set_title("Up")
-
-
-def plot_color_trajs(truth, extraps, ax51, ax52):
-    # plot the truth
-    color = "lime"
-    linestyle = "--"
-    lw = 1
-    label = "Truth"
-    zorder = 8
-    ax51.plot(
-        truth[:, 1] / 1e3,
-        truth[:, 3] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-        linestyle=linestyle,
-    )
-    ax52.plot(
-        truth[:, 1] / 1e3,
-        truth[:, 2] / 1e3,
-        label=label,
-        color=color,
-        lw=lw,
-        zorder=zorder,
-        linestyle=linestyle,
-    )
-
-    tall = []
-    dall = []
-    call = []
-    uall = []
-    for i in range(len(extraps)):
-        ex = extraps[i]
-        t, d, c, u, *_ = ex.T
-        tall.append(t)
-        dall.append(d / 1e3)
-        call.append(c / 1e3)
-        uall.append(u / 1e3)
-
-    init_times = tuple(x[0][0] for x in extraps)
-    plot = multiline(dall, uall, init_times, ax=ax51, cmap="plasma", lw=0.5, label="NEXT")
-    multiline(dall, call, init_times, ax=ax52, cmap="plasma", lw=0.5)
-
-    cbar = ax51.get_figure().colorbar(plot, ax=[ax51, ax52])
-    cbar.set_label(label="Trajectory Initial Point Validity Time")
-
-    ax51.set_xlabel("Down [km]")
-    ax51.set_ylabel("Up [km]")
-    ax52.set_ylabel("Cross [km]")
-
-
-def plot_position_error_downrange(truth, extraps, output_path, title=None):
-    impact_ecef = deepcopy(truth[-1, POS_SLICE])
-    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
-    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
-
-    fig, ax = plt.subplots(1, 1)
-    downranges = []
-    pos_errors = []
-    init_times = []
-
-    for extrap in extraps:
-        truth_match = truth_at_extrap_times(truth, extrap)
-        downrange = np.empty(extrap.shape[0], dtype=np.float64)
-        for i, state in enumerate(truth_match):
-            ned_pos = ecef_to_ned(state[POS_SLICE], impact_ecef)
-            downrange[i] = ned_to_dcu(ned_pos, ref_angle)[0] / 1e3
-        downranges.append(downrange)
-        pos_errors.append(np.linalg.norm(extrap[:, POS_SLICE] - truth_match[:, POS_SLICE], axis=1))
-        init_times.append(extrap[0, TIME_INDEX])
-
-    if downranges:
-        plot = multiline(downranges, pos_errors, init_times, ax=ax, cmap="plasma", lw=0.5, label="NEXT")
-        cbar = fig.colorbar(plot, ax=ax)
-        cbar.set_label(label="Extrap Initial Point Validity Time")
-
-    ax.set_xlabel("Downrange [km]")
-    ax.set_ylabel("Position Error [m]")
-    ax.grid(True)
-    if title:
-        ax.set_title(title, wrap=True)
-        fig.canvas.manager.set_window_title(title)
-    ax.legend()
-    add_classification_markings(fig, Classification.UNCLASSIFIED)
-    add_lmpi_markings(fig)
-    fig.savefig(output_path, format="png", facecolor="white", transparent=False)
-    plt.close(fig)
-
-
-def sim_ingress(truth_states, guide_point_ecef, args):
-    # truth states are expected to be an array of format
-    # seconds from launch, position x3, velocity x3, acceleration x3
-
-    # define guide point at the end of the pre-cut phase truth
-    impact_ecef = deepcopy(guide_point_ecef)
-    impact_time = truth_states[-1, 0]
-
-    # The SBI inputs are already pre-cut by phase, so keep the whole phase.
-    truth_states_sr_cut = np.asarray(
-        tuple(x for x in truth_states if not np.allclose(x[VEL_SLICE], [0, 0, 0])),
+    # filter the points by max slant range from impact
+    # TODO: can this be done with np.where?
+    sr_ecef_data = np.asarray(
+        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
         dtype=np.float64,
     )
+    # TODO: add a min slant range to avoid the origin discontinuity
+    # sr_ecef_data = np.asarray(
+    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
+    #     dtype=np.float64,
+    # )
 
-    # start sim clock at truth firm track range
-    firm_track_time = truth_states_sr_cut[0][0]
-    sim_time = deepcopy(firm_track_time)
-    trajs = []
-    truth_trajs = []
+    # nice idea, but it wasn't the source of the problem
+    # filter the points by only those above the horizon. Work from impact backwards.
+    # def while_gen_backward_up(data):
+    #     for x in reversed(data):
+    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
+    #             yield x
+    #         else:
+    #             break
 
-    # sim to the end of the truth
-    while sim_time <= impact_time - measurement_dt:
-        # print("sim time step", sim_time, impact_time, measurement_dt)
-        # grab the current target state
-        tgt_state_ecef_index = np.where(truth_states_sr_cut[:, 0] == sim_time)
-        tgt_state_ecef_index_forward = np.where(truth_states_sr_cut[:, 0] >= sim_time)
-        if len(tgt_state_ecef_index[0]) == 0:
-            # missed a truth point at that time. grab the next one in the chain and update sim time for that step
-            try:
-                tgt_state_ecef_index = np.array(tgt_state_ecef_index_forward[0][0])
-            except IndexError:
-                # ran out of states in the truth
-                return truth_states_sr_cut, trajs, truth_trajs
-            sim_time = truth_states_sr_cut[tgt_state_ecef_index].squeeze()[0]
-        tgt_state_ecef = truth_states_sr_cut[tgt_state_ecef_index]
-        truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
+    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
 
-        x0 = tgt_state_ecef.squeeze()
-        traj = NEXT_tactical_interface(
-            x0[0:7],
-            impact_ecef,
-            extrapolation_dt,
-            max_traj_states,
-            impact_time,
-            args,
-            lned_origin_state_ecef=truth_states_sr_cut[0, 0:7],
+    # TODO: move this to a trajectory time check helper function file
+    # check the time rate of the data
+    # diff the time column, run unique, print that if there is more than 1 unique
+    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
+    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
+    if np.any(time_diff < 0):
+        raise ValueError(
+            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
         )
-        if traj is not None:
-            if isinstance(traj, int) and traj == -1:
-                # got a stop sim signal for the algorithm under test
-                break
-            trajs.append(traj)
-            truth_trajs.append(truth_traj_forward)
-        # step sim time by measurement dt and repeat
-        sim_time += measurement_dt
-    return truth_states_sr_cut, trajs, truth_trajs
 
+    # TODO: this resampling needs to move into a function so it can reused
+    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
+    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
 
-def bound(low, high, x):
-    return max(low, min(high, x))
-
-
-def round_to(x, base):
-    return base * round(x / base)
-
-
-ort_sess_stash = None  # TODO: Stop cheating with a global variable. Only used for GRDTH models
-
-
-def NEXT_tactical_interface(
-    initial_state_ecef,
-    guide_point_ecef,
-    dt,
-    n_steps,
-    extrap_stop_time,
-    args,
-    lned_origin_state_ecef=None,
-):
-    # initial state ecef is expected to be a 1d vector for time in seconds, position x3, and velocity x3 in ECEF
-    # guide point ecef is expected to be...
-
-    # check if target is too close
-    initial_state_slant_range = np.linalg.norm(initial_state_ecef[POS_SLICE] - guide_point_ecef)
-    if initial_state_slant_range < args.sr_min:
-        print("target too close", initial_state_slant_range, args.sr_min)
-        return -1
-
-    # transform into NEXT frame
-    use_grdth = "_grdth_" in os.path.basename(args.model)
-    use_geodesic = "_geod_" in os.path.basename(args.model)
-    use_avfor = "_avfor_" in os.path.basename(args.model)
-    use_lned = "_lned_" in os.path.basename(args.model)
-    initial_point_heading = None
-    global ort_sess_stash
-    if use_grdth:
-        initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
-        initial_state_slant_range = np.hypot(initial_state_NEXT_frame[GR_INDEX], initial_state_NEXT_frame[DOWN_INDEX])
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            # load NEXT model
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    elif use_geodesic:
-        _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
-        initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
-            np.atleast_2d(initial_state_ecef[POS_SLICE]),
-            np.atleast_2d(initial_state_ecef[VEL_SLICE]),
-            np.zeros_like(
-                np.atleast_2d(initial_state_ecef[VEL_SLICE])
-            ),  # TODO: better handling of acceleration being in the transform functions
-            guide_point_ecef,
-        )
-        # Prepend time and only include pos and vel
-        initial_state_NEXT_frame = np.hstack(
-            [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
-        )[0]
-        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            # load NEXT model
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    elif use_avfor:
-        initial_state_NEXT_frame = ecef_to_avfor(initial_state_ecef)[0]
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    elif use_lned:
-        if lned_origin_state_ecef is None:
-            lned_origin_state_ecef = initial_state_ecef
-        # Training uses one fixed local origin per phase, so keep that same origin for rolling sim starts.
-        initial_state_NEXT_frame = ecef_to_local_ned_hvuh(
-            np.vstack([lned_origin_state_ecef, initial_state_ecef]), guide_point_ecef
-        )[-1]
-        if ort_sess_stash:
-            ort_sess = ort_sess_stash
-        else:
-            ort_sess = onnxruntime.InferenceSession(args.model)
-            ort_sess_stash = ort_sess
-    else:
-        initial_state_NEXT_frame, initial_point_heading, flip_c = ecef_to_next_dcu(initial_state_ecef, guide_point_ecef)
-        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
-        bucket_range = 100000
-        rounded_sr = int(bound(bucket_range, args.sr_max, round_to(initial_state_slant_range, bucket_range)) / 1e3)
-        model_name_to_load = re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", args.model)
-        scalar_name_to_load = os.path.join(
-            os.path.dirname(args.scalar), re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", os.path.basename(args.scalar))
-        )
-        args.scalar = scalar_name_to_load
-        ort_sess = onnxruntime.InferenceSession(model_name_to_load)
-
-    # call the extrapolator
     try:
-        NEXT_extrap = NEXT_extrapolation(
-            initial_state_NEXT_frame,
-            dt,
-            n_steps,
-            extrap_stop_time,
-            initial_point_heading,
-            use_grdth,
-            use_geodesic,
-            use_avfor,
-            use_lned,
-            args,
-            ort_sess,
+        resampled_sr_ecef_data = np.hstack(
+            [np.atleast_2d(new_times).T]
+            + [
+                make_interp_spline(
+                    sr_ecef_data[:, 0],
+                    sr_ecef_data[:, 1:],
+                    bc_type="not-a-knot",
+                )(new_times, extrapolate=True)
+            ]
         )
-    except ValueError as e:
-        print("Extrap failed", traceback.format_exc())
-        return None
+    except Exception as e:
+        print(f"warning: {traj_number} had the error with interpolation")
+        raise e
 
-    # get back to ECEF
     if use_grdth:
-        NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
-    elif use_geodesic:
-        NEXT_extrap_ecef = np.hstack(
-            [
-                NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
-                local_geodesic_to_ecef_vec(
-                    np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]), guide_point_ecef
-                ),
-            ],
-        )[:, :7]
-    elif use_avfor:
-        NEXT_extrap_ecef = avfor_to_ecef(NEXT_extrap, initial_state_ecef)
-    elif use_lned:
-        NEXT_extrap_ecef = local_ned_hvuh_to_ecef(NEXT_extrap, lned_origin_state_ecef, guide_point_ecef)
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
+        if np.any(next_frame_data[GR_INDEX] > 1e10):
+            print(f"this ground range for traj {traj_number} seems excessive", next_frame_data[GR_INDEX].max)
+
+        # check the inverse transform
+        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
     else:
-        NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
 
-    # use numpy gradient (second order inner. first order on boundary) for a numerical derivative
-    a = np.gradient(NEXT_extrap_ecef[:, VEL_SLICE], axis=0)
+        # check the inverse transform
+        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
+    # closeness_check
+    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
+    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
+    # print(f"MSE round-trip position: {pos_err:.3e}")
+    # print(f"MSE round-trip velocity: {vel_err:.3e}")
 
-    # TODO: move this to outside the model loop
-    def get_acc(x):
-        a = np.zeros_like(x)
-        # TODO: Fix this
-        # for j in range(3):
-        #     # inner points
-        #     a[1:-1, j] = (x[2:, j] - x[:2, j]) / 2
-        #     # boundary points
-        #     a[0, j] = x[1, j] - x[0, j]
-        #     a[-1, j] = x[-1, j] - x[-2, j]
-        return a
+    # add column for traj number
+    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
 
-    a_test = get_acc(NEXT_extrap_ecef[:, VEL_SLICE])
-    # if not np.allclose(a, a_test):
-    #     print("WOAH! Numerical method did not work")
+    # add columns for ECEF reference point (12, 13, 14)
+    # TODO: stop doing this to save some RAM and use a metadata attribute
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
 
-    NEXT_extrap_ecef = np.hstack([NEXT_extrap_ecef, a])
+    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
+    #     print(next_frame_data)
+    # np.savetxt(
+    #     "grdth_" + traj_number,
+    #     next_frame_data,
+    #     delimiter=",",
+    #     # header=",".join(header_row),
+    #     comments="",
+    #     fmt="%.8f",
+    # )
 
-    # output ECEF traj
-    return NEXT_extrap_ecef
+    return next_frame_data, traj_number
 
 
-def NEXT_extrapolation(
-    initial_state_next_frame,
-    dt: float,
-    n_steps: int,
-    extrap_stop_time: float,
-    ref_angle,
-    use_grdth: bool,
-    use_geodesic: bool,
-    use_avfor: bool,
-    use_lned: bool,
-    args,
-    ort_sess: onnxruntime.InferenceSession,
-):
-    # print("initial_state_next_frame", initial_state_next_frame)
+def prep_trajectory_time(x):
+    # load_single_truth(x, debug=False), x.name, args.sr, path
+    ecef_data, traj_number, max_time, trajectory_dt, use_grdth = x
+    # keep time, pos, vel. don't need the rest of the columns
+    ecef_data = ecef_data[:, 0:7]
+    # print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
 
-    # ort_sess_scalar = onnxruntime.InferenceSession(args.scalar)  # switch to using ONNX for scalar (update: can't)
-    use_scalar = "_scalarOn" in os.path.basename(args.model)
-    if use_scalar:
-        with open(args.scalar, "rb") as scalar_pickle:
-            NEXT_scalar = pickle.load(scalar_pickle)
-    state_size = 6
+    # remove launch point based on near zero speed state
+    # while np.all(np.isclose(np.linalg.norm(ecef_data[0, VEL_SLICE]), 0)):
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        # while np.any(ecef_data[0, VEL_SLICE] <= 1e-8):
+        ecef_data = ecef_data[1:]
+
+    # check that the trajectory has enough time data in it
+    traj_time_range = ecef_data[-1, TIME_INDEX] - ecef_data[0, TIME_INDEX]
+    if abs(traj_time_range) < max_time:
+        # raise ValueError(
+        #     f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
+        # )
+        print(
+            f"trajectory {traj_number} only has a time range of {traj_time_range} which is less than the requested max time of {max_time}"
+        )
+        return None, None
+
+    # begin PrSM data mods
+    # NOTE: The PrSM data is in launch FRD. For the sake of this prototype, convert FRD to ECEF. Reference point will be London Tower Bridge b/c why not
+    # ref_ecef = [3964833.672418, -5219.57764451, 4952079.70278825]
+    # ref_heading = 0  # assume that it coming from the north (not true for real data, but i get to pick in this case with prsm data)
+    # # covert to impact frame
+    # ecef_data[:, POS_SLICE] = ecef_data[:, POS_SLICE] - ecef_data[-1, POS_SLICE]
+
+    # # FRD to DCU to NED to ECEF
+    # new_ecef_data = np.empty_like(ecef_data)
+    # new_ecef_data[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+    # for i in range(ecef_data.shape[0]):
+    #     p_dcu = frd_to_dcu(ecef_data[i, POS_SLICE])
+    #     p_ned = dcu_to_ned(p_dcu, ref_heading)
+    #     p_ecef = ned_to_ecef(p_ned, ref_ecef)
+    #     new_ecef_data[i, POS_SLICE] = p_ecef
+
+    #     v_dcu = frd_to_dcu(ecef_data[i, VEL_SLICE])
+    #     v_ned = dcu_to_ned(v_dcu, ref_heading)
+    #     v_ecef = ned_to_ecef_velocity(v_ned, ref_ecef)
+    #     new_ecef_data[i, VEL_SLICE] = v_ecef
+    # ecef_data = new_ecef_data
+    # end PrSM data mods
+
+    # filter the points by max slant range from impact
+    # TODO: can this be done with np.where?
+    # time_ecef_data = np.asarray(
+    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
+    #     dtype=np.float64,
+    # )
+    impact_time = ecef_data[-1, TIME_INDEX]
+    start_time = impact_time - max_time
+    time_ecef_data = ecef_data[ecef_data[:, TIME_INDEX] >= start_time]
+    # now make the impact time precisely the max time
+    time_ecef_data[:, TIME_INDEX] = time_ecef_data[:, TIME_INDEX] + max_time
+    # TODO: add a min slant range to avoid the origin discontinuity
+    # sr_ecef_data = np.asarray(
+    #     tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) > 1000),
+    #     dtype=np.float64,
+    # )
+
+    # nice idea, but it wasn't the source of the problem
+    # filter the points by only those above the horizon. Work from impact backwards.
+    # def while_gen_backward_up(data):
+    #     for x in reversed(data):
+    #         if ecef_to_ned(x[POS_SLICE], ref_ecef)[2] <= 0:
+    #             yield x
+    #         else:
+    #             break
+
+    # sr_ecef_data = np.asarray(tuple(reversed(tuple(while_gen_backward_up(sr_ecef_data)))))
+
+    # TODO: move this to a trajectory time check helper function file
+    # check the time rate of the data
+    # diff the time column, run unique, print that if there is more than 1 unique
+    time_diff = np.diff(time_ecef_data[:, TIME_INDEX])
+    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
+    if np.any(time_diff < 0):
+        raise ValueError(
+            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
+        )
+
+    # TODO: this resampling needs to move into a function so it can reused
+    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
+    new_times = np.arange(0, max_time + trajectory_dt, trajectory_dt)
+
+    try:
+        resampled_sr_ecef_data = np.hstack(
+            [np.atleast_2d(new_times).T]
+            + [
+                make_interp_spline(
+                    time_ecef_data[:, 0],
+                    time_ecef_data[:, 1:],
+                    bc_type="not-a-knot",
+                )(new_times, extrapolate=True)
+            ]
+        )
+    except Exception as e:
+        print(f"warning: {traj_number} had the error with interpolation")
+        raise e
+
     if use_grdth:
-        state_size = 5
-    elif use_avfor:
-        state_size = 4
-    elif use_lned:
-        state_size = 7
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading = ecef_to_next_grdth(
+            resampled_sr_ecef_data,
+            ref_ecef,
+        )
+        # pass
 
-    # infer at extrapolation dt
-    # keep going until the termination criteria is met
-    # the initial point will be the initial state
-    model_augmentation_dim = int(re.findall(r"_(\d)aug_", args.model)[-1])
-    extrap = np.array([np.hstack([initial_state_next_frame])])
-    if model_augmentation_dim > 0:
-        augmentation_state = torch.zeros(
-            1, model_augmentation_dim
-        )  # TODO: is there a data driven when to find how many zeros to add? filename
-    validity_time = deepcopy(initial_state_next_frame[0])
+        # check the inverse transform
+        # check_ecef = next_grdth_to_ecef(
+        #     next_frame_data,
+        #     ref_ecef,
+        #     initial_point_heading,
+        # )
+    else:
+        # convert ecef truth to the training frame
+        next_frame_data, initial_point_heading = ecef_to_next_dcu(
+            resampled_sr_ecef_data,
+            ref_ecef,
+        )
 
-    # n_steps = 5
-    temp_iter = 0
-    while temp_iter < n_steps and float(validity_time) < extrap_stop_time:
-        temp_iter = temp_iter + 1
-        validity_time += dt
+        # check the inverse transform
+        # check_ecef = next_dcu_to_ecef(
+        #     next_frame_data,
+        #     ref_ecef,
+        #     initial_point_heading,
+        # )
+    # closeness_check
+    # pos_err = mean_squared_error(resampled_sr_ecef_data[POS_SLICE], check_ecef[POS_SLICE])
+    # vel_err = mean_squared_error(resampled_sr_ecef_data[VEL_SLICE], check_ecef[VEL_SLICE])
+    # print(f"MSE round-trip position: {pos_err:.3e}")
+    # print(f"MSE round-trip velocity: {vel_err:.3e}")
 
-        if use_scalar:
-            # print("\nstartig step", temp_iter)
-            pos_vel = np.asarray([extrap[-1][1 : state_size + 1]])
-            # print("pos_vel", pos_vel)
-            # TODO: No need to cast to a tensor. change this to use numpy
-            scaled_pos_vel = torch.Tensor(NEXT_scalar.transform(pos_vel))
-            # print("scaled_pos_vel", scaled_pos_vel)
-            if model_augmentation_dim > 0:
-                # print("aug state", augmentation_state)
-                temp_state = torch.cat((scaled_pos_vel, augmentation_state), dim=1)
-            else:
-                temp_state = scaled_pos_vel
-            # print("temp state", temp_state)
-            model_input = temp_state[0].detach().numpy()
-            # print("model_input", model_input)
-            model_output = ort_sess.run(["output"], {"input": model_input})[-1].reshape(1, -1)
-            # print("model_output", model_output)
-            next_state_raw = model_output * dt + temp_state.detach().numpy()
-            # print("next_state raw", next_state_raw)
-            augmentation_state = torch.Tensor(next_state_raw[:, state_size:])
-            # print("augmentation_state", augmentation_state)
-            next_state = NEXT_scalar.inverse_transform(
-                next_state_raw[:, :state_size]
-            )  # skl2onnx does not support this. see https://github.com/onnx/sklearn-onnx/issues/765
-            # print("next state", next_state)
-        else:
-            temp_state = torch.Tensor(np.asarray([extrap[-1][1 : state_size + 1]]))
-            next_state = (
-                ort_sess.run(["output"], {"input": temp_state[0].detach().numpy()})[-1] * dt
-                + temp_state.detach().numpy()[-1]
-            )
+    # add column for traj number
+    # next_frame_data = np.c_[next_frame_data, [traj_number] * next_frame_data.shape[0]]
 
-        next_state = np.insert(next_state, 0, validity_time)
-        temp_extrap = np.vstack([extrap, next_state])
+    # add columns for ECEF reference point (12, 13, 14)
+    # TODO: stop doing this to save some RAM and use a metadata attribute
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
 
-        # TODO: What if I scaled the ending criteria so that the extrap can be entirly done in the scalared space?
-        if use_grdth and (temp_extrap[-1, DOWN_INDEX] > 0 or temp_extrap[-1, GR_INDEX] < 2600e3):
-            print("grdth below the ground", temp_extrap[-1, DOWN_INDEX])
-            break
-        elif use_avfor and temp_extrap[-1, 2] < 0:
-            print("avfor below the ground", temp_extrap[-1, 2])
-            break
-        elif use_lned and temp_extrap[-1, 3] < 0:
-            print("lned below the ground", temp_extrap[-1, 3])
-            break
-        # elif not use_grdth and (temp_extrap[-1, 3] < 0 or np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 250e3):
-        elif not use_grdth and not use_avfor and not use_lned and (np.linalg.norm(temp_extrap[-1, POS_SLICE]) < 2600e3):
-            print("dcu below the ground", temp_extrap[-1, 3])
-            break
-        extrap = np.vstack([extrap, next_state])
+    # if traj_number in ("traj.data.19.csv", "traj.data.11.csv"):
+    #     print(next_frame_data)
+    # np.savetxt(
+    #     "grdth_" + traj_number,
+    #     next_frame_data,
+    #     delimiter=",",
+    #     # header=",".join(header_row),
+    #     comments="",
+    #     fmt="%.8f",
+    # )
 
-    if extrap.shape[0] < 3:
-        raise ValueError(f"Extrap was too short {extrap.shape}")
-
-    return extrap
+    return next_frame_data, traj_number
 
 
-if __name__ == "__main__":
-    main()
+def prep_many_trajs_time(traj_targets):
+    # multiprocessed trajectory prep (the output is ordered like the input)
+    # cpu_count = psutil.cpu_count(logical=False)
+    # if cpu_count is None:
+    #     cpu_count = mp.cpu_count()
+    # print(f"there are {cpu_count} cpus being used for trajectory prep")
+    # with mp.Pool(processes=cpu_count) as pool:
+    #     # time based trajectory loading
+    #     tmp_data = pool.map(prep_trajectory_time, traj_targets)
+    # single threaded, but single line
+    tmp_data = map(prep_trajectory_time, traj_targets)
+    # single threaded, but one at a time
+    # tmp_data = []
+    # for x in traj_targets[7:]:
+    #     tmp_data.append(prep_trajectory(x))
+    #     exit(0)
 
-# dump the buffer at the end of the run
-print("", end="", flush=True)
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+
+    print("post-prep. how many made it though prep", len(traj_targets))
+    return tmp_data
+
+
+def prep_many_trajs(traj_targets):
+    # multiprocessed trajectory prep (the output is ordered like the input)
+    # cpu_count = psutil.cpu_count(logical=False)
+    # if cpu_count is None:
+    #     cpu_count = mp.cpu_count()
+    # print(f"there are {cpu_count} cpus being used for trajectory prep")
+    # with mp.Pool(processes=cpu_count) as pool:
+    #     tmp_data = pool.map(prep_trajectory, traj_targets)
+    # single threaded, but single line
+    tmp_data = map(prep_trajectory, traj_targets)
+    # single threaded, but one at a time
+    # tmp_data = []
+    # for x in traj_targets[7:]:
+    #     tmp_data.append(prep_trajectory(x))
+    #     exit(0)
+
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+
+    # check if all of the trajectories are much shorter than the asked for bucket
+    # if not use_grdth:
+    #     if all((np.linalg.norm(x[0, POS_SLICE] - x[-1, POS_SLICE]) < args.sr - BUCKET_SIZE for x, _ in tmp_data)):
+    #         print(
+    #             f"All trajectories are shorter than the SR ({args.sr}) minus bucket size ({BUCKET_SIZE}). Skipping making this model"
+    #         )
+    #         exit()
+
+    print("post-prep. how many made it though prep", len(traj_targets))
+    return tmp_data

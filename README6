@@ -585,6 +585,125 @@ def local_geodesic_to_ecef_vec(state, impact_ecef):
     return np.hstack([p_ecef, v_ecef, a_ecef])
 
 
+def _local_heading_from_guide(origin_ecef, guide_ecef=None, fallback_vel_ecef=None):
+    """Resolve the frame's fixed heading (radians) used to rotate N/E into forward/right.
+
+    The heading is taken from the origin toward `guide_ecef` (the impact point), so
+    'forward' points down-range. If no guide is available, fall back to the initial
+    velocity direction. This MUST be computed identically in the forward and reverse
+    transforms or the round trip will not close.
+    """
+    if guide_ecef is not None:
+        lat0, lon0, _ = ecef_to_geodetic(*origin_ecef)
+        lat_guide, lon_guide, _ = ecef_to_geodetic(*guide_ecef)
+        dist, azi, _, _, _ = inverse_geodesic(lat0, lon0, lat_guide, lon_guide)
+        if dist > 0:
+            return deg2rad(azi)
+
+    if fallback_vel_ecef is None:
+        return 0.0
+    vel_ned = ecef_to_ned_velocity(fallback_vel_ecef, origin_ecef)
+    return np.arctan2(vel_ned[1], vel_ned[0])
+
+
+def ecef_to_local_ned_hvuh(ecef_data, guide_ecef=None):
+    """ECEF -> heading-rotated local NED frame (6-state, Cartesian).
+
+    Contract (differs from the geodesic frames -- read before using):
+      * Input : (N, 7) [time, x, y, z, vx, vy, vz] ECEF.
+      * Output: (N, 7) [time, forward, right, altitude, v_forward, v_right, v_up].
+      * ORIGIN is ``ecef_data[0]`` -- the trajectory's OWN first point -- NOT the
+        impact point. Every trajectory therefore starts at (0, 0, h0), keeping
+        state magnitudes small and comparable across the dataset.
+      * ``guide_ecef`` (impact point) sets the HEADING only, never the origin.
+
+    Contrast with ecef_to_local_geodesic_vec, which is origin-at-impact and polar
+    (range/azimuth). This frame carries cross-track deviation directly in metres as
+    the ``right`` channel, so no azimuth-rate integration is needed downstream.
+    """
+    ecef_data = np.atleast_2d(ecef_data)
+    origin = ecef_data[0, POS_SLICE]
+    lat0, lon0, _ = ecef_to_geodetic(*origin)
+    heading0 = _local_heading_from_guide(origin, guide_ecef, ecef_data[0, VEL_SLICE])
+
+    lned = np.empty((ecef_data.shape[0], 7))  # time, forward, right, altitude, v_forward, v_right, v_up
+    lned[:, TIME_INDEX] = ecef_data[:, TIME_INDEX]
+
+    for i, state in enumerate(ecef_data):
+        lat, lon, hae = ecef_to_geodetic(*state[POS_SLICE])
+        dist, azi, _, _, _ = inverse_geodesic(lat0, lon0, lat, lon)
+        vel_ned = ecef_to_ned_velocity(state[VEL_SLICE], origin)
+        north = dist * np.cos(deg2rad(azi))
+        east = dist * np.sin(deg2rad(azi))
+
+        lned[i, 1] = north * np.cos(heading0) + east * np.sin(heading0)
+        lned[i, 2] = -north * np.sin(heading0) + east * np.cos(heading0)
+        lned[i, 3] = hae
+        lned[i, 4] = vel_ned[0] * np.cos(heading0) + vel_ned[1] * np.sin(heading0)
+        lned[i, 5] = -vel_ned[0] * np.sin(heading0) + vel_ned[1] * np.cos(heading0)
+        lned[i, 6] = -vel_ned[2]
+
+    return lned
+
+
+def local_ned_hvuh_to_ecef(lned_data, initial_state_ecef, guide_ecef=None):
+    """Inverse of ecef_to_local_ned_hvuh.
+
+    ``initial_state_ecef`` is the (7,) ECEF state that defined the origin on the
+    forward pass -- i.e. the first row of the ECEF trajectory. Passing anything else
+    (e.g. the impact point) silently shifts the whole trajectory.
+    """
+    lned_data = np.atleast_2d(lned_data)
+    initial_state_ecef = np.asarray(initial_state_ecef)
+    origin = initial_state_ecef[POS_SLICE]
+    lat0, lon0, _ = ecef_to_geodetic(*origin)
+    heading0 = _local_heading_from_guide(origin, guide_ecef, initial_state_ecef[VEL_SLICE])
+
+    ecef_data = np.empty((lned_data.shape[0], 7))
+    ecef_data[:, TIME_INDEX] = lned_data[:, TIME_INDEX]
+
+    for i, state in enumerate(lned_data):
+        north = state[1] * np.cos(heading0) - state[2] * np.sin(heading0)
+        east = state[1] * np.sin(heading0) + state[2] * np.cos(heading0)
+        dist = np.hypot(north, east)
+        azi = rad2deg(np.arctan2(east, north))
+        lat, lon, _, _, _ = forward_geodesic(lat0, lon0, dist, azi)
+        vel_ned = np.array(
+            [
+                state[4] * np.cos(heading0) - state[5] * np.sin(heading0),
+                state[4] * np.sin(heading0) + state[5] * np.cos(heading0),
+                -state[6],
+            ]
+        )
+
+        ecef_data[i, POS_SLICE] = geodetic_to_ecef(lat, lon, state[3])
+        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(vel_ned, origin)
+
+    return ecef_data
+
+
+def check_lned_roundtrip(ecef_data, guide_ecef=None, pos_tol=1.0, vel_tol=1e-3):
+    """Fail loudly if the local-NED forward/reverse pair does not close.
+
+    Returns (max_pos_err_m, max_vel_err_mps). Raises ValueError past tolerance.
+    Call this once at data-prep time -- a silent frame error is the failure mode
+    that has already cost this project a debugging cycle.
+    """
+    ecef_data = np.atleast_2d(ecef_data)
+    lned = ecef_to_local_ned_hvuh(ecef_data, guide_ecef)
+    back = local_ned_hvuh_to_ecef(lned, ecef_data[0], guide_ecef)
+
+    pos_err = float(np.max(np.abs(back[:, POS_SLICE] - ecef_data[:, POS_SLICE])))
+    vel_err = float(np.max(np.abs(back[:, VEL_SLICE] - ecef_data[:, VEL_SLICE])))
+    if pos_err > pos_tol or vel_err > vel_tol:
+        raise ValueError(
+            f"local-NED round trip failed: max position error {pos_err:.3f} m "
+            f"(tol {pos_tol}), max velocity error {vel_err:.6f} m/s (tol {vel_tol}). "
+            "Check that guide_ecef and initial_state_ecef match the forward pass."
+        )
+    return pos_err, vel_err
+
+
 def prep_trajectory(x):
     # load_single_truth(x, debug=False), x.name, args.sr, path
     ecef_data, traj_number, max_sr, trajectory_dt, use_grdth = x

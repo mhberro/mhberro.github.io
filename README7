@@ -1,244 +1,267 @@
-# gru_ode.py
-"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting."""
+# physics_field.py
+"""Torch implementation of the SINDy-discovered f_physics term.
+
+Design constraints this file must satisfy (all from the integration brief):
+
+  1. STATELESS. No module-state mutation in forward, or autograd/adjoint break.
+  2. ONNX-EXPORTABLE under torch.export. No data-dependent control flow, no
+     Python-level branching on tensor VALUES, no .item(), no dynamic shapes.
+     All term selection is resolved at CONSTRUCTION time into dense buffers.
+  3. INDEPENDENTLY EVALUABLE. f_physics(y) must run without the neural term so
+     the planned runtime guardrail can blend toward physics-only later.
+  4. SCALING CONVENTION: unscale -> apply physics in physical units -> rescale.
+     The derivative transform has NO mean term (d/dt of a constant is zero).
+  5. NON-TRAINABLE by default, with an option to fine-tune under tight priors.
+
+The term set is fixed at construction from the discovery JSON. Terms that did
+not pass the inclusion gate are simply absent -- an UNEXPLAINED row (e.g.
+dv_alpha/dt when maneuvers dominate) contributes exactly zero, by construction
+rather than by a runtime check.
+"""
 
 from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
 
 import torch
 from torch import nn
 
+# state layout in the 5-state integrated geodesic frame
+S_IDX, H_IDX, VS_IDX, VA_IDX, VH_IDX = 0, 1, 2, 3, 4
+ROW_NAME_TO_INDEX = {"dv_s/dt": VS_IDX, "dv_alpha/dt": VA_IDX, "dv_h/dt": VH_IDX}
 
-class FullGRUODECell(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
-        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
-            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            if bias:
-                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
-                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
-            else:
-                self.register_parameter("bias_rz", None)
-                self.register_parameter("bias_g", None)
+# ---------------------------------------------------------------------------
+# term encoding
+# ---------------------------------------------------------------------------
+# Each library term is encoded as a fixed integer opcode plus a scale height.
+# Evaluating a term is then a dense gather + elementwise product -- no branching
+# on values, so torch.export traces it cleanly.
+OP_CONST = 0        # 1
+OP_RHO = 1          # exp(-h/H)
+OP_RHO_VS_V = 2     # exp(-h/H) * v_s * |v|
+OP_RHO_VH_V = 3     # exp(-h/H) * v_h * |v|
+OP_RHO_V2 = 4       # exp(-h/H) * |v|^2
+OP_RHO_V2_VA = 5    # exp(-h/H) * |v|^2 * v_alpha
+OP_RHO_V_VA = 6     # exp(-h/H) * |v| * v_alpha
+OP_VS = 7
+OP_VH = 8
+OP_VA = 9
+OP_V = 10
+OP_VS2 = 11
+OP_VH2 = 12
+OP_VS_VH = 13
+OP_VA_VS = 14
+OP_VA_VH = 15
+OP_VA2 = 16
 
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_rz = self.lin_hrz(h)
-        if self.input_size > 0:
-            pre_rz = pre_rz + self.lin_xrz(x)
-        elif self.bias_rz is not None:
-            pre_rz = pre_rz + self.bias_rz
-        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
-
-        pre_g = self.lin_hg(r * h)
-        if self.input_size > 0:
-            pre_g = pre_g + self.lin_xg(x)
-        elif self.bias_g is not None:
-            pre_g = pre_g + self.bias_g
-        g = torch.tanh(pre_g)
-
-        return (1.0 - z) * (g - h)
+_RHO_RE = re.compile(r"^exp\(-h/([0-9.]+)k\)(.*)$")
 
 
-class MinimalGRUODECell(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hf = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.lin_hh = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            self.lin_xf = nn.Linear(input_size, hidden_size, bias=bias)
-            self.lin_xh = nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            self.bias_f = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
-            self.bias_h = torch.nn.Parameter(torch.zeros(hidden_size)) if bias else None
+def parse_term(name: str) -> tuple[int, float]:
+    """Map a library term name to (opcode, scale_height_metres).
 
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_f = self.lin_hf(h)
-        if self.input_size > 0:
-            pre_f = pre_f + self.lin_xf(x)
-        elif self.bias_f is not None:
-            pre_f = pre_f + self.bias_f
-        f = torch.sigmoid(pre_f)
+    Raises on anything unrecognised -- failing loudly beats silently dropping a
+    discovered term and shipping a physics model that is quietly missing its
+    dominant drag component.
+    """
+    name = name.strip()
+    if name == "1":
+        return OP_CONST, 0.0
 
-        pre_h = self.lin_hh(f * h)
-        if self.input_size > 0:
-            pre_h = pre_h + self.lin_xh(x)
-        elif self.bias_h is not None:
-            pre_h = pre_h + self.bias_h
-        g = torch.tanh(pre_h)
+    m = _RHO_RE.match(name)
+    if m:
+        H = float(m.group(1)) * 1000.0
+        rest = m.group(2)
+        table = {
+            "": OP_RHO,
+            "*v_s*|v|": OP_RHO_VS_V,
+            "*v_h*|v|": OP_RHO_VH_V,
+            "*|v|^2": OP_RHO_V2,
+            "*|v|^2*v_alpha": OP_RHO_V2_VA,
+            "*|v|*v_alpha": OP_RHO_V_VA,
+        }
+        if rest not in table:
+            raise ValueError(f"unrecognised density-term suffix {rest!r} in {name!r}")
+        return table[rest], H
 
-        return (1.0 - f) * (g - h)
-
-
-class GRUBayesCell(nn.Module):
-    def __init__(self, hidden_size: int, obs_dim: int, prep_hidden: int = 4, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.obs_dim = obs_dim
-        self.prep_hidden = prep_hidden
-        self.w_prep = nn.Parameter(0.01 * torch.randn(obs_dim, 4, prep_hidden))
-        self.b_prep = nn.Parameter(torch.zeros(obs_dim, prep_hidden))
-        self.gru = nn.GRUCell(obs_dim * prep_hidden, hidden_size, bias=bias)
-
-    def forward(
-        self,
-        h: torch.Tensor,
-        y: torch.Tensor,
-        mask: torch.Tensor,
-        mu: torch.Tensor,
-        logvar: torch.Tensor,
-    ) -> torch.Tensor:
-        sigma = torch.exp(0.5 * logvar)
-        error = (y - mu) / (sigma + 1e-6)
-        feats = torch.stack([mu, sigma, y, error], dim=-1)
-        prepped = torch.relu(torch.einsum("boi,oih->boh", feats, self.w_prep) + self.b_prep)
-        prepped = prepped * mask.unsqueeze(-1)
-        prepped = prepped.reshape(prepped.shape[0], -1)
-        return self.gru(prepped, h)
+    plain = {
+        "v_s": OP_VS, "v_h": OP_VH, "v_alpha": OP_VA, "|v|": OP_V,
+        "v_s^2": OP_VS2, "v_h^2": OP_VH2, "v_s*v_h": OP_VS_VH,
+        "v_alpha*v_s": OP_VA_VS, "v_alpha*v_h": OP_VA_VH, "v_alpha^2": OP_VA2,
+    }
+    if name in plain:
+        return plain[name], 0.0
+    raise ValueError(f"unrecognised library term {name!r} -- cannot build f_physics")
 
 
-class GRUODEFunc(nn.Module):
-    ORDER = "y_first"
+class PhysicsField(nn.Module):
+    """f_physics(y_phys) -> (..., 5) derivative in PHYSICAL units.
 
-    def __init__(
-        self,
-        state_vector_len: int,
-        nhidden: int,
-        latent_dim: int | None = None,
-        minimal: bool = False,
-        encoder_hidden: int | None = None,
-        encoder_input_idx: list[int] | None = None,
-        encoder_dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.state_vector_len = state_vector_len
-        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
-        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+    Rows ds/dt and dh/dt are left at ZERO here on purpose: they are exact
+    identities already enforced in GRUODEPredictorModel.forward via index_copy.
+    Writing them here too would double-count.
+    """
 
-        if encoder_input_idx is None:
-            encoder_input_idx = list(range(state_vector_len))
-        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
-        enc_in = len(encoder_input_idx)
-
-        # Expose active dropout on the initial mapping layer to satisfy Fix C
-        if encoder_dropout > 0.0:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Dropout(p=encoder_dropout),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
-        else:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
-        self.encoder_dropout = float(encoder_dropout)
-
-        cell_cls = MinimalGRUODECell if minimal else FullGRUODECell
-        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=0, bias=True)
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim, enc_h),
-            nn.SiLU(),
-            nn.Linear(enc_h, state_vector_len),
-        )
-        self.nfe = 0
-
-    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
-        return self.cell(t, h)
-
-    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
-        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
-        return self.encoder(x_sel)
-
-    def decode(self, h: torch.Tensor) -> torch.Tensor:
-        return self.decoder(h)
-
-
-class GRUODEPredictorModel(nn.Module):
-    def __init__(
-        self,
-        func: GRUODEFunc,
-        pos_idx: list[int] | None = None,
-        vel_idx: list[int] | None = None,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
-        physics=None,
-    ):
-        """Production wrapper implementing a stateless continuous integration field.
-
-        `physics` is an optional ScaledPhysicsField implementing the fused model
-            xdot = f_physics(y) + f_residual(y, h)
-        It consumes the SCALED physical state and returns a SCALED derivative,
-        so it drops straight into the existing scaled-space pipeline. When None
-        (the default) behaviour is bit-identical to the pure-neural model.
+    def __init__(self, terms: list[tuple[str, int, float]], trainable: bool = False):
+        """
+        Args:
+            terms: list of (term_name, row_index, coefficient).
+            trainable: if True, coefficients become nn.Parameter (fine-tuning
+                under tight priors); default False = fixed buffers.
         """
         super().__init__()
-        self.func = func
+        self.n_terms = len(terms)
+        self.trainable = bool(trainable)
+
+        if self.n_terms == 0:
+            # Degenerate but legal: no physics discovered. Keep the module so
+            # downstream code paths are identical, but it contributes zero.
+            self.register_buffer("ops", torch.zeros(0, dtype=torch.long))
+            self.register_buffer("scale_heights", torch.zeros(0))
+            self.register_buffer("rows", torch.zeros(0, dtype=torch.long))
+            coef = torch.zeros(0)
+        else:
+            ops, Hs, rows, coefs = [], [], [], []
+            for name, row, c in terms:
+                op, H = parse_term(name)
+                ops.append(op)
+                Hs.append(H if H > 0 else 1.0)  # avoid div-by-zero; unused when op has no rho
+                rows.append(row)
+                coefs.append(c)
+            self.register_buffer("ops", torch.tensor(ops, dtype=torch.long))
+            self.register_buffer("scale_heights", torch.tensor(Hs, dtype=torch.float32))
+            self.register_buffer("rows", torch.tensor(rows, dtype=torch.long))
+            coef = torch.tensor(coefs, dtype=torch.float32)
+
+        if trainable:
+            self.coef = nn.Parameter(coef)
+            self.register_buffer("coef_prior", coef.clone())
+        else:
+            self.register_buffer("coef", coef)
+            self.register_buffer("coef_prior", coef.clone())
+
+        # one-hot row scatter matrix (n_terms, 5), built once
+        scatter = torch.zeros(self.n_terms, 5)
+        for i in range(self.n_terms):
+            scatter[i, int(self.rows[i])] = 1.0
+        self.register_buffer("row_scatter", scatter)
+
+    def term_values(self, y_phys: torch.Tensor) -> torch.Tensor:
+        """Evaluate every term on physical-unit states. Returns (..., n_terms).
+
+        Fully branch-free over term types: each opcode's value is computed for
+        all terms and selected by a precomputed mask. This costs a few redundant
+        elementwise ops and buys clean torch.export tracing.
+        """
+        if self.n_terms == 0:
+            return y_phys.new_zeros(y_phys.shape[:-1] + (0,))
+
+        h = y_phys[..., H_IDX].unsqueeze(-1)      # (..., 1)
+        v_s = y_phys[..., VS_IDX].unsqueeze(-1)
+        v_a = y_phys[..., VA_IDX].unsqueeze(-1)
+        v_h = y_phys[..., VH_IDX].unsqueeze(-1)
+        # v_alpha is a RATE (rad/s); excluded from the speed norm deliberately.
+        v = torch.sqrt(v_s * v_s + v_h * v_h + 1e-24)
+
+        rho = torch.exp(-h / self.scale_heights)  # (..., n_terms) via broadcast
+
+        ops = self.ops
+        one = torch.ones_like(rho)
+        cand = torch.stack(
+            [
+                one,                       # OP_CONST
+                rho,                       # OP_RHO
+                rho * v_s * v,             # OP_RHO_VS_V
+                rho * v_h * v,             # OP_RHO_VH_V
+                rho * v * v,               # OP_RHO_V2
+                rho * v * v * v_a,         # OP_RHO_V2_VA
+                rho * v * v_a,             # OP_RHO_V_VA
+                v_s * one,                 # OP_VS
+                v_h * one,                 # OP_VH
+                v_a * one,                 # OP_VA
+                v * one,                   # OP_V
+                v_s * v_s * one,           # OP_VS2
+                v_h * v_h * one,           # OP_VH2
+                v_s * v_h * one,           # OP_VS_VH
+                v_a * v_s * one,           # OP_VA_VS
+                v_a * v_h * one,           # OP_VA_VH
+                v_a * v_a * one,           # OP_VA2
+            ],
+            dim=0,
+        )  # (n_ops, ..., n_terms)
+
+        idx = ops.view(*([1] * (cand.dim() - 1)), -1).expand_as(cand[0]).unsqueeze(0)
+        return torch.gather(cand, 0, idx).squeeze(0)
+
+    def forward(self, y_phys: torch.Tensor) -> torch.Tensor:
+        """f_physics in PHYSICAL units. Stateless. Returns (..., 5)."""
+        if self.n_terms == 0:
+            return torch.zeros_like(y_phys)
+        vals = self.term_values(y_phys) * self.coef      # (..., n_terms)
+        return vals @ self.row_scatter                   # (..., 5)
+
+    def prior_penalty(self) -> torch.Tensor:
+        """Tight-prior regulariser for the optional fine-tuning mode.
+
+        Keeps fine-tuned coefficients near their SINDy values; without this,
+        fine-tuning can drift the physics term into fitting maneuvers, which
+        destroys the extrapolation guarantee it exists to provide.
+        """
+        if not self.trainable or self.n_terms == 0:
+            return torch.zeros((), device=self.coef.device)
+        scale = self.coef_prior.abs().clamp_min(1e-12)
+        return (((self.coef - self.coef_prior) / scale) ** 2).mean()
+
+    @classmethod
+    def from_json(cls, path, trainable: bool = False, verbose: bool = True):
+        """Build from discover_physics.py's exported coefficients."""
+        spec = json.loads(Path(path).read_text())
+        terms: list[tuple[str, int, float]] = []
+        for row_name, r in spec["rows"].items():
+            row = ROW_NAME_TO_INDEX[row_name]
+            for name, c in zip(r["terms"], r["coefficients"]):
+                terms.append((name, row, float(c)))
+        obj = cls(terms, trainable=trainable)
+        if verbose:
+            print(f"[PhysicsField] gate={spec.get('gate')} loaded {len(terms)} terms")
+            for row_name, r in spec["rows"].items():
+                n = len(r["terms"])
+                tag = "" if n else "   <-- UNEXPLAINED, contributes zero"
+                print(f"    {row_name:14s}: {n} terms{tag}")
+        return obj
+
+
+class ScaledPhysicsField(nn.Module):
+    """Wraps PhysicsField with the StandardScaler unscale/rescale contract.
+
+    CONVENTION (verified numerically in sindy/scaling.py):
+        y_phys   = y_scaled * scale + mean        [state inverse: HAS mean]
+        f_phys   = physics(y_phys)
+        f_scaled = f_phys / scale                 [derivative: NO mean]
+
+    The missing mean on the derivative is the trap. A wrong version still runs
+    and still trains; it just injects a large constant drift into every row.
+    """
+
+    def __init__(self, physics: PhysicsField, state_mean, state_scale):
+        super().__init__()
         self.physics = physics
-        self.use_physics = physics is not None
-        self.n_features = func.state_vector_len
-        self.hidden_size = func.latent_dim
-        self.second_order = pos_idx is not None and vel_idx is not None
-        
-        if self.second_order:
-            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-            if pos_scale is not None and vel_scale is not None:
-                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-                    pos_scale, dtype=torch.float32
-                )
-                offset = (
-                    torch.as_tensor(vel_mean, dtype=torch.float32)
-                    / torch.as_tensor(pos_scale, dtype=torch.float32)
-                    if vel_mean is not None
-                    else torch.zeros_like(ratio)
-                )
-                self.register_buffer("so_ratio", ratio)
-                self.register_buffer("so_offset", offset)
-                self.scaled_space = True
-            else:
-                self.scaled_space = False
+        mean = torch.as_tensor(state_mean, dtype=torch.float32).flatten()
+        scale = torch.as_tensor(state_scale, dtype=torch.float32).flatten()
+        if mean.numel() != 5 or scale.numel() != 5:
+            raise ValueError(
+                f"expected 5-element scaler stats for the 5-state frame, "
+                f"got mean {mean.numel()}, scale {scale.numel()}"
+            )
+        if torch.any(scale <= 0):
+            raise ValueError("scaler scale_ contains non-positive entries")
+        self.register_buffer("state_mean", mean)
+        self.register_buffer("state_scale", scale)
 
-    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
-        self.func.nfe += 1
-        
-        # Unpack the absolute physical and latent partitions directly from the solver state
-        y_read = state[..., : self.n_features]
-        h = state[..., self.n_features : self.n_features + self.hidden_size]
-
-        # Enforce analytical bounding constraints cleanly on every evaluation step
-        h = torch.tanh(h)
-        dh = self.func.cell(t, h)
-        xdot = self.func.decode(h)
-
-        # ---- fused physics term -------------------------------------------
-        # xdot = f_physics(y) + f_residual(y, h). The neural decoder output is
-        # now the RESIDUAL: what physics cannot express (principally maneuvers).
-        #
-        # Added BEFORE the second-order index_copy so the exact position-row
-        # identities still win: PhysicsField writes zeros to rows s and h, and
-        # index_copy overwrites them regardless, so there is no double-count.
-        #
-        # Stateless: no module-state mutation here, so autograd/adjoint hold.
-        if self.use_physics:
-            xdot = xdot + self.physics(y_read)
-
-        if self.second_order:
-            vel_now = y_read.index_select(-1, self.vel_idx)
-            if getattr(self, "scaled_space", False):
-                vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
-
-        return torch.cat((xdot, dh), dim=-1)
+    def forward(self, y_scaled: torch.Tensor) -> torch.Tensor:
+        """Returns f_physics expressed in SCALED derivative units."""
+        y_phys = y_scaled * self.state_scale + self.state_mean
+        f_phys = self.physics(y_phys)
+        return f_phys / self.state_scale

@@ -1,267 +1,213 @@
-# physics_field.py
-"""Torch implementation of the SINDy-discovered f_physics term.
+# validate_fused.py
+"""Validation suite for the fused model  xdot = f_physics(x) + f_residual(x,h).
 
-Design constraints this file must satisfy (all from the integration brief):
+RUN THIS ON YOUR MACHINE. It was written without a torch install available, so
+it is unexecuted -- treat the first run as a debugging session, not a report.
 
-  1. STATELESS. No module-state mutation in forward, or autograd/adjoint break.
-  2. ONNX-EXPORTABLE under torch.export. No data-dependent control flow, no
-     Python-level branching on tensor VALUES, no .item(), no dynamic shapes.
-     All term selection is resolved at CONSTRUCTION time into dense buffers.
-  3. INDEPENDENTLY EVALUABLE. f_physics(y) must run without the neural term so
-     the planned runtime guardrail can blend toward physics-only later.
-  4. SCALING CONVENTION: unscale -> apply physics in physical units -> rescale.
-     The derivative transform has NO mean term (d/dt of a constant is zero).
-  5. NON-TRAINABLE by default, with an option to fine-tune under tight priors.
-
-The term set is fixed at construction from the discovery JSON. Terms that did
-not pass the inclusion gate are simply absent -- an UNEXPLAINED row (e.g.
-dv_alpha/dt when maneuvers dominate) contributes exactly zero, by construction
-rather than by a runtime check.
+Covers the four checks the brief requires beyond training loss:
+  1. physics-only standalone behaviour
+  2. residual vs physics magnitude along trajectories  (the key diagnostic)
+  3. out-of-distribution integration                    (the acceptance test)
+  4. ONNX / PyTorch equivalence on fixed input
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import re
-from pathlib import Path
 
+import numpy as np
 import torch
-from torch import nn
 
-# state layout in the 5-state integrated geodesic frame
-S_IDX, H_IDX, VS_IDX, VA_IDX, VH_IDX = 0, 1, 2, 3, 4
-ROW_NAME_TO_INDEX = {"dv_s/dt": VS_IDX, "dv_alpha/dt": VA_IDX, "dv_h/dt": VH_IDX}
+from physics_field import PhysicsField, ScaledPhysicsField
+
 
 # ---------------------------------------------------------------------------
-# term encoding
+# 0. sanity: the scaling contract, checked numerically on the identity rows
 # ---------------------------------------------------------------------------
-# Each library term is encoded as a fixed integer opcode plus a scale height.
-# Evaluating a term is then a dense gather + elementwise product -- no branching
-# on values, so torch.export traces it cleanly.
-OP_CONST = 0        # 1
-OP_RHO = 1          # exp(-h/H)
-OP_RHO_VS_V = 2     # exp(-h/H) * v_s * |v|
-OP_RHO_VH_V = 3     # exp(-h/H) * v_h * |v|
-OP_RHO_V2 = 4       # exp(-h/H) * |v|^2
-OP_RHO_V2_VA = 5    # exp(-h/H) * |v|^2 * v_alpha
-OP_RHO_V_VA = 6     # exp(-h/H) * |v| * v_alpha
-OP_VS = 7
-OP_VH = 8
-OP_VA = 9
-OP_V = 10
-OP_VS2 = 11
-OP_VH2 = 12
-OP_VS_VH = 13
-OP_VA_VS = 14
-OP_VA_VH = 15
-OP_VA2 = 16
-
-_RHO_RE = re.compile(r"^exp\(-h/([0-9.]+)k\)(.*)$")
-
-
-def parse_term(name: str) -> tuple[int, float]:
-    """Map a library term name to (opcode, scale_height_metres).
-
-    Raises on anything unrecognised -- failing loudly beats silently dropping a
-    discovered term and shipping a physics model that is quietly missing its
-    dominant drag component.
+def check_scaling_contract(scaled_physics: ScaledPhysicsField, verbose=True):
+    """The unscale/rescale convention must satisfy, for the identity rows,
+        ds_scaled/dt = (v_s_scaled*scale_vs + mean_vs) / scale_s
+    PhysicsField writes ZERO to rows 0,1 so this specifically confirms the
+    physics term is not corrupting the identity rows.
     """
-    name = name.strip()
-    if name == "1":
-        return OP_CONST, 0.0
+    mean = scaled_physics.state_mean
+    scale = scaled_physics.state_scale
+    y = torch.randn(32, 5)
+    out = scaled_physics(y)
+    ok = torch.allclose(out[:, :2], torch.zeros_like(out[:, :2]), atol=0)
+    if verbose:
+        print(f"[scaling] physics contribution to identity rows s,h: "
+              f"max |.| = {out[:, :2].abs().max().item():.3e}  "
+              f"{'PASS' if ok else 'FAIL -- would double-count with index_copy'}")
+    return ok
 
-    m = _RHO_RE.match(name)
-    if m:
-        H = float(m.group(1)) * 1000.0
-        rest = m.group(2)
-        table = {
-            "": OP_RHO,
-            "*v_s*|v|": OP_RHO_VS_V,
-            "*v_h*|v|": OP_RHO_VH_V,
-            "*|v|^2": OP_RHO_V2,
-            "*|v|^2*v_alpha": OP_RHO_V2_VA,
-            "*|v|*v_alpha": OP_RHO_V_VA,
-        }
-        if rest not in table:
-            raise ValueError(f"unrecognised density-term suffix {rest!r} in {name!r}")
-        return table[rest], H
 
-    plain = {
-        "v_s": OP_VS, "v_h": OP_VH, "v_alpha": OP_VA, "|v|": OP_V,
-        "v_s^2": OP_VS2, "v_h^2": OP_VH2, "v_s*v_h": OP_VS_VH,
-        "v_alpha*v_s": OP_VA_VS, "v_alpha*v_h": OP_VA_VH, "v_alpha^2": OP_VA2,
+# ---------------------------------------------------------------------------
+# 1. physics-only standalone
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def integrate_physics_only(scaled_physics, y0_scaled, steps, dt):
+    """RK4 on f_physics alone, in SCALED space, with the exact identity rows
+    enforced exactly as GRUODEPredictorModel does."""
+    mean = scaled_physics.state_mean
+    scale = scaled_physics.state_scale
+
+    def field(y):
+        f = scaled_physics(y).clone()
+        # exact identities: ds/dt = v_s, dh/dt = v_h, transformed to scaled space
+        v_s_phys = y[..., 2] * scale[2] + mean[2]
+        v_h_phys = y[..., 4] * scale[4] + mean[4]
+        f[..., 0] = v_s_phys / scale[0]
+        f[..., 1] = v_h_phys / scale[1]
+        return f
+
+    y = y0_scaled.clone()
+    traj = [y.clone()]
+    for _ in range(steps):
+        k1 = field(y); k2 = field(y + 0.5 * dt * k1)
+        k3 = field(y + 0.5 * dt * k2); k4 = field(y + dt * k3)
+        y = y + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        traj.append(y.clone())
+    return torch.stack(traj, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# 2. residual vs physics magnitude -- THE KEY DIAGNOSTIC
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def residual_vs_physics(model, scaled_states, latents):
+    """Compare ||f_physics|| against ||f_residual|| along real trajectories.
+
+    Success looks like: physics DOMINANT in cruise, residual SPIKING only during
+    maneuvers. If the residual dominates everywhere, SINDy captured little and
+    the extrapolation safety was NOT bought -- report that plainly rather than
+    hiding behind an aggregate metric.
+
+    Args:
+        model: the fused GRUODEPredictorModel (must have .physics set)
+        scaled_states: (T, 5) scaled physical states along a trajectory
+        latents:       (T, latent_dim) matching latent states
+    """
+    if getattr(model, "physics", None) is None:
+        raise ValueError("model has no physics term; run with --physics-coeffs")
+
+    f_phys = model.physics(scaled_states)                       # (T,5)
+    h = torch.tanh(latents)
+    f_res = model.func.decode(h)                                # (T,5) residual
+
+    # compare on the ACCELERATION rows only; rows 0,1 are identities
+    acc = [2, 3, 4]
+    np_ = f_phys[:, acc].norm(dim=-1)
+    nr_ = f_res[:, acc].norm(dim=-1)
+    ratio = nr_ / (np_ + 1e-12)
+
+    return {
+        "phys_norm": np_.cpu().numpy(),
+        "resid_norm": nr_.cpu().numpy(),
+        "ratio": ratio.cpu().numpy(),
+        "median_ratio": float(ratio.median()),
+        "frac_physics_dominant": float((ratio < 1.0).float().mean()),
     }
-    if name in plain:
-        return plain[name], 0.0
-    raise ValueError(f"unrecognised library term {name!r} -- cannot build f_physics")
 
 
-class PhysicsField(nn.Module):
-    """f_physics(y_phys) -> (..., 5) derivative in PHYSICAL units.
+def report_residual(stats):
+    r = stats["median_ratio"]
+    frac = stats["frac_physics_dominant"]
+    print(f"[residual] median ||f_res||/||f_phys|| = {r:.3f}")
+    print(f"[residual] physics dominant on {frac*100:.1f}% of samples")
+    if r < 0.5:
+        print("  -> physics carries the bulk of the dynamics. Extrapolation "
+              "safety is real.")
+    elif r < 1.5:
+        print("  -> comparable magnitudes. Partial benefit; inspect where the "
+              "residual spikes (expect maneuvers).")
+    else:
+        print("  -> RESIDUAL DOMINATES. SINDy captured little. State this "
+              "plainly: the fused model has NOT bought extrapolation safety, "
+              "and the physics term is close to decorative.")
 
-    Rows ds/dt and dh/dt are left at ZERO here on purpose: they are exact
-    identities already enforced in GRUODEPredictorModel.forward via index_copy.
-    Writing them here too would double-count.
+
+# ---------------------------------------------------------------------------
+# 3. out-of-distribution acceptance test
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def ood_test(model, y0_scaled, steps, dt, scaler_mean, scaler_scale,
+             launch_speed=None):
+    """Integrate FAR past the training regime and check the model stays physical.
+
+    Pure-neural models gain energy, exceed launch speed, and fly underground.
+    The fused model should decelerate. This is the acceptance test.
     """
+    latent = model.func.encode(y0_scaled)
+    state = torch.cat([y0_scaled, latent], dim=-1)
 
-    def __init__(self, terms: list[tuple[str, int, float]], trainable: bool = False):
-        """
-        Args:
-            terms: list of (term_name, row_index, coefficient).
-            trainable: if True, coefficients become nn.Parameter (fine-tuning
-                under tight priors); default False = fixed buffers.
-        """
-        super().__init__()
-        self.n_terms = len(terms)
-        self.trainable = bool(trainable)
+    mean = torch.as_tensor(scaler_mean, dtype=torch.float32)
+    scale = torch.as_tensor(scaler_scale, dtype=torch.float32)
 
-        if self.n_terms == 0:
-            # Degenerate but legal: no physics discovered. Keep the module so
-            # downstream code paths are identical, but it contributes zero.
-            self.register_buffer("ops", torch.zeros(0, dtype=torch.long))
-            self.register_buffer("scale_heights", torch.zeros(0))
-            self.register_buffer("rows", torch.zeros(0, dtype=torch.long))
-            coef = torch.zeros(0)
-        else:
-            ops, Hs, rows, coefs = [], [], [], []
-            for name, row, c in terms:
-                op, H = parse_term(name)
-                ops.append(op)
-                Hs.append(H if H > 0 else 1.0)  # avoid div-by-zero; unused when op has no rho
-                rows.append(row)
-                coefs.append(c)
-            self.register_buffer("ops", torch.tensor(ops, dtype=torch.long))
-            self.register_buffer("scale_heights", torch.tensor(Hs, dtype=torch.float32))
-            self.register_buffer("rows", torch.tensor(rows, dtype=torch.long))
-            coef = torch.tensor(coefs, dtype=torch.float32)
+    hs, speeds = [], []
+    for i in range(steps):
+        d = model(torch.zeros(()), state)
+        state = state + dt * d  # Euler is fine for a divergence check
+        y = state[..., :5]
+        y_phys = y * scale + mean
+        h_m = y_phys[..., 1]
+        v = torch.sqrt(y_phys[..., 2] ** 2 + y_phys[..., 4] ** 2)
+        hs.append(float(h_m.mean()))
+        speeds.append(float(v.mean()))
 
-        if trainable:
-            self.coef = nn.Parameter(coef)
-            self.register_buffer("coef_prior", coef.clone())
-        else:
-            self.register_buffer("coef", coef)
-            self.register_buffer("coef_prior", coef.clone())
-
-        # one-hot row scatter matrix (n_terms, 5), built once
-        scatter = torch.zeros(self.n_terms, 5)
-        for i in range(self.n_terms):
-            scatter[i, int(self.rows[i])] = 1.0
-        self.register_buffer("row_scatter", scatter)
-
-    def term_values(self, y_phys: torch.Tensor) -> torch.Tensor:
-        """Evaluate every term on physical-unit states. Returns (..., n_terms).
-
-        Fully branch-free over term types: each opcode's value is computed for
-        all terms and selected by a precomputed mask. This costs a few redundant
-        elementwise ops and buys clean torch.export tracing.
-        """
-        if self.n_terms == 0:
-            return y_phys.new_zeros(y_phys.shape[:-1] + (0,))
-
-        h = y_phys[..., H_IDX].unsqueeze(-1)      # (..., 1)
-        v_s = y_phys[..., VS_IDX].unsqueeze(-1)
-        v_a = y_phys[..., VA_IDX].unsqueeze(-1)
-        v_h = y_phys[..., VH_IDX].unsqueeze(-1)
-        # v_alpha is a RATE (rad/s); excluded from the speed norm deliberately.
-        v = torch.sqrt(v_s * v_s + v_h * v_h + 1e-24)
-
-        rho = torch.exp(-h / self.scale_heights)  # (..., n_terms) via broadcast
-
-        ops = self.ops
-        one = torch.ones_like(rho)
-        cand = torch.stack(
-            [
-                one,                       # OP_CONST
-                rho,                       # OP_RHO
-                rho * v_s * v,             # OP_RHO_VS_V
-                rho * v_h * v,             # OP_RHO_VH_V
-                rho * v * v,               # OP_RHO_V2
-                rho * v * v * v_a,         # OP_RHO_V2_VA
-                rho * v * v_a,             # OP_RHO_V_VA
-                v_s * one,                 # OP_VS
-                v_h * one,                 # OP_VH
-                v_a * one,                 # OP_VA
-                v * one,                   # OP_V
-                v_s * v_s * one,           # OP_VS2
-                v_h * v_h * one,           # OP_VH2
-                v_s * v_h * one,           # OP_VS_VH
-                v_a * v_s * one,           # OP_VA_VS
-                v_a * v_h * one,           # OP_VA_VH
-                v_a * v_a * one,           # OP_VA2
-            ],
-            dim=0,
-        )  # (n_ops, ..., n_terms)
-
-        idx = ops.view(*([1] * (cand.dim() - 1)), -1).expand_as(cand[0]).unsqueeze(0)
-        return torch.gather(cand, 0, idx).squeeze(0)
-
-    def forward(self, y_phys: torch.Tensor) -> torch.Tensor:
-        """f_physics in PHYSICAL units. Stateless. Returns (..., 5)."""
-        if self.n_terms == 0:
-            return torch.zeros_like(y_phys)
-        vals = self.term_values(y_phys) * self.coef      # (..., n_terms)
-        return vals @ self.row_scatter                   # (..., 5)
-
-    def prior_penalty(self) -> torch.Tensor:
-        """Tight-prior regulariser for the optional fine-tuning mode.
-
-        Keeps fine-tuned coefficients near their SINDy values; without this,
-        fine-tuning can drift the physics term into fitting maneuvers, which
-        destroys the extrapolation guarantee it exists to provide.
-        """
-        if not self.trainable or self.n_terms == 0:
-            return torch.zeros((), device=self.coef.device)
-        scale = self.coef_prior.abs().clamp_min(1e-12)
-        return (((self.coef - self.coef_prior) / scale) ** 2).mean()
-
-    @classmethod
-    def from_json(cls, path, trainable: bool = False, verbose: bool = True):
-        """Build from discover_physics.py's exported coefficients."""
-        spec = json.loads(Path(path).read_text())
-        terms: list[tuple[str, int, float]] = []
-        for row_name, r in spec["rows"].items():
-            row = ROW_NAME_TO_INDEX[row_name]
-            for name, c in zip(r["terms"], r["coefficients"]):
-                terms.append((name, row, float(c)))
-        obj = cls(terms, trainable=trainable)
-        if verbose:
-            print(f"[PhysicsField] gate={spec.get('gate')} loaded {len(terms)} terms")
-            for row_name, r in spec["rows"].items():
-                n = len(r["terms"])
-                tag = "" if n else "   <-- UNEXPLAINED, contributes zero"
-                print(f"    {row_name:14s}: {n} terms{tag}")
-        return obj
+    hs, speeds = np.array(hs), np.array(speeds)
+    v0 = launch_speed if launch_speed is not None else speeds[0]
+    gained = bool((speeds > v0 * 1.01).any())
+    return {
+        "altitude": hs,
+        "speed": speeds,
+        "max_speed": float(speeds.max()),
+        "launch_speed": float(v0),
+        "gained_energy": gained,
+        "verdict": "FAIL: gained energy" if gained else "PASS: monotone-safe speed",
+    }
 
 
-class ScaledPhysicsField(nn.Module):
-    """Wraps PhysicsField with the StandardScaler unscale/rescale contract.
+# ---------------------------------------------------------------------------
+# 4. ONNX equivalence
+# ---------------------------------------------------------------------------
+def onnx_equivalence(model, onnx_path, state_size, latent_dim, atol=1e-5):
+    """The fused field must export AND agree with PyTorch on fixed input.
 
-    CONVENTION (verified numerically in sindy/scaling.py):
-        y_phys   = y_scaled * scale + mean        [state inverse: HAS mean]
-        f_phys   = physics(y_phys)
-        f_scaled = f_phys / scale                 [derivative: NO mean]
-
-    The missing mean on the derivative is the trap. A wrong version still runs
-    and still trains; it just injects a large constant drift into every row.
+    A silent mismatch here is the exact class of bug that has bitten this
+    project before: the simulator ran happily against a model that was not the
+    trained one.
     """
+    import onnxruntime as ort
 
-    def __init__(self, physics: PhysicsField, state_mean, state_scale):
-        super().__init__()
-        self.physics = physics
-        mean = torch.as_tensor(state_mean, dtype=torch.float32).flatten()
-        scale = torch.as_tensor(state_scale, dtype=torch.float32).flatten()
-        if mean.numel() != 5 or scale.numel() != 5:
-            raise ValueError(
-                f"expected 5-element scaler stats for the 5-state frame, "
-                f"got mean {mean.numel()}, scale {scale.numel()}"
-            )
-        if torch.any(scale <= 0):
-            raise ValueError("scaler scale_ contains non-positive entries")
-        self.register_buffer("state_mean", mean)
-        self.register_buffer("state_scale", scale)
+    x = torch.randn(1, state_size + latent_dim)
+    with torch.no_grad():
+        ref = model(torch.zeros(()), x).cpu().numpy()
 
-    def forward(self, y_scaled: torch.Tensor) -> torch.Tensor:
-        """Returns f_physics expressed in SCALED derivative units."""
-        y_phys = y_scaled * self.state_scale + self.state_mean
-        f_phys = self.physics(y_phys)
-        return f_phys / self.state_scale
+    sess = ort.InferenceSession(onnx_path)
+    name = sess.get_inputs()[0].name
+    got = sess.run(None, {name: x.cpu().numpy().astype(np.float32)})[0]
+
+    err = float(np.abs(ref - got).max())
+    ok = err <= atol
+    print(f"[onnx] max |torch - onnx| = {err:.3e}  {'PASS' if ok else 'FAIL'}")
+    if not ok:
+        print("  Do NOT deploy. The simulator would be running a different "
+              "model than the one you validated.")
+    return ok, err
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--coeffs", required=True)
+    ap.add_argument("--scaler", required=True, help="pickled StandardScaler")
+    args = ap.parse_args()
+
+    import pickle
+    scaler = pickle.load(open(args.scaler, "rb"))
+    pf = PhysicsField.from_json(args.coeffs)
+    spf = ScaledPhysicsField(pf, scaler.mean_[:5], scaler.scale_[:5])
+    check_scaling_contract(spf)
+    print("\nStandalone physics integration and OOD tests require a trained "
+          "checkpoint; import these functions from your eval script.")

@@ -1,213 +1,37 @@
-# validate_fused.py
-"""Validation suite for the fused model  xdot = f_physics(x) + f_residual(x,h).
+version: '3.8'
 
-RUN THIS ON YOUR MACHINE. It was written without a torch install available, so
-it is unexecuted -- treat the first run as a debugging session, not a report.
-
-Covers the four checks the brief requires beyond training loss:
-  1. physics-only standalone behaviour
-  2. residual vs physics magnitude along trajectories  (the key diagnostic)
-  3. out-of-distribution integration                    (the acceptance test)
-  4. ONNX / PyTorch equivalence on fixed input
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-
-import numpy as np
-import torch
-
-from physics_field import PhysicsField, ScaledPhysicsField
+services:
+  anomaly-detector:
+    build: .
+    image: automation-toolset:latest
+    container_name: automation-test-run
+    isolation: process
+    ports:
+      - "8501:8501"
+    environment:
+      - STREAMLIT_SERVER_HEADLESS=true
+    volumes:
+      - G:/docker-storage/logs:C:/app/logs:ro
+      - G:/docker-storage/reports:C:/app/reports
+    entrypoint: ["streamlit", "run", "src/nbf_anomaly_detection.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    restart: always
 
 
-# ---------------------------------------------------------------------------
-# 0. sanity: the scaling contract, checked numerically on the identity rows
-# ---------------------------------------------------------------------------
-def check_scaling_contract(scaled_physics: ScaledPhysicsField, verbose=True):
-    """The unscale/rescale convention must satisfy, for the identity rows,
-        ds_scaled/dt = (v_s_scaled*scale_vs + mean_vs) / scale_s
-    PhysicsField writes ZERO to rows 0,1 so this specifically confirms the
-    physics term is not corrupting the identity rows.
-    """
-    mean = scaled_physics.state_mean
-    scale = scaled_physics.state_scale
-    y = torch.randn(32, 5)
-    out = scaled_physics(y)
-    ok = torch.allclose(out[:, :2], torch.zeros_like(out[:, :2]), atol=0)
-    if verbose:
-        print(f"[scaling] physics contribution to identity rows s,h: "
-              f"max |.| = {out[:, :2].abs().max().item():.3e}  "
-              f"{'PASS' if ok else 'FAIL -- would double-count with index_copy'}")
-    return ok
+======
+dockerfile
 
-
-# ---------------------------------------------------------------------------
-# 1. physics-only standalone
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def integrate_physics_only(scaled_physics, y0_scaled, steps, dt):
-    """RK4 on f_physics alone, in SCALED space, with the exact identity rows
-    enforced exactly as GRUODEPredictorModel does."""
-    mean = scaled_physics.state_mean
-    scale = scaled_physics.state_scale
-
-    def field(y):
-        f = scaled_physics(y).clone()
-        # exact identities: ds/dt = v_s, dh/dt = v_h, transformed to scaled space
-        v_s_phys = y[..., 2] * scale[2] + mean[2]
-        v_h_phys = y[..., 4] * scale[4] + mean[4]
-        f[..., 0] = v_s_phys / scale[0]
-        f[..., 1] = v_h_phys / scale[1]
-        return f
-
-    y = y0_scaled.clone()
-    traj = [y.clone()]
-    for _ in range(steps):
-        k1 = field(y); k2 = field(y + 0.5 * dt * k1)
-        k3 = field(y + 0.5 * dt * k2); k4 = field(y + dt * k3)
-        y = y + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        traj.append(y.clone())
-    return torch.stack(traj, dim=0)
-
-
-# ---------------------------------------------------------------------------
-# 2. residual vs physics magnitude -- THE KEY DIAGNOSTIC
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def residual_vs_physics(model, scaled_states, latents):
-    """Compare ||f_physics|| against ||f_residual|| along real trajectories.
-
-    Success looks like: physics DOMINANT in cruise, residual SPIKING only during
-    maneuvers. If the residual dominates everywhere, SINDy captured little and
-    the extrapolation safety was NOT bought -- report that plainly rather than
-    hiding behind an aggregate metric.
-
-    Args:
-        model: the fused GRUODEPredictorModel (must have .physics set)
-        scaled_states: (T, 5) scaled physical states along a trajectory
-        latents:       (T, latent_dim) matching latent states
-    """
-    if getattr(model, "physics", None) is None:
-        raise ValueError("model has no physics term; run with --physics-coeffs")
-
-    f_phys = model.physics(scaled_states)                       # (T,5)
-    h = torch.tanh(latents)
-    f_res = model.func.decode(h)                                # (T,5) residual
-
-    # compare on the ACCELERATION rows only; rows 0,1 are identities
-    acc = [2, 3, 4]
-    np_ = f_phys[:, acc].norm(dim=-1)
-    nr_ = f_res[:, acc].norm(dim=-1)
-    ratio = nr_ / (np_ + 1e-12)
-
-    return {
-        "phys_norm": np_.cpu().numpy(),
-        "resid_norm": nr_.cpu().numpy(),
-        "ratio": ratio.cpu().numpy(),
-        "median_ratio": float(ratio.median()),
-        "frac_physics_dominant": float((ratio < 1.0).float().mean()),
-    }
-
-
-def report_residual(stats):
-    r = stats["median_ratio"]
-    frac = stats["frac_physics_dominant"]
-    print(f"[residual] median ||f_res||/||f_phys|| = {r:.3f}")
-    print(f"[residual] physics dominant on {frac*100:.1f}% of samples")
-    if r < 0.5:
-        print("  -> physics carries the bulk of the dynamics. Extrapolation "
-              "safety is real.")
-    elif r < 1.5:
-        print("  -> comparable magnitudes. Partial benefit; inspect where the "
-              "residual spikes (expect maneuvers).")
-    else:
-        print("  -> RESIDUAL DOMINATES. SINDy captured little. State this "
-              "plainly: the fused model has NOT bought extrapolation safety, "
-              "and the physics term is close to decorative.")
-
-
-# ---------------------------------------------------------------------------
-# 3. out-of-distribution acceptance test
-# ---------------------------------------------------------------------------
-@torch.no_grad()
-def ood_test(model, y0_scaled, steps, dt, scaler_mean, scaler_scale,
-             launch_speed=None):
-    """Integrate FAR past the training regime and check the model stays physical.
-
-    Pure-neural models gain energy, exceed launch speed, and fly underground.
-    The fused model should decelerate. This is the acceptance test.
-    """
-    latent = model.func.encode(y0_scaled)
-    state = torch.cat([y0_scaled, latent], dim=-1)
-
-    mean = torch.as_tensor(scaler_mean, dtype=torch.float32)
-    scale = torch.as_tensor(scaler_scale, dtype=torch.float32)
-
-    hs, speeds = [], []
-    for i in range(steps):
-        d = model(torch.zeros(()), state)
-        state = state + dt * d  # Euler is fine for a divergence check
-        y = state[..., :5]
-        y_phys = y * scale + mean
-        h_m = y_phys[..., 1]
-        v = torch.sqrt(y_phys[..., 2] ** 2 + y_phys[..., 4] ** 2)
-        hs.append(float(h_m.mean()))
-        speeds.append(float(v.mean()))
-
-    hs, speeds = np.array(hs), np.array(speeds)
-    v0 = launch_speed if launch_speed is not None else speeds[0]
-    gained = bool((speeds > v0 * 1.01).any())
-    return {
-        "altitude": hs,
-        "speed": speeds,
-        "max_speed": float(speeds.max()),
-        "launch_speed": float(v0),
-        "gained_energy": gained,
-        "verdict": "FAIL: gained energy" if gained else "PASS: monotone-safe speed",
-    }
-
-
-# ---------------------------------------------------------------------------
-# 4. ONNX equivalence
-# ---------------------------------------------------------------------------
-def onnx_equivalence(model, onnx_path, state_size, latent_dim, atol=1e-5):
-    """The fused field must export AND agree with PyTorch on fixed input.
-
-    A silent mismatch here is the exact class of bug that has bitten this
-    project before: the simulator ran happily against a model that was not the
-    trained one.
-    """
-    import onnxruntime as ort
-
-    x = torch.randn(1, state_size + latent_dim)
-    with torch.no_grad():
-        ref = model(torch.zeros(()), x).cpu().numpy()
-
-    sess = ort.InferenceSession(onnx_path)
-    name = sess.get_inputs()[0].name
-    got = sess.run(None, {name: x.cpu().numpy().astype(np.float32)})[0]
-
-    err = float(np.abs(ref - got).max())
-    ok = err <= atol
-    print(f"[onnx] max |torch - onnx| = {err:.3e}  {'PASS' if ok else 'FAIL'}")
-    if not ok:
-        print("  Do NOT deploy. The simulator would be running a different "
-              "model than the one you validated.")
-    return ok, err
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--coeffs", required=True)
-    ap.add_argument("--scaler", required=True, help="pickled StandardScaler")
-    args = ap.parse_args()
-
-    import pickle
-    scaler = pickle.load(open(args.scaler, "rb"))
-    pf = PhysicsField.from_json(args.coeffs)
-    spf = ScaledPhysicsField(pf, scaler.mean_[:5], scaler.scale_[:5])
-    check_scaling_contract(spf)
-    print("\nStandalone physics integration and OOD tests require a trained "
-          "checkpoint; import these functions from your eval script.")
+#FROM python:3.11-windowsservercore
+#FROM mcr.microsoft.com/windows/servercore:ltsc2022
+FROM python:3.11-windowsservercore-ltsc2022
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+COPY requirements.txt .
+COPY packages/ ./packages/
+RUN pip install --no-index --find-links=./packages -r requirements.txt
+COPY src/ ./src/
+COPY data/ ./data/
+RUN powershell -Command New-Item -ItemType Directory -Path C:\logs
+RUN powershell -Command New-Item -ItemType Directory -Force -Path C:\app\logs
+RUN powershell -Command New-Item -ItemType Directory -Force -Path C:\app\reports
+ENTRYPOINT ["python", "src/nbf_anomaly_detection.py"]

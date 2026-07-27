@@ -1,65 +1,259 @@
-# NBF Anomaly Detection - Windows Server 2022 / process isolation
-#
-# The `version:` key is obsolete in Compose v2 and is intentionally absent;
-# leaving it in produces a warning on every invocation.
-#
-# CRITICAL: `source:` must be a path the Docker daemon (LocalSystem, Session 0)
-# can resolve. See the handover notes. Pick ONE of the three source styles
-# below and comment out the others.
+# discover_physics.py
+"""Ensemble weak-form SINDy discovery of f_physics for the glide phase.
 
-services:
-  anomaly-detector:
-    build: .
-    image: automation-toolset:latest
-    container_name: automation-test-run
-    isolation: process
-    ports:
-      - "8501:8501"
+Per-row fitting with per-row normalisation and per-row thresholds, because
+dv_s/dt and dv_h/dt are m/s^2 while dv_alpha/dt is rad/s^2 -- a single global
+threshold silently zeroes the entire v_alpha row.
 
-    environment:
-      STREAMLIT_SERVER_HEADLESS: "true"
-      NBF_LOG_DIR: 'C:\app\logs'
-      NBF_REPORT_DIR: 'C:\app\reports'
-      NBF_DATA_DIR: 'C:\app\data'
-      # Path an ANALYST on the host uses to reach the trace tree. This is what
-      # the [Raw Log] links in the PDF will point at, so it must be the host
-      # view (G:\... or \\server\share\...), never the container view.
-      NBF_HOST_LOG_ROOT: 'G:\docker-storage\logs'
+Usage (on real data):
+    python discover_physics.py --data glide_trajectories.npy --dt 1.0
 
-    volumes:
-      # ---- ACTIVE: G: drive, long-form syntax.
-      # Confirmed 2026-07-27: G: is a local fixed disk (Win32_LogicalDisk
-      # DriveType 3, no ProviderName) and the daemon mounts it successfully
-      # via `docker run -v G:\docker-storage\logs:C:\probe`. The drive was
-      # never the problem - the short-form volume string was. Long-form
-      # syntax removes the colon-splitting ambiguity entirely.
-      - type: bind
-        source: 'G:\docker-storage\logs'
-        target: 'C:\app\logs'
-        read_only: true
-      - type: bind
-        source: 'G:\docker-storage\reports'
-        target: 'C:\app\reports'
+Expected data format: either an (n_traj,) object array of (T_i, 5) arrays, or a
+(n_traj, T, 5) array, in PHYSICAL units [s, h, v_s, v_alpha, v_h], glide phase
+only.
+"""
 
-      # Uncomment ONLY after creating G:\docker-storage\dart on the host,
-      # otherwise this mount reproduces "bind source path does not exist".
-      # - type: bind
-      #   source: 'G:\docker-storage\dart'
-      #   target: 'C:\app\data'
-      #   read_only: true
+from __future__ import annotations
 
-      # ---- ALTERNATIVE 1: directory mount point on the system drive.
-      # Requires `mountvol C:\docker-storage\ \\?\Volume{GUID}\` first.
-      # Only worth doing if the G: letter ever stops being assigned at boot.
-      # - type: bind
-      #   source: 'C:\docker-storage\logs'
-      #   target: 'C:\app\logs'
-      #   read_only: true
+import argparse
+import json
+from pathlib import Path
 
-      # ---- ALTERNATIVE 2: UNC source, no drive letter involved.
-      # - type: bind
-      #   source: '\\NBF-FS01\sit-traces\logs'
-      #   target: 'C:\app\logs'
-      #   read_only: true
+import numpy as np
 
-    restart: unless-stopped
+from physics_library import (
+    ACCEL_ROWS,
+    ACCEL_ROW_NAMES,
+    S_IDX,
+    H_IDX,
+    VS_IDX,
+    VH_IDX,
+    build_library,
+    library_condition_report,
+)
+from weak_ensemble import ensemble_sindy_row, refit_on_selected, weak_form_system
+
+# per-row sparsity thresholds on NORMALISED coefficients.
+DEFAULT_THRESHOLDS = {
+    VS_IDX: 0.05,
+    3: 0.05,       # v_alpha row (VA_IDX)
+    VH_IDX: 0.05,
+}
+INCLUSION_GATE = 0.90
+
+
+def fit_identity_rows(trajs, dt, window=40, stride=10):
+    """Free correctness check: fit ds/dt and dh/dt with the SAME weak-form
+    pipeline against a tiny library [v_s, v_h]. Must return ~1.0 on the right
+    velocity. Any other answer is a pipeline bug (sign, offset, window, dt),
+    NOT a discovery.
+    """
+    A_all_s, b_all_s, A_all_h, b_all_h = [], [], [], []
+    for X in trajs:
+        small = np.column_stack([X[:, VS_IDX], X[:, VH_IDX]])
+        A_s, b_s = weak_form_system(X, small, dt, row=S_IDX, window=window, stride=stride)
+        A_h, b_h = weak_form_system(X, small, dt, row=H_IDX, window=window, stride=stride)
+        A_all_s.append(A_s); b_all_s.append(b_s)
+        A_all_h.append(A_h); b_all_h.append(b_h)
+
+    A_s = np.vstack(A_all_s); b_s = np.concatenate(b_all_s)
+    A_h = np.vstack(A_all_h); b_h = np.concatenate(b_all_h)
+
+    xi_s = np.linalg.lstsq(A_s, b_s, rcond=None)[0]
+    xi_h = np.linalg.lstsq(A_h, b_h, rcond=None)[0]
+    return {
+        "ds/dt": {"v_s": float(xi_s[0]), "v_h": float(xi_s[1])},
+        "dh/dt": {"v_s": float(xi_h[0]), "v_h": float(xi_h[1])},
+    }
+
+
+def check_identity_rows(res, tol=0.02):
+    """Fail loudly if the identity rows did not come back as identities."""
+    problems = []
+    if abs(res["ds/dt"]["v_s"] - 1.0) > tol or abs(res["ds/dt"]["v_h"]) > tol:
+        problems.append(f"ds/dt should be 1.0*v_s + 0.0*v_h, got {res['ds/dt']}")
+    if abs(res["dh/dt"]["v_h"] - 1.0) > tol or abs(res["dh/dt"]["v_s"]) > tol:
+        problems.append(f"dh/dt should be 1.0*v_h + 0.0*v_s, got {res['dh/dt']}")
+    return problems
+
+
+def discover(trajs, dt, window=40, stride=10, n_models=300, thresholds=None,
+             gate=INCLUSION_GATE, seed=0, verbose=True):
+    """Run the full per-row discovery. Returns a result dict."""
+    thresholds = thresholds or DEFAULT_THRESHOLDS
+    rng = np.random.default_rng(seed)
+
+    # --- identity-row correctness check FIRST -------------------------------
+    ident = fit_identity_rows(trajs, dt, window, stride)
+    problems = check_identity_rows(ident)
+    if verbose:
+        print("=" * 72)
+        print("IDENTITY-ROW CHECK (must recover ds/dt=v_s, dh/dt=v_h)")
+        print("=" * 72)
+        for k, v in ident.items():
+            print(f"  {k:8s}: " + ", ".join(f"{kk}={vv:+.6f}" for kk, vv in v.items()))
+        if problems:
+            print("  !! FAILED -- this is a PIPELINE BUG, not a discovery:")
+            for p in problems:
+                print("     -", p)
+        else:
+            print("  PASS -- weak-form pipeline recovers exact identities.")
+        print()
+
+    # --- build library over all glide data ----------------------------------
+    Theta_list, names = [], None
+    for X in trajs:
+        Th, names = build_library(X)
+        Theta_list.append(Th)
+
+    cond = library_condition_report(np.vstack(Theta_list), names)
+    if verbose:
+        print("=" * 72)
+        print("LIBRARY CONDITIONING")
+        print("=" * 72)
+        print(f"  features        : {cond['n_features']}")
+        print(f"  condition number: {cond['cond']:.3e}")
+        print(f"  max |corr|      : {cond['max_abs_corr']:.4f} "
+              f"between {cond['max_corr_pair'][0]} and {cond['max_corr_pair'][1]}")
+        print("  (high collinearity is expected across neighbouring scale heights;")
+        print("   this is exactly why inclusion probability, not a point estimate,")
+        print("   is the gate.)")
+        print()
+
+    results = {}
+    for row, row_name in zip(ACCEL_ROWS, ACCEL_ROW_NAMES):
+        A_list, b_list = [], []
+        for X, Th in zip(trajs, Theta_list):
+            A, b = weak_form_system(X, Th, dt, row=row, window=window, stride=stride)
+            A_list.append(A)
+            b_list.append(b)
+
+        # bootstrap over TRAJECTORIES (not windows) to respect correlation
+        traj_index = np.concatenate([np.full(len(b), i) for i, b in enumerate(b_list)])
+        A = np.vstack(A_list)
+        b = np.concatenate(b_list)
+
+        ens = ensemble_sindy_row(
+            A, b,
+            threshold=thresholds[row],
+            n_models=n_models,
+            rng=np.random.default_rng(rng.integers(1 << 30)),
+        )
+
+        keep = ens["inclusion_prob"] >= gate
+        # An unexplained row contributes NOTHING to f_physics. Without this,
+        # a near-noise row saturates inclusion at 1.00 and floods f_physics
+        # with spurious high-coefficient terms -- corrupting exactly the
+        # regime f_physics exists to make safe.
+        if not ens["explained"]:
+            keep = np.zeros_like(keep, dtype=bool)
+        xi_final = refit_on_selected(A, b, keep)
+
+        results[row_name] = {
+            "row": row,
+            "names": names,
+            "inclusion_prob": ens["inclusion_prob"],
+            "coef_median": ens["coef_median"],
+            "coef_q05": ens["coef_q05"],
+            "coef_q95": ens["coef_q95"],
+            "keep": keep,
+            "coef_final": xi_final,
+            "n_windows": len(b),
+            "n_traj": len(trajs),
+            "median_oob_r2": ens["median_oob_r2"],
+            "explained": ens["explained"],
+            "min_r2": ens["min_r2"],
+        }
+
+    return {"rows": results, "identity": ident, "identity_problems": problems,
+            "condition": cond, "names": names, "gate": gate}
+
+
+def report(res, top_k=12):
+    """Readable inclusion table + discovered equations."""
+    print("=" * 72)
+    print(f"ENSEMBLE-SINDy INCLUSION TABLE  (gate = {res['gate']:.0%})")
+    print("=" * 72)
+    for row_name, r in res["rows"].items():
+        status = "EXPLAINED" if r["explained"] else "UNEXPLAINED -> contributes nothing"
+        print(f"\n--- {row_name} ---  ({r['n_windows']} weak-form windows, "
+              f"{r['n_traj']} trajectories)")
+        print(f"  out-of-bag R^2 (median): {r['median_oob_r2']:.4f}   "
+              f"floor {r['min_r2']:.2f}   [{status}]")
+        if not r["explained"]:
+            print("  Inclusion probabilities below are SATURATED and meaningless:")
+            print("  the target is near-noise, so normalisation inflates every")
+            print("  coefficient above threshold. Reported for transparency only.")
+        order = np.argsort(-r["inclusion_prob"])
+        print(f"  {'term':<28s} {'incl':>6s}  {'median':>12s}  "
+              f"{'[q05':>12s} {'q95]':>12s}  gate")
+        for j in order[:top_k]:
+            p = r["inclusion_prob"][j]
+            mark = "KEEP" if r["keep"][j] else "  --"
+            print(f"  {r['names'][j]:<28s} {p:6.2f}  {r['coef_median'][j]:12.4e}  "
+                  f"{r['coef_q05'][j]:12.4e} {r['coef_q95'][j]:12.4e}  {mark}")
+
+    print("\n" + "=" * 72)
+    print("DISCOVERED f_physics  (terms passing the inclusion gate)")
+    print("=" * 72)
+    any_terms = False
+    for row_name, r in res["rows"].items():
+        kept = np.where(r["keep"])[0]
+        if len(kept) == 0:
+            print(f"  {row_name} = 0        <-- NO TERM PASSED THE GATE")
+            continue
+        any_terms = True
+        parts = [f"{r['coef_final'][j]:+.4e}*{r['names'][j]}" for j in kept]
+        print(f"  {row_name} = " + "  ".join(parts))
+    if not any_terms:
+        print("\n  NEGATIVE RESULT: no sparse physics survived gating.")
+        print("  Do NOT force this into the architecture. See assessment notes.")
+    print()
+
+
+def export_coefficients(res, path):
+    """Dump gated coefficients for the fused field to load."""
+    out = {"gate": res["gate"], "rows": {}}
+    for row_name, r in res["rows"].items():
+        kept = np.where(r["keep"])[0]
+        out["rows"][row_name] = {
+            "row_index": int(r["row"]),
+            "terms": [r["names"][j] for j in kept],
+            "coefficients": [float(r["coef_final"][j]) for j in kept],
+            "inclusion_prob": [float(r["inclusion_prob"][j]) for j in kept],
+            "coef_q05": [float(r["coef_q05"][j]) for j in kept],
+            "coef_q95": [float(r["coef_q95"][j]) for j in kept],
+        }
+    Path(path).write_text(json.dumps(out, indent=2))
+    return out
+
+
+def _load(path):
+    arr = np.load(path, allow_pickle=True)
+    if arr.dtype == object:
+        return [np.asarray(a, float) for a in arr]
+    if arr.ndim == 3:
+        return [arr[i] for i in range(arr.shape[0])]
+    raise ValueError(f"unexpected data shape {arr.shape}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True, help="glide-phase trajectories, physical units")
+    ap.add_argument("--dt", type=float, required=True)
+    ap.add_argument("--window", type=int, default=40)
+    ap.add_argument("--stride", type=int, default=10)
+    ap.add_argument("--n-models", type=int, default=300)
+    ap.add_argument("--gate", type=float, default=INCLUSION_GATE)
+    ap.add_argument("--out", default="f_physics_coefficients.json")
+    args = ap.parse_args()
+
+    trajs = _load(args.data)
+    res = discover(trajs, args.dt, args.window, args.stride, args.n_models, gate=args.gate)
+    report(res)
+    export_coefficients(res, args.out)
+    print(f"wrote {args.out}")
+
+
+if __name__ == "__main__":
+    main()

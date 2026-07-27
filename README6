@@ -1,38 +1,6 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python inspect_dump.py --data glide.npy --frame lned --dt 1.0                                      
-trajectories : 117
-columns      : 6  (frame 'lned' expects 6)
-length       : 24 .. 705 samples (24 .. 705 s at dt=1.0)
+python NEXT_training.py --frame geodesic --geodesic-mode integrated --sbi-phase glide \
+  --dump-glide-npy glide_geo.npy --tgt-data-paths trajectory_library/phases/HighE_HGV \
+  --sr 100000 --use-scalar --aug 0 --nhidden 256 --dt 1.0 \
+  -o model_outputs/SBI/mo_bff_gruode_sindy --model-type gruode
 
-per-column ranges (physical units):
-  Forward             -0.00 ..     3841431.50   mean   1066653.42
-  Right          -385540.16 ..      399499.75   mean     32721.26
-  Altitude         20446.92 ..      110081.19   mean     58311.21
-  VForward           840.77 ..        6088.53   mean      5425.88
-  VRight           -3710.03 ..        3679.79   mean        11.68
-  VUp              -3432.38 ..         492.86   mean     -1081.88
-
-checks:
-  [ok]   Altitude is in metres (20447..110081)
-  |v| pooled median 5900.4 m/s   range 3791.7..6170.0
-  |v| at t=0       median 6077.6 m/s   range 5058.3..6109.4
-  [ok]   entry speed consistent with hypersonic glide
-  vertical: 3.8% of samples ascending
-
-identity check  (dPos/dt should equal the paired velocity):
-  [FAIL] dForward/dt vs VForward: RMS residual     174.6 m/s  (3.2% of RMS VForward)
-  [  ok] dRight/dt vs VRight: RMS residual      15.7 m/s  (1.3% of RMS VRight)
-  [FAIL] dAltitude/dt vs VUp: RMS residual    1031.6 m/s  (83.4% of RMS VUp)
-
-  *** The position rows are NOT exact identities in this data.
-      Two things depend on that assumption and are affected:
-        1. discover_physics.py's identity check will fail. That is a
-           real frame property here, not a pipeline bug.
-        2. GRUODEPredictorModel hard-codes dPos/dt = Vel via
-           index_copy when second_order is on. In this frame that
-           forces a systematically wrong position derivative.
-      Likely cause in lned: velocity is resolved in the NED basis at
-      the ORIGIN, while altitude is true HAE following the ellipsoid.
-      Over long range these conventions diverge with Earth curvature.
-
-first row of trajectory 0:
-  Forward=0.00  Right=0.00  Altitude=33846.34  VForward=5309.61  VRight=579.25  VUp=-21.53
+python inspect_dump.py --data glide_geo.npy --frame geodesic --dt 1.0

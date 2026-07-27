@@ -1,38 +1,127 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python inspect_dump.py --data glide.npy --frame lned --dt 1.0 
-trajectories : 117
-columns      : 6  (frame 'lned' expects 6)
-length       : 24 .. 705 samples (24 .. 705 s at dt=1.0)
+# inspect_dump.py
+"""Inspect a dumped .npy trajectory file before feeding it to SINDy discovery.
 
-per-column ranges (physical units):
-  Forward             -0.00 ..     3841431.50   mean   1066653.42
-  Right          -385540.16 ..      399499.75   mean     32721.26
-  Altitude         20446.92 ..      110081.19   mean     58311.21
-  VForward           840.77 ..        6088.53   mean      5425.88
-  VRight           -3710.03 ..        3679.79   mean        11.68
-  VUp              -3432.38 ..         492.86   mean     -1081.88
+Answers the three questions that matter:
+  1. Is it in the frame you think it is (column count + plausible ranges)?
+  2. Is it PHYSICAL units, not scaled?
+  3. Is it actually the GLIDE phase?
 
-checks:
-  [ok]   Altitude is in metres (20447..110081)
-  |v| pooled median 5900.4 m/s   range 3791.7..6170.0
-  |v| at t=0       median 6077.6 m/s   range 5058.3..6109.4
-  [ok]   entry speed consistent with hypersonic glide
-  vertical: 3.8% of samples ascending
+Usage:  python inspect_dump.py --data glide.npy --frame lned --dt 1.0
+"""
+from __future__ import annotations
 
-first row of trajectory 0:
-  Forward=0.00  Right=0.00  Altitude=33846.34  VForward=5309.61  VRight=579.25  VUp=-21.53
-(.venv) e471302@usmk2tqq3hkk2 next % python discover_physics.py --data glide.npy --frame lned --dt 1.0 --out f_physics_coefficients.json
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/discover_physics.py", line 264, in <module>
+import argparse
+import numpy as np
+
+FRAMES = {
+    "lned": (["Forward", "Right", "Altitude", "VForward", "VRight", "VUp"], 2, [3, 4, 5]),
+    "geodesic": (["s", "h", "v_s", "v_alpha", "v_h"], 1, [2, 4]),
+}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--frame", default="lned", choices=sorted(FRAMES))
+    ap.add_argument("--dt", type=float, default=1.0)
+    a = ap.parse_args()
+
+    arr = np.load(a.data, allow_pickle=True)
+    trajs = [np.asarray(t, dtype=float) for t in arr] if arr.dtype == object else [arr[i] for i in range(len(arr))]
+    names, alt_i, vel_i = FRAMES[a.frame]
+
+    ncol = trajs[0].shape[1]
+    print(f"trajectories : {len(trajs)}")
+    print(f"columns      : {ncol}  (frame {a.frame!r} expects {len(names)})")
+    if ncol != len(names):
+        print("  *** COLUMN COUNT MISMATCH. Wrong --frame, or the time column")
+        print("      was not stripped. Discovery would misalign every term.")
+        return
+
+    lens = [len(t) for t in trajs]
+    dur = np.array(lens) * a.dt
+    print(f"length       : {min(lens)} .. {max(lens)} samples "
+          f"({dur.min():.0f} .. {dur.max():.0f} s at dt={a.dt})")
+
+    allrows = np.vstack(trajs)
+    print("\nper-column ranges (physical units):")
+    for j, nm in enumerate(names):
+        col = allrows[:, j]
+        print(f"  {nm:<10s} {col.min():14.2f} .. {col.max():14.2f}   mean {col.mean():12.2f}")
+
+    print("\nchecks:")
+    alt = allrows[:, alt_i]
+    if np.abs(alt).max() < 100:
+        print(f"  [FAIL] {names[alt_i]} max |.| = {np.abs(alt).max():.3f} -- this is SCALED "
+              f"data, not physical. exp(-h/H) is meaningless here.")
+    else:
+        print(f"  [ok]   {names[alt_i]} is in metres ({alt.min():.0f}..{alt.max():.0f})")
+
+    spd = np.sqrt((allrows[:, vel_i] ** 2).sum(axis=1))
+    # Discriminate on INITIAL speed per trajectory, not the pooled median: a
+    # glide run that is integrated down to impact decays into the terminal
+    # regime and drags the pooled median well below its cruise value. Entry
+    # speed does not have that problem.
+    v0 = np.array([np.sqrt((t[0, vel_i] ** 2).sum()) for t in trajs])
+    print(f"  |v| pooled median {np.median(spd):.1f} m/s   range {spd.min():.1f}..{spd.max():.1f}")
+    print(f"  |v| at t=0       median {np.median(v0):.1f} m/s   "
+          f"range {v0.min():.1f}..{v0.max():.1f}")
+    if np.median(v0) < 800:
+        print("  [FAIL] entry speed far below hypersonic glide (~1700-2600 m/s).")
+        print("         This is BOOST data. Re-dump with --sbi-phase glide.")
+    elif np.median(v0) > 1200:
+        print("  [ok]   entry speed consistent with hypersonic glide")
+    else:
+        print("  [??]   entry speed between regimes; check the phase split")
+
+    # ascent fraction: glide should be predominantly descending
+    if a.frame == "lned":
+        vup = allrows[:, 5]
+        frac_up = float((vup > 0).mean())
+        print(f"  vertical: {frac_up*100:.1f}% of samples ascending")
+        if frac_up > 0.5:
+            print("         [FAIL] mostly ASCENDING -- that is boost, not glide.")
+
+    # --- identity check: does dPos/dt actually equal Vel in this data? -------
+    # The physics library and GRUODEPredictorModel BOTH assume the position rows
+    # are exact identities. In lned that assumption depends on the velocity
+    # basis matching the position convention; at long range it can fail badly.
+    pos_i = {"lned": [0, 1, 2], "geodesic": [0, 1]}[a.frame]
+    pair_v = {"lned": [3, 4, 5], "geodesic": [2, 4]}[a.frame]
+    print("\nidentity check  (dPos/dt should equal the paired velocity):")
+    worst = 0.0
+    for p_i, v_i in zip(pos_i, pair_v):
+        num, den = [], []
+        for t in trajs:
+            if len(t) < 7:
+                continue
+            tt = np.arange(len(t)) * a.dt
+            resid = np.gradient(t[:, p_i], tt)[3:-3] - t[3:-3, v_i]
+            num.append(resid ** 2)
+            den.append(t[3:-3, v_i] ** 2)
+        if not num:
+            continue
+        rms = float(np.sqrt(np.concatenate(num).mean()))
+        scale = float(np.sqrt(np.concatenate(den).mean())) + 1e-12
+        worst = max(worst, rms / scale)
+        flag = "ok" if rms / scale < 0.02 else "FAIL"
+        print(f"  [{flag:>4s}] d{names[p_i]}/dt vs {names[v_i]}: "
+              f"RMS residual {rms:9.1f} m/s  ({100*rms/scale:.1f}% of RMS {names[v_i]})")
+    if worst >= 0.02:
+        print("\n  *** The position rows are NOT exact identities in this data.")
+        print("      Two things depend on that assumption and are affected:")
+        print("        1. discover_physics.py's identity check will fail. That is a")
+        print("           real frame property here, not a pipeline bug.")
+        print("        2. GRUODEPredictorModel hard-codes dPos/dt = Vel via")
+        print("           index_copy when second_order is on. In this frame that")
+        print("           forces a systematically wrong position derivative.")
+        print("      Likely cause in lned: velocity is resolved in the NED basis at")
+        print("      the ORIGIN, while altitude is true HAE following the ellipsoid.")
+        print("      Over long range these conventions diverge with Earth curvature.")
+
+    print("\nfirst row of trajectory 0:")
+    print("  " + "  ".join(f"{nm}={v:.2f}" for nm, v in zip(names, trajs[0][0])))
+
+
+if __name__ == "__main__":
     main()
-  File "/Users/e471302/lm_cm_repos/next/discover_physics.py", line 256, in main
-    res = discover(trajs, frame, args.dt, args.window, args.stride,
-          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/discover_physics.py", line 79, in discover
-    ident = fit_identity_rows(trajs, frame, dt, window, stride)
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/discover_physics.py", line 45, in fit_identity_rows
-    A, b = weak_form_system(X, small, dt, row=pos_row, window=window, stride=stride)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/weak_ensemble.py", line 67, in weak_form_system
-    raise ValueError(f"window {window} exceeds trajectory length {N}")
-ValueError: window 40 exceeds trajectory length 31

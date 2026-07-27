@@ -1,143 +1,264 @@
-# physics_library.py
-"""Aerodynamic candidate library for HGV glide dynamics in the 5-state
-integrated geodesic frame [s, h, v_s, v_alpha, v_h].
+# discover_physics.py
+"""Ensemble weak-form SINDy discovery of f_physics for the glide phase.
 
-Design rationale (per-family justification is in FAMILY_NOTES below). The
-library is built from flight-mechanics forms, NOT a generic polynomial sweep:
-a polynomial sweep cannot express exp(-h/H), and the exponential atmosphere is
-the single term that buys correct out-of-distribution extrapolation.
+Per-row fitting with per-row normalisation and per-row thresholds, because
+dv_s/dt and dv_h/dt are m/s^2 while dv_alpha/dt is rad/s^2 -- a single global
+threshold silently zeroes the entire v_alpha row.
 
-Everything here operates in PHYSICAL UNITS (metres, seconds, radians).
-The scaled-space transform happens later, at integration time, not here.
+Usage (on real data):
+    python discover_physics.py --data glide_trajectories.npy --dt 1.0
+
+Expected data format: either an (n_traj,) object array of (T_i, 5) arrays, or a
+(n_traj, T, 5) array, in PHYSICAL units [s, h, v_s, v_alpha, v_h], glide phase
+only.
 """
 
 from __future__ import annotations
 
+import argparse
+import json
+from pathlib import Path
+
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# state layout (physical units)
-# ---------------------------------------------------------------------------
-S_IDX, H_IDX, VS_IDX, VA_IDX, VH_IDX = 0, 1, 2, 3, 4
-STATE_NAMES = ["s", "h", "v_s", "v_alpha", "v_h"]
+from physics_library import build_library, get_frame, library_condition_report
+from weak_ensemble import ensemble_sindy_row, refit_on_selected, weak_form_system
 
-# rows we actually fit. ds/dt = v_s and dh/dt = v_h are exact identities and
-# are hard-coded in GRUODEPredictorModel.forward -- asking SINDy to rediscover
-# them is a correctness check, not a discovery (see fit_identity_rows).
-ACCEL_ROWS = [VS_IDX, VA_IDX, VH_IDX]
-ACCEL_ROW_NAMES = ["dv_s/dt", "dv_alpha/dt", "dv_h/dt"]
-
-# candidate exponential-atmosphere scale heights [m]. The true US-standard
-# value is ~7.16 km in the 10-50 km band; we let the ensemble choose because
-# the effective scale height depends on the altitude band actually flown.
-SCALE_HEIGHTS_M = (6000.0, 6500.0, 7000.0, 7500.0, 8000.0, 8500.0, 9000.0)
-
-G0 = 9.80665  # [m/s^2]
-
-FAMILY_NOTES = {
-    "const": "Gravity / trim bias. dv_h/dt must contain ~-g; its recovery is a sanity check.",
-    "density": "rho(h) ~ exp(-h/H). The OOD-safety term: lower h -> denser air -> more drag.",
-    "drag": "rho(h)*v*|v| and rho(h)*v_i*|v|. Quadratic drag is the dominant glide force.",
-    "lift": "rho(h)*|v|^2 acting on the vertical/lateral rows: sustains glide equilibrium.",
-    "poly": "Low-order velocity polynomials. Absorb mild non-aerodynamic structure.",
-    "coupling": "v_alpha*v_s etc. Kinematic curvature coupling in a rotating track frame.",
-}
+# per-row sparsity thresholds on NORMALISED coefficients.
+DEFAULT_THRESHOLD = 0.05
+INCLUSION_GATE = 0.90
 
 
-def _speed(X: np.ndarray) -> np.ndarray:
-    """Total speed magnitude. v_alpha is a RATE (rad/s), not a linear velocity,
-    so it is deliberately excluded from the speed norm -- including it would be
-    a units error (rad/s summed with m/s)."""
-    return np.sqrt(X[:, VS_IDX] ** 2 + X[:, VH_IDX] ** 2) + 1e-12
-
-
-def build_library(X: np.ndarray, scale_heights=SCALE_HEIGHTS_M) -> tuple[np.ndarray, list[str]]:
-    """Build the candidate feature matrix Theta(X).
-
-    Args:
-        X: (N, 5) states in PHYSICAL units [s, h, v_s, v_alpha, v_h].
-        scale_heights: candidate H values for exp(-h/H).
-
-    Returns:
-        Theta: (N, n_features)
-        names: feature names, aligned with Theta columns.
+def fit_identity_rows(trajs, frame, dt, window=40, stride=10):
+    """Free correctness check: fit ds/dt and dh/dt with the SAME weak-form
+    pipeline against a tiny library [v_s, v_h]. Must return ~1.0 on the right
+    velocity. Any other answer is a pipeline bug (sign, offset, window, dt),
+    NOT a discovery.
     """
-    X = np.asarray(X, dtype=np.float64)
-    if X.ndim != 2 or X.shape[1] != 5:
-        raise ValueError(f"expected (N,5) physical-unit states, got {X.shape}")
-
-    h = X[:, H_IDX]
-    v_s = X[:, VS_IDX]
-    v_a = X[:, VA_IDX]
-    v_h = X[:, VH_IDX]
-    v = _speed(X)
-
-    cols: list[np.ndarray] = []
-    names: list[str] = []
-
-    def add(col, name):
-        cols.append(np.asarray(col, dtype=np.float64))
-        names.append(name)
-
-    # --- constant (gravity / trim) -----------------------------------------
-    add(np.ones_like(h), "1")
-
-    # --- exponential atmosphere and drag/lift forms -------------------------
-    for H in scale_heights:
-        rho = np.exp(-h / H)
-        tag = f"exp(-h/{H/1000:.1f}k)"
-        add(rho, tag)
-        # quadratic drag along each linear-velocity axis
-        add(rho * v_s * v, f"{tag}*v_s*|v|")
-        add(rho * v_h * v, f"{tag}*v_h*|v|")
-        # isotropic dynamic-pressure term (lift-form / |v|^2)
-        add(rho * v * v, f"{tag}*|v|^2")
-        # lateral: dynamic pressure driving azimuth rate (lift-form on v_alpha)
-        add(rho * v * v * v_a, f"{tag}*|v|^2*v_alpha")
-        add(rho * v * v_a, f"{tag}*|v|*v_alpha")
-
-    # --- low-order velocity polynomials -------------------------------------
-    add(v_s, "v_s")
-    add(v_h, "v_h")
-    add(v_a, "v_alpha")
-    add(v, "|v|")
-    add(v_s * v_s, "v_s^2")
-    add(v_h * v_h, "v_h^2")
-    add(v_s * v_h, "v_s*v_h")
-
-    # --- kinematic coupling -------------------------------------------------
-    add(v_a * v_s, "v_alpha*v_s")
-    add(v_a * v_h, "v_alpha*v_h")
-    add(v_a * v_a, "v_alpha^2")
-
-    Theta = np.column_stack(cols)
-    if not np.all(np.isfinite(Theta)):
-        bad = names[int(np.argmax(~np.isfinite(Theta).all(axis=0)))]
-        raise ValueError(f"non-finite entries in library (first bad family near '{bad}')")
-    return Theta, names
+    vel_cols = frame.vel_idx
+    vel_names = [frame.state_names[i] for i in vel_cols]
+    out = {}
+    for pos_row, true_vel in frame.identity_pairs:
+        A_all, b_all = [], []
+        for X in trajs:
+            small = np.column_stack([X[:, i] for i in vel_cols])
+            A, b = weak_form_system(X, small, dt, row=pos_row, window=window, stride=stride)
+            A_all.append(A); b_all.append(b)
+        xi = np.linalg.lstsq(np.vstack(A_all), np.concatenate(b_all), rcond=None)[0]
+        key = f"d{frame.state_names[pos_row]}/dt"
+        out[key] = {
+            "expected": frame.state_names[true_vel],
+            "coefs": {nm: float(c) for nm, c in zip(vel_names, xi)},
+        }
+    return out
 
 
-def library_condition_report(Theta: np.ndarray, names: list[str]) -> dict:
-    """Diagnose collinearity. Many exp(-h/H) columns at nearby H are highly
-    correlated by construction; ensembling handles the resulting instability by
-    reporting inclusion probability rather than a single coefficient, but the
-    user should still see how bad it is."""
-    # Drop zero-variance columns (e.g. the constant) before the correlation
-    # report -- they are legitimate library terms but make corrcoef divide by
-    # zero, producing a cosmetic inf/nan that masks real conditioning problems.
-    keep_var = Theta.std(axis=0) > 0
-    Theta = Theta[:, keep_var]
-    names = [n for n, k in zip(names, keep_var) if k]
-    Th = Theta - Theta.mean(axis=0, keepdims=True)
-    sd = Th.std(axis=0)
-    sd[sd == 0] = 1.0
-    Z = Th / sd
-    C = np.corrcoef(Z, rowvar=False)
-    np.fill_diagonal(C, 0.0)
-    i, j = np.unravel_index(np.argmax(np.abs(C)), C.shape)
-    return {
-        "n_features": Theta.shape[1],
-        "cond": float(np.linalg.cond(Z)),
-        "max_abs_corr": float(np.abs(C[i, j])),
-        "max_corr_pair": (names[i], names[j]),
-    }
+def check_identity_rows(res, tol=0.02):
+    """Fail loudly if the identity rows did not come back as identities."""
+    problems = []
+    for key, r in res.items():
+        for nm, c in r["coefs"].items():
+            target = 1.0 if nm == r["expected"] else 0.0
+            if abs(c - target) > tol:
+                problems.append(
+                    f"{key} should be 1.0*{r['expected']} and 0 elsewhere, got "
+                    + ", ".join(f"{k}={v:+.5f}" for k, v in r["coefs"].items())
+                )
+                break
+    return problems
+
+
+def discover(trajs, frame="geodesic", dt=1.0, window=40, stride=10, n_models=300,
+             threshold=DEFAULT_THRESHOLD, gate=INCLUSION_GATE, seed=0, verbose=True):
+    """Run the full per-row discovery. Returns a result dict."""
+    if isinstance(frame, str):
+        frame = get_frame(frame)
+    rng = np.random.default_rng(seed)
+
+    # --- identity-row correctness check FIRST -------------------------------
+    ident = fit_identity_rows(trajs, frame, dt, window, stride)
+    problems = check_identity_rows(ident)
+    if verbose:
+        print("=" * 72)
+        print(f"IDENTITY-ROW CHECK  [frame: {frame.name}, {frame.n_state}-state]")
+        print("=" * 72)
+        for k, v in ident.items():
+            body = ", ".join(f"{kk}={vv:+.6f}" for kk, vv in v["coefs"].items())
+            print(f"  {k:16s} (expect 1.0*{v['expected']}): {body}")
+        if problems:
+            print("  !! FAILED -- this is a PIPELINE BUG, not a discovery:")
+            for p in problems:
+                print("     -", p)
+        else:
+            print("  PASS -- weak-form pipeline recovers exact identities.")
+        print()
+
+    # --- build library over all glide data ----------------------------------
+    Theta_list, names = [], None
+    for X in trajs:
+        Th, names = build_library(X, frame)
+        Theta_list.append(Th)
+
+    cond = library_condition_report(np.vstack(Theta_list), names)
+    if verbose:
+        print("=" * 72)
+        print("LIBRARY CONDITIONING")
+        print("=" * 72)
+        print(f"  features        : {cond['n_features']}")
+        print(f"  condition number: {cond['cond']:.3e}")
+        print(f"  max |corr|      : {cond['max_abs_corr']:.4f} "
+              f"between {cond['max_corr_pair'][0]} and {cond['max_corr_pair'][1]}")
+        print("  (high collinearity is expected across neighbouring scale heights;")
+        print("   this is exactly why inclusion probability, not a point estimate,")
+        print("   is the gate.)")
+        print()
+
+    results = {}
+    for row, row_name in zip(frame.accel_rows, frame.accel_row_names):
+        A_list, b_list = [], []
+        for X, Th in zip(trajs, Theta_list):
+            A, b = weak_form_system(X, Th, dt, row=row, window=window, stride=stride)
+            A_list.append(A)
+            b_list.append(b)
+
+        # bootstrap over TRAJECTORIES (not windows) to respect correlation
+        traj_index = np.concatenate([np.full(len(b), i) for i, b in enumerate(b_list)])
+        A = np.vstack(A_list)
+        b = np.concatenate(b_list)
+
+        ens = ensemble_sindy_row(
+            A, b,
+            threshold=threshold,
+            n_models=n_models,
+            rng=np.random.default_rng(rng.integers(1 << 30)),
+        )
+
+        keep = ens["inclusion_prob"] >= gate
+        # An unexplained row contributes NOTHING to f_physics. Without this,
+        # a near-noise row saturates inclusion at 1.00 and floods f_physics
+        # with spurious high-coefficient terms -- corrupting exactly the
+        # regime f_physics exists to make safe.
+        if not ens["explained"]:
+            keep = np.zeros_like(keep, dtype=bool)
+        xi_final = refit_on_selected(A, b, keep)
+
+        results[row_name] = {
+            "row": row,
+            "names": names,
+            "inclusion_prob": ens["inclusion_prob"],
+            "coef_median": ens["coef_median"],
+            "coef_q05": ens["coef_q05"],
+            "coef_q95": ens["coef_q95"],
+            "keep": keep,
+            "coef_final": xi_final,
+            "n_windows": len(b),
+            "n_traj": len(trajs),
+            "median_oob_r2": ens["median_oob_r2"],
+            "explained": ens["explained"],
+            "min_r2": ens["min_r2"],
+        }
+
+    return {"rows": results, "identity": ident, "identity_problems": problems,
+            "condition": cond, "names": names, "gate": gate,
+            "frame": frame.name, "n_state": frame.n_state}
+
+
+def report(res, top_k=12):
+    """Readable inclusion table + discovered equations."""
+    print("=" * 72)
+    print(f"ENSEMBLE-SINDy INCLUSION TABLE  (gate = {res['gate']:.0%})")
+    print("=" * 72)
+    for row_name, r in res["rows"].items():
+        status = "EXPLAINED" if r["explained"] else "UNEXPLAINED -> contributes nothing"
+        print(f"\n--- {row_name} ---  ({r['n_windows']} weak-form windows, "
+              f"{r['n_traj']} trajectories)")
+        print(f"  out-of-bag R^2 (median): {r['median_oob_r2']:.4f}   "
+              f"floor {r['min_r2']:.2f}   [{status}]")
+        if not r["explained"]:
+            print("  Inclusion probabilities below are SATURATED and meaningless:")
+            print("  the target is near-noise, so normalisation inflates every")
+            print("  coefficient above threshold. Reported for transparency only.")
+        order = np.argsort(-r["inclusion_prob"])
+        print(f"  {'term':<28s} {'incl':>6s}  {'median':>12s}  "
+              f"{'[q05':>12s} {'q95]':>12s}  gate")
+        for j in order[:top_k]:
+            p = r["inclusion_prob"][j]
+            mark = "KEEP" if r["keep"][j] else "  --"
+            print(f"  {r['names'][j]:<28s} {p:6.2f}  {r['coef_median'][j]:12.4e}  "
+                  f"{r['coef_q05'][j]:12.4e} {r['coef_q95'][j]:12.4e}  {mark}")
+
+    print("\n" + "=" * 72)
+    print("DISCOVERED f_physics  (terms passing the inclusion gate)")
+    print("=" * 72)
+    any_terms = False
+    for row_name, r in res["rows"].items():
+        kept = np.where(r["keep"])[0]
+        if len(kept) == 0:
+            print(f"  {row_name} = 0        <-- NO TERM PASSED THE GATE")
+            continue
+        any_terms = True
+        parts = [f"{r['coef_final'][j]:+.4e}*{r['names'][j]}" for j in kept]
+        print(f"  {row_name} = " + "  ".join(parts))
+    if not any_terms:
+        print("\n  NEGATIVE RESULT: no sparse physics survived gating.")
+        print("  Do NOT force this into the architecture. See assessment notes.")
+    print()
+
+
+def export_coefficients(res, path):
+    """Dump gated coefficients for the fused field to load."""
+    out = {"gate": res["gate"], "frame": res["frame"], "n_state": res["n_state"], "rows": {}}
+    for row_name, r in res["rows"].items():
+        kept = np.where(r["keep"])[0]
+        out["rows"][row_name] = {
+            "row_index": int(r["row"]),
+            "terms": [r["names"][j] for j in kept],
+            "coefficients": [float(r["coef_final"][j]) for j in kept],
+            "inclusion_prob": [float(r["inclusion_prob"][j]) for j in kept],
+            "coef_q05": [float(r["coef_q05"][j]) for j in kept],
+            "coef_q95": [float(r["coef_q95"][j]) for j in kept],
+        }
+    Path(path).write_text(json.dumps(out, indent=2))
+    return out
+
+
+def _load(path):
+    arr = np.load(path, allow_pickle=True)
+    if arr.dtype == object:
+        return [np.asarray(a, float) for a in arr]
+    if arr.ndim == 3:
+        return [arr[i] for i in range(arr.shape[0])]
+    raise ValueError(f"unexpected data shape {arr.shape}")
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True, help="glide-phase trajectories, physical units")
+    ap.add_argument("--frame", default="lned", choices=["geodesic", "lned"],
+                    help="state frame of the input data (default: lned)")
+    ap.add_argument("--dt", type=float, required=True)
+    ap.add_argument("--window", type=int, default=40)
+    ap.add_argument("--stride", type=int, default=10)
+    ap.add_argument("--n-models", type=int, default=300)
+    ap.add_argument("--gate", type=float, default=INCLUSION_GATE)
+    ap.add_argument("--out", default="f_physics_coefficients.json")
+    args = ap.parse_args()
+
+    trajs = _load(args.data)
+    frame = get_frame(args.frame)
+    bad = [t.shape for t in trajs if t.shape[1] != frame.n_state]
+    if bad:
+        raise ValueError(
+            f"--frame {args.frame} expects {frame.n_state} columns, but got "
+            f"trajectories with shapes {bad[:3]}. Wrong --frame, or the data "
+            f"still has its time column."
+        )
+    res = discover(trajs, frame, args.dt, args.window, args.stride,
+                   args.n_models, gate=args.gate)
+    report(res)
+    export_coefficients(res, args.out)
+    print(f"wrote {args.out}")
+
+
+if __name__ == "__main__":
+    main()

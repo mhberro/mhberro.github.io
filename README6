@@ -1,127 +1,103 @@
-# inspect_dump.py
-"""Inspect a dumped .npy trajectory file before feeding it to SINDy discovery.
+"""Do the lned identities dPos/dt = Vel actually hold at long range?
 
-Answers the three questions that matter:
-  1. Is it in the frame you think it is (column count + plausible ranges)?
-  2. Is it PHYSICAL units, not scaled?
-  3. Is it actually the GLIDE phase?
+The lned transform resolves VELOCITY in the NED basis AT THE ORIGIN, but stores
+ALTITUDE as true height above the ellipsoid, which follows Earth curvature. Over
+a few hundred km those two conventions agree to within noise. Over thousands of
+km they cannot: the local vertical at the far end is rotated substantially from
+the origin's vertical.
 
-Usage:  python inspect_dump.py --data glide.npy --frame lned --dt 1.0
+This measures the disagreement as a function of downrange, using the same WGS-84
+reimplementation used to validate the frame earlier.
 """
-from __future__ import annotations
-
-import argparse
 import numpy as np
 
-FRAMES = {
-    "lned": (["Forward", "Right", "Altitude", "VForward", "VRight", "VUp"], 2, [3, 4, 5]),
-    "geodesic": (["s", "h", "v_s", "v_alpha", "v_h"], 1, [2, 4]),
-}
+A = 6378137.0; F = 1/298.257223563; E2 = F*(2-F)
+TIME_INDEX = 0; POS_SLICE = slice(1,4); VEL_SLICE = slice(4,7)
+d2r, r2d = np.deg2rad, np.rad2deg
 
+def ecef_to_geodetic(x,y,z):
+    lon=np.arctan2(y,x); p=np.hypot(x,y); lat=np.arctan2(z,p*(1-E2))
+    for _ in range(200):
+        N=A/np.sqrt(1-E2*np.sin(lat)**2); h=p/np.cos(lat)-N
+        lat=np.arctan2(z,p*(1-E2*N/(N+h)))
+    N=A/np.sqrt(1-E2*np.sin(lat)**2); h=p/np.cos(lat)-N
+    return r2d(lat), r2d(lon), h
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True)
-    ap.add_argument("--frame", default="lned", choices=sorted(FRAMES))
-    ap.add_argument("--dt", type=float, default=1.0)
-    a = ap.parse_args()
+def geodetic_to_ecef(lat,lon,h):
+    lat,lon=d2r(lat),d2r(lon); N=A/np.sqrt(1-E2*np.sin(lat)**2)
+    return np.array([(N+h)*np.cos(lat)*np.cos(lon),(N+h)*np.cos(lat)*np.sin(lon),
+                     (N*(1-E2)+h)*np.sin(lat)])
 
-    arr = np.load(a.data, allow_pickle=True)
-    trajs = [np.asarray(t, dtype=float) for t in arr] if arr.dtype == object else [arr[i] for i in range(len(arr))]
-    names, alt_i, vel_i = FRAMES[a.frame]
+def _R(lat,lon):
+    lat,lon=d2r(lat),d2r(lon); sl,cl,so,co=np.sin(lat),np.cos(lat),np.sin(lon),np.cos(lon)
+    return np.array([[-sl*co,-sl*so,cl],[-so,co,0.],[-cl*co,-cl*so,-sl]])
 
-    ncol = trajs[0].shape[1]
-    print(f"trajectories : {len(trajs)}")
-    print(f"columns      : {ncol}  (frame {a.frame!r} expects {len(names)})")
-    if ncol != len(names):
-        print("  *** COLUMN COUNT MISMATCH. Wrong --frame, or the time column")
-        print("      was not stripped. Discovery would misalign every term.")
-        return
+def ecef_to_ned_velocity(v,origin):
+    lat,lon,_=ecef_to_geodetic(*origin); return _R(lat,lon)@np.asarray(v)
 
-    lens = [len(t) for t in trajs]
-    dur = np.array(lens) * a.dt
-    print(f"length       : {min(lens)} .. {max(lens)} samples "
-          f"({dur.min():.0f} .. {dur.max():.0f} s at dt={a.dt})")
+def inverse_geodesic(lat0,lon0,lat,lon):
+    R=6371008.8; p0,p1=d2r(lat0),d2r(lat); dl=d2r(lon-lon0); dp=p1-p0
+    a=np.sin(dp/2)**2+np.cos(p0)*np.cos(p1)*np.sin(dl/2)**2
+    dist=2*R*np.arcsin(np.sqrt(np.clip(a,0,1)))
+    azi=r2d(np.arctan2(np.sin(dl)*np.cos(p1),np.cos(p0)*np.sin(p1)-np.sin(p0)*np.cos(p1)*np.cos(dl)))
+    return dist,azi,None,None,None
 
-    allrows = np.vstack(trajs)
-    print("\nper-column ranges (physical units):")
-    for j, nm in enumerate(names):
-        col = allrows[:, j]
-        print(f"  {nm:<10s} {col.min():14.2f} .. {col.max():14.2f}   mean {col.mean():12.2f}")
+def _heading(origin,guide):
+    lat0,lon0,_=ecef_to_geodetic(*origin); lg,ng,_=ecef_to_geodetic(*guide)
+    d,azi,_,_,_=inverse_geodesic(lat0,lon0,lg,ng)
+    return d2r(azi)
 
-    print("\nchecks:")
-    alt = allrows[:, alt_i]
-    if np.abs(alt).max() < 100:
-        print(f"  [FAIL] {names[alt_i]} max |.| = {np.abs(alt).max():.3f} -- this is SCALED "
-              f"data, not physical. exp(-h/H) is meaningless here.")
-    else:
-        print(f"  [ok]   {names[alt_i]} is in metres ({alt.min():.0f}..{alt.max():.0f})")
+def ecef_to_lned(ecef,guide):
+    origin=ecef[0,POS_SLICE]; lat0,lon0,_=ecef_to_geodetic(*origin)
+    h0=_heading(origin,guide)
+    out=np.empty((len(ecef),7)); out[:,0]=ecef[:,0]
+    for i,st in enumerate(ecef):
+        lat,lon,hae=ecef_to_geodetic(*st[POS_SLICE])
+        dist,azi,_,_,_=inverse_geodesic(lat0,lon0,lat,lon)
+        vn=ecef_to_ned_velocity(st[VEL_SLICE],origin)   # <-- basis at ORIGIN
+        n=dist*np.cos(d2r(azi)); e=dist*np.sin(d2r(azi))
+        out[i,1]=n*np.cos(h0)+e*np.sin(h0); out[i,2]=-n*np.sin(h0)+e*np.cos(h0)
+        out[i,3]=hae                                     # <-- true HAE (curved)
+        out[i,4]=vn[0]*np.cos(h0)+vn[1]*np.sin(h0)
+        out[i,5]=-vn[0]*np.sin(h0)+vn[1]*np.cos(h0)
+        out[i,6]=-vn[2]
+    return out
 
-    spd = np.sqrt((allrows[:, vel_i] ** 2).sum(axis=1))
-    # Discriminate on INITIAL speed per trajectory, not the pooled median: a
-    # glide run that is integrated down to impact decays into the terminal
-    # regime and drags the pooled median well below its cruise value. Entry
-    # speed does not have that problem.
-    v0 = np.array([np.sqrt((t[0, vel_i] ** 2).sum()) for t in trajs])
-    print(f"  |v| pooled median {np.median(spd):.1f} m/s   range {spd.min():.1f}..{spd.max():.1f}")
-    print(f"  |v| at t=0       median {np.median(v0):.1f} m/s   "
-          f"range {v0.min():.1f}..{v0.max():.1f}")
-    if np.median(v0) < 800:
-        print("  [FAIL] entry speed far below hypersonic glide (~1700-2600 m/s).")
-        print("         This is BOOST data. Re-dump with --sbi-phase glide.")
-    elif np.median(v0) > 1200:
-        print("  [ok]   entry speed consistent with hypersonic glide")
-    else:
-        print("  [??]   entry speed between regimes; check the phase split")
+# --- build a long-range, high-altitude profile matching the user's ranges ----
+dt=1.0; T=700
+lat0,lon0=34.0,-117.0
+rng_total_km=3841.0; hmax=110000.0; h0_=33846.0
+R_E=6371008.8
+ecef=np.zeros((T,7))
+for i in range(T):
+    f=i/(T-1)
+    s=rng_total_km*1000.0*f                      # downrange arc length
+    hae=h0_+(hmax-h0_)*np.sin(np.pi*f)**0.9      # lofted arc
+    ang=s/R_E
+    lat=lat0-r2d(ang)*0.8; lon=lon0+r2d(ang)*0.6
+    ecef[i,0]=i*dt; ecef[i,POS_SLICE]=geodetic_to_ecef(lat,lon,hae)
+for i in range(T):
+    j=min(i+1,T-1); k=max(i-1,0)
+    ecef[i,VEL_SLICE]=(ecef[j,POS_SLICE]-ecef[k,POS_SLICE])/max(ecef[j,0]-ecef[k,0],1e-9)
+guide=ecef[-1,POS_SLICE]
 
-    # ascent fraction: glide should be predominantly descending
-    if a.frame == "lned":
-        vup = allrows[:, 5]
-        frac_up = float((vup > 0).mean())
-        print(f"  vertical: {frac_up*100:.1f}% of samples ascending")
-        if frac_up > 0.5:
-            print("         [FAIL] mostly ASCENDING -- that is boost, not glide.")
+L=ecef_to_lned(ecef,guide)
+t=L[:,0]; F_,R_,ALT=L[:,1],L[:,2],L[:,3]; VF,VR,VU=L[:,4],L[:,5],L[:,6]
 
-    # --- identity check: does dPos/dt actually equal Vel in this data? -------
-    # The physics library and GRUODEPredictorModel BOTH assume the position rows
-    # are exact identities. In lned that assumption depends on the velocity
-    # basis matching the position convention; at long range it can fail badly.
-    pos_i = {"lned": [0, 1, 2], "geodesic": [0, 1]}[a.frame]
-    pair_v = {"lned": [3, 4, 5], "geodesic": [2, 4]}[a.frame]
-    print("\nidentity check  (dPos/dt should equal the paired velocity):")
-    worst = 0.0
-    for p_i, v_i in zip(pos_i, pair_v):
-        num, den = [], []
-        for t in trajs:
-            if len(t) < 7:
-                continue
-            tt = np.arange(len(t)) * a.dt
-            resid = np.gradient(t[:, p_i], tt)[3:-3] - t[3:-3, v_i]
-            num.append(resid ** 2)
-            den.append(t[3:-3, v_i] ** 2)
-        if not num:
-            continue
-        rms = float(np.sqrt(np.concatenate(num).mean()))
-        scale = float(np.sqrt(np.concatenate(den).mean())) + 1e-12
-        worst = max(worst, rms / scale)
-        flag = "ok" if rms / scale < 0.02 else "FAIL"
-        print(f"  [{flag:>4s}] d{names[p_i]}/dt vs {names[v_i]}: "
-              f"RMS residual {rms:9.1f} m/s  ({100*rms/scale:.1f}% of RMS {names[v_i]})")
-    if worst >= 0.02:
-        print("\n  *** The position rows are NOT exact identities in this data.")
-        print("      Two things depend on that assumption and are affected:")
-        print("        1. discover_physics.py's identity check will fail. That is a")
-        print("           real frame property here, not a pipeline bug.")
-        print("        2. GRUODEPredictorModel hard-codes dPos/dt = Vel via")
-        print("           index_copy when second_order is on. In this frame that")
-        print("           forces a systematically wrong position derivative.")
-        print("      Likely cause in lned: velocity is resolved in the NED basis at")
-        print("      the ORIGIN, while altitude is true HAE following the ellipsoid.")
-        print("      Over long range these conventions diverge with Earth curvature.")
+def d(x): return np.gradient(x,t)
 
-    print("\nfirst row of trajectory 0:")
-    print("  " + "  ".join(f"{nm}={v:.2f}" for nm, v in zip(names, trajs[0][0])))
+print("Long-range lned identity check")
+print(f"  downrange spans 0 .. {F_.max()/1000:.0f} km,  altitude {ALT.min()/1000:.1f} .. {ALT.max()/1000:.1f} km")
+print(f"  central angle at far end: {r2d(F_.max()/R_E):.1f} deg of Earth curvature\n")
 
+print(f"{'downrange km':>13s} {'|dF/dt - VF|':>13s} {'|dR/dt - VR|':>13s} {'|dALT/dt - VU|':>15s}")
+for frac in [0.05,0.2,0.4,0.6,0.8,0.98]:
+    i=int(frac*(T-1))
+    print(f"{F_[i]/1000:13.0f} {abs(d(F_)[i]-VF[i]):13.2f} {abs(d(R_)[i]-VR[i]):13.2f} {abs(d(ALT)[i]-VU[i]):15.2f}")
 
-if __name__ == "__main__":
-    main()
+sl=slice(3,-3)
+print("\nRMS identity residual over the trajectory (m/s):")
+print(f"  dForward/dt  vs VForward : {np.sqrt(np.mean((d(F_)[sl]-VF[sl])**2)):10.2f}")
+print(f"  dRight/dt    vs VRight   : {np.sqrt(np.mean((d(R_)[sl]-VR[sl])**2)):10.2f}")
+print(f"  dAltitude/dt vs VUp      : {np.sqrt(np.mean((d(ALT)[sl]-VU[sl])**2)):10.2f}")
+print(f"\n  typical |v| = {np.sqrt(VF**2+VR**2+VU**2).mean():.0f} m/s")

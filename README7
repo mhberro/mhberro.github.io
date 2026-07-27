@@ -1,264 +1,249 @@
-# discover_physics.py
-"""Ensemble weak-form SINDy discovery of f_physics for the glide phase.
+# physics_field.py
+"""Torch implementation of the SINDy-discovered f_physics term. FRAME-AGNOSTIC.
 
-Per-row fitting with per-row normalisation and per-row thresholds, because
-dv_s/dt and dv_h/dt are m/s^2 while dv_alpha/dt is rad/s^2 -- a single global
-threshold silently zeroes the entire v_alpha row.
+Supports both the 5-state geodesic frame [s,h,v_s,v_alpha,v_h] and the 6-state
+lned frame [Forward,Right,Altitude,VForward,VRight,VUp]. The frame is read from
+the discovery JSON, so a coefficient file and the model it is loaded into cannot
+silently disagree.
 
-Usage (on real data):
-    python discover_physics.py --data glide_trajectories.npy --dt 1.0
+Design constraints:
+  1. STATELESS -- no module-state mutation in forward, or autograd/adjoint break.
+  2. ONNX-EXPORTABLE under torch.export. Every term is encoded at CONSTRUCTION
+     time into dense numeric buffers; evaluation is gather + multiply with no
+     data-dependent control flow and no Python branching on tensor values.
+  3. INDEPENDENTLY EVALUABLE -- f_physics(y) runs without the neural term, for
+     the planned runtime guardrail blend.
+  4. SCALING: unscale -> physics in physical units -> rescale. The derivative
+     transform has NO mean term (d/dt of a constant is zero).
+  5. NON-TRAINABLE by default; optional fine-tuning under a tight prior.
 
-Expected data format: either an (n_traj,) object array of (T_i, 5) arrays, or a
-(n_traj, T, 5) array, in PHYSICAL units [s, h, v_s, v_alpha, v_h], glide phase
-only.
+TERM ENCODING (frame-agnostic). Every library term is exactly:
+
+    coef * exp(-h * inv_H) * |v|^p * comp[c1] * comp[c2]
+
+where comp is the state vector augmented with a trailing 1.0, so c=n_state
+means "absent". Non-density terms use inv_H = 0, giving exp(0) = 1 exactly.
+This single form covers the constant, density, drag, lift, side-force,
+polynomial and coupling families in both frames.
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
-import numpy as np
+import torch
+from torch import nn
 
-from physics_library import build_library, get_frame, library_condition_report
-from weak_ensemble import ensemble_sindy_row, refit_on_selected, weak_form_system
+# frame layouts, mirroring physics_library.FrameSpec
+FRAME_SPECS = {
+    "geodesic": {
+        "state_names": ["s", "h", "v_s", "v_alpha", "v_h"],
+        "alt_idx": 1,
+        "speed_idx": [2, 4],          # v_alpha excluded: rad/s, not m/s
+        "pos_idx": [0, 1],
+        "vel_idx": [2, 4],
+    },
+    "lned": {
+        "state_names": ["Forward", "Right", "Altitude", "VForward", "VRight", "VUp"],
+        "alt_idx": 2,                 # true height above ellipsoid
+        "speed_idx": [3, 4, 5],       # all genuine linear velocities
+        "pos_idx": [0, 1, 2],
+        "vel_idx": [3, 4, 5],
+    },
+}
 
-# per-row sparsity thresholds on NORMALISED coefficients.
-DEFAULT_THRESHOLD = 0.05
-INCLUSION_GATE = 0.90
 
+def parse_term(name: str, state_names: list[str]):
+    """Map a library term name to (inv_H, speed_power, c1, c2).
 
-def fit_identity_rows(trajs, frame, dt, window=40, stride=10):
-    """Free correctness check: fit ds/dt and dh/dt with the SAME weak-form
-    pipeline against a tiny library [v_s, v_h]. Must return ~1.0 on the right
-    velocity. Any other answer is a pipeline bug (sign, offset, window, dt),
-    NOT a discovery.
+    c1/c2 are state indices, or len(state_names) meaning "absent".
+    Raises on anything unrecognised -- failing loudly beats silently dropping a
+    discovered term and shipping physics that is quietly missing its drag.
     """
-    vel_cols = frame.vel_idx
-    vel_names = [frame.state_names[i] for i in vel_cols]
-    out = {}
-    for pos_row, true_vel in frame.identity_pairs:
-        A_all, b_all = [], []
-        for X in trajs:
-            small = np.column_stack([X[:, i] for i in vel_cols])
-            A, b = weak_form_system(X, small, dt, row=pos_row, window=window, stride=stride)
-            A_all.append(A); b_all.append(b)
-        xi = np.linalg.lstsq(np.vstack(A_all), np.concatenate(b_all), rcond=None)[0]
-        key = f"d{frame.state_names[pos_row]}/dt"
-        out[key] = {
-            "expected": frame.state_names[true_vel],
-            "coefs": {nm: float(c) for nm, c in zip(vel_names, xi)},
-        }
-    return out
+    n = len(state_names)
+    inv_H, p, comps = 0.0, 0, []
 
-
-def check_identity_rows(res, tol=0.02):
-    """Fail loudly if the identity rows did not come back as identities."""
-    problems = []
-    for key, r in res.items():
-        for nm, c in r["coefs"].items():
-            target = 1.0 if nm == r["expected"] else 0.0
-            if abs(c - target) > tol:
-                problems.append(
-                    f"{key} should be 1.0*{r['expected']} and 0 elsewhere, got "
-                    + ", ".join(f"{k}={v:+.5f}" for k, v in r["coefs"].items())
-                )
-                break
-    return problems
-
-
-def discover(trajs, frame="geodesic", dt=1.0, window=40, stride=10, n_models=300,
-             threshold=DEFAULT_THRESHOLD, gate=INCLUSION_GATE, seed=0, verbose=True):
-    """Run the full per-row discovery. Returns a result dict."""
-    if isinstance(frame, str):
-        frame = get_frame(frame)
-    rng = np.random.default_rng(seed)
-
-    # --- identity-row correctness check FIRST -------------------------------
-    ident = fit_identity_rows(trajs, frame, dt, window, stride)
-    problems = check_identity_rows(ident)
-    if verbose:
-        print("=" * 72)
-        print(f"IDENTITY-ROW CHECK  [frame: {frame.name}, {frame.n_state}-state]")
-        print("=" * 72)
-        for k, v in ident.items():
-            body = ", ".join(f"{kk}={vv:+.6f}" for kk, vv in v["coefs"].items())
-            print(f"  {k:16s} (expect 1.0*{v['expected']}): {body}")
-        if problems:
-            print("  !! FAILED -- this is a PIPELINE BUG, not a discovery:")
-            for p in problems:
-                print("     -", p)
-        else:
-            print("  PASS -- weak-form pipeline recovers exact identities.")
-        print()
-
-    # --- build library over all glide data ----------------------------------
-    Theta_list, names = [], None
-    for X in trajs:
-        Th, names = build_library(X, frame)
-        Theta_list.append(Th)
-
-    cond = library_condition_report(np.vstack(Theta_list), names)
-    if verbose:
-        print("=" * 72)
-        print("LIBRARY CONDITIONING")
-        print("=" * 72)
-        print(f"  features        : {cond['n_features']}")
-        print(f"  condition number: {cond['cond']:.3e}")
-        print(f"  max |corr|      : {cond['max_abs_corr']:.4f} "
-              f"between {cond['max_corr_pair'][0]} and {cond['max_corr_pair'][1]}")
-        print("  (high collinearity is expected across neighbouring scale heights;")
-        print("   this is exactly why inclusion probability, not a point estimate,")
-        print("   is the gate.)")
-        print()
-
-    results = {}
-    for row, row_name in zip(frame.accel_rows, frame.accel_row_names):
-        A_list, b_list = [], []
-        for X, Th in zip(trajs, Theta_list):
-            A, b = weak_form_system(X, Th, dt, row=row, window=window, stride=stride)
-            A_list.append(A)
-            b_list.append(b)
-
-        # bootstrap over TRAJECTORIES (not windows) to respect correlation
-        traj_index = np.concatenate([np.full(len(b), i) for i, b in enumerate(b_list)])
-        A = np.vstack(A_list)
-        b = np.concatenate(b_list)
-
-        ens = ensemble_sindy_row(
-            A, b,
-            threshold=threshold,
-            n_models=n_models,
-            rng=np.random.default_rng(rng.integers(1 << 30)),
-        )
-
-        keep = ens["inclusion_prob"] >= gate
-        # An unexplained row contributes NOTHING to f_physics. Without this,
-        # a near-noise row saturates inclusion at 1.00 and floods f_physics
-        # with spurious high-coefficient terms -- corrupting exactly the
-        # regime f_physics exists to make safe.
-        if not ens["explained"]:
-            keep = np.zeros_like(keep, dtype=bool)
-        xi_final = refit_on_selected(A, b, keep)
-
-        results[row_name] = {
-            "row": row,
-            "names": names,
-            "inclusion_prob": ens["inclusion_prob"],
-            "coef_median": ens["coef_median"],
-            "coef_q05": ens["coef_q05"],
-            "coef_q95": ens["coef_q95"],
-            "keep": keep,
-            "coef_final": xi_final,
-            "n_windows": len(b),
-            "n_traj": len(trajs),
-            "median_oob_r2": ens["median_oob_r2"],
-            "explained": ens["explained"],
-            "min_r2": ens["min_r2"],
-        }
-
-    return {"rows": results, "identity": ident, "identity_problems": problems,
-            "condition": cond, "names": names, "gate": gate,
-            "frame": frame.name, "n_state": frame.n_state}
-
-
-def report(res, top_k=12):
-    """Readable inclusion table + discovered equations."""
-    print("=" * 72)
-    print(f"ENSEMBLE-SINDy INCLUSION TABLE  (gate = {res['gate']:.0%})")
-    print("=" * 72)
-    for row_name, r in res["rows"].items():
-        status = "EXPLAINED" if r["explained"] else "UNEXPLAINED -> contributes nothing"
-        print(f"\n--- {row_name} ---  ({r['n_windows']} weak-form windows, "
-              f"{r['n_traj']} trajectories)")
-        print(f"  out-of-bag R^2 (median): {r['median_oob_r2']:.4f}   "
-              f"floor {r['min_r2']:.2f}   [{status}]")
-        if not r["explained"]:
-            print("  Inclusion probabilities below are SATURATED and meaningless:")
-            print("  the target is near-noise, so normalisation inflates every")
-            print("  coefficient above threshold. Reported for transparency only.")
-        order = np.argsort(-r["inclusion_prob"])
-        print(f"  {'term':<28s} {'incl':>6s}  {'median':>12s}  "
-              f"{'[q05':>12s} {'q95]':>12s}  gate")
-        for j in order[:top_k]:
-            p = r["inclusion_prob"][j]
-            mark = "KEEP" if r["keep"][j] else "  --"
-            print(f"  {r['names'][j]:<28s} {p:6.2f}  {r['coef_median'][j]:12.4e}  "
-                  f"{r['coef_q05'][j]:12.4e} {r['coef_q95'][j]:12.4e}  {mark}")
-
-    print("\n" + "=" * 72)
-    print("DISCOVERED f_physics  (terms passing the inclusion gate)")
-    print("=" * 72)
-    any_terms = False
-    for row_name, r in res["rows"].items():
-        kept = np.where(r["keep"])[0]
-        if len(kept) == 0:
-            print(f"  {row_name} = 0        <-- NO TERM PASSED THE GATE")
+    for tok in name.strip().split("*"):
+        tok = tok.strip()
+        if tok in ("", "1"):
             continue
-        any_terms = True
-        parts = [f"{r['coef_final'][j]:+.4e}*{r['names'][j]}" for j in kept]
-        print(f"  {row_name} = " + "  ".join(parts))
-    if not any_terms:
-        print("\n  NEGATIVE RESULT: no sparse physics survived gating.")
-        print("  Do NOT force this into the architecture. See assessment notes.")
-    print()
+        if tok.startswith("exp(-h/") and tok.endswith("k)"):
+            H_km = float(tok[len("exp(-h/"):-2])
+            if H_km <= 0:
+                raise ValueError(f"non-positive scale height in {name!r}")
+            inv_H = 1.0 / (H_km * 1000.0)
+            continue
+        if tok == "|v|":
+            p += 1
+            continue
+        if tok == "|v|^2":
+            p += 2
+            continue
+        if tok.endswith("^2"):
+            base = tok[:-2]
+            if base not in state_names:
+                raise ValueError(f"unknown state {base!r} in term {name!r}")
+            comps += [state_names.index(base)] * 2
+            continue
+        if tok in state_names:
+            comps.append(state_names.index(tok))
+            continue
+        raise ValueError(f"unrecognised token {tok!r} in library term {name!r}")
+
+    if len(comps) > 2:
+        raise ValueError(f"term {name!r} has >2 state factors; unsupported")
+    while len(comps) < 2:
+        comps.append(n)  # absent -> multiplies by 1.0
+    return inv_H, float(p), comps[0], comps[1]
 
 
-def export_coefficients(res, path):
-    """Dump gated coefficients for the fused field to load."""
-    out = {"gate": res["gate"], "frame": res["frame"], "n_state": res["n_state"], "rows": {}}
-    for row_name, r in res["rows"].items():
-        kept = np.where(r["keep"])[0]
-        out["rows"][row_name] = {
-            "row_index": int(r["row"]),
-            "terms": [r["names"][j] for j in kept],
-            "coefficients": [float(r["coef_final"][j]) for j in kept],
-            "inclusion_prob": [float(r["inclusion_prob"][j]) for j in kept],
-            "coef_q05": [float(r["coef_q05"][j]) for j in kept],
-            "coef_q95": [float(r["coef_q95"][j]) for j in kept],
-        }
-    Path(path).write_text(json.dumps(out, indent=2))
-    return out
+class PhysicsField(nn.Module):
+    """f_physics(y_phys) -> (..., n_state) derivative in PHYSICAL units.
+
+    Position rows are left at ZERO on purpose: they are exact identities already
+    enforced in GRUODEPredictorModel.forward via index_copy. Writing them here
+    too would double-count.
+    """
+
+    def __init__(self, terms, frame="lned", trainable: bool = False):
+        """
+        Args:
+            terms: list of (term_name, row_index, coefficient).
+            frame: "geodesic" or "lned".
+        """
+        super().__init__()
+        if frame not in FRAME_SPECS:
+            raise ValueError(f"unknown frame {frame!r}")
+        spec = FRAME_SPECS[frame]
+        self.frame = frame
+        self.state_names = spec["state_names"]
+        self.n_state = len(self.state_names)
+        self.alt_idx = spec["alt_idx"]
+        self.n_terms = len(terms)
+        self.trainable = bool(trainable)
+
+        self.register_buffer("speed_idx", torch.tensor(spec["speed_idx"], dtype=torch.long))
+
+        inv_H, pw, c1, c2, rows, coefs = [], [], [], [], [], []
+        for name, row, c in terms:
+            iH, p, a, b = parse_term(name, self.state_names)
+            if not (0 <= int(row) < self.n_state):
+                raise ValueError(f"row {row} out of range for {frame} frame")
+            inv_H.append(iH); pw.append(p); c1.append(a); c2.append(b)
+            rows.append(int(row)); coefs.append(float(c))
+
+        self.register_buffer("inv_H", torch.tensor(inv_H, dtype=torch.float32))
+        self.register_buffer("speed_pow", torch.tensor(pw, dtype=torch.float32))
+        self.register_buffer("c1", torch.tensor(c1, dtype=torch.long))
+        self.register_buffer("c2", torch.tensor(c2, dtype=torch.long))
+        self.register_buffer("rows", torch.tensor(rows, dtype=torch.long))
+
+        coef = torch.tensor(coefs, dtype=torch.float32)
+        if trainable:
+            self.coef = nn.Parameter(coef)
+        else:
+            self.register_buffer("coef", coef)
+        self.register_buffer("coef_prior", coef.clone())
+
+        scatter = torch.zeros(self.n_terms, self.n_state)
+        for i, r in enumerate(rows):
+            scatter[i, r] = 1.0
+        self.register_buffer("row_scatter", scatter)
+
+    def forward(self, y_phys: torch.Tensor) -> torch.Tensor:
+        """f_physics in PHYSICAL units. Stateless. Returns (..., n_state)."""
+        if self.n_terms == 0:
+            return torch.zeros_like(y_phys)
+
+        h = y_phys[..., self.alt_idx].unsqueeze(-1)              # (...,1)
+        vsel = y_phys.index_select(-1, self.speed_idx)
+        v = torch.sqrt((vsel * vsel).sum(-1, keepdim=True) + 1e-24)
+
+        # exp(-h*inv_H): inv_H = 0 for non-density terms gives exactly 1.0
+        rho = torch.exp(-h * self.inv_H)                          # (...,n_terms)
+        vpow = torch.pow(v, self.speed_pow)                       # (...,n_terms)
+
+        ones = torch.ones_like(y_phys[..., :1])
+        aug = torch.cat([y_phys, ones], dim=-1)                   # (...,n_state+1)
+        a = aug.index_select(-1, self.c1)
+        b = aug.index_select(-1, self.c2)
+
+        vals = rho * vpow * a * b * self.coef                     # (...,n_terms)
+        return vals @ self.row_scatter                            # (...,n_state)
+
+    def prior_penalty(self) -> torch.Tensor:
+        """Tight-prior regulariser for optional fine-tuning. Without it,
+        fine-tuning can drift the physics term into fitting maneuvers, which
+        destroys the extrapolation guarantee it exists to provide."""
+        if not self.trainable or self.n_terms == 0:
+            return torch.zeros((), device=self.coef.device)
+        scale = self.coef_prior.abs().clamp_min(1e-12)
+        return (((self.coef - self.coef_prior) / scale) ** 2).mean()
+
+    @classmethod
+    def from_json(cls, path, frame=None, trainable=False, verbose=True):
+        """Build from discover_physics.py's exported coefficients.
+
+        The frame is read from the JSON. If `frame` is also given and disagrees,
+        this raises rather than silently misaligning columns.
+        """
+        spec = json.loads(Path(path).read_text())
+        json_frame = spec.get("frame", "geodesic")
+        if frame is not None and frame != json_frame:
+            raise ValueError(
+                f"frame mismatch: coefficients were discovered in {json_frame!r} "
+                f"but the model is running {frame!r}. Re-run discovery in the "
+                f"frame you are training in."
+            )
+        fr = json_frame
+        names = FRAME_SPECS[fr]["state_names"]
+        terms = []
+        for row_name, r in spec["rows"].items():
+            row = r.get("row_index")
+            if row is None:
+                raise ValueError(f"row_index missing for {row_name}")
+            for nm, c in zip(r["terms"], r["coefficients"]):
+                terms.append((nm, int(row), float(c)))
+        obj = cls(terms, frame=fr, trainable=trainable)
+        if verbose:
+            print(f"[PhysicsField] frame={fr} gate={spec.get('gate')} "
+                  f"terms={len(terms)} states={obj.n_state}")
+            for row_name, r in spec["rows"].items():
+                n = len(r["terms"])
+                tag = "" if n else "   <-- UNEXPLAINED, contributes zero"
+                print(f"    {row_name:16s}: {n} terms{tag}")
+        return obj
 
 
-def _load(path):
-    arr = np.load(path, allow_pickle=True)
-    if arr.dtype == object:
-        return [np.asarray(a, float) for a in arr]
-    if arr.ndim == 3:
-        return [arr[i] for i in range(arr.shape[0])]
-    raise ValueError(f"unexpected data shape {arr.shape}")
+class ScaledPhysicsField(nn.Module):
+    """Wraps PhysicsField with the StandardScaler unscale/rescale contract.
 
+        y_phys   = y_scaled * scale + mean        [state inverse: HAS mean]
+        f_phys   = physics(y_phys)
+        f_scaled = f_phys / scale                 [derivative: NO mean]
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="glide-phase trajectories, physical units")
-    ap.add_argument("--frame", default="lned", choices=["geodesic", "lned"],
-                    help="state frame of the input data (default: lned)")
-    ap.add_argument("--dt", type=float, required=True)
-    ap.add_argument("--window", type=int, default=40)
-    ap.add_argument("--stride", type=int, default=10)
-    ap.add_argument("--n-models", type=int, default=300)
-    ap.add_argument("--gate", type=float, default=INCLUSION_GATE)
-    ap.add_argument("--out", default="f_physics_coefficients.json")
-    args = ap.parse_args()
+    The missing mean on the derivative is the trap. A wrong version still runs
+    and still trains; it just injects a large constant drift into every row.
+    """
 
-    trajs = _load(args.data)
-    frame = get_frame(args.frame)
-    bad = [t.shape for t in trajs if t.shape[1] != frame.n_state]
-    if bad:
-        raise ValueError(
-            f"--frame {args.frame} expects {frame.n_state} columns, but got "
-            f"trajectories with shapes {bad[:3]}. Wrong --frame, or the data "
-            f"still has its time column."
-        )
-    res = discover(trajs, frame, args.dt, args.window, args.stride,
-                   args.n_models, gate=args.gate)
-    report(res)
-    export_coefficients(res, args.out)
-    print(f"wrote {args.out}")
+    def __init__(self, physics: PhysicsField, state_mean, state_scale):
+        super().__init__()
+        self.physics = physics
+        n = physics.n_state
+        mean = torch.as_tensor(state_mean, dtype=torch.float32).flatten()
+        scale = torch.as_tensor(state_scale, dtype=torch.float32).flatten()
+        if mean.numel() != n or scale.numel() != n:
+            raise ValueError(
+                f"frame {physics.frame!r} is {n}-state, but scaler stats have "
+                f"mean {mean.numel()} / scale {scale.numel()} entries."
+            )
+        if torch.any(scale <= 0):
+            raise ValueError("scaler scale_ contains non-positive entries")
+        self.register_buffer("state_mean", mean)
+        self.register_buffer("state_scale", scale)
 
-
-if __name__ == "__main__":
-    main()
+    def forward(self, y_scaled: torch.Tensor) -> torch.Tensor:
+        """Returns f_physics expressed in SCALED derivative units."""
+        y_phys = y_scaled * self.state_scale + self.state_mean
+        return self.physics(y_phys) / self.state_scale

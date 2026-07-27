@@ -1,260 +1,143 @@
-# weak_ensemble.py
-"""Weak-form (integral) SINDy with bootstrap ensembling.
+# physics_library.py
+"""Aerodynamic candidate library for HGV glide dynamics in the 5-state
+integrated geodesic frame [s, h, v_s, v_alpha, v_h].
 
-No pysindy dependency -- implemented directly on numpy/scipy so it can run in
-the training environment without adding a package. The formulation follows the
-weak/integral SINDy construction:
+Design rationale (per-family justification is in FAMILY_NOTES below). The
+library is built from flight-mechanics forms, NOT a generic polynomial sweep:
+a polynomial sweep cannot express exp(-h/H), and the exponential atmosphere is
+the single term that buys correct out-of-distribution extrapolation.
 
-    integral over window of  xdot . phi  dt  =  -integral of x . phi' dt
-                                                (integration by parts, phi
-                                                 compactly supported)
-
-so the left-hand side never requires a numerical derivative of x. This is the
-point: the data is chaotic maneuvering flight and finite-differencing v_alpha
-in particular would produce mostly noise.
-
-Test functions phi are C^inf bump functions supported on each window, which
-vanish with all derivatives at the window edges, so the boundary terms drop.
+Everything here operates in PHYSICAL UNITS (metres, seconds, radians).
+The scaled-space transform happens later, at integration time, not here.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
-# test functions
+# state layout (physical units)
 # ---------------------------------------------------------------------------
-def bump_and_derivative(m: int, p: int = 8) -> tuple[np.ndarray, np.ndarray]:
-    """C^inf-like compactly supported test function on m samples and its
-    derivative w.r.t. the normalised coordinate tau in [-1, 1].
+S_IDX, H_IDX, VS_IDX, VA_IDX, VH_IDX = 0, 1, 2, 3, 4
+STATE_NAMES = ["s", "h", "v_s", "v_alpha", "v_h"]
 
-    phi(tau) = (1 - tau^2)^p   -- vanishes to order p at both ends.
-    phi'(tau) = -2*p*tau*(1 - tau^2)^(p-1)
-    """
-    tau = np.linspace(-1.0, 1.0, m)
-    phi = (1.0 - tau**2) ** p
-    dphi = -2.0 * p * tau * (1.0 - tau**2) ** (p - 1)
-    return phi, dphi
+# rows we actually fit. ds/dt = v_s and dh/dt = v_h are exact identities and
+# are hard-coded in GRUODEPredictorModel.forward -- asking SINDy to rediscover
+# them is a correctness check, not a discovery (see fit_identity_rows).
+ACCEL_ROWS = [VS_IDX, VA_IDX, VH_IDX]
+ACCEL_ROW_NAMES = ["dv_s/dt", "dv_alpha/dt", "dv_h/dt"]
+
+# candidate exponential-atmosphere scale heights [m]. The true US-standard
+# value is ~7.16 km in the 10-50 km band; we let the ensemble choose because
+# the effective scale height depends on the altitude band actually flown.
+SCALE_HEIGHTS_M = (6000.0, 6500.0, 7000.0, 7500.0, 8000.0, 8500.0, 9000.0)
+
+G0 = 9.80665  # [m/s^2]
+
+FAMILY_NOTES = {
+    "const": "Gravity / trim bias. dv_h/dt must contain ~-g; its recovery is a sanity check.",
+    "density": "rho(h) ~ exp(-h/H). The OOD-safety term: lower h -> denser air -> more drag.",
+    "drag": "rho(h)*v*|v| and rho(h)*v_i*|v|. Quadratic drag is the dominant glide force.",
+    "lift": "rho(h)*|v|^2 acting on the vertical/lateral rows: sustains glide equilibrium.",
+    "poly": "Low-order velocity polynomials. Absorb mild non-aerodynamic structure.",
+    "coupling": "v_alpha*v_s etc. Kinematic curvature coupling in a rotating track frame.",
+}
 
 
-def weak_form_system(
-    X: np.ndarray,
-    Theta: np.ndarray,
-    dt: float,
-    row: int,
-    window: int = 40,
-    stride: int = 10,
-    poly_order: int = 8,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Assemble the weak-form linear system for ONE state row.
+def _speed(X: np.ndarray) -> np.ndarray:
+    """Total speed magnitude. v_alpha is a RATE (rad/s), not a linear velocity,
+    so it is deliberately excluded from the speed norm -- including it would be
+    a units error (rad/s summed with m/s)."""
+    return np.sqrt(X[:, VS_IDX] ** 2 + X[:, VH_IDX] ** 2) + 1e-12
 
-    For each window W with test function phi:
-        b_W = -(1/2) * dtau * sum( x_row * dphi )      [ = integral xdot*phi ]
-        A_W =  (1/2) * dtau * sum( Theta * phi ) * ... (trapezoid weights)
 
-    where the factor dt/2 * (2/m-1) bookkeeping is folded into a consistent
-    scaling that cancels between A and b (both are integrals over the same
-    window against phi or phi'). We keep the physical dt so coefficients come
-    out in physical units.
+def build_library(X: np.ndarray, scale_heights=SCALE_HEIGHTS_M) -> tuple[np.ndarray, list[str]]:
+    """Build the candidate feature matrix Theta(X).
+
+    Args:
+        X: (N, 5) states in PHYSICAL units [s, h, v_s, v_alpha, v_h].
+        scale_heights: candidate H values for exp(-h/H).
 
     Returns:
-        A: (n_windows, n_features)
-        b: (n_windows,)
+        Theta: (N, n_features)
+        names: feature names, aligned with Theta columns.
     """
-    N = X.shape[0]
-    if window > N:
-        raise ValueError(f"window {window} exceeds trajectory length {N}")
-    phi, dphi = bump_and_derivative(window, p=poly_order)
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2 or X.shape[1] != 5:
+        raise ValueError(f"expected (N,5) physical-unit states, got {X.shape}")
 
-    # tau spans [-1,1] over (window-1)*dt seconds  =>  dtau/dt = 2/((window-1)*dt)
-    half_len = 0.5 * (window - 1) * dt  # seconds; d t = half_len * d tau
+    h = X[:, H_IDX]
+    v_s = X[:, VS_IDX]
+    v_a = X[:, VA_IDX]
+    v_h = X[:, VH_IDX]
+    v = _speed(X)
 
-    A_rows, b_rows = [], []
-    for start in range(0, N - window + 1, stride):
-        sl = slice(start, start + window)
-        x_row = X[sl, row]
-        Th_w = Theta[sl, :]
+    cols: list[np.ndarray] = []
+    names: list[str] = []
 
-        # integral( xdot * phi ) dt = -integral( x * dphi/dt ) dt
-        #                           = -integral( x * dphi ) dtau
-        b_w = -np.trapezoid(x_row * dphi, dx=2.0 / (window - 1))
-        # integral( Theta * phi ) dt = half_len * integral( Theta * phi ) dtau
-        A_w = half_len * np.trapezoid(Th_w * phi[:, None], dx=2.0 / (window - 1), axis=0)
+    def add(col, name):
+        cols.append(np.asarray(col, dtype=np.float64))
+        names.append(name)
 
-        A_rows.append(A_w)
-        b_rows.append(b_w)
+    # --- constant (gravity / trim) -----------------------------------------
+    add(np.ones_like(h), "1")
 
-    return np.asarray(A_rows), np.asarray(b_rows)
+    # --- exponential atmosphere and drag/lift forms -------------------------
+    for H in scale_heights:
+        rho = np.exp(-h / H)
+        tag = f"exp(-h/{H/1000:.1f}k)"
+        add(rho, tag)
+        # quadratic drag along each linear-velocity axis
+        add(rho * v_s * v, f"{tag}*v_s*|v|")
+        add(rho * v_h * v, f"{tag}*v_h*|v|")
+        # isotropic dynamic-pressure term (lift-form / |v|^2)
+        add(rho * v * v, f"{tag}*|v|^2")
+        # lateral: dynamic pressure driving azimuth rate (lift-form on v_alpha)
+        add(rho * v * v * v_a, f"{tag}*|v|^2*v_alpha")
+        add(rho * v * v_a, f"{tag}*|v|*v_alpha")
 
+    # --- low-order velocity polynomials -------------------------------------
+    add(v_s, "v_s")
+    add(v_h, "v_h")
+    add(v_a, "v_alpha")
+    add(v, "|v|")
+    add(v_s * v_s, "v_s^2")
+    add(v_h * v_h, "v_h^2")
+    add(v_s * v_h, "v_s*v_h")
 
-# ---------------------------------------------------------------------------
-# sparse regression
-# ---------------------------------------------------------------------------
-def stlsq(A: np.ndarray, b: np.ndarray, threshold: float, n_iter: int = 20,
-          ridge: float = 1e-8) -> np.ndarray:
-    """Sequentially-thresholded least squares on NORMALISED columns.
+    # --- kinematic coupling -------------------------------------------------
+    add(v_a * v_s, "v_alpha*v_s")
+    add(v_a * v_h, "v_alpha*v_h")
+    add(v_a * v_a, "v_alpha^2")
 
-    Caller is responsible for column normalisation; `threshold` is applied to
-    the normalised coefficients so a single threshold is meaningful across
-    features with wildly different units.
-    """
-    n_feat = A.shape[1]
-    active = np.ones(n_feat, dtype=bool)
-    xi = np.zeros(n_feat)
-
-    for _ in range(n_iter):
-        if not active.any():
-            break
-        Aa = A[:, active]
-        # ridge-stabilised lstsq (library is deliberately collinear)
-        G = Aa.T @ Aa + ridge * np.eye(Aa.shape[1])
-        coef = np.linalg.solve(G, Aa.T @ b)
-        xi_new = np.zeros(n_feat)
-        xi_new[active] = coef
-
-        small = np.abs(xi_new) < threshold
-        new_active = active & ~small
-        if new_active.sum() == active.sum():
-            xi = xi_new
-            break
-        if not new_active.any():
-            # threshold killed everything -- keep previous non-empty solution
-            xi = xi_new
-            xi[small] = 0.0
-            break
-        active = new_active
-        xi = xi_new
-        xi[~active] = 0.0
-
-    return xi
+    Theta = np.column_stack(cols)
+    if not np.all(np.isfinite(Theta)):
+        bad = names[int(np.argmax(~np.isfinite(Theta).all(axis=0)))]
+        raise ValueError(f"non-finite entries in library (first bad family near '{bad}')")
+    return Theta, names
 
 
-def ensemble_sindy_row(
-    A: np.ndarray,
-    b: np.ndarray,
-    threshold: float,
-    n_models: int = 300,
-    subset_frac: float = 0.7,
-    library_bagging: bool = True,
-    lib_frac: float = 0.85,
-    min_r2: float = 0.10,
-    rng: np.random.Generator | None = None,
-) -> dict:
-    """Bootstrap-ensemble STLSQ for one row.
-
-    Returns per-term inclusion probability and coefficient distributions.
-    Inclusion probability -- not the point estimate -- is the gate for what is
-    allowed into f_physics.
-
-    Column normalisation is done ONCE on the full matrix so thresholds and
-    coefficients are comparable across bootstrap replicates; coefficients are
-    de-normalised back to physical units before returning.
-
-    `min_r2` is an ABSOLUTE explanatory-power floor and it is essential.
-    Normalising by ||b|| makes a near-zero target look order-1, so on a row that
-    is mostly unmodellable (v_alpha, dominated by unobserved maneuver commands)
-    every candidate clears the relative threshold and inclusion probability
-    saturates at 1.00 for the whole library. That is saturation, not discovery.
-    A row whose ensemble cannot beat min_r2 out-of-sample is reported as
-    UNEXPLAINED and contributes nothing to f_physics.
-    """
-    rng = rng or np.random.default_rng(0)
-    n_samp, n_feat = A.shape
-
-    col_norm = np.linalg.norm(A, axis=0)
-    col_norm[col_norm == 0] = 1.0
-    b_norm = np.linalg.norm(b)
-    b_norm = b_norm if b_norm > 0 else 1.0
-
-    An = A / col_norm
-    bn = b / b_norm
-
-    coefs = np.zeros((n_models, n_feat))
-    included = np.zeros((n_models, n_feat), dtype=bool)
-    oos_r2 = np.full(n_models, np.nan)
-
-    n_sub = max(8, int(subset_frac * n_samp))
-    n_lib = max(3, int(lib_frac * n_feat))
-    all_idx = np.arange(n_samp)
-
-    for k in range(n_models):
-        idx = rng.choice(n_samp, size=n_sub, replace=True)
-        if library_bagging:
-            lib_idx = rng.choice(n_feat, size=n_lib, replace=False)
-        else:
-            lib_idx = np.arange(n_feat)
-
-        xi_sub = stlsq(An[np.ix_(idx, lib_idx)], bn[idx], threshold=threshold)
-        xi_full = np.zeros(n_feat)
-        xi_full[lib_idx] = xi_sub
-        coefs[k] = xi_full
-        offered = np.zeros(n_feat, dtype=bool)
-        offered[lib_idx] = True
-        included[k] = offered & (np.abs(xi_full) > 0)
-
-        # out-of-bag R^2: honest explanatory power on samples not fitted
-        oob = np.setdiff1d(all_idx, np.unique(idx), assume_unique=False)
-        if oob.size >= 5:
-            pred = An[oob] @ xi_full
-            resid = bn[oob] - pred
-            ss_res = float(resid @ resid)
-            centred = bn[oob] - bn[oob].mean()
-            ss_tot = float(centred @ centred)
-            if ss_tot > 0:
-                oos_r2[k] = 1.0 - ss_res / ss_tot
-
-    median_r2 = float(np.nanmedian(oos_r2)) if np.isfinite(oos_r2).any() else float("nan")
-    explained = np.isfinite(median_r2) and median_r2 >= min_r2
-
-    # Inclusion probability, conditioned on the term having been OFFERED.
-    # With library bagging a term is offered only lib_frac of the time, so the
-    # raw mean understates inclusion by exactly that factor; divide it out.
-    incl_prob = included.mean(axis=0)
-    if library_bagging:
-        incl_prob = incl_prob / lib_frac  # de-bias for offer rate
-        incl_prob = np.clip(incl_prob, 0.0, 1.0)
-
-    # de-normalise: xi_phys = xi_norm * b_norm / col_norm
-    coefs_phys = coefs * (b_norm / col_norm)[None, :]
-
-    nz = np.abs(coefs) > 0
-    with np.errstate(invalid="ignore"):
-        med = np.array([
-            np.median(coefs_phys[nz[:, j], j]) if nz[:, j].any() else 0.0
-            for j in range(n_feat)
-        ])
-        q05 = np.array([
-            np.quantile(coefs_phys[nz[:, j], j], 0.05) if nz[:, j].any() else 0.0
-            for j in range(n_feat)
-        ])
-        q95 = np.array([
-            np.quantile(coefs_phys[nz[:, j], j], 0.95) if nz[:, j].any() else 0.0
-            for j in range(n_feat)
-        ])
-
+def library_condition_report(Theta: np.ndarray, names: list[str]) -> dict:
+    """Diagnose collinearity. Many exp(-h/H) columns at nearby H are highly
+    correlated by construction; ensembling handles the resulting instability by
+    reporting inclusion probability rather than a single coefficient, but the
+    user should still see how bad it is."""
+    # Drop zero-variance columns (e.g. the constant) before the correlation
+    # report -- they are legitimate library terms but make corrcoef divide by
+    # zero, producing a cosmetic inf/nan that masks real conditioning problems.
+    keep_var = Theta.std(axis=0) > 0
+    Theta = Theta[:, keep_var]
+    names = [n for n, k in zip(names, keep_var) if k]
+    Th = Theta - Theta.mean(axis=0, keepdims=True)
+    sd = Th.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = Th / sd
+    C = np.corrcoef(Z, rowvar=False)
+    np.fill_diagonal(C, 0.0)
+    i, j = np.unravel_index(np.argmax(np.abs(C)), C.shape)
     return {
-        "inclusion_prob": incl_prob,
-        "coef_median": med,
-        "coef_q05": q05,
-        "coef_q95": q95,
-        "coefs_all": coefs_phys,
-        "col_norm": col_norm,
-        "b_norm": b_norm,
-        "median_oob_r2": median_r2,
-        "oob_r2_all": oos_r2,
-        "explained": bool(explained),
-        "min_r2": float(min_r2),
+        "n_features": Theta.shape[1],
+        "cond": float(np.linalg.cond(Z)),
+        "max_abs_corr": float(np.abs(C[i, j])),
+        "max_corr_pair": (names[i], names[j]),
     }
-
-
-def refit_on_selected(A: np.ndarray, b: np.ndarray, keep: np.ndarray) -> np.ndarray:
-    """Unregularised-ish least squares refit restricted to the gated terms.
-    Debiases the shrinkage that thresholding induces."""
-    xi = np.zeros(A.shape[1])
-    if not keep.any():
-        return xi
-    Aa = A[:, keep]
-    G = Aa.T @ Aa + 1e-10 * np.eye(Aa.shape[1])
-    xi[keep] = np.linalg.solve(G, Aa.T @ b)
-    return xi

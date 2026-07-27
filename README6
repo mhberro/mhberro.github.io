@@ -1,6 +1,35 @@
-python NEXT_training.py --frame geodesic --geodesic-mode integrated --sbi-phase glide \
-  --dump-glide-npy glide_geo.npy --tgt-data-paths trajectory_library/phases/HighE_HGV \
-  --sr 100000 --use-scalar --aug 0 --nhidden 256 --dt 1.0 \
-  -o model_outputs/SBI/mo_bff_gruode_sindy --model-type gruode
+(.venv) e471302@usmk2tqq3hkk2 next % python inspect_dump.py --data glide_geo.npy --frame geodesic --dt 1.0
+trajectories : 117
+columns      : 5  (frame 'geodesic' expects 5)
+length       : 24 .. 705 samples (24 .. 705 s at dt=1.0)
 
-python inspect_dump.py --data glide_geo.npy --frame geodesic --dt 1.0
+per-column ranges (physical units):
+  s                26943.03 ..     3869614.25   mean   1015583.32
+  h                13799.23 ..       99995.28   mean     50242.21
+  v_s              -6151.19 ..       -3637.87   mean     -5465.25
+  v_alpha             -0.01 ..           0.01   mean        -0.00
+  v_h              -1610.51 ..        3408.31   mean       701.71
+
+checks:
+  [ok]   h is in metres (13799..99995)
+  |v| pooled median 5672.9 m/s   range 3713.5..6164.4
+  |v| at t=0       median 6014.5 m/s   range 5018.9..6105.3
+  [ok]   entry speed consistent with hypersonic glide
+
+identity check  (dPos/dt should equal the paired velocity):
+  [FAIL] ds/dt vs v_s: RMS residual     125.1 m/s  (2.3% of RMS v_s)
+  [FAIL] dh/dt vs v_h: RMS residual    1112.5 m/s  (109.4% of RMS v_h)
+
+  *** The position rows are NOT exact identities in this data.
+      Two things depend on that assumption and are affected:
+        1. discover_physics.py's identity check will fail. That is a
+           real frame property here, not a pipeline bug.
+        2. GRUODEPredictorModel hard-codes dPos/dt = Vel via
+           index_copy when second_order is on. In this frame that
+           forces a systematically wrong position derivative.
+      Likely cause in lned: velocity is resolved in the NED basis at
+      the ORIGIN, while altitude is true HAE following the ellipsoid.
+      Over long range these conventions diverge with Earth curvature.
+
+first row of trajectory 0:
+  s=188174.83  h=27331.14  v_s=-5307.93  v_alpha=-0.00  v_h=135.34

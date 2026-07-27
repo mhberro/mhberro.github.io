@@ -1,259 +1,96 @@
-# discover_physics.py
-"""Ensemble weak-form SINDy discovery of f_physics for the glide phase.
+# scaling.py
+"""The scaled-space <-> physical-space contract for f_physics.
 
-Per-row fitting with per-row normalisation and per-row thresholds, because
-dv_s/dt and dv_h/dt are m/s^2 while dv_alpha/dt is rad/s^2 -- a single global
-threshold silently zeroes the entire v_alpha row.
+CONVENTION CHOSEN (stated explicitly, per the requirement):
 
-Usage (on real data):
-    python discover_physics.py --data glide_trajectories.npy --dt 1.0
+    UNSCALE INSIDE forward, APPLY PHYSICS IN PHYSICAL UNITS, RESCALE THE RESULT.
 
-Expected data format: either an (n_traj,) object array of (T_i, 5) arrays, or a
-(n_traj, T, 5) array, in PHYSICAL units [s, h, v_s, v_alpha, v_h], glide phase
-only.
+That is, given a scaled state y_scaled as seen by the solver:
+
+    y_phys   = y_scaled * scale_ + mean_          (StandardScaler inverse)
+    f_phys   = f_physics(y_phys)                   [physical units, m/s^2 etc]
+    f_scaled = f_phys / scale_                     (derivative transform)
+
+The derivative transform has NO mean term. This is the easy place to get it
+wrong: the inverse transform of a STATE includes +mean_, but the transform of a
+TIME DERIVATIVE does not, because d/dt(mean_) = 0. A f_physics that adds
+mean_/scale_ to xdot would inject a large constant drift into every row while
+still "running" perfectly happily.
+
+Why this convention rather than baking the scaling into the coefficients:
+exp(-h/H) is nonlinear in h, so there is no exact linear reparameterisation of
+the discovered coefficients into scaled space. Any attempt to pre-fold the
+scaling would only be valid to first order around the scaler mean. Unscaling
+inside forward is exact.
+
+Cost: two elementwise multiplies per evaluation. Negligible, and both are
+ONNX-exportable (no data-dependent control flow).
 """
 
 from __future__ import annotations
 
-import argparse
-import json
-from pathlib import Path
-
 import numpy as np
 
-from physics_library import (
-    ACCEL_ROWS,
-    ACCEL_ROW_NAMES,
-    S_IDX,
-    H_IDX,
-    VS_IDX,
-    VH_IDX,
-    build_library,
-    library_condition_report,
-)
-from weak_ensemble import ensemble_sindy_row, refit_on_selected, weak_form_system
 
-# per-row sparsity thresholds on NORMALISED coefficients.
-DEFAULT_THRESHOLDS = {
-    VS_IDX: 0.05,
-    3: 0.05,       # v_alpha row (VA_IDX)
-    VH_IDX: 0.05,
-}
-INCLUSION_GATE = 0.90
+def unscale_state(y_scaled: np.ndarray, mean: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """StandardScaler inverse for a STATE: y_phys = y*scale + mean."""
+    return y_scaled * scale + mean
 
 
-def fit_identity_rows(trajs, dt, window=40, stride=10):
-    """Free correctness check: fit ds/dt and dh/dt with the SAME weak-form
-    pipeline against a tiny library [v_s, v_h]. Must return ~1.0 on the right
-    velocity. Any other answer is a pipeline bug (sign, offset, window, dt),
-    NOT a discovery.
+def scale_derivative(f_phys: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Transform a TIME DERIVATIVE into scaled space: f_scaled = f_phys/scale.
+
+    NOTE: no mean term. See module docstring.
     """
-    A_all_s, b_all_s, A_all_h, b_all_h = [], [], [], []
-    for X in trajs:
-        small = np.column_stack([X[:, VS_IDX], X[:, VH_IDX]])
-        A_s, b_s = weak_form_system(X, small, dt, row=S_IDX, window=window, stride=stride)
-        A_h, b_h = weak_form_system(X, small, dt, row=H_IDX, window=window, stride=stride)
-        A_all_s.append(A_s); b_all_s.append(b_s)
-        A_all_h.append(A_h); b_all_h.append(b_h)
-
-    A_s = np.vstack(A_all_s); b_s = np.concatenate(b_all_s)
-    A_h = np.vstack(A_all_h); b_h = np.concatenate(b_all_h)
-
-    xi_s = np.linalg.lstsq(A_s, b_s, rcond=None)[0]
-    xi_h = np.linalg.lstsq(A_h, b_h, rcond=None)[0]
-    return {
-        "ds/dt": {"v_s": float(xi_s[0]), "v_h": float(xi_s[1])},
-        "dh/dt": {"v_s": float(xi_h[0]), "v_h": float(xi_h[1])},
-    }
+    return f_phys / scale
 
 
-def check_identity_rows(res, tol=0.02):
-    """Fail loudly if the identity rows did not come back as identities."""
-    problems = []
-    if abs(res["ds/dt"]["v_s"] - 1.0) > tol or abs(res["ds/dt"]["v_h"]) > tol:
-        problems.append(f"ds/dt should be 1.0*v_s + 0.0*v_h, got {res['ds/dt']}")
-    if abs(res["dh/dt"]["v_h"] - 1.0) > tol or abs(res["dh/dt"]["v_s"]) > tol:
-        problems.append(f"dh/dt should be 1.0*v_h + 0.0*v_s, got {res['dh/dt']}")
-    return problems
+def verify_scaling_roundtrip(mean, scale, rtol=1e-10):
+    """Numerical check of the convention on a known analytic case.
 
+    Uses the exact identity row ds/dt = v_s, which must hold in BOTH spaces:
+        physical: ds/dt = v_s
+        scaled  : ds_scaled/dt = v_s_phys / scale_s
+                                = (v_s_scaled*scale_vs + mean_vs) / scale_s
 
-def discover(trajs, dt, window=40, stride=10, n_models=300, thresholds=None,
-             gate=INCLUSION_GATE, seed=0, verbose=True):
-    """Run the full per-row discovery. Returns a result dict."""
-    thresholds = thresholds or DEFAULT_THRESHOLDS
-    rng = np.random.default_rng(seed)
+    If a naive implementation forgot the mean on the state inverse, or wrongly
+    added a mean to the derivative, this check fails loudly.
+    """
+    mean = np.asarray(mean, float)
+    scale = np.asarray(scale, float)
+    rng = np.random.default_rng(0)
+    y_scaled = rng.normal(size=(64, 5))
 
-    # --- identity-row correctness check FIRST -------------------------------
-    ident = fit_identity_rows(trajs, dt, window, stride)
-    problems = check_identity_rows(ident)
-    if verbose:
-        print("=" * 72)
-        print("IDENTITY-ROW CHECK (must recover ds/dt=v_s, dh/dt=v_h)")
-        print("=" * 72)
-        for k, v in ident.items():
-            print(f"  {k:8s}: " + ", ".join(f"{kk}={vv:+.6f}" for kk, vv in v.items()))
-        if problems:
-            print("  !! FAILED -- this is a PIPELINE BUG, not a discovery:")
-            for p in problems:
-                print("     -", p)
-        else:
-            print("  PASS -- weak-form pipeline recovers exact identities.")
-        print()
+    y_phys = unscale_state(y_scaled, mean, scale)
 
-    # --- build library over all glide data ----------------------------------
-    Theta_list, names = [], None
-    for X in trajs:
-        Th, names = build_library(X)
-        Theta_list.append(Th)
+    # physical-space derivative for the identity rows only
+    f_phys = np.zeros_like(y_phys)
+    f_phys[:, 0] = y_phys[:, 2]  # ds/dt = v_s
+    f_phys[:, 1] = y_phys[:, 4]  # dh/dt = v_h
 
-    cond = library_condition_report(np.vstack(Theta_list), names)
-    if verbose:
-        print("=" * 72)
-        print("LIBRARY CONDITIONING")
-        print("=" * 72)
-        print(f"  features        : {cond['n_features']}")
-        print(f"  condition number: {cond['cond']:.3e}")
-        print(f"  max |corr|      : {cond['max_abs_corr']:.4f} "
-              f"between {cond['max_corr_pair'][0]} and {cond['max_corr_pair'][1]}")
-        print("  (high collinearity is expected across neighbouring scale heights;")
-        print("   this is exactly why inclusion probability, not a point estimate,")
-        print("   is the gate.)")
-        print()
+    f_scaled = scale_derivative(f_phys, scale)
 
-    results = {}
-    for row, row_name in zip(ACCEL_ROWS, ACCEL_ROW_NAMES):
-        A_list, b_list = [], []
-        for X, Th in zip(trajs, Theta_list):
-            A, b = weak_form_system(X, Th, dt, row=row, window=window, stride=stride)
-            A_list.append(A)
-            b_list.append(b)
+    expect_s = (y_scaled[:, 2] * scale[2] + mean[2]) / scale[0]
+    expect_h = (y_scaled[:, 4] * scale[4] + mean[4]) / scale[1]
 
-        # bootstrap over TRAJECTORIES (not windows) to respect correlation
-        traj_index = np.concatenate([np.full(len(b), i) for i, b in enumerate(b_list)])
-        A = np.vstack(A_list)
-        b = np.concatenate(b_list)
-
-        ens = ensemble_sindy_row(
-            A, b,
-            threshold=thresholds[row],
-            n_models=n_models,
-            rng=np.random.default_rng(rng.integers(1 << 30)),
+    err_s = float(np.max(np.abs(f_scaled[:, 0] - expect_s)))
+    err_h = float(np.max(np.abs(f_scaled[:, 1] - expect_h)))
+    ok = err_s <= rtol * max(1.0, np.abs(expect_s).max()) and \
+         err_h <= rtol * max(1.0, np.abs(expect_h).max())
+    if not ok:
+        raise ValueError(
+            f"scaling convention check FAILED: ds err {err_s:.3e}, dh err {err_h:.3e}"
         )
-
-        keep = ens["inclusion_prob"] >= gate
-        # An unexplained row contributes NOTHING to f_physics. Without this,
-        # a near-noise row saturates inclusion at 1.00 and floods f_physics
-        # with spurious high-coefficient terms -- corrupting exactly the
-        # regime f_physics exists to make safe.
-        if not ens["explained"]:
-            keep = np.zeros_like(keep, dtype=bool)
-        xi_final = refit_on_selected(A, b, keep)
-
-        results[row_name] = {
-            "row": row,
-            "names": names,
-            "inclusion_prob": ens["inclusion_prob"],
-            "coef_median": ens["coef_median"],
-            "coef_q05": ens["coef_q05"],
-            "coef_q95": ens["coef_q95"],
-            "keep": keep,
-            "coef_final": xi_final,
-            "n_windows": len(b),
-            "n_traj": len(trajs),
-            "median_oob_r2": ens["median_oob_r2"],
-            "explained": ens["explained"],
-            "min_r2": ens["min_r2"],
-        }
-
-    return {"rows": results, "identity": ident, "identity_problems": problems,
-            "condition": cond, "names": names, "gate": gate}
+    return {"ds_err": err_s, "dh_err": err_h}
 
 
-def report(res, top_k=12):
-    """Readable inclusion table + discovered equations."""
-    print("=" * 72)
-    print(f"ENSEMBLE-SINDy INCLUSION TABLE  (gate = {res['gate']:.0%})")
-    print("=" * 72)
-    for row_name, r in res["rows"].items():
-        status = "EXPLAINED" if r["explained"] else "UNEXPLAINED -> contributes nothing"
-        print(f"\n--- {row_name} ---  ({r['n_windows']} weak-form windows, "
-              f"{r['n_traj']} trajectories)")
-        print(f"  out-of-bag R^2 (median): {r['median_oob_r2']:.4f}   "
-              f"floor {r['min_r2']:.2f}   [{status}]")
-        if not r["explained"]:
-            print("  Inclusion probabilities below are SATURATED and meaningless:")
-            print("  the target is near-noise, so normalisation inflates every")
-            print("  coefficient above threshold. Reported for transparency only.")
-        order = np.argsort(-r["inclusion_prob"])
-        print(f"  {'term':<28s} {'incl':>6s}  {'median':>12s}  "
-              f"{'[q05':>12s} {'q95]':>12s}  gate")
-        for j in order[:top_k]:
-            p = r["inclusion_prob"][j]
-            mark = "KEEP" if r["keep"][j] else "  --"
-            print(f"  {r['names'][j]:<28s} {p:6.2f}  {r['coef_median'][j]:12.4e}  "
-                  f"{r['coef_q05'][j]:12.4e} {r['coef_q95'][j]:12.4e}  {mark}")
+def demonstrate_mean_bug(mean, scale):
+    """Show the magnitude of the error the mean-on-derivative bug would cause.
 
-    print("\n" + "=" * 72)
-    print("DISCOVERED f_physics  (terms passing the inclusion gate)")
-    print("=" * 72)
-    any_terms = False
-    for row_name, r in res["rows"].items():
-        kept = np.where(r["keep"])[0]
-        if len(kept) == 0:
-            print(f"  {row_name} = 0        <-- NO TERM PASSED THE GATE")
-            continue
-        any_terms = True
-        parts = [f"{r['coef_final'][j]:+.4e}*{r['names'][j]}" for j in kept]
-        print(f"  {row_name} = " + "  ".join(parts))
-    if not any_terms:
-        print("\n  NEGATIVE RESULT: no sparse physics survived gating.")
-        print("  Do NOT force this into the architecture. See assessment notes.")
-    print()
-
-
-def export_coefficients(res, path):
-    """Dump gated coefficients for the fused field to load."""
-    out = {"gate": res["gate"], "rows": {}}
-    for row_name, r in res["rows"].items():
-        kept = np.where(r["keep"])[0]
-        out["rows"][row_name] = {
-            "row_index": int(r["row"]),
-            "terms": [r["names"][j] for j in kept],
-            "coefficients": [float(r["coef_final"][j]) for j in kept],
-            "inclusion_prob": [float(r["inclusion_prob"][j]) for j in kept],
-            "coef_q05": [float(r["coef_q05"][j]) for j in kept],
-            "coef_q95": [float(r["coef_q95"][j]) for j in kept],
-        }
-    Path(path).write_text(json.dumps(out, indent=2))
-    return out
-
-
-def _load(path):
-    arr = np.load(path, allow_pickle=True)
-    if arr.dtype == object:
-        return [np.asarray(a, float) for a in arr]
-    if arr.ndim == 3:
-        return [arr[i] for i in range(arr.shape[0])]
-    raise ValueError(f"unexpected data shape {arr.shape}")
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="glide-phase trajectories, physical units")
-    ap.add_argument("--dt", type=float, required=True)
-    ap.add_argument("--window", type=int, default=40)
-    ap.add_argument("--stride", type=int, default=10)
-    ap.add_argument("--n-models", type=int, default=300)
-    ap.add_argument("--gate", type=float, default=INCLUSION_GATE)
-    ap.add_argument("--out", default="f_physics_coefficients.json")
-    args = ap.parse_args()
-
-    trajs = _load(args.data)
-    res = discover(trajs, args.dt, args.window, args.stride, args.n_models, gate=args.gate)
-    report(res)
-    export_coefficients(res, args.out)
-    print(f"wrote {args.out}")
-
-
-if __name__ == "__main__":
-    main()
+    Returned value is the spurious constant drift (in scaled units/s) that a
+    buggy `f_scaled = (f_phys - mean)/scale` would inject. Reported so the user
+    can see this is not a rounding-level concern.
+    """
+    mean = np.asarray(mean, float)
+    scale = np.asarray(scale, float)
+    return np.abs(mean / scale)

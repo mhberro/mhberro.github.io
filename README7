@@ -1,27 +1,6 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python inspect_dump.py --data glide.npy --frame lned --dt 1.0 
-trajectories : 117
-columns      : 6  (frame 'lned' expects 6)
-length       : 24 .. 705 samples (24 .. 705 s at dt=1.0)
+python NEXT_training.py --frame lned --sbi-phase glide --consistent-velocity \
+  --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000 --use-scalar \
+  --aug 0 --nhidden 256 --dt 1.0 -o model_outputs/SBI/mo_bff_gruode_sindy --model-type gruode
 
-per-column ranges (physical units):
-  Forward             -0.00 ..     3841431.50   mean   1066653.42
-  Right          -385540.16 ..      399499.75   mean     32721.26
-  Altitude         20446.92 ..      110081.19   mean     58311.21
-  VForward          1250.79 ..        6102.29   mean      5560.95
-  VRight           -3756.25 ..        3739.00   mean        12.63
-  VUp              -1632.14 ..         492.86   mean      -206.43
-
-checks:
-  [ok]   Altitude is in metres (20447..110081)
-  |v| pooled median 5900.9 m/s   range 3849.8..6170.0
-  |v| at t=0       median 6077.6 m/s   range 5058.3..6109.4
-  [ok]   entry speed consistent with hypersonic glide
-  vertical: 31.6% of samples ascending
-
-identity check  (dPos/dt should equal the paired velocity):
-  [  ok] dForward/dt vs VForward: RMS residual      56.1 m/s  (1.0% of RMS VForward)
-  [  ok] dRight/dt vs VRight: RMS residual      10.2 m/s  (0.8% of RMS VRight)
-  [  ok] dAltitude/dt vs VUp: RMS residual       1.8 m/s  (0.5% of RMS VUp)
-
-first row of trajectory 0:
-  Forward=0.00  Right=0.00  Altitude=33846.34  VForward=5309.61  VRight=579.25  VUp=-21.53
+cd sindy && python discover_physics.py --data ../glide.npy --frame lned --dt 1.0 \
+    --window 20 --stride 5 --out f_physics_coefficients.json

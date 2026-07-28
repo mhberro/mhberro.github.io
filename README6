@@ -383,7 +383,7 @@ def forward_geodesic(lat0, lon0, s, azi):
 # ----------------------------------------------------------------------
 # 4. Vectorised geodesic-based state conversion
 # ----------------------------------------------------------------------
-def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef, *, per_point_velocity=False):
+def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef):
     """
     Vectorised conversion of whole trajectories.
 
@@ -431,37 +431,19 @@ def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef, *, per_point
     m12 = np.empty(N)
     M12 = np.empty(N)
 
-    az2_deg = np.empty(N)  # forward azimuth AT THE CURRENT POINT (was discarded)
     for i in range(N):
-        s[i], az_deg[i], az2_deg[i], m12[i], M12[i] = inverse_geodesic(
-            lat0_deg, lon0_deg, lat[i], lon[i]
-        )
+        s[i], az_deg[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
 
     # ------------------------------------------------------------------
-    # 3) Build the ENU rotation(s)
+    # 3) Build ENU rotation matrix once (same for whole trajectory)
     # ------------------------------------------------------------------
-    # LEGACY (per_point_velocity=False): one rotation built at the reference
-    # point and applied to the whole trajectory. This makes the frame a valid,
-    # invertible coordinate transform -- the reverse routine uses the same
-    # single rotation, so round-trip closure is exact -- but it does NOT make
-    # it a valid second-order state space: the velocity columns are then not
-    # the time-derivatives of the position columns. Over long range the local
-    # vertical rotates away from the reference vertical, so horizontal motion
-    # leaks into v_h and dh/dt != v_h.
-    #
-    # FIXED (per_point_velocity=True): rebuild the rotation at each point's own
-    # lat/lon, so v_h is the true rate of change of h and ds/dt = v_s holds to
-    # geodesic-convergence accuracy.
-    if per_point_velocity:
-        R_all = np.empty((N, 3, 3))
-        for i in range(N):
-            R_all[i] = enu_rotation_matrix(deg2rad(lat[i]), deg2rad(lon[i]))
-        v_enu = np.einsum("nij,nj->ni", R_all, v_ecef)
-        a_enu = np.einsum("nij,nj->ni", R_all, a_ecef)
-    else:
-        R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
-        v_enu = _apply_rotation(R, v_ecef)  # (N,3)
-        a_enu = _apply_rotation(R, a_ecef)  # (N,3)
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+
+    # ------------------------------------------------------------------
+    # 4) Rotate velocities & accelerations to ENU (vectorised)
+    # ------------------------------------------------------------------
+    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
+    a_enu = _apply_rotation(R, a_ecef)  # (N,3)
 
     # Split ENU components for readability
     v_east, v_north, v_up = v_enu[:, 0], v_enu[:, 1], v_enu[:, 2]
@@ -470,19 +452,13 @@ def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef, *, per_point
     # ------------------------------------------------------------------
     # 5) Build unit vectors that follow each geodesic direction
     # ------------------------------------------------------------------
-    az_rad = deg2rad(az_deg)  # (N,) azimuth AT THE REFERENCE -- the frame's
-                              # angular coordinate, unchanged by this fix.
-
-    # The tangent basis must be expressed in whichever ENU frame the velocities
-    # were rotated into. Legacy: reference ENU, so use the reference azimuth.
-    # Fixed: each point's own ENU, so use that point's own forward azimuth.
-    az_tan = deg2rad(az2_deg) if per_point_velocity else az_rad
+    az_rad = deg2rad(az_deg)  # (N,)
 
     # Tangent (east-north) unit vector along the geodesic
-    t_hat = np.column_stack((np.sin(az_tan), np.cos(az_tan), np.zeros(N)))  # (N,3)
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
 
     # Lateral unit vector (perpendicular to t_hat in the ENU plane)
-    l_hat = np.column_stack((np.cos(az_tan), -np.sin(az_tan), np.zeros(N)))  # (N,3)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
 
     # Up unit vector - same for all rows
     up_hat = np.array([0.0, 0.0, 1.0])
@@ -528,7 +504,7 @@ def ecef_to_local_geodesic_vec(p_ecef, v_ecef, a_ecef, impact_ecef, *, per_point
 # ----------------------------------------------------------------------
 # 5. Vectorised inverse conversion (local → ECEF)
 # ----------------------------------------------------------------------
-def local_geodesic_to_ecef_vec(state, impact_ecef, *, per_point_velocity=False):
+def local_geodesic_to_ecef_vec(state, impact_ecef):
     """
     Convert a batch of geodesic-based states (as returned by
     `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
@@ -557,22 +533,13 @@ def local_geodesic_to_ecef_vec(state, impact_ecef, *, per_point_velocity=False):
     lat = np.empty(N)
     lon = np.empty(N)
 
-    az2_deg = np.empty(N)  # forward azimuth AT THE DESTINATION (was discarded)
     for i in range(N):
-        lat[i], lon[i], az2_deg[i], _, _ = forward_geodesic(
-            lat0_deg, lon0_deg, state[i, 0], rad2deg(state[i, 1])
-        )
+        lat[i], lon[i], _, _, _ = forward_geodesic(lat0_deg, lon0_deg, state[i, 0], rad2deg(state[i, 1]))
 
     # ------------------------------------------------------------------
-    # 2) Build the ENU rotation(s) -- MUST mirror the forward routine exactly,
-    #    or the round trip stops closing.
+    # 2) Build ENU rotation matrix (same for whole batch)
     # ------------------------------------------------------------------
-    if per_point_velocity:
-        R_all = np.empty((N, 3, 3))
-        for i in range(N):
-            R_all[i] = enu_rotation_matrix(deg2rad(lat[i]), deg2rad(lon[i]))
-    else:
-        R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
 
     # ------------------------------------------------------------------
     # 3) Assemble ENU velocity / acceleration from geodesic components
@@ -586,9 +553,8 @@ def local_geodesic_to_ecef_vec(state, impact_ecef, *, per_point_velocity=False):
         _, _, _, _, M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
 
     # Unit vectors per sample (same definitions as in the forward routine)
-    az_tan = deg2rad(az2_deg) if per_point_velocity else az_rad
-    t_hat = np.column_stack((np.sin(az_tan), np.cos(az_tan), np.zeros(N)))  # (N,3)
-    l_hat = np.column_stack((np.cos(az_tan), -np.sin(az_tan), np.zeros(N)))  # (N,3)
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
     up_hat = np.array([0.0, 0.0, 1.0])
 
     # ENU velocity
@@ -608,12 +574,8 @@ def local_geodesic_to_ecef_vec(state, impact_ecef, *, per_point_velocity=False):
     for i in range(N):
         p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + state[i, 2])
 
-    if per_point_velocity:
-        v_ecef = np.einsum("nji,nj->ni", R_all, v_enu)  # R_all[i].T @ v_enu[i]
-        a_ecef = np.einsum("nji,nj->ni", R_all, a_enu)
-    else:
-        v_ecef = _apply_rotation(R.T, v_enu)
-        a_ecef = _apply_rotation(R.T, a_enu)
+    v_ecef = _apply_rotation(R.T, v_enu)
+    a_ecef = _apply_rotation(R.T, a_enu)
 
     # Add impact offset to positions (the geodetic conversion already gives
     # absolute coordinates, so no extra offset is needed)
@@ -644,7 +606,7 @@ def _local_heading_from_guide(origin_ecef, guide_ecef=None, fallback_vel_ecef=No
     return np.arctan2(vel_ned[1], vel_ned[0])
 
 
-def ecef_to_local_ned_hvuh(ecef_data, guide_ecef=None, *, per_point_velocity=False):
+def ecef_to_local_ned_hvuh(ecef_data, guide_ecef=None):
     """ECEF -> heading-rotated local NED frame (6-state, Cartesian).
 
     Contract (differs from the geodesic frames -- read before using):
@@ -669,46 +631,22 @@ def ecef_to_local_ned_hvuh(ecef_data, guide_ecef=None, *, per_point_velocity=Fal
 
     for i, state in enumerate(ecef_data):
         lat, lon, hae = ecef_to_geodetic(*state[POS_SLICE])
-        dist, azi, az2, m12, _ = inverse_geodesic(lat0, lon0, lat, lon)
+        dist, azi, _, _, _ = inverse_geodesic(lat0, lon0, lat, lon)
+        vel_ned = ecef_to_ned_velocity(state[VEL_SLICE], origin)
         north = dist * np.cos(deg2rad(azi))
         east = dist * np.sin(deg2rad(azi))
 
         lned[i, 1] = north * np.cos(heading0) + east * np.sin(heading0)
         lned[i, 2] = -north * np.sin(heading0) + east * np.cos(heading0)
         lned[i, 3] = hae
-
-        if not per_point_velocity:
-            # LEGACY: velocity resolved in the NED basis at the ORIGIN. Valid as
-            # an invertible transform, but the velocity columns are then NOT the
-            # time-derivatives of the position columns: over long range the local
-            # vertical rotates away from the origin vertical and horizontal
-            # motion leaks into VUp.
-            vel_ned = ecef_to_ned_velocity(state[VEL_SLICE], origin)
-            lned[i, 4] = vel_ned[0] * np.cos(heading0) + vel_ned[1] * np.sin(heading0)
-            lned[i, 5] = -vel_ned[0] * np.sin(heading0) + vel_ned[1] * np.cos(heading0)
-            lned[i, 6] = -vel_ned[2]
-        else:
-            # FIXED: (Forward, Right) is an azimuthal-equidistant projection of
-            # the current point about the origin. Its time derivative is a chain
-            # rule through that map, NOT a rigid rotation of the NED velocity.
-            # Radial scale is 1 (equidistant); transverse scale is dist/m12.
-            # Applying this makes dPos/dt == Vel, leaving the POSITION columns
-            # untouched -- only the velocity columns change.
-            vel_ned = ecef_to_ned_velocity(state[VEL_SLICE], state[POS_SLICE])
-            azt = deg2rad(az2)  # geodesic tangent AT THIS POINT, pointing outward
-            v_rad = vel_ned[0] * np.cos(azt) + vel_ned[1] * np.sin(azt)
-            v_trn = -vel_ned[0] * np.sin(azt) + vel_ned[1] * np.cos(azt)
-            scale = (dist / m12) if m12 > 0.0 else 1.0
-            v_t = v_trn * scale
-            theta = deg2rad(azi) - heading0
-            lned[i, 4] = v_rad * np.cos(theta) - v_t * np.sin(theta)
-            lned[i, 5] = v_rad * np.sin(theta) + v_t * np.cos(theta)
-            lned[i, 6] = -vel_ned[2]
+        lned[i, 4] = vel_ned[0] * np.cos(heading0) + vel_ned[1] * np.sin(heading0)
+        lned[i, 5] = -vel_ned[0] * np.sin(heading0) + vel_ned[1] * np.cos(heading0)
+        lned[i, 6] = -vel_ned[2]
 
     return lned
 
 
-def local_ned_hvuh_to_ecef(lned_data, initial_state_ecef, guide_ecef=None, *, per_point_velocity=False):
+def local_ned_hvuh_to_ecef(lned_data, initial_state_ecef, guide_ecef=None):
     """Inverse of ecef_to_local_ned_hvuh.
 
     ``initial_state_ecef`` is the (7,) ECEF state that defined the origin on the
@@ -729,40 +667,22 @@ def local_ned_hvuh_to_ecef(lned_data, initial_state_ecef, guide_ecef=None, *, pe
         east = state[1] * np.sin(heading0) + state[2] * np.cos(heading0)
         dist = np.hypot(north, east)
         azi = rad2deg(np.arctan2(east, north))
-        lat, lon, az2, m12, _ = forward_geodesic(lat0, lon0, dist, azi)
-        ecef_data[i, POS_SLICE] = geodetic_to_ecef(lat, lon, state[3])
+        lat, lon, _, _, _ = forward_geodesic(lat0, lon0, dist, azi)
+        vel_ned = np.array(
+            [
+                state[4] * np.cos(heading0) - state[5] * np.sin(heading0),
+                state[4] * np.sin(heading0) + state[5] * np.cos(heading0),
+                -state[6],
+            ]
+        )
 
-        if not per_point_velocity:
-            vel_ned = np.array(
-                [
-                    state[4] * np.cos(heading0) - state[5] * np.sin(heading0),
-                    state[4] * np.sin(heading0) + state[5] * np.cos(heading0),
-                    -state[6],
-                ]
-            )
-            ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(vel_ned, origin)
-        else:
-            # Exact inverse of the forward chain rule. MUST mirror it or the
-            # round trip stops closing.
-            theta = deg2rad(azi) - heading0
-            v_rad = state[4] * np.cos(theta) + state[5] * np.sin(theta)
-            v_t = -state[4] * np.sin(theta) + state[5] * np.cos(theta)
-            scale = (dist / m12) if m12 > 0.0 else 1.0
-            v_trn = v_t / scale if scale != 0.0 else v_t
-            azt = deg2rad(az2)
-            vel_ned = np.array(
-                [
-                    v_rad * np.cos(azt) - v_trn * np.sin(azt),
-                    v_rad * np.sin(azt) + v_trn * np.cos(azt),
-                    -state[6],
-                ]
-            )
-            ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(vel_ned, ecef_data[i, POS_SLICE])
+        ecef_data[i, POS_SLICE] = geodetic_to_ecef(lat, lon, state[3])
+        ecef_data[i, VEL_SLICE] = ned_to_ecef_velocity(vel_ned, origin)
 
     return ecef_data
 
 
-def check_lned_roundtrip(ecef_data, guide_ecef=None, pos_tol=1.0, vel_tol=1e-3, *, per_point_velocity=False):
+def check_lned_roundtrip(ecef_data, guide_ecef=None, pos_tol=1.0, vel_tol=1e-3):
     """Fail loudly if the local-NED forward/reverse pair does not close.
 
     Returns (max_pos_err_m, max_vel_err_mps). Raises ValueError past tolerance.
@@ -770,10 +690,8 @@ def check_lned_roundtrip(ecef_data, guide_ecef=None, pos_tol=1.0, vel_tol=1e-3, 
     that has already cost this project a debugging cycle.
     """
     ecef_data = np.atleast_2d(ecef_data)
-    lned = ecef_to_local_ned_hvuh(ecef_data, guide_ecef, per_point_velocity=per_point_velocity)
-    back = local_ned_hvuh_to_ecef(
-        lned, ecef_data[0], guide_ecef, per_point_velocity=per_point_velocity
-    )
+    lned = ecef_to_local_ned_hvuh(ecef_data, guide_ecef)
+    back = local_ned_hvuh_to_ecef(lned, ecef_data[0], guide_ecef)
 
     pos_err = float(np.max(np.abs(back[:, POS_SLICE] - ecef_data[:, POS_SLICE])))
     vel_err = float(np.max(np.abs(back[:, VEL_SLICE] - ecef_data[:, VEL_SLICE])))

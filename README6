@@ -1,930 +1,496 @@
-# sindy_physics.py
-"""Ensemble-SINDy discovery of the sparse physical vector field f_physics.
+"""Tests for the physics term: parity, invariants, OOD behaviour, robustness.
 
-This module is the *offline* half of the APHYNITY-style decomposition
+Two implementations of the same equations exist by necessity - numpy in
+sindy_physics for offline discovery, torch in gru_ode for training and export.
+The SINDy fit initialises the torch parameters, so a disagreement between them
+would start training from coefficients that do not describe the field being
+integrated, and would surface only as a mysteriously poor result rather than
+as an error. Section 1 checks they agree.
 
-    xdot = f_physics(x; theta_p) + f_NODE(x, h; theta_a)
+Sections 2-4 check the properties the architecture is actually being bought
+for: that the physical field cannot add energy at any state in R^n, that it
+decelerates rather than accelerates the runaway states prior work observed,
+and that coefficient recovery survives sensor noise and unmodelled maneuvers.
 
-It discovers which physical terms are supported by the data, estimates their
-coefficients, and writes a JSON spec that ``gru_ode.HGVPhysics`` consumes
-directly. Nothing here depends on torch, so discovery can run on a CPU box
-without the training stack.
-
---------------------------------------------------------------------------
-THE LIBRARY IS PHYSICS-STRUCTURED, NOT POLYNOMIAL
---------------------------------------------------------------------------
-A generic polynomial library (the SINDy default) is actively harmful here.
-The failure being targeted is out-of-distribution: extrapolations gain energy,
-exceed launch speed and fly below ground. A polynomial in altitude fitted on
-in-distribution data diverges the moment it leaves that data - it has exactly
-the pathology we are trying to remove. So the library contains four terms,
-each of which extrapolates correctly by construction:
-
-  T1 drag        a = -k_d * rho * V * v                       [k_d in 1/m]
-       Vector form, not v^2. Always antiparallel to velocity, so it
-       dissipates energy at every state in R^n, including states no training
-       trajectory ever visited. Lower altitude -> larger rho -> more
-       deceleration. This is the single term buying the OOD property.
-
-  T2 lift        a_h = -k_l * rho * V * v_u * vhat_h
-                 a_u = +k_l * rho * V * V_h                   [k_l in 1/m]
-       Perpendicular to velocity within the vertical plane, so a . v == 0
-       identically. Lift can therefore shape the trajectory (skip-glide)
-       but can *never* add energy, at any state. Enforced by construction,
-       not by a penalty.
-
-  T3 gravity     g = k_g * g0 * (R/(R+alt))^2                 [k_g dimensionless]
-  T4 curvature   a_u = +k_c * V_h^2 / (R + alt)               [k_c dimensionless]
-       Both are known kinematics. They are still regressed, because the
-       recovered k_g and k_c are a *frame-contract check*: correct frame and
-       units give k_g ~= 1 and k_c ~= 1. A recovered k_g of 0.4 means the
-       altitude channel, the unit convention or the frame handedness is
-       wrong. Given that this project has already been bitten by an
-       asymmetric transform pair, that diagnostic is worth its cost.
-
-Density is rho_hat = exp(-alt_geo / H) with the sea-level rho0 folded into
-k_d and k_l. This makes the altitude datum irrelevant to identifiability:
-exp(-(alt + c)/H) = exp(-c/H) * exp(-alt/H), so any constant offset between
-the frame's altitude channel and true altitude is absorbed by the
-coefficient. Only H itself must be estimated, which is done by a 1-D scan
-outside the sparse regression.
-
---------------------------------------------------------------------------
-WHY ENSEMBLE, NOT PLAIN SINDy
---------------------------------------------------------------------------
-Plain STLSQ gives a point estimate and no notion of confidence. With ~120
-trajectories and derivative estimates from finite differences, a term can be
-selected or dropped on noise alone. Ensemble-SINDy (Fasel et al.) bootstraps
-the rows and bags the library, then reports a *median* coefficient and an
-inclusion probability per term. Terms below the inclusion threshold are
-switched off structurally - their coefficient is pinned at zero and not
-trained - which is what keeps f_physics sparse and interpretable through the
-subsequent APHYNITY fine-tuning.
-
---------------------------------------------------------------------------
-UNITS: THIS RUNS IN PHYSICAL UNITS, NOT SCALED UNITS
---------------------------------------------------------------------------
-The training pipeline StandardScaler-normalises the state. Every function
-here expects metres and metres/second. Un-scale before calling. Passing
-scaled data yields a spec whose k_g is not ~1, which the frame-contract
-check will catch.
-
---------------------------------------------------------------------------
-INTEGRATION CHECKLIST (files not available to me - see notes at end)
---------------------------------------------------------------------------
-NEXT_training.py:
-  1. argparse:
-       --physics {none,hgv}          default none
-       --physics-spec PATH           JSON written by this module
-       --physics-only                ablation: drop f_NODE from the velocity
-                                     channels (reproduces APHYNITY's
-                                     "Incomplete physics" row)
-       --aphynity-lambda0 FLOAT      default 1.0
-       --aphynity-tau2 FLOAT         default 100.0
-       --aphynity-penalty-weight F   default 1.0
-       --freeze-physics              ablation: SINDy coefficients fixed
-  2. Build the physics term next to where GRUODEFunc is built:
-       spec = sindy_physics.load_spec(args.physics_spec)
-       physics = gru_ode.HGVPhysics.from_spec(spec)
-     and pass physics=physics into GRUODEPredictorModel, along with
-       state_mean=scaler.mean_, state_scale=scaler.scale_
-     The model raises if physics is given without scaler stats. That is
-     deliberate: silently treating scaled units as metres is the exact class
-     of bug that has already cost this project a 120 km offset.
-  3. Optimiser: put physics parameters in their own param group with a
-     smaller LR (1e-3 x base is a reasonable start). They are ~4 numbers
-     with much larger gradients than the network weights.
-  4. Checkpointing: save the spec dict *inside* the checkpoint, not beside
-     it. infer(), the ONNX exporter and the simulator must all rebuild the
-     identical structure. A spec mismatch is silent - the model loads, the
-     physics is subtly different, and the error looks like a training
-     regression.
-  5. Validation metrics: log ||F_a|| as a diagnostic. Do NOT put it in the
-     early-stopping criterion - early stopping stays on positional error.
-     ||F_a|| is how you read off how incomplete the physics is (APHYNITY
-     Table 1, last column).
-
-loss_functions.py:
-  Move gru_ode.APHYNITYObjective here verbatim; it has no dependency on the
-  model module. It wraps the existing trajectory loss, it does not replace
-  it.
-
-ONNX / simulator:
-  All ops used are exp, sqrt, clamp, softplus, index_select, index_copy -
-  all exportable. No new export work is needed, but the exporter must
-  construct the model *with* physics and scaler stats, and the simulator
-  must be handed the same spec.
+Run where torch is available to additionally exercise the real module.
 """
-
-from __future__ import annotations
-
-import argparse
-import json
-from dataclasses import dataclass, field
-from typing import Sequence
-
 import numpy as np
 
-try:  # optional, only used to smooth derivative estimates
-    from scipy.signal import savgol_filter
-except ImportError:  # pragma: no cover
-    savgol_filter = None
+import sindy_physics as sp
+
+R = sp.EARTH_RADIUS_M
+G0 = sp.G0
+EPS = 1e-8
+
+# =========================================================================
+# 1. Parity: numpy library vs. torch field
+# =========================================================================
 
 
-EARTH_RADIUS_M = 6_371_000.0
-G0 = 9.80665
-_EPS = 1e-8
 
-TERM_DRAG = "drag"
-TERM_LIFT = "lift"
-TERM_GRAVITY = "gravity"
-TERM_CURVATURE = "curvature"
+def torch_forward_transliterated(y_phys, fs, k_drag, k_lift, H,
+                                 k_grav=1.0, k_curv=1.0, max_density_ratio=5.0):
+    """Line-by-line mirror of HGVPhysics.forward, in numpy.
 
-
-# ---------------------------------------------------------------------------
-# Frame contracts
-# ---------------------------------------------------------------------------
-@dataclass
-class FrameSpec:
-    """How a frame's state vector maps onto the physics.
-
-    Attributes:
-        name: frame identifier, mirrored into the JSON spec.
-        n_features: length of the (time-stripped) state vector.
-        height_idx: index of the altitude channel.
-        phys_vel_idx: state indices of the velocity channels physics acts on.
-            Channels omitted here are left entirely to f_NODE.
-        horiz_vel_local: positions *within* phys_vel_idx that are horizontal.
-        vert_vel_local: position within phys_vel_idx that is vertical (up).
-        horiz_pos_idx: state indices of horizontal position. Used to tilt
-            gravity when the velocity basis is fixed.
-        fixed_velocity_basis: True when the velocity components are resolved in
-            a basis fixed at the frame origin (lned: NEXT_frame rotates ECEF
-            velocity into the NED frame AT THE ORIGIN). False when the basis
-            follows the vehicle (geodesic: v_s is along-track at the current
-            point). This single bit decides two things - see term_names() and
-            build_terms().
-        alt_ref_m: constant added to the altitude channel to reach altitude
-            above the density datum. Zero for both current frames: lned stores
-            true height above the WGS-84 ellipsoid (NEXT_frame writes
-            ``lned[i, 3] = hae``), and the geodesic frame stores h - h0 with h0
-            the impact-point height, which is ~0. Identifiability-neutral in any
-            case, since a constant offset is absorbed by k_d and k_l.
+    Deliberately follows the torch source operation by operation, including
+    the index_copy assembly, rather than being rewritten in vectorised numpy.
+    A parity test that shares an implementation tests nothing.
     """
+    alt = y_phys[:, [fs.height_idx]] + fs.alt_ref_m
+    pos_h = y_phys[:, list(fs.horiz_pos_idx)]
 
-    name: str
-    n_features: int
-    height_idx: int
-    phys_vel_idx: tuple[int, ...]
-    horiz_vel_local: tuple[int, ...]
-    vert_vel_local: int
-    horiz_pos_idx: tuple[int, ...]
-    fixed_velocity_basis: bool
-    alt_ref_m: float = 0.0
+    # No tangent-plane altitude correction: NEXT_frame stores true hae.
 
-    def term_names(self) -> list[str]:
-        # Curvature relief is an artefact of a rotating (vehicle-following)
-        # velocity basis. When the basis is fixed at the origin the same effect
-        # appears instead as the tilt of gravity, so including both would
-        # double-count and make the two columns collinear.
-        terms = [TERM_DRAG, TERM_LIFT, TERM_GRAVITY]
-        if not self.fixed_velocity_basis:
-            terms.append(TERM_CURVATURE)
-        return terms
+    rho = np.exp(np.minimum(-alt / H, np.log(max_density_ratio)))
 
-    def to_dict(self) -> dict:
-        return {
-            "name": self.name,
-            "n_features": self.n_features,
-            "height_idx": self.height_idx,
-            "phys_vel_idx": list(self.phys_vel_idx),
-            "horiz_vel_local": list(self.horiz_vel_local),
-            "vert_vel_local": self.vert_vel_local,
-            "horiz_pos_idx": list(self.horiz_pos_idx),
-            "fixed_velocity_basis": self.fixed_velocity_basis,
-            "alt_ref_m": self.alt_ref_m,
-        }
+    v = y_phys[:, list(fs.phys_vel_idx)]
+    vh = v[:, list(fs.horiz_vel_local)]
+    vu = v[:, [fs.vert_vel_local]]
+    speed_h = np.sqrt((vh * vh).sum(-1, keepdims=True) + EPS)
+    speed = np.sqrt(speed_h * speed_h + vu * vu + EPS)
 
-    @classmethod
-    def from_dict(cls, d: dict) -> "FrameSpec":
-        return cls(
-            name=d["name"],
-            n_features=int(d["n_features"]),
-            height_idx=int(d["height_idx"]),
-            phys_vel_idx=tuple(int(i) for i in d["phys_vel_idx"]),
-            horiz_vel_local=tuple(int(i) for i in d["horiz_vel_local"]),
-            vert_vel_local=int(d["vert_vel_local"]),
-            horiz_pos_idx=tuple(int(i) for i in d["horiz_pos_idx"]),
-            fixed_velocity_basis=bool(d["fixed_velocity_basis"]),
-            alt_ref_m=float(d.get("alt_ref_m", 0.0)),
-        )
+    zero = np.zeros_like(v)
 
+    acc = -k_drag * rho * speed * v
 
-def frame_spec_for(frame: str, *, geodesic_mode: str = "integrated", alt_ref_m: float = 0.0) -> FrameSpec:
-    """Canonical frame contracts.
+    lift_h = -(k_lift * rho * speed * vu / speed_h) * vh
+    lift_u = k_lift * rho * speed * speed_h
+    lift = zero.copy()
+    lift[:, list(fs.horiz_vel_local)] = lift_h
+    lift[:, [fs.vert_vel_local]] = lift_u
+    acc = acc + lift
 
-    v_alpha is deliberately excluded from phys_vel_idx in the geodesic frame.
-    It is an angular rate (rad/s), not a velocity, so a drag term on it is
-    dimensionally meaningless; and azimuth change on an HGV is overwhelmingly
-    a guidance command rather than state-determined physics. Assigning it to
-    f_NODE is the whole point of the decomposition.
-    """
-    if frame == "geodesic" and geodesic_mode == "integrated":
-        # [s, h, v_s, v_alpha, v_h]
-        return FrameSpec(
-            name="geodesic_integrated",
-            n_features=5,
-            height_idx=1,
-            phys_vel_idx=(2, 4),
-            horiz_vel_local=(0,),
-            vert_vel_local=1,
-            horiz_pos_idx=(0,),
-            fixed_velocity_basis=False,
-            alt_ref_m=alt_ref_m,
-        )
-    if frame == "lned":
-        # [Forward, Right, Altitude, VForward, VRight, VUp]
-        return FrameSpec(
-            name="lned",
-            n_features=6,
-            height_idx=2,
-            phys_vel_idx=(3, 4, 5),
-            horiz_vel_local=(0, 1),
-            vert_vel_local=2,
-            horiz_pos_idx=(0, 1),
-            # NEXT_frame.ecef_to_local_ned_hvuh resolves velocity with
-            # ecef_to_ned_velocity(state[VEL_SLICE], origin) - the basis is
-            # pinned at the trajectory's first point, so gravity tilts as the
-            # vehicle travels down-range and there is no curvature term.
-            fixed_velocity_basis=True,
-            alt_ref_m=alt_ref_m,
-        )
-    if frame == "geodesic" and geodesic_mode == "original":
-        raise NotImplementedError(
-            "The 6-state geodesic 'original' layout (azimuth as an explicit state) "
-            "is not encoded here because its column order was not available to me. "
-            "Fill in a FrameSpec by reading the transform in NEXT_frame.py directly - "
-            "do not guess the ordering. Then verify with check_frame_contract(), "
-            "which should recover k_gravity ~= 1."
-        )
-    raise ValueError(f"unknown frame {frame!r} / mode {geodesic_mode!r}")
-
-
-# ---------------------------------------------------------------------------
-# Derivative estimation
-# ---------------------------------------------------------------------------
-def estimate_derivatives(
-    traj: np.ndarray,
-    dt: float,
-    *,
-    window: int = 11,
-    polyorder: int = 3,
-    trim: int = 5,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate d(state)/dt on a uniform grid.
-
-    APHYNITY Appendix D argues at length against supervising a *model* on
-    finite-difference derivatives, and that argument is respected: the neural
-    model is trained on integrated trajectories. But SINDy is a linear
-    regression on derivatives by definition, so it needs them here. The
-    exposure is limited because the discovered coefficients are only an
-    initialisation - the APHYNITY trajectory loss refines them.
-
-    Returns (states, dstates) with edges trimmed.
-    """
-    traj = np.asarray(traj, dtype=np.float64)
-    if traj.ndim != 2:
-        raise ValueError(f"expected (T, D), got {traj.shape}")
-    T = traj.shape[0]
-    if T < window + 2 * trim:
-        raise ValueError(f"trajectory too short: {T} samples")
-
-    if savgol_filter is not None:
-        w = min(window, T if T % 2 == 1 else T - 1)
-        if w <= polyorder:
-            w = polyorder + 1 + (polyorder % 2 == 0)
-        d = savgol_filter(traj, w, polyorder, deriv=1, delta=dt, axis=0, mode="interp")
-    else:  # central differences
-        d = np.gradient(traj, dt, axis=0)
-
-    if trim > 0:
-        return traj[trim:-trim], d[trim:-trim]
-    return traj, d
-
-
-# ---------------------------------------------------------------------------
-# Library
-# ---------------------------------------------------------------------------
-def build_terms(states: np.ndarray, fs: FrameSpec, scale_height_m: float,
-                max_density_ratio: float = 5.0) -> np.ndarray:
-    """Evaluate the physics library.
-
-    Returns (N, C, K) where C = len(fs.phys_vel_idx) and K = len(fs.term_names()).
-    Entry [n, c, k] is the contribution of term k to channel c at sample n,
-    with unit coefficient. All in SI.
-    """
-    states = np.asarray(states, dtype=np.float64)
-    N = states.shape[0]
-    names = fs.term_names()
-    C = len(fs.phys_vel_idx)
-    K = len(names)
-
-    alt = states[:, fs.height_idx] + fs.alt_ref_m
-    pos_h = states[:, list(fs.horiz_pos_idx)] if fs.horiz_pos_idx else np.zeros((N, 0))
-
-    # No tangent-plane altitude correction is applied. It would be needed if
-    # the altitude channel measured height above a plane, but NEXT_frame writes
-    # lned[i, 3] = hae, i.e. true height above the WGS-84 ellipsoid, and the
-    # geodesic frame writes h - h0. Both are already geometric altitudes;
-    # adding d^2/(2R) here would inject a spurious ~785 m error at 100 km.
-
-    # Saturating the density is not cosmetic. Below the datum exp(-alt/H)
-    # grows without bound: at alt = -100 km it is e^13.9 ~= 1.1e6, which makes
-    # the field violently stiff exactly in the regime the model is known to
-    # wander into. Saturation keeps the restoring deceleration strong and
-    # correctly signed while leaving the ODE integrable. 5x sea level is
-    # already unphysical; it exists only as a numerical guard rail.
-    z = np.clip(-alt / scale_height_m, a_min=None, a_max=np.log(max_density_ratio))
-    rho = np.exp(z)
-
-    v = states[:, list(fs.phys_vel_idx)]                    # (N, C)
-    vh = v[:, list(fs.horiz_vel_local)]                     # (N, Ch)
-    vu = v[:, fs.vert_vel_local]                            # (N,)
-    Vh = np.sqrt(np.sum(vh**2, axis=1) + _EPS)              # (N,)
-    V = np.sqrt(Vh**2 + vu**2 + _EPS)                       # (N,)
-
-    A = np.zeros((N, C, K))
-    hl = list(fs.horiz_vel_local)
-    vl = fs.vert_vel_local
-
-    ki = names.index(TERM_DRAG)
-    A[:, :, ki] = -(rho * V)[:, None] * v
-
-    ki = names.index(TERM_LIFT)
-    A[:, hl, ki] = -(rho * V * vu / Vh)[:, None] * vh
-    A[:, vl, ki] = rho * V * Vh
-
-    ki = names.index(TERM_GRAVITY)
-    g = G0 * (EARTH_RADIUS_M / (EARTH_RADIUS_M + alt)) ** 2
+    g = k_grav * G0 * (R / (R + alt)) ** 2
+    grav = zero.copy()
     if fs.fixed_velocity_basis:
-        # "Down" at horizontal offset p_h, expressed in the origin's fixed
-        # basis, is approximately (-p_h/R, -1): gravity tilts as the vehicle
-        # travels down-range. That tilt is what produces the apparent curvature
-        # relief in a fixed basis, which is why TERM_CURVATURE is absent here.
-        A[:, hl, ki] = -(g / EARTH_RADIUS_M)[:, None] * pos_h
-        A[:, vl, ki] = -g
+        grav[:, list(fs.horiz_vel_local)] = -(g / R) * pos_h
+        grav[:, [fs.vert_vel_local]] = -g
     else:
-        A[:, vl, ki] = -g
+        grav[:, [fs.vert_vel_local]] = -g
+    acc = acc + grav
 
-    if TERM_CURVATURE in names:
-        ki = names.index(TERM_CURVATURE)
-        A[:, vl, ki] = Vh**2 / (EARTH_RADIUS_M + alt)
+    m_curv = 0.0 if fs.fixed_velocity_basis else 1.0
+    curv = zero.copy()
+    curv[:, [fs.vert_vel_local]] = m_curv * k_curv * speed_h * speed_h / (R + alt)
+    acc = acc + curv
 
-    return A
-
-
-# ---------------------------------------------------------------------------
-# Sparse regression
-# ---------------------------------------------------------------------------
-KNOWN_TERMS = (TERM_GRAVITY, TERM_CURVATURE)
-UNKNOWN_TERMS = (TERM_DRAG, TERM_LIFT)
+    return acc
 
 
-def split_terms(fs: FrameSpec) -> tuple[list[str], list[str]]:
-    """Known kinematics vs. unknown aerodynamics.
-
-    Gravity and curvature are not unknowns. Leaving them as free regression
-    columns is actively harmful: in a vehicle-following frame both act only on
-    the vertical channel and are slowly varying, so they are near-collinear.
-    The regression then trades one against the other, and because H is scanned
-    against that same residual, the mis-set pair drags the scale height off
-    with it. Empirically this recovered k_curvature = -21.6 and H = 6150 m
-    against a truth of 1.0 and 7200 m.
-
-    So the known terms are moved to the left-hand side with unit coefficient
-    and only drag and lift are regressed. Their correctness is verified
-    separately by frame_contract_diagnostic(), which is a check rather than
-    a fit.
-    """
+def library_field(y_phys, fs, k_drag, k_lift, H, max_density_ratio=5.0):
+    """Same field assembled from the SINDy library columns."""
+    A = sp.build_terms(y_phys, fs, H, max_density_ratio=max_density_ratio)
     names = fs.term_names()
-    known = [n for n in names if n in KNOWN_TERMS]
-    unknown = [n for n in names if n in UNKNOWN_TERMS]
-    return known, unknown
+    coef = np.array([
+        k_drag if n == sp.TERM_DRAG else k_lift if n == sp.TERM_LIFT else 1.0
+        for n in names
+    ])
+    return A @ coef
 
 
-def _columns(A: np.ndarray, fs: FrameSpec, names: Sequence[str]) -> np.ndarray:
-    all_names = fs.term_names()
-    idx = [all_names.index(n) for n in names]
-    return A[:, :, idx]
+rng = np.random.default_rng(11)
+ok = True
+print("numpy library vs. transliterated torch field")
+print("-" * 62)
+for frame, mode, alt_ref in (("geodesic", "integrated", 0.0), ("lned", "", 0.0)):
+    fs = sp.frame_spec_for(frame, geodesic_mode=mode or "integrated", alt_ref_m=alt_ref)
+    y = np.zeros((3000, fs.n_features))
+    y[:, fs.height_idx] = rng.uniform(-20_000, 90_000, 3000)
+    for i in fs.horiz_pos_idx:
+        y[:, i] = rng.uniform(-3e5, 3e5, 3000)
+    for i in fs.phys_vel_idx:
+        y[:, i] = rng.uniform(-3000, 3000, 3000)
 
+    kd, kl, H = 8.75e-5, 1.75e-4, 7200.0
+    a1 = library_field(y, fs, kd, kl, H)
+    a2 = torch_forward_transliterated(y, fs, kd, kl, H)
+    err = np.max(np.abs(a1 - a2)) / max(np.max(np.abs(a1)), 1e-12)
+    good = err < 1e-12
+    ok &= good
+    print(f"  [{'PASS' if good else 'FAIL'}] {fs.name:<22} max relative disagreement {err:.2e}")
 
-def build_offset(states: np.ndarray, fs: FrameSpec, scale_height_m: float) -> np.ndarray:
-    """Contribution of the known kinematic terms, unit coefficients. (N, C)."""
-    known, _ = split_terms(fs)
-    A = build_terms(states, fs, scale_height_m)
-    return _columns(A, fs, known).sum(axis=2)
+# ---- real torch check, when available -------------------------------------
+try:
+    import torch  # noqa: F401
+    import gru_ode
 
-
-def stlsq(A: np.ndarray, b: np.ndarray, threshold: float = 0.05,
-          ridge: float = 1e-8, max_iter: int = 20) -> np.ndarray:
-    """Sequentially-thresholded least squares on column-normalised features.
-
-    Thresholding happens in normalised space. The raw coefficients span
-    ~1e-5 (k_d, in 1/m) to ~1 (k_g, dimensionless), so a threshold applied to
-    raw magnitudes would delete drag every single time.
-    """
-    A = np.asarray(A, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    norms = np.linalg.norm(A, axis=0)
-    norms = np.where(norms < _EPS, 1.0, norms)
-    An = A / norms
-
-    K = An.shape[1]
-    active = np.ones(K, dtype=bool)
-    xi = np.zeros(K)
-    for _ in range(max_iter):
-        xi_new = np.zeros(K)
-        if active.any():
-            Aa = An[:, active]
-            G = Aa.T @ Aa + ridge * np.eye(Aa.shape[1])
-            xi_new[active] = np.linalg.solve(G, Aa.T @ b)
-        small = np.abs(xi_new) < threshold
-        new_active = active & ~small
-        if new_active.sum() == 0:
-            break
-        if np.array_equal(new_active, active):
-            xi = xi_new
-            break
-        active = new_active
-        xi = xi_new
-    xi[~active] = 0.0
-    return xi / norms  # back to physical units
-
-
-def ensemble_sindy(
-    A: np.ndarray,
-    b: np.ndarray,
-    *,
-    n_bootstraps: int = 200,
-    threshold: float = 0.05,
-    library_bagging: bool = True,
-    n_drop: int = 1,
-    rng: np.random.Generator | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Bootstrap ensemble of STLSQ fits.
-
-    Returns (median_coef, inclusion_prob, coef_samples).
-    Coefficients from bags that did not offer a term are NaN, so the median
-    is over bags where the term was actually available - otherwise library
-    bagging would bias every coefficient toward zero.
-    """
-    rng = rng or np.random.default_rng(0)
-    N, K = A.shape
-    # With only two candidate columns, dropping one leaves a single-column fit
-    # that cannot express the drag/lift trade-off, which biases both terms.
-    if K < 3:
-        library_bagging = False
-    samples = np.full((n_bootstraps, K), np.nan)
-
-    for i in range(n_bootstraps):
-        rows = rng.integers(0, N, size=N)
-        cols = np.arange(K)
-        if library_bagging and K > n_drop + 1:
-            drop = rng.choice(K, size=n_drop, replace=False)
-            cols = np.setdiff1d(cols, drop)
-        xi = stlsq(A[np.ix_(rows, cols)], b[rows], threshold=threshold)
-        samples[i, cols] = xi
-
-    offered = ~np.isnan(samples)
-    retained = offered & (np.abs(np.nan_to_num(samples)) > 0)
-    with np.errstate(invalid="ignore"):
-        median = np.nanmedian(samples, axis=0)
-    median = np.nan_to_num(median)
-    inclusion = retained.sum(axis=0) / np.maximum(offered.sum(axis=0), 1)
-    return median, inclusion, samples
-
-
-# ---------------------------------------------------------------------------
-# Discovery
-# ---------------------------------------------------------------------------
-def _stack(trajectories: Sequence[np.ndarray], dt: float, fs: FrameSpec,
-           **deriv_kw) -> tuple[np.ndarray, np.ndarray]:
-    S, D = [], []
-    for traj in trajectories:
-        traj = np.asarray(traj, dtype=np.float64)
-        if traj.shape[1] != fs.n_features:
-            raise ValueError(
-                f"frame {fs.name!r} expects {fs.n_features} columns, got {traj.shape[1]}. "
-                "Strip the time column and confirm the frame contract before continuing."
-            )
-        s, d = estimate_derivatives(traj, dt, **deriv_kw)
-        S.append(s)
-        D.append(d)
-    return np.concatenate(S, axis=0), np.concatenate(D, axis=0)
-
-
-def _design(states: np.ndarray, dstates: np.ndarray, fs: FrameSpec,
-            scale_height_m: float, *, free_known: bool = False
-            ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Build the stacked regression problem.
-
-    Coefficients are shared across velocity channels, so the channel axis is
-    folded into the sample axis rather than fitted per-channel: one k_d
-    governs drag on every component, which is what makes the term a vector
-    drag law instead of three unrelated scalars.
-
-    free_known=False (default) subtracts gravity and curvature from the
-    target and regresses only drag and lift.
-    free_known=True regresses everything, for the frame-contract diagnostic.
-    """
-    A_all = build_terms(states, fs, scale_height_m)
-    N, C, _ = A_all.shape
-    b = dstates[:, list(fs.phys_vel_idx)].copy()          # (N, C)
-
-    if free_known:
-        names = fs.term_names()
-    else:
-        known, names = split_terms(fs)
-        if known:
-            b = b - _columns(A_all, fs, known).sum(axis=2)
-
-    A = _columns(A_all, fs, names).reshape(N * C, len(names))
-    return A, b.reshape(N * C), list(names)
-
-
-def scan_scale_height(states, dstates, fs, *, h_grid=None, threshold=0.05,
-                      subsample=20000, rng=None) -> tuple[float, np.ndarray]:
-    """1-D scan for H, outside the sparse regression.
-
-    H enters nonlinearly through exp(-alt/H), so it cannot be recovered by a
-    linear solve. Scanning is more transparent than adding one drag column per
-    candidate H and letting sparsity choose, and it avoids near-collinear
-    columns.
-    """
-    rng = rng or np.random.default_rng(0)
-    h_grid = np.asarray(h_grid if h_grid is not None else np.linspace(4500.0, 12000.0, 31))
-    if states.shape[0] > subsample:
-        idx = rng.choice(states.shape[0], size=subsample, replace=False)
-        states, dstates = states[idx], dstates[idx]
-
-    residuals = np.empty_like(h_grid)
-    for i, H in enumerate(h_grid):
-        A, b, _ = _design(states, dstates, fs, H)
-        xi = stlsq(A, b, threshold=threshold)
-        residuals[i] = np.sqrt(np.mean((A @ xi - b) ** 2))
-    return float(h_grid[int(np.argmin(residuals))]), residuals
-
-
-def frame_contract_diagnostic(states: np.ndarray, dstates: np.ndarray,
-                              fs: FrameSpec, scale_height_m: float) -> dict:
-    """Free-fit every term, including the known ones, purely as a check.
-
-    Correct frame, correct units and a correct altitude channel give
-    k_gravity ~= 1 and k_curvature ~= 1, because those columns are exact
-    kinematics that the data cannot argue with. Anything else means the
-    downstream drag and lift numbers are describing a coordinate error.
-    """
-    A, b, names = _design(states, dstates, fs, scale_height_m, free_known=True)
-    # Plain least squares, no thresholding: we want the unbiased estimate of
-    # the known coefficients, not a sparse model.
-    coef, *_ = np.linalg.lstsq(A, b, rcond=None)
-    return {n: float(c) for n, c in zip(names, coef)}
-
-
-def discover_physics(
-    trajectories: Sequence[np.ndarray],
-    dt: float,
-    fs: FrameSpec,
-    *,
-    n_bootstraps: int = 200,
-    threshold: float = 0.05,
-    inclusion_threshold: float = 0.6,
-    h_grid=None,
-    refine_h: bool = True,
-    seed: int = 0,
-    deriv_kw: dict | None = None,
-) -> dict:
-    """Full pipeline: derivatives -> H scan -> Ensemble-SINDy -> spec dict.
-
-    Args:
-        trajectories: sequence of (T, n_features) arrays in PHYSICAL units.
-        dt: uniform sample spacing in seconds.
-        fs: frame contract.
-        inclusion_threshold: terms below this bootstrap inclusion probability
-            are switched off structurally (coefficient pinned to zero, not
-            trained). This is what keeps f_physics sparse.
-
-    Returns a spec dict; hand it to save_spec() and to HGVPhysics.from_spec().
-    """
-    rng = np.random.default_rng(seed)
-    states, dstates = _stack(trajectories, dt, fs, **(deriv_kw or {}))
-
-    H, residuals = scan_scale_height(states, dstates, fs, h_grid=h_grid,
-                                     threshold=threshold, rng=rng)
-    if refine_h:
-        fine = np.linspace(max(H - 600.0, 2000.0), H + 600.0, 25)
-        H, _ = scan_scale_height(states, dstates, fs, h_grid=fine,
-                                 threshold=threshold, rng=rng)
-
-    A, b, names = _design(states, dstates, fs, H)
-    median, inclusion, _ = ensemble_sindy(
-        A, b, n_bootstraps=n_bootstraps, threshold=threshold, rng=rng
-    )
-
-    enabled = {n: bool(inclusion[i] >= inclusion_threshold and abs(median[i]) > 0)
-               for i, n in enumerate(names)}
-    coefficients = {n: (float(median[i]) if enabled[n] else 0.0) for i, n in enumerate(names)}
-    incl = {n: float(inclusion[i]) for i, n in enumerate(names)}
-    trainable = {n: True for n in names}
-
-    xi = np.array([coefficients[n] for n in names])
-    resid = float(np.sqrt(np.mean((A @ xi - b) ** 2)))
-    baseline = float(np.sqrt(np.mean(b**2)))
-
-    # Known kinematics rejoin the spec with unit coefficients, held fixed.
-    # They are part of f_physics; they are simply not unknowns.
-    known, _ = split_terms(fs)
-    for n in known:
-        coefficients[n] = 1.0
-        enabled[n] = True
-        incl[n] = 1.0
-        trainable[n] = False
-
-    diagnostic = frame_contract_diagnostic(states, dstates, fs, H)
-
-    spec = {
-        "schema": "hgv_physics/1",
-        "frame": fs.to_dict(),
-        "scale_height_m": float(H),
-        "learn_scale_height": True,
-        "terms": fs.term_names(),
-        "regressed_terms": list(names),
-        "coefficients": coefficients,
-        "enabled": enabled,
-        "trainable": trainable,
-        "inclusion_probability": incl,
-        "max_density_ratio": 5.0,
-        "diagnostics": {
-            "n_samples": int(states.shape[0]),
-            "n_trajectories": len(trajectories),
-            "dt": float(dt),
-            "residual_rms_m_s2": resid,
-            "target_rms_m_s2": baseline,
-            "variance_explained": float(1.0 - (resid / baseline) ** 2) if baseline > 0 else float("nan"),
-            "n_bootstraps": int(n_bootstraps),
-            "inclusion_threshold": float(inclusion_threshold),
-            "free_fit_coefficients": diagnostic,
-        },
-        "interpretation": interpret(coefficients),
-    }
-    spec["frame_contract_check"] = check_frame_contract(spec)
-    return spec
-
-
-def interpret(coefficients: dict, rho0: float = 1.225) -> dict:
-    """Turn coefficients into quantities an engineer can sanity-check.
-
-    k_d = rho0 / (2 * beta), so beta = rho0 / (2 * k_d) is the ballistic
-    coefficient in kg/m^2. k_l / k_d is the lift-to-drag ratio. If either is
-    physically absurd, the fit is wrong and no amount of neural augmentation
-    will fix it.
-    """
-    kd = coefficients.get(TERM_DRAG, 0.0)
-    kl = coefficients.get(TERM_LIFT, 0.0)
-    out: dict[str, float | str] = {}
-    out["ballistic_coefficient_kg_m2"] = float(rho0 / (2.0 * kd)) if kd > 0 else float("nan")
-    out["lift_to_drag_ratio"] = float(kl / kd) if kd > 0 else float("nan")
-    out["note"] = (
-        "HGV ballistic coefficients are typically ~2e3-1e4 kg/m^2 and L/D ~1-3. "
-        "Values far outside that suggest a units or frame error, not an exotic vehicle."
-    )
-    return out
-
-
-def check_frame_contract(spec: dict, tol: float = 0.25) -> dict:
-    """Gravity and curvature coefficients must come back near 1.
-
-    They are known kinematics: the regression is not free to choose them. If
-    it does choose something else, the altitude channel, the units or the
-    frame handedness is wrong, and every downstream number is meaningless.
-    This is cheap insurance against exactly the class of bug that produced a
-    silent 120 km offset before.
-    """
-    result = {"ok": True, "messages": []}
-    free = spec.get("diagnostics", {}).get("free_fit_coefficients", {})
-    for term in (TERM_GRAVITY, TERM_CURVATURE):
-        if term not in free:
-            continue
-        k = free[term]
-        if abs(k - 1.0) > tol:
-            result["ok"] = False
-            result["messages"].append(
-                f"free-fit {term} coefficient is {k:.3f}, expected 1.00 +/- {tol}. "
-                "The altitude channel, the unit convention (metres vs scaled) or the "
-                "frame handedness is likely wrong. Do not trust drag/lift until this "
-                "resolves."
-            )
-    if result["ok"]:
-        result["messages"].append(
-            "free-fit gravity/curvature recovered near 1.0; frame contract consistent."
-        )
-    return result
-
-
-def save_spec(spec: dict, path: str) -> None:
-    with open(path, "w") as fh:
-        json.dump(spec, fh, indent=2)
-
-
-def load_spec(path: str) -> dict:
-    with open(path) as fh:
-        spec = json.load(fh)
-    if spec.get("schema") != "hgv_physics/1":
-        raise ValueError(f"unexpected physics spec schema: {spec.get('schema')!r}")
-    return spec
-
-
-def format_report(spec: dict) -> str:
-    lines = [
-        "Ensemble-SINDy physics discovery",
-        "=" * 60,
-        f"frame                : {spec['frame']['name']}",
-        f"scale height H       : {spec['scale_height_m']:.1f} m",
-        f"trajectories/samples : {spec['diagnostics']['n_trajectories']} / {spec['diagnostics']['n_samples']}",
-        "",
-        f"{'term':<12}{'coefficient':>16}{'inclusion':>12}  status",
-        "-" * 60,
-    ]
-    for t in spec["terms"]:
-        if not spec.get("trainable", {}).get(t, True):
-            status = "fixed (known kinematics)"
-        elif spec["enabled"][t]:
-            status = "ACTIVE (learned)"
-        else:
-            status = "pruned"
-        lines.append(
-            f"{t:<12}{spec['coefficients'][t]:>16.6g}{spec['inclusion_probability'][t]:>12.2f}  {status}"
-        )
-    d = spec["diagnostics"]
-    lines += [
-        "-" * 60,
-        f"residual RMS         : {d['residual_rms_m_s2']:.4f} m/s^2  (target RMS {d['target_rms_m_s2']:.4f})",
-        f"variance explained   : {100 * d['variance_explained']:.2f} %",
-        "",
-        "Interpretation",
-        f"  ballistic coefficient : {spec['interpretation']['ballistic_coefficient_kg_m2']:.0f} kg/m^2",
-        f"  lift-to-drag ratio    : {spec['interpretation']['lift_to_drag_ratio']:.2f}",
-        "",
-        "Frame contract check (free fit of known terms; both should be ~1.00)",
-        "  " + ", ".join(
-            f"{k}={v:.4g}" for k, v in spec["diagnostics"].get("free_fit_coefficients", {}).items()
-        ),
-    ]
-    lines += [f"  {m}" for m in spec["frame_contract_check"]["messages"]]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Self-test: synthetic HGV with known parameters
-# ---------------------------------------------------------------------------
-def _simulate_hgv(fs: FrameSpec, k_d: float, k_l: float, H: float, dt: float,
-                  n_steps: int, x0: np.ndarray, maneuver: float = 0.0,
-                  seed: int = 0) -> np.ndarray:
-    """RK4 integration of the true field, optionally plus an unmodelled
-    guidance-like forcing, to check that discovery recovers k_d, k_l and H."""
-    rng = np.random.default_rng(seed)
-    fs_local = fs
-
-    def field(x, t):
-        A = build_terms(x[None, :], fs_local, H)[0]   # (C, K)
-        names = fs_local.term_names()
-        coef = np.array([
-            k_d if n == TERM_DRAG else
-            k_l if n == TERM_LIFT else
-            1.0
-            for n in names
-        ])
-        acc = A @ coef                                # (C,)
-        dx = np.zeros_like(x)
-        dx[list(fs_local.phys_vel_idx)] = acc
-        if fs_local.fixed_velocity_basis:
-            dx[0], dx[1], dx[2] = x[3], x[4], x[5]
-        else:
-            dx[0], dx[1] = x[2], x[4]
-        if maneuver:
-            # a guidance command: state-independent, so no state-autonomous
-            # model can recover it. This is the aleatoric floor.
-            dx[fs_local.phys_vel_idx[0]] += maneuver * np.sin(0.05 * t)
-        return dx
-
-    out = np.empty((n_steps, x0.size))
-    x = x0.astype(np.float64).copy()
-    t = 0.0
-    for i in range(n_steps):
-        out[i] = x
-        k1 = field(x, t)
-        k2 = field(x + 0.5 * dt * k1, t + 0.5 * dt)
-        k3 = field(x + 0.5 * dt * k2, t + 0.5 * dt)
-        k4 = field(x + dt * k3, t + dt)
-        x = x + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-        t += dt
-    return out
-
-
-def self_test(verbose: bool = True) -> dict:
-    """End-to-end check on synthetic data with known ground truth."""
-    results = {}
-    dt = 1.0
-    true_kd, true_kl, true_H = 8.75e-5, 1.75e-4, 7200.0   # beta ~ 7000, L/D = 2
-
-    entry_alt = 40_000.0
-    for frame, mode in (("geodesic", "integrated"), ("lned", "")):
-        # alt_ref is zero for both frames: lned stores true height above the
-        # WGS-84 ellipsoid and the geodesic frame stores height above the
-        # impact point, which sits at h0 ~ 0.
-        fs = frame_spec_for(frame, geodesic_mode=mode or "integrated", alt_ref_m=0.0)
-        rng = np.random.default_rng(7)
-        trajs = []
-        for j in range(12):
-            if fs.fixed_velocity_basis:
-                x0 = np.array([0.0, 0.0, entry_alt, 2200.0 + 200 * rng.standard_normal(),
-                               50.0 * rng.standard_normal(), -60.0])
-            else:
-                x0 = np.array([0.0, entry_alt, 2200.0 + 200 * rng.standard_normal(),
-                               0.0, -60.0])
-            trajs.append(_simulate_hgv(fs, true_kd, true_kl, true_H, dt, 300, x0, seed=j))
-
-        spec = discover_physics(trajs, dt, fs, n_bootstraps=120, seed=1)
-        kd = spec["coefficients"][TERM_DRAG]
-        kl = spec["coefficients"][TERM_LIFT]
-        results[fs.name] = {
-            "k_d_err_pct": 100 * abs(kd - true_kd) / true_kd,
-            "k_l_err_pct": 100 * abs(kl - true_kl) / true_kl,
-            "H_err_pct": 100 * abs(spec["scale_height_m"] - true_H) / true_H,
-            "frame_ok": spec["frame_contract_check"]["ok"],
-            "spec": spec,
+    print("\ntorch HGVPhysics vs. numpy library")
+    print("-" * 62)
+    for frame, mode, alt_ref in (("geodesic", "integrated", 0.0), ("lned", "", 0.0)):
+        fs = sp.frame_spec_for(frame, geodesic_mode=mode or "integrated", alt_ref_m=alt_ref)
+        spec = {
+            "schema": "hgv_physics/1",
+            "frame": fs.to_dict(),
+            "scale_height_m": 7200.0,
+            "terms": fs.term_names(),
+            "coefficients": {"drag": 8.75e-5, "lift": 1.75e-4, "gravity": 1.0, "curvature": 1.0},
+            "enabled": {n: True for n in fs.term_names()},
+            "trainable": {"drag": True, "lift": True, "gravity": False, "curvature": False},
+            "max_density_ratio": 5.0,
+            "frame_contract_check": {"ok": True, "messages": []},
         }
-        if verbose:
-            print(format_report(spec))
-            print(f"\n  recovery error: k_d {results[fs.name]['k_d_err_pct']:.2f}%, "
-                  f"k_l {results[fs.name]['k_l_err_pct']:.2f}%, "
-                  f"H {results[fs.name]['H_err_pct']:.2f}%\n")
-    return results
+        phys = gru_ode.HGVPhysics.from_spec(spec)
 
+        y = np.zeros((2000, fs.n_features))
+        y[:, fs.height_idx] = rng.uniform(-20_000, 90_000, 2000)
+        for i in fs.horiz_pos_idx:
+            y[:, i] = rng.uniform(-3e5, 3e5, 2000)
+        for i in fs.phys_vel_idx:
+            y[:, i] = rng.uniform(-3000, 3000, 2000)
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-def _main(argv=None) -> int:
-    p = argparse.ArgumentParser(description="Ensemble-SINDy discovery of f_physics")
-    p.add_argument("--data", help="directory or .npy/.npz of (T, D) trajectories in PHYSICAL units")
-    p.add_argument("--frame", default="lned", choices=["geodesic", "lned"])
-    p.add_argument("--geodesic-mode", default="integrated", choices=["integrated", "original"])
-    p.add_argument("--dt", type=float, default=1.0)
-    p.add_argument("--alt-ref", type=float, default=0.0,
-                   help="metres from the frame's altitude datum to sea level")
-    p.add_argument("--bootstraps", type=int, default=200)
-    p.add_argument("--threshold", type=float, default=0.05)
-    p.add_argument("--inclusion-threshold", type=float, default=0.6)
-    p.add_argument("--out", default="physics_spec.json")
-    p.add_argument("--self-test", action="store_true")
-    args = p.parse_args(argv)
+        a_np = library_field(y, fs, 8.75e-5, 1.75e-4, 7200.0)
+        a_t = phys(torch.as_tensor(y, dtype=torch.float64)).detach().numpy()
+        err = np.max(np.abs(a_np - a_t)) / max(np.max(np.abs(a_np)), 1e-12)
+        good = err < 1e-6
+        ok &= good
+        print(f"  [{'PASS' if good else 'FAIL'}] {fs.name:<22} max relative disagreement {err:.2e}")
 
-    if args.self_test:
-        self_test()
-        return 0
-    if not args.data:
-        p.error("--data is required unless --self-test is given")
-
-    import os
-
-    if os.path.isdir(args.data):
-        files = sorted(
-            os.path.join(args.data, f) for f in os.listdir(args.data)
-            if f.endswith((".npy", ".csv"))
+        # invariants, on the real module
+        v = torch.as_tensor(y[:, list(fs.phys_vel_idx)], dtype=torch.float64)
+        kl_only = gru_ode.HGVPhysics.from_spec(
+            {**spec, "coefficients": {"drag": 0.0, "lift": 1.75e-4, "gravity": 0.0, "curvature": 0.0},
+             "enabled": {"drag": False, "lift": True, "gravity": False, "curvature": False}}
         )
-        trajs = [np.load(f) if f.endswith(".npy") else np.loadtxt(f, delimiter=",") for f in files]
-    elif args.data.endswith(".npz"):
-        z = np.load(args.data)
-        trajs = [z[k] for k in z.files]
-    else:
-        trajs = [np.load(args.data)]
-
-    fs = frame_spec_for(args.frame, geodesic_mode=args.geodesic_mode, alt_ref_m=args.alt_ref)
-    spec = discover_physics(
-        trajs, args.dt, fs,
-        n_bootstraps=args.bootstraps,
-        threshold=args.threshold,
-        inclusion_threshold=args.inclusion_threshold,
-    )
-    print(format_report(spec))
-    save_spec(spec, args.out)
-    print(f"\nwrote {args.out}")
-    if not spec["frame_contract_check"]["ok"]:
-        print("\nFRAME CONTRACT CHECK FAILED - do not train on this spec.")
-        return 2
-    return 0
+        p = (kl_only(torch.as_tensor(y, dtype=torch.float64)) * v).sum(-1)
+        good = float(p.abs().max()) < 1e-6
+        ok &= good
+        print(f"  [{'PASS' if good else 'FAIL'}] {fs.name:<22} torch lift does zero work")
+except ImportError:
+    print("\n  (torch not installed here - run this file where torch is available "
+          "to check the real module and the ONNX-relevant ops)")
 
 
-if __name__ == "__main__":
-    raise SystemExit(_main())
+
+# =========================================================================
+# 2-4. Invariants, OOD behaviour, robustness
+# =========================================================================
+
+
+
+def _random_states(fs, n, alt_lo, alt_hi, spd):
+    x = np.zeros((n, fs.n_features))
+    x[:, fs.height_idx] = rng.uniform(alt_lo, alt_hi, n)
+    for i in fs.horiz_pos_idx:
+        x[:, i] = rng.uniform(-2e5, 2e5, n)
+    for c, i in enumerate(fs.phys_vel_idx):
+        x[:, i] = rng.uniform(-spd, spd, n)
+    return x
+
+
+def check(name, ok, detail=""):
+    print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f"  {detail}" if detail else ""))
+    return ok
+
+
+rng = np.random.default_rng(0)
+all_ok = True
+for frame, mode, alt_ref in (("geodesic", "integrated", 0.0), ("lned", "", 0.0)):
+    fs = sp.frame_spec_for(frame, geodesic_mode=mode or "integrated", alt_ref_m=alt_ref)
+    names = fs.term_names()
+    print(f"\n{fs.name}")
+    print("-" * 62)
+
+    # ---- 1. Lift is exactly zero-work, at every state including OOD ones ----
+    x = _random_states(fs, 4000, -60_000, 120_000, 6000.0)
+    A = sp.build_terms(x, fs, 7200.0)
+    v = x[:, list(fs.phys_vel_idx)]
+    lift = A[:, :, names.index(sp.TERM_LIFT)]
+    power = np.sum(lift * v, axis=1)
+    scale = np.maximum(np.linalg.norm(lift, axis=1) * np.linalg.norm(v, axis=1), 1e-12)
+    all_ok &= check("lift does zero work (a.v == 0) everywhere",
+                    np.max(np.abs(power) / scale) < 1e-10,
+                    f"max relative power {np.max(np.abs(power)/scale):.2e}")
+
+    # ---- 2. Drag always dissipates, at every state including OOD ones ----
+    drag = A[:, :, names.index(sp.TERM_DRAG)]
+    dpow = np.sum(drag * v, axis=1)
+    all_ok &= check("drag never adds energy (a.v <= 0) everywhere",
+                    np.all(dpow <= 1e-9),
+                    f"max power {dpow.max():.2e}")
+
+    # ---- 3. Lower altitude => stronger drag (the extrapolation property) ----
+    xs = np.zeros((2, fs.n_features))
+    xs[:, fs.height_idx] = [30_000.0, 5_000.0]
+    xs[:, fs.phys_vel_idx[0]] = 2000.0
+    dA = 8.75e-5 * sp.build_terms(xs, fs, 7200.0)[:, :, names.index(sp.TERM_DRAG)]
+    lo, hi = np.linalg.norm(dA[0]), np.linalg.norm(dA[1])
+    all_ok &= check("drag increases monotonically as altitude falls",
+                    hi > lo * 10, f"|a| {lo:.3f} -> {hi:.3f} m/s^2")
+
+    # ---- 4. Density is bounded below ground: no numerical explosion ----
+    xs = np.zeros((3, fs.n_features))
+    xs[:, fs.height_idx] = [-10_000.0, -100_000.0, -1e6]
+    xs[:, fs.phys_vel_idx[0]] = 3000.0
+    # Check the acceleration actually applied, i.e. with the fitted coefficient.
+    dA = 8.75e-5 * sp.build_terms(xs, fs, 7200.0)[:, :, names.index(sp.TERM_DRAG)]
+    peak = np.max(np.abs(dA))
+    all_ok &= check("below-ground states stay finite and solver-tractable",
+                    np.all(np.isfinite(dA)) and peak < 1e4,
+                    f"peak |a| {peak:.0f} m/s^2 = {peak/9.81:.0f} g (density saturated)")
+
+    # ---- 5. The OOD failure mode itself: fast + low => strong deceleration ----
+    # Prior work: extrapolations gain energy, exceed launch speed, fly below
+    # ground. Check the physics term opposes exactly that.
+    xs = np.zeros((1, fs.n_features))
+    xs[0, fs.height_idx] = 2_000.0
+    xs[0, fs.phys_vel_idx[fs.horiz_vel_local[0]]] = 8000.0   # far above launch speed
+    A5 = sp.build_terms(xs, fs, 7200.0)
+    kd, kl = 8.75e-5, 1.75e-4
+    coef = np.array([kd if n == sp.TERM_DRAG else kl if n == sp.TERM_LIFT else 1.0
+                     for n in names])
+    acc = A5[0] @ coef
+    v5 = xs[0, list(fs.phys_vel_idx)]
+    all_ok &= check("runaway-speed state is decelerated, not accelerated",
+                    float(acc @ v5) < 0,
+                    f"dE/dt = {float(acc @ v5):.3e} J/kg/s")
+
+# ---- 6. Robustness: noise + an unmodelled guidance maneuver ----
+print("\nrobustness (noise + unmodelled maneuver)")
+print("-" * 62)
+fs = sp.frame_spec_for("lned", alt_ref_m=0.0)
+true_kd, true_kl, true_H = 8.75e-5, 1.75e-4, 7200.0
+for noise_m, man in ((0.0, 0.0), (5.0, 0.0), (5.0, 3.0), (20.0, 6.0)):
+    trajs = []
+    r = np.random.default_rng(3)
+    for j in range(14):
+        x0 = np.array([0.0, 0.0, 40_000.0, 2200.0 + 200 * r.standard_normal(),
+                       50.0 * r.standard_normal(), -60.0])
+        t = sp._simulate_hgv(fs, true_kd, true_kl, true_H, 1.0, 300, x0,
+                             maneuver=man, seed=j)
+        if noise_m:
+            t = t.copy()
+            t[:, :3] += noise_m * r.standard_normal(t[:, :3].shape)
+            t[:, 3:] += (noise_m / 10.0) * r.standard_normal(t[:, 3:].shape)
+        trajs.append(t)
+    spec = sp.discover_physics(trajs, 1.0, fs, n_bootstraps=80, seed=2)
+    kd = spec["coefficients"][sp.TERM_DRAG]
+    kl = spec["coefficients"][sp.TERM_LIFT]
+    print(f"  pos noise {noise_m:>4.0f} m, maneuver {man:>3.0f} m/s^2 -> "
+          f"k_d err {100*abs(kd-true_kd)/true_kd:5.1f}%, "
+          f"k_l err {100*abs(kl-true_kl)/true_kl:5.1f}%, "
+          f"H err {100*abs(spec['scale_height_m']-true_H)/true_H:5.1f}%, "
+          f"beta {spec['interpretation']['ballistic_coefficient_kg_m2']:6.0f}, "
+          f"resid {spec['diagnostics']['residual_rms_m_s2']:.3f}")
+
+
+
+# =========================================================================
+# 5. lned frame kinematics: is d(pos)/dt == vel, and does the shipped
+#    transport correction fix it?
+# =========================================================================
+# GRUODEPredictorModel overwrites the position channels of the vector field
+# with the velocity channels. That identity is exact only when the position
+# coordinates are the time-integral of the velocity coordinates. In lned they
+# are not: NEXT_frame measures forward/right as GEODESIC displacement and
+# altitude as true hae, but resolves velocity with
+# ecef_to_ned_velocity(state[VEL_SLICE], origin) - a basis pinned at the
+# trajectory's first point. Project modules are not importable standalone
+# (geographiclib, pandas, coordinate_transform_functions), so WGS-84 is
+# reimplemented here and the transform mirrored line for line.
+
+
+A_WGS84 = 6378137.0
+F_WGS84 = 1.0 / 298.257223563
+B_WGS84 = A_WGS84 * (1 - F_WGS84)
+E2 = 2 * F_WGS84 - F_WGS84**2
+GM = 3.986004418e14
+
+
+def geodetic_to_ecef(lat_deg, lon_deg, h):
+    lat, lon = np.radians(lat_deg), np.radians(lon_deg)
+    N = A_WGS84 / np.sqrt(1 - E2 * np.sin(lat) ** 2)
+    return np.array([
+        (N + h) * np.cos(lat) * np.cos(lon),
+        (N + h) * np.cos(lat) * np.sin(lon),
+        ((1 - F_WGS84) ** 2 * N + h) * np.sin(lat),
+    ])
+
+
+def ecef_to_geodetic(x, y, z):
+    """Bowring's method; sub-millimetre for terrestrial altitudes."""
+    lon = np.arctan2(y, x)
+    p = np.hypot(x, y)
+    ep2 = (A_WGS84**2 - B_WGS84**2) / B_WGS84**2
+    th = np.arctan2(A_WGS84 * z, B_WGS84 * p)
+    lat = np.arctan2(z + ep2 * B_WGS84 * np.sin(th) ** 3,
+                     p - E2 * A_WGS84 * np.cos(th) ** 3)
+    N = A_WGS84 / np.sqrt(1 - E2 * np.sin(lat) ** 2)
+    h = p / np.cos(lat) - N
+    return np.degrees(lat), np.degrees(lon), h
+
+
+def vincenty_inverse(lat1, lon1, lat2, lon2):
+    """Geodesic distance (m) and forward azimuth (deg) on WGS-84."""
+    L = np.radians(lon2 - lon1)
+    U1 = np.arctan((1 - F_WGS84) * np.tan(np.radians(lat1)))
+    U2 = np.arctan((1 - F_WGS84) * np.tan(np.radians(lat2)))
+    sU1, cU1, sU2, cU2 = np.sin(U1), np.cos(U1), np.sin(U2), np.cos(U2)
+    lam = L
+    for _ in range(200):
+        sl, cl = np.sin(lam), np.cos(lam)
+        sin_sigma = np.hypot(cU2 * sl, cU1 * sU2 - sU1 * cU2 * cl)
+        if sin_sigma == 0:
+            return 0.0, 0.0
+        cos_sigma = sU1 * sU2 + cU1 * cU2 * cl
+        sigma = np.arctan2(sin_sigma, cos_sigma)
+        sin_alpha = cU1 * cU2 * sl / sin_sigma
+        cos2_alpha = 1 - sin_alpha**2
+        cos2sm = cos_sigma - 2 * sU1 * sU2 / cos2_alpha if cos2_alpha != 0 else 0.0
+        C = F_WGS84 / 16 * cos2_alpha * (4 + F_WGS84 * (4 - 3 * cos2_alpha))
+        lam_prev = lam
+        lam = L + (1 - C) * F_WGS84 * sin_alpha * (
+            sigma + C * sin_sigma * (cos2sm + C * cos_sigma * (-1 + 2 * cos2sm**2))
+        )
+        if abs(lam - lam_prev) < 1e-14:
+            break
+    u2 = cos2_alpha * (A_WGS84**2 - B_WGS84**2) / B_WGS84**2
+    Aa = 1 + u2 / 16384 * (4096 + u2 * (-768 + u2 * (320 - 175 * u2)))
+    Bb = u2 / 1024 * (256 + u2 * (-128 + u2 * (74 - 47 * u2)))
+    d_sigma = Bb * sin_sigma * (cos2sm + Bb / 4 * (
+        cos_sigma * (-1 + 2 * cos2sm**2)
+        - Bb / 6 * cos2sm * (-3 + 4 * sin_sigma**2) * (-3 + 4 * cos2sm**2)))
+    s = B_WGS84 * Aa * (sigma - d_sigma)
+    azi = np.degrees(np.arctan2(cU2 * np.sin(lam), cU1 * sU2 - sU1 * cU2 * np.cos(lam)))
+    return s, azi
+
+
+def ned_rotation(lat_deg, lon_deg):
+    lat, lon = np.radians(lat_deg), np.radians(lon_deg)
+    sl, cl, so, co = np.sin(lat), np.cos(lat), np.sin(lon), np.cos(lon)
+    return np.array([
+        [-sl * co, -sl * so,  cl],
+        [-so,       co,       0.0],
+        [-cl * co, -cl * so, -sl],
+    ])
+
+
+def ecef_to_ned_velocity(v_ecef, origin_ecef):
+    lat0, lon0, _ = ecef_to_geodetic(*origin_ecef)
+    return ned_rotation(lat0, lon0) @ v_ecef
+
+
+def ecef_to_local_ned_hvuh(ecef_data, guide_ecef):
+    """Mirror of NEXT_frame.ecef_to_local_ned_hvuh."""
+    origin = ecef_data[0, 1:4]
+    lat0, lon0, _ = ecef_to_geodetic(*origin)
+    lat_g, lon_g, _ = ecef_to_geodetic(*guide_ecef)
+    _, azi_g = vincenty_inverse(lat0, lon0, lat_g, lon_g)
+    heading0 = np.radians(azi_g)
+
+    out = np.empty((ecef_data.shape[0], 7))
+    out[:, 0] = ecef_data[:, 0]
+    for i, st in enumerate(ecef_data):
+        lat, lon, hae = ecef_to_geodetic(*st[1:4])
+        dist, azi = vincenty_inverse(lat0, lon0, lat, lon)
+        vel_ned = ecef_to_ned_velocity(st[4:7], origin)
+        north = dist * np.cos(np.radians(azi))
+        east = dist * np.sin(np.radians(azi))
+        out[i, 1] = north * np.cos(heading0) + east * np.sin(heading0)
+        out[i, 2] = -north * np.sin(heading0) + east * np.cos(heading0)
+        out[i, 3] = hae
+        out[i, 4] = vel_ned[0] * np.cos(heading0) + vel_ned[1] * np.sin(heading0)
+        out[i, 5] = -vel_ned[0] * np.sin(heading0) + vel_ned[1] * np.cos(heading0)
+        out[i, 6] = -vel_ned[2]
+    return out
+
+# --- a realistic glide, integrated in ECEF -------------------------------
+def simulate_ecef(lat0=25.0, lon0=120.0, h0=40000.0, speed=2200.0,
+                  azimuth_deg=70.0, gamma_deg=0.0, T=900.0, dt=1.0,
+                  beta=7000.0, ld=2.0):
+    p = geodetic_to_ecef(lat0, lon0, h0)
+    R = ned_rotation(lat0, lon0)
+    az, ga = np.radians(azimuth_deg), np.radians(gamma_deg)
+    v_ned = speed * np.array([np.cos(ga) * np.cos(az), np.cos(ga) * np.sin(az), -np.sin(ga)])
+    v = R.T @ v_ned
+
+    def acc(p, v):
+        r = np.linalg.norm(p)
+        g = -GM * p / r**3
+        _, _, h = ecef_to_geodetic(*p)
+        rho = 1.225 * np.exp(-max(h, 0.0) / 7200.0)
+        sp = np.linalg.norm(v)
+        drag = -(rho * sp / (2 * beta)) * v
+        # lift perpendicular to velocity in the vertical plane, L/D = ld,
+        # so the vehicle actually glides instead of ploughing in
+        up = p / r
+        vhat = v / sp
+        perp = up - np.dot(up, vhat) * vhat
+        n = np.linalg.norm(perp)
+        lift = ld * np.linalg.norm(drag) * (perp / n) if n > 1e-9 else 0.0
+        return g + drag + lift
+
+    n = int(T / dt) + 1
+    out = np.empty((n, 7))
+    t = 0.0
+    used = n
+    for i in range(n):
+        _, _, hh = ecef_to_geodetic(*p)
+        if hh <= 0.0:            # stop at impact; below ground is not a trajectory
+            used = i
+            break
+        out[i] = [t, *p, *v]
+        k1v, k1a = v, acc(p, v)
+        k2v, k2a = v + 0.5 * dt * k1a, acc(p + 0.5 * dt * k1v, v + 0.5 * dt * k1a)
+        k3v, k3a = v + 0.5 * dt * k2a, acc(p + 0.5 * dt * k2v, v + 0.5 * dt * k2a)
+        k4v, k4a = v + dt * k3a, acc(p + dt * k3v, v + dt * k3a)
+        p = p + dt / 6 * (k1v + 2 * k2v + 2 * k3v + k4v)
+        v = v + dt / 6 * (k1a + 2 * k2a + 2 * k3a + k4a)
+        t += dt
+    return out[:used]
+
+
+
+
+def transport_correction_transliterated(F, Rt, Alt, VF, VR, VU):
+    """Line-by-line mirror of the transport branch in GRUODEPredictorModel."""
+    Re = 6371000.0
+    p_h = np.stack([F, Rt], axis=1)
+    alt = Alt[:, None]
+    v_h = np.stack([VF, VR], axis=1)
+    v_u = VU[:, None]
+
+    dist = np.sqrt((p_h * p_h).sum(-1, keepdims=True) + EPS)
+    u_hat = p_h / dist
+    psi = dist / Re
+    sin_p, cos_p = np.sin(psi), np.cos(psi)
+
+    v_along = (v_h * u_hat).sum(-1, keepdims=True)
+    v_local_along = v_along * cos_p - v_u * sin_p
+    v_local_up = v_along * sin_p + v_u * cos_p
+    ground_scale = Re / (Re + alt)
+
+    dpos_h = (v_local_along * u_hat + (v_h - v_along * u_hat)) * ground_scale
+    return np.concatenate([dpos_h, v_local_up], axis=1)
+
+
+print("\nlned frame kinematics (WGS-84, realistic lifting glide)")
+print("-" * 62)
+_ecef = simulate_ecef(azimuth_deg=70.0)
+_latg, _long, _ = ecef_to_geodetic(*_ecef[-1, 1:4])
+for _label, _guide in (
+    ("down-range only", _ecef[-1, 1:4]),
+    ("with cross-track", geodetic_to_ecef(_latg - 3.0, _long + 3.0, 0.0)),
+):
+    _l = ecef_to_local_ned_hvuh(_ecef, _guide)
+    _dt = 1.0
+    _dpos = np.gradient(_l[:, 1:4], _dt, axis=0)
+    _naive = _l[:, 4:7]
+    _corr = transport_correction_transliterated(*[_l[:, j] for j in (1, 2, 3, 4, 5, 6)])
+    _k = slice(3, -3)
+    _en = np.abs(_dpos - _naive)[_k].max(axis=0)
+    _ec = np.abs(_dpos - _corr)[_k].max(axis=0)
+    _dn = abs(np.cumsum(_dpos[:, 2] - _naive[:, 2])[-3] * _dt) / 1000
+    _dc = abs(np.cumsum(_dpos[:, 2] - _corr[:, 2])[-3] * _dt) / 1000
+    print(f"  {_label} ({_l[:,1].max()/1000:.0f} km down-range, "
+          f"{abs(_l[:,2]).max()/1000:.0f} km cross-track)")
+    print(f"    naive     d(pos)/dt-vel  max: F {_en[0]:7.3f}  R {_en[1]:7.3f}  Alt {_en[2]:7.3f} m/s"
+          f"  -> {_dn:6.2f} km altitude drift")
+    print(f"    corrected                max: F {_ec[0]:7.3f}  R {_ec[1]:7.3f}  Alt {_ec[2]:7.3f} m/s"
+          f"  -> {_dc:6.3f} km altitude drift")
+    _ok = _ec.max() < 0.25 and _dc < 0.1
+    all_ok &= _ok
+    print(f"    [{'PASS' if _ok else 'FAIL'}] correction closes the frame-kinematics gap")
+
+all_ok &= ok
+print("\nALL TESTS PASSED" if all_ok else "\nSOME TESTS FAILED")
+raise SystemExit(0 if all_ok else 1)

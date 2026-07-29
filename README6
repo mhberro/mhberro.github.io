@@ -1,66 +1,603 @@
-Run C
+# loss_functions.py
 
-(.venv) e471302@usmk2tqq3hkk2 next % python -u NEXT_training.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000 --use-scalar --frame lned --aug 0 --nhidden 256 --dt 1.0 -o model_outputs/SBI/mo_bff_esindy_gruode --model-type gruode --sbi-phase glide  --physics hgv --discover-physics
-There are 120 training trajs and 30 validation trajs. There will be 8 batch(es) for training and 2 for validation
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
-discovery data written to model_outputs/SBI/mo_bff_esindy_gruode/HighE_HGV/NEXT_HighE_HGV_lned_glide_100sr_1.0sec_256hid_0aug_16_scalarOn_discovery_data.npz
-Ensemble-SINDy physics discovery
-============================================================
-frame                : lned
-scale height H       : 12600.0 m
-trajectories/samples : 117 / 36876
+"""Loss functions for a Neural Ordinary Differential Equation model."""
 
-term             coefficient   inclusion  status
-------------------------------------------------------------
-drag             6.20151e-06        1.00  ACTIVE (learned)
-lift             4.20357e-06        1.00  ACTIVE (learned)
-gravity                    1        1.00  fixed (known kinematics)
-------------------------------------------------------------
-residual RMS         : 14.7820 m/s^2  (target RMS 15.4202)
-variance explained   : 8.11 %
+from __future__ import annotations
 
-Interpretation
-  ballistic coefficient : 98766 kg/m^2
-  lift-to-drag ratio    : 0.68
+from typing import Callable
 
-Frame contract check (free fit of known terms; both should be ~1.00)
-  drag=6.246e-06, lift=5.381e-06, gravity=1.171
-  free-fit gravity/curvature recovered near 1.0 on well-conditioned columns; frame contract consistent.
-f_physics initialised: {'k_drag_per_m': 6.2015083130972926e-06, 'k_lift_per_m': 4.203565367788542e-06, 'scale_height_m': 12600.0, 'ballistic_coefficient_kg_m2': 98766.29508121902, 'lift_to_drag_ratio': 0.6778295142990957}
-running length strategy (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x17ce56390>, 0.0001)
-physics-lr-scale: 3 physical parameters at lr=1e-05
-length strategy results in too few states. overriding to maintain stability
-[INFO] Epoch 5: loss: 0.0004236 pos_err: 347.2980652 vel_err: 60.2236938 aug_norm: 0.0000835 lambda: 6.8581676 opt_loss: 0.0029886 val_loss: 0.0000809 val_pos_err: 268.6301880 val_vel_err: 50.0672379 val_aug_norm: 0.0000810 val_lambda: 6.9005275 val_opt_loss: 0.0006390
-[INFO] Epoch 10: loss: 0.0003832 pos_err: 332.8429565 vel_err: 68.7300262 aug_norm: 0.0000735 lambda: 8.4651518 opt_loss: 0.0033175 val_loss: 0.0000835 val_pos_err: 264.6997986 val_vel_err: 50.3497658 val_aug_norm: 0.0000792 val_lambda: 8.5034733 val_opt_loss: 0.0007892
-[INFO] Epoch 15: loss: 0.0003399 pos_err: 254.5706635 vel_err: 68.1217499 aug_norm: 0.0000753 lambda: 9.9806137 opt_loss: 0.0034673 val_loss: 0.0000752 val_pos_err: 257.1149597 val_vel_err: 49.6661911 val_aug_norm: 0.0000796 val_lambda: 10.0145998 val_opt_loss: 0.0008323
-[INFO] Epoch 20: loss: 0.0003548 pos_err: 308.4249268 vel_err: 63.4537354 aug_norm: 0.0000821 lambda: 11.4265261 opt_loss: 0.0041366 val_loss: 0.0000753 val_pos_err: 246.5323029 val_vel_err: 51.3029442 val_aug_norm: 0.0000831 val_lambda: 11.4620094 val_opt_loss: 0.0009463
-[INFO] Epoch 25: loss: 0.0003083 pos_err: 259.3198853 vel_err: 57.2009163 aug_norm: 0.0000850 lambda: 12.8286047 opt_loss: 0.0040398 val_loss: 0.0000818 val_pos_err: 236.8093109 val_vel_err: 52.6776466 val_aug_norm: 0.0000845 val_lambda: 12.8594332 val_opt_loss: 0.0011359
-[INFO] Epoch 30: loss: 0.0003479 pos_err: 288.0232544 vel_err: 66.9154816 aug_norm: 0.0000811 lambda: 14.1405888 opt_loss: 0.0050003 val_loss: 0.0000839 val_pos_err: 228.6853180 val_vel_err: 52.0991364 val_aug_norm: 0.0000828 val_lambda: 14.1753759 val_opt_loss: 0.0012726
-[INFO] Epoch 35: loss: 0.0002521 pos_err: 160.1933136 vel_err: 54.2858238 aug_norm: 0.0000907 lambda: 15.4352407 opt_loss: 0.0039815 val_loss: 0.0000730 val_pos_err: 187.9040527 val_vel_err: 56.0386810 val_aug_norm: 0.0000888 val_lambda: 15.4604483 val_opt_loss: 0.0012172
-[INFO] Epoch 40: loss: 0.0005909 pos_err: 337.9858093 vel_err: 78.1243668 aug_norm: 0.0000853 lambda: 16.6521168 opt_loss: 0.0099242 val_loss: 0.0000784 val_pos_err: 188.9589081 val_vel_err: 55.3096581 val_aug_norm: 0.0000866 val_lambda: 16.7112026 val_opt_loss: 0.0013969
-[INFO] Epoch 45: loss: 0.0002744 pos_err: 201.7911072 vel_err: 60.1341743 aug_norm: 0.0000846 lambda: 17.8353214 opt_loss: 0.0049788 val_loss: 0.0000856 val_pos_err: 192.7829742 val_vel_err: 54.1135330 val_aug_norm: 0.0000828 val_lambda: 17.8627625 val_opt_loss: 0.0016122
-[INFO] Epoch 50: loss: 0.0002370 pos_err: 203.8259583 vel_err: 59.4137306 aug_norm: 0.0000840 lambda: 18.9727688 opt_loss: 0.0045810 val_loss: 0.0000743 val_pos_err: 213.5294647 val_vel_err: 53.4279556 val_aug_norm: 0.0000863 val_lambda: 18.9964714 val_opt_loss: 0.0014979
-[INFO] Epoch 55: loss: 0.0003130 pos_err: 205.2002411 vel_err: 61.9848175 aug_norm: 0.0000929 lambda: 20.0884113 opt_loss: 0.0063805 val_loss: 0.0000734 val_pos_err: 183.2500153 val_vel_err: 56.1300125 val_aug_norm: 0.0000893 val_lambda: 20.1197109 val_opt_loss: 0.0015652
-[INFO] Epoch 60: loss: 0.0002032 pos_err: 207.0889282 vel_err: 64.6935196 aug_norm: 0.0000800 lambda: 21.1509094 opt_loss: 0.0043783 val_loss: 0.0000847 val_pos_err: 200.2555237 val_vel_err: 53.6873856 val_aug_norm: 0.0000828 val_lambda: 21.1712322 val_opt_loss: 0.0018752
-[INFO] Early stopping triggered at 64
-running length strategy (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x17c5b2f90>, 0.0001)
-physics-lr-scale: 3 physical parameters at lr=1e-05
-[INFO] Epoch 5: loss: 0.0277987 pos_err: 8618.1484375 vel_err: 297.4010620 aug_norm: 0.0004241 lambda: 336.2687683 opt_loss: 9.3482609 val_loss: 0.0128887 val_pos_err: 8561.8486328 val_vel_err: 305.4458313 val_aug_norm: 0.0004336 val_lambda: 339.0486450 val_opt_loss: 4.3703237
-[INFO] Epoch 10: loss: 0.1154717 pos_err: 16924.2988281 vel_err: 495.4709778 aug_norm: 0.0011289 lambda: 539.8851929 opt_loss: 62.3425827 val_loss: 0.0169824 val_pos_err: 10277.4082031 val_vel_err: 388.1043091 val_aug_norm: 0.0011859 val_lambda: 551.4323730 val_opt_loss: 9.3658533
-[INFO] Epoch 15: loss: 0.0607596 pos_err: 12968.8876953 vel_err: 420.2057495 aug_norm: 0.0013456 lambda: 738.1414795 opt_loss: 44.8505211 val_loss: 0.0156159 val_pos_err: 8734.3925781 val_vel_err: 362.0424194 val_aug_norm: 0.0013477 val_lambda: 744.2174683 val_opt_loss: 11.6229610
-[INFO] Epoch 20: loss: 0.0131582 pos_err: 6198.7031250 vel_err: 330.8079834 aug_norm: 0.0020793 lambda: 925.1374512 opt_loss: 12.1752596 val_loss: 0.0157172 val_pos_err: 8145.2197266 val_vel_err: 381.4114685 val_aug_norm: 0.0020507 val_lambda: 926.4532471 val_opt_loss: 14.5633001
-[INFO] Epoch 25: loss: 0.0137657 pos_err: 4727.6962891 vel_err: 304.8401489 aug_norm: 0.0034995 lambda: 1094.2752686 opt_loss: 15.0669756 val_loss: 0.0160941 val_pos_err: 7134.6718750 val_vel_err: 390.9772034 val_aug_norm: 0.0034111 val_lambda: 1095.6518555 val_opt_loss: 17.6368942
-[INFO] Epoch 30: loss: 0.0094021 pos_err: 6903.3715820 vel_err: 413.2199707 aug_norm: 0.0051344 lambda: 1256.3630371 opt_loss: 11.8175993 val_loss: 0.0161158 val_pos_err: 7923.3222656 val_vel_err: 433.5388794 val_aug_norm: 0.0055564 val_lambda: 1257.3032227 val_opt_loss: 20.2680016
-[INFO] Epoch 35: loss: 0.0564517 pos_err: 14161.4365234 vel_err: 603.4191284 aug_norm: 0.0066715 lambda: 1400.6579590 opt_loss: 79.0761261 val_loss: 0.0112455 val_pos_err: 9216.2695312 val_vel_err: 473.3076782 val_aug_norm: 0.0076264 val_lambda: 1406.3031006 val_opt_loss: 15.8222570
-[INFO] Epoch 40: loss: 0.0198955 pos_err: 16845.6074219 vel_err: 681.6543579 aug_norm: 0.0114193 lambda: 1538.7009277 opt_loss: 30.6246223 val_loss: 0.0171851 val_pos_err: 13070.9824219 val_vel_err: 561.2783813 val_aug_norm: 0.0120355 val_lambda: 1540.6903076 val_opt_loss: 26.4889297
-[INFO] Epoch 45: loss: 0.0157067 pos_err: 15836.1201172 vel_err: 711.5388794 aug_norm: 0.0163660 lambda: 1670.5784912 opt_loss: 26.2557163 val_loss: 0.0115941 val_pos_err: 13300.7880859 val_vel_err: 614.8284302 val_aug_norm: 0.0146921 val_lambda: 1672.1491699 val_opt_loss: 19.4017754
-[INFO] Epoch 50: loss: 0.0335417 pos_err: 18596.1757812 vel_err: 763.6625977 aug_norm: 0.0145181 lambda: 1800.1408691 opt_loss: 60.3942528 val_loss: 0.0113463 val_pos_err: 14534.9042969 val_vel_err: 617.7019653 val_aug_norm: 0.0146019 val_lambda: 1803.4949951 val_opt_loss: 20.4775639
-[INFO] Epoch 55: loss: 0.0228078 pos_err: 17712.3261719 vel_err: 660.0521851 aug_norm: 0.0177680 lambda: 1926.4704590 opt_loss: 43.9563446 val_loss: 0.0151381 val_pos_err: 15707.5751953 val_vel_err: 631.7672729 val_aug_norm: 0.0156401 val_lambda: 1928.7513428 val_opt_loss: 29.2132835
-[INFO] Epoch 60: loss: 0.0173647 pos_err: 16577.5859375 vel_err: 773.3231201 aug_norm: 0.0137179 lambda: 2050.9165039 opt_loss: 35.6272316 val_loss: 0.0118697 val_pos_err: 13507.1816406 val_vel_err: 635.3607788 val_aug_norm: 0.0140534 val_lambda: 2052.6530762 val_opt_loss: 24.3784809
-[INFO] Epoch 65: loss: 0.0260620 pos_err: 13285.6953125 vel_err: 653.7918701 aug_norm: 0.0133117 lambda: 2168.3833008 opt_loss: 56.5257683 val_loss: 0.0140681 val_pos_err: 12138.7500000 val_vel_err: 604.0671997 val_aug_norm: 0.0125301 val_lambda: 2170.9895020 val_opt_loss: 30.5542526
-[INFO] Epoch 70: loss: 0.1134909 pos_err: 35844.9140625 vel_err: 1087.9702148 aug_norm: 0.0133027 lambda: 2291.4428711 opt_loss: 260.0713196 val_loss: 0.0111977 val_pos_err: 14098.1689453 val_vel_err: 670.8258057 val_aug_norm: 0.0154411 val_lambda: 2302.7919922 val_opt_loss: 25.8014164
+import torch
+from sklearn.preprocessing import MinMaxScaler
+from torch import Tensor
+from torch.nn import MSELoss
+from tslearn.metrics import SoftDTWLossPyTorch
+
+
+class WrappedMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int] | tuple[int, ...],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        position_loss_weight: float = 80.0,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        """Initializes WrappedMSELoss with scale-space focus and L2 regularization."""
+        super().__init__(reduction="none")
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.position_loss_weight = position_loss_weight
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        """Saves a structural reference to evaluate explicit parameter decay penalties."""
+        self.model_ref = model
+
+    def forward(self, pred: Tensor, target: Tensor) -> dict[str, Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # 1. Generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # 2. Compute elementwise unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # 3. Construct the mathematically normalized scale-space weight matrix
+        pos_end_idx = self.vel_indices[0]
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[:pos_end_idx] = self.position_loss_weight
+        
+        # Normalization step: Prevents artificial gradient amplification and directional distortion
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        # 4. Generate the linear temporal ramp to penalize late-horizon integration drift
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        # 5. Compute the final balanced, masked loss metric
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # 6. Apply L2 Regularization parameter penalty — training passes only.
+        # Validation runs under torch.no_grad(); adding the (slowly drifting)
+        # weight-norm term there pollutes val_loss and fights the fine-grained
+        # early-stopping min_delta thresholds (1e-5 and below).
+        if self.model_ref is not None and self.l2_reg > 0 and torch.is_grad_enabled():
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # Compute metrics.
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred - pos_target) * valid_mask
+            vel_diff = torch.abs(vel_pred - vel_target) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * pos_pred.shape[-1] + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * vel_pred.shape[-1] + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class SecondOrderSplitMSELoss(torch.nn.Module):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        vel_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        pos_expect: float = "inf",
+        vel_expect: float = "inf",
+    ) -> None:
+        """Initializes SecondOrderSplitMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.vel_weight = vel_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.pos_expect = pos_expect
+        self.vel_expect = vel_expect
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+
+        if self.scaler is not None:
+            pred_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+            target_unscaled = torch.from_numpy(
+                self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                    -1, n_timesteps, self.N_FEATURES
+                )
+            )
+        else:
+            pred_unscaled = pred.detach()
+            target_unscaled = target.detach()
+
+        pos_pred_unscaled = pred_unscaled[..., : self.vel_indices[0]]
+        pos_target_unscaled = target_unscaled[..., : self.vel_indices[0]]
+        vel_pred_unscaled = pred_unscaled[..., self.vel_indices]
+        vel_target_unscaled = target_unscaled[..., self.vel_indices]
+
+        avg_pos_diff = torch.nn.L1Loss().forward(pos_pred_unscaled, pos_target_unscaled)
+        avg_vel_diff = torch.nn.L1Loss().forward(vel_pred_unscaled, vel_target_unscaled)
+
+        pos_pred = pred[..., : self.vel_indices[0]]
+        pos_target = target[..., : self.vel_indices[0]]
+        vel_pred = pred[..., self.vel_indices]
+        vel_target = target[..., self.vel_indices]
+
+        pos_ratio = torch.max(torch.Tensor([1.0]), avg_pos_diff / self.pos_expect) ** 2
+        vel_ratio = torch.max(torch.Tensor([1.0]), avg_vel_diff / self.vel_expect) ** 2
+
+        pos_loss = torch.nn.MSELoss().forward(pos_pred, pos_target) * pos_ratio
+        vel_loss = torch.nn.MSELoss().forward(vel_pred, vel_target) * vel_ratio
+        total_loss = pos_loss + vel_loss
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class PhysicsSplitMSELoss(torch.nn.Module):
+    """Position/velocity-weighted MSE tied with a cross-target kinematic constraint.
+    
+    Forces the predicted position derivatives to align directly with the true velocity 
+    targets, anchoring velocity features without causing optimization multi-task gridlock.
+    """
+    def __init__(
+        self,
+        height_idx: int,
+        pos_indices: list[int] | tuple[int, ...],
+        vel_indices: list[int] | tuple[int, ...],
+        dt: float,
+        pos_weight: float = 80.0,
+        vel_weight: float = 0.0,
+        physics_weight: float = 0.5,
+        scaler: StandardScaler | None = None,
+        N_FEATURES: int = 6,
+        l2_reg: float = 1e-4,
+        temporal_weighting: bool = True,
+    ) -> None:
+        super().__init__()
+        self.height_idx = height_idx
+        self.register_buffer("pos_indices", torch.tensor(list(pos_indices), dtype=torch.long))
+        self.register_buffer("vel_indices", torch.tensor(list(vel_indices), dtype=torch.long))
+        self.dt = float(dt)
+        self.pos_weight = pos_weight
+        self.vel_weight = vel_weight
+        self.physics_weight = physics_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        self.l2_reg = l2_reg
+        self.temporal_weighting = temporal_weighting
+        self.model_ref = None
+
+        if scaler is not None and hasattr(scaler, "scale_"):
+            scale = torch.as_tensor(scaler.scale_, dtype=torch.float32)
+            self.register_buffer("pos_scale", scale[list(pos_indices)].clone().view(1, 1, -1))
+            self.register_buffer("vel_scale", scale[list(vel_indices)].clone().view(1, 1, -1))
+        else:
+            self.pos_scale = None
+            self.vel_scale = None
+
+    def set_model(self, model: torch.nn.Module) -> None:
+        self.model_ref = model
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        batch_size, n_timesteps, _ = pred.shape
+        
+        # generate a broadcastable valid sequence mask to eliminate padding pollution
+        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
+        
+        # Compute  unreduced normalized loss
+        elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
+        
+        # Construct normalized mapping weights across coordinates
+        weights = torch.ones(self.N_FEATURES, device=pred.device)
+        weights[self.pos_indices] = self.pos_weight
+        weights[self.vel_indices] = self.vel_weight
+        
+        weights = weights / weights.mean()
+        weights_view = weights.view(1, 1, -1)
+        
+        
+        if self.temporal_weighting:
+            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            combined_weights = weights_view * t_weights
+        else:
+            combined_weights = weights_view
+            
+        masked_loss = elementwise_loss * combined_weights * valid_mask
+        loss_data = masked_loss.sum() / (valid_mask.sum() * self.N_FEATURES + 1e-8)
+
+        # Match predicted position updates against true target velocities
+        if self.physics_weight > 0.0 and n_timesteps >= 2:
+            pos_pred_phys = pred[..., self.pos_indices]
+            vel_true_phys = target[..., self.vel_indices]  # Anchor using the actual target states
+
+            # Convert to physical space variables for valid identity checking
+            if self.pos_scale is not None:
+                pos_phys = pos_pred_phys * self.pos_scale.to(pred.device)
+                vel_phys = vel_true_phys * self.vel_scale.to(pred.device)
+            else:
+                pos_phys = pos_pred_phys
+                vel_phys = vel_true_phys
+
+            # Compute forward finite difference on predictions vs raw target fields
+            dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
+            vel_true_mid = vel_phys[:, :-1, :]
+
+            # Re-normalize residual back to scaled spaces
+            if self.pos_scale is not None:
+                resid = (dpos_dt - vel_true_mid) / self.pos_scale.to(pred.device)
+            else:
+                resid = dpos_dt - vel_true_mid
+
+            valid_mask_mid = valid_mask[:, :-1, :]
+            physics_loss = (resid ** 2 * valid_mask_mid).sum() / (valid_mask_mid.sum() * len(self.pos_indices) + 1e-8)
+            
+            loss_data = loss_data + self.physics_weight * physics_loss
+
+        # Apply L2 Regularization 
+        if self.model_ref is not None and self.l2_reg > 0 and torch.is_grad_enabled():
+            l2_penalty = 0.0
+            for param in self.model_ref.parameters():
+                if param.requires_grad:
+                    l2_penalty += torch.sum(param ** 2)
+            loss_data = loss_data + self.l2_reg * l2_penalty
+
+        # unscaled physical evaluation metrics
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(pred.device)
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.cpu().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                ).to(target.device)
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred_u = pred_unscaled[..., self.pos_indices]
+            pos_target_u = target_unscaled[..., self.pos_indices]
+            vel_pred_u = pred_unscaled[..., self.vel_indices]
+            vel_target_u = target_unscaled[..., self.vel_indices]
+
+            pos_diff = torch.abs(pos_pred_u - pos_target_u) * valid_mask
+            vel_diff = torch.abs(vel_pred_u - vel_target_u) * valid_mask
+
+            avg_pos_diff = pos_diff.sum() / (valid_mask.sum() * len(self.pos_indices) + 1e-8)
+            avg_vel_diff = vel_diff.sum() / (valid_mask.sum() * len(self.vel_indices) + 1e-8)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class EnergyMSELoss(MSELoss):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        energy_fn: Callable[[Tensor, int, list[int]], Tensor],
+        energy_weight: float | None = 1.0,
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+    ) -> None:
+        """Initializes EnergyMSELoss."""
+        super().__init__()
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.energy_fn = energy_fn
+        self.energy_weight = energy_weight
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+        energy_pred = self.energy_fn(pred, self.height_idx, self.vel_indices)
+        energy_target = self.energy_fn(target, self.height_idx, self.vel_indices)
+        loss_energy = super().forward(energy_pred, energy_target) * self.energy_weight
+
+        total_loss = loss_data + loss_energy
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": total_loss,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "energy_loss": loss_energy,
+        }
+
+
+class ReverseLinearWeightingLoss(torch.nn.modules.loss._Loss):  # noqa: SLF001
+    def __init__(self) -> None:
+        """Initializes ReverseLinearWeightingLoss."""
+        super().__init__()
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        batch_size, time_steps, n_features = pred.shape
+        reverse_linear_weights: torch.Tensor = torch.arange(time_steps).repeat(batch_size, 1)
+        reverse_linear_weights = reverse_linear_weights / reverse_linear_weights.sum(dim=1, keepdim=True) * 100.0
+        reverse_linear_weights = torch.stack([reverse_linear_weights for _ in range(n_features)], dim=-1)
+        return {"loss": torch.mean(torch.abs(pred - target) * reverse_linear_weights)}
+
+
+class SoftDTWLossWrapper(SoftDTWLossPyTorch):
+    def __init__(
+        self,
+        height_idx: int,
+        vel_indices: list[int],
+        scaler: MinMaxScaler | None = None,
+        N_FEATURES: int = 6,
+        gamma=1,
+        normalize=False,
+        dist_func=None,
+    ):
+        super().__init__(gamma, normalize, dist_func)
+        self.height_idx = height_idx
+        self.vel_indices = list(vel_indices)
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        n_timesteps = pred.size(1)
+        loss_data = super().forward(pred, target)
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+        return {
+            "loss": loss_data,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+        }
+
+
+class WeightedHuberLoss(torch.nn.Module):
+    def __init__(
+        self,
+        delta_pos,
+        delta_vel,
+        vel_indices: list[int],
+        weight_pos=1.0,
+        weight_vel=1.0,
+        scaler=None,
+        N_FEATURES: int = 6,
+    ):
+        super().__init__()
+        self.delta_pos = delta_pos
+        self.delta_vel = delta_vel
+        self.delta_pos_unsacled = delta_pos
+        self.delta_vel_unsacled = delta_vel
+        self.vel_indices = list(vel_indices)
+        self.wp = weight_pos
+        self.wv = weight_vel
+        self.scaler = scaler
+        self.N_FEATURES = N_FEATURES
+        if scaler is not None:
+            sigma = scaler.scale_
+            self.delta_pos = delta_pos / sigma[: self.vel_indices[0]].mean()
+            self.delta_vel = delta_vel / sigma[self.vel_indices[0] :].mean()
+
+    def forward(self, pred, target):
+        n_timesteps = pred.size(1)
+
+        pos_pred_scaled = pred[..., : self.vel_indices[0]]
+        pos_target_scaled = target[..., : self.vel_indices[0]]
+        vel_pred_scaled = pred[..., self.vel_indices]
+        vel_target_scaled = target[..., self.vel_indices]
+
+        with torch.no_grad():
+            if self.scaler is not None:
+                pred_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(pred.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+                target_unscaled = torch.from_numpy(
+                    self.scaler.inverse_transform(target.detach().numpy().reshape(-1, self.N_FEATURES)).reshape(
+                        -1, n_timesteps, self.N_FEATURES
+                    )
+                )
+            else:
+                pred_unscaled = pred.detach()
+                target_unscaled = target.detach()
+
+            pos_pred = pred_unscaled[..., : self.vel_indices[0]]
+            pos_target = target_unscaled[..., : self.vel_indices[0]]
+            vel_pred = pred_unscaled[..., self.vel_indices]
+            vel_target = target_unscaled[..., self.vel_indices]
+
+            avg_pos_diff = torch.nn.L1Loss().forward(pos_pred, pos_target)
+            avg_vel_diff = torch.nn.L1Loss().forward(vel_pred, vel_target)
+
+            avg_pos_diff_scaled = torch.nn.L1Loss().forward(pos_pred_scaled, pos_target_scaled)
+            avg_vel_diff_scaled = torch.nn.L1Loss().forward(vel_pred_scaled, vel_target_scaled)
+
+        loss_pos = torch.nn.HuberLoss(delta=self.delta_pos).forward(pos_pred_scaled, pos_target_scaled) * self.wp
+        loss_vel = torch.nn.HuberLoss(delta=self.delta_vel).forward(vel_pred_scaled, vel_target_scaled) * self.wv
+
+        total_loss = (loss_pos * self.wp) + (loss_vel * self.wv)
+        total_loss_unweighted = loss_pos + loss_vel
+        return {
+            "loss": total_loss,
+            "loss_unweighted": total_loss_unweighted,
+            "pos_err": avg_pos_diff,
+            "vel_err": avg_vel_diff,
+            "pos_err_scaled": avg_pos_diff_scaled,
+            "vel_err_scaled": avg_vel_diff_scaled,
+        }
+
+
+class APHYNITYObjective(torch.nn.Module):
+    """Adaptively constrained objective (APHYNITY Algorithm 1), rescaled.
+
+    The constrained problem is: minimise ||F_a|| subject to the trajectory
+    constraint. The method of multipliers relaxes it to
+
+        L_lambda = w*||F_a||^2 + lambda*L_traj,   lambda <- lambda + tau2*L_traj
+
+    which is what the paper writes. Implemented literally, that form is unusable
+    with a fixed learning rate on this problem. lambda rises monotonically
+    because tau2*L_traj is non-negative, and it only stops rising when L_traj
+    reaches zero. APHYNITY's pendulum and PDE problems do drive it to
+    ~zero. This one cannot: maneuvers are guidance commands, so there is an
+    aleatoric floor and L_traj plateaus well above zero. lambda therefore grows
+    without bound, and since the gradient of lambda*L_traj is lambda times the
+    gradient of L_traj, the effective step size grows with it. Observed in
+    training: lambda reached 2291 by epoch 70, multiplying every gradient by
+    2291 against a learning rate chosen for unit scale, and the run diverged.
+
+    Dividing through by lambda gives
+
+        L = L_traj + (w/lambda)*||F_a||^2
+
+    which has exactly the same minimiser for every lambda - scaling an
+    objective by a positive constant does not move its argmin - while keeping
+    the trajectory gradient at unit scale. The multiplier now does what it is
+    supposed to do, which is make the penalty progressively less important as
+    the constraint tightens, rather than inflating the whole loss.
+
+    A practical consequence: the objective is now on the same scale as the
+    plain trajectory loss, so learning rates tuned without physics carry over
+    unchanged.
+
+    It WRAPS the existing trajectory loss, it does not replace it. Pass
+    whatever PhysicsSplitMSELoss (or any other criterion here) already returns
+    as traj_loss.
+    """
+
+    def __init__(
+        self,
+        lambda0: float = 1.0,
+        tau2: float = 100.0,
+        penalty_weight: float = 1.0,
+        lambda_max: float = 1e4,
+    ):
+        super().__init__()
+        # A buffer, not an attribute, so lambda is checkpointed. Resuming with
+        # lambda reset to lambda0 would hand the model a different objective and
+        # look exactly like a training regression.
+        self.register_buffer("lam", torch.tensor(float(lambda0)))
+        self.register_buffer("lam0", torch.tensor(float(lambda0)))
+        self.tau2 = float(tau2)
+        self.penalty_weight = float(penalty_weight)
+        # Beyond this the penalty is numerically irrelevant anyway; the cap only
+        # stops lambda drifting into a range where 1/lambda underflows.
+        self.lambda_max = float(lambda_max)
+
+    def forward(self, traj_loss: torch.Tensor, aug_norm: torch.Tensor) -> torch.Tensor:
+        return traj_loss + (self.penalty_weight / self.lam) * aug_norm
+
+    @torch.no_grad()
+    def update(self, traj_loss: torch.Tensor) -> None:
+        """Call once per optimiser step, after stepping."""
+        self.lam.add_(self.tau2 * float(traj_loss))
+        self.lam.clamp_(max=self.lambda_max)
+
+    @torch.no_grad()
+    def reset(self) -> None:
+        """Restart the multiplier.
+
+        Each length strategy is a fresh optimisation problem with a different
+        horizon and therefore a different natural scale for L_traj. Carrying
+        lambda across them means later strategies begin with the penalty
+        already switched off, so the least-action pressure only ever applies to
+        the shortest horizon.
+        """
+        self.lam.fill_(float(self.lam0))

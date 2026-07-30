@@ -1,13 +1,45 @@
-python NEXT_training.py \
-    --tgt-data-paths /path/to/your/hgv_data \
-    --frame geodesic \
-    --geodesic-mode integrated \
-    --model-type aphynity-gruode \
-    --sbi-phase glide \
-    --use-scalar \
-    --window-size 60 \
-    --window-stride 10 \
-    --nhidden 200 \
-    --dt 0.1 \
-    --gpuidx 0 \
-    -o model_outputs
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 60 --window-stride 10 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide/GEODESIC/glide 
+There are 120 training trajs and 30 validation trajs.
+the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
+  3.33451128e+03  2.49174647e+03  3.30483557e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
+ -2.11725726e+02  3.46356979e+03  2.44161046e+03]
+the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
+ -2.53746866e+03  3.40224301e+03  2.13890946e+03]
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+Discovered Physics Matrix Xi:
+ [[0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]
+ [0. 0. 0. 0. 0.]]
+Traceback (most recent call last):
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1033, in <module>
+    main()
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1012, in main
+    (node, model_name) = train_NEXT(
+                         ^^^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 299, in train_NEXT
+    node.model = APHYNITYGRUODEPredictorModel(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/aphynity_gru_ode.py", line 34, in __init__
+    ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 0

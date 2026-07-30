@@ -1,13 +1,13 @@
-# Insert inside NODEPredictor.fit() at the end of the validation block:
-
-if validation_data is not None:
-    # [Validation calculation logic ...]
-    for key, value in val_sums.items():
-        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-    # Update APHYNITY dual Lagrangian multiplier at epoch boundary
-    if hasattr(self.criterion, "update_lagrangian_multiplier"):
-        val_loss_epoch = metrics.get("val_traj_loss", metrics.get("val_loss", 0.0))
-        if isinstance(val_loss_epoch, torch.Tensor):
-            val_loss_epoch = val_loss_epoch.item()
-        self.criterion.update_lagrangian_multiplier(val_loss_epoch)
+python NEXT_training.py \
+    --tgt-data-paths /path/to/your/hgv_data \
+    --frame geodesic \
+    --geodesic-mode integrated \
+    --model-type aphynity-gruode \
+    --sbi-phase glide \
+    --use-scalar \
+    --window-size 60 \
+    --window-stride 10 \
+    --nhidden 200 \
+    --dt 0.1 \
+    --gpuidx 0 \
+    -o model_outputs

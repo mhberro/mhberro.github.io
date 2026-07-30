@@ -1,82 +1,53 @@
-# aphynity_gru_ode.py
-"""APHYNITY + GRU-ODE hybrid prediction model."""
+# aphynity_loss.py
+"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from gru_ode import GRUODEFunc
 
 
-class APHYNITYGRUODEPredictorModel(nn.Module):
+class APHYNITYAdaptiveLossWrapper(nn.Module):
+    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
+
     def __init__(
         self,
-        func: GRUODEFunc,
-        physics_model: nn.Module,
-        pos_idx: list[int] | None = None,
-        vel_idx: list[int] | None = None,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
+        base_criterion: nn.Module,
+        lambda_init: float = 1.0,
+        tau2: float = 20.0,
+        node_norm_weight: float = 1.0,
     ):
-        """Production model fusing Ensemble-SINDy physics and GRU-ODE neural residuals."""
         super().__init__()
-        self.func = func
-        self.physics_model = physics_model
-        self.n_features = func.state_vector_len
-        self.hidden_size = func.latent_dim
-        self.second_order = pos_idx is not None and vel_idx is not None
+        self.base_criterion = base_criterion
+        self.tau2 = float(tau2)
+        self.node_norm_weight = float(node_norm_weight)
+        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
+        self.model_ref = None
 
-        if self.second_order:
-            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-            if pos_scale is not None and vel_scale is not None:
-                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-                    pos_scale, dtype=torch.float32
-                )
-                offset = (
-                    torch.as_tensor(vel_mean, dtype=torch.float32)
-                    / torch.as_tensor(pos_scale, dtype=torch.float32)
-                    if vel_mean is not None
-                    else torch.zeros_like(ratio)
-                )
-                self.register_buffer("so_ratio", ratio)
-                self.register_buffer("so_offset", offset)
-                self.scaled_space = True
-            else:
-                self.scaled_space = False
+    def set_model(self, model: nn.Module) -> None:
+        self.model_ref = model
+        if hasattr(self.base_criterion, "set_model"):
+            self.base_criterion.set_model(model)
 
-        self.last_node_norm = torch.tensor(0.0)
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        metrics = self.base_criterion(pred, target)
+        traj_loss = metrics["loss"]
 
-    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
-        self.func.nfe += 1
+        node_norm = torch.tensor(0.0, device=pred.device)
+        if self.model_ref is not None and hasattr(self.model_ref, "last_node_norm"):
+            node_norm = self.model_ref.last_node_norm.to(pred.device)
 
-        # Unpack physical states y (5) and latent states h (100)
-        y_read = state[..., : self.n_features]
-        h = state[..., self.n_features : self.n_features + self.hidden_size]
-        h = torch.tanh(h)
+        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
+        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
 
-        # Closed-loop latent evolution: dh/dt = cell(h, y)
-        if getattr(self.func, "cell_input_size", 0) > 0:
-            dh = self.func.cell(t, h, y_read)
-        else:
-            dh = self.func.cell(t, h)
+        out_metrics = dict(metrics)
+        out_metrics["loss"] = total_loss
+        out_metrics["traj_loss"] = traj_loss.detach()
+        out_metrics["node_norm"] = node_norm.detach()
+        out_metrics["lambda"] = self.lambda_val.detach()
+        return out_metrics
 
-        # APHYNITY dynamics vector field fusion: dy/dt = f_physics(y) + f_NODE(h)
-        f_phys = self.physics_model(y_read)
-        f_node = self.func.decode(h)
-
-        # Store residual norm for APHYNITY minimal action optimization
-        self.last_node_norm = torch.mean(f_node ** 2)
-
-        xdot = f_phys + f_node
-
-        # Exact 2nd-order kinematic identity enforcement: ds/dt = v_s, dh/dt = v_h
-        if self.second_order:
-            vel_now = y_read.index_select(-1, self.vel_idx)
-            if getattr(self, "scaled_space", False):
-                vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
-
-        return torch.cat((xdot, dh), dim=-1)
+    def update_lagrangian_multiplier(self, last_val_loss: float) -> None:
+        """Adaptive update: lambda_{j+1} = lambda_j + tau2 * L_traj"""
+        with torch.no_grad():
+            self.lambda_val += self.tau2 * last_val_loss

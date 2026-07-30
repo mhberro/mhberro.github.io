@@ -1,86 +1,33 @@
+PS E:\anomaly_detection\anomaly-detection> Get-Content G:\config.toml
+concurrent = 12
+check_interval = 0
+connection_max_age = "15m0s"
+shutdown_timeout = 0
 
-PS E:\anomaly_detection\anomaly-detection> Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='G:'" | Select DeviceID, DriveType, ProviderName, FileSystem
+[session_server]
+  session_timeout = 1800
 
-DeviceID DriveType ProviderName FileSystem
--------- --------- ------------ ----------
-G:               3              NTFS
+[[runners]]
+  name = "windows2"
+  url = ""
+  id = 47990
+  token = ""
+  token_obtained_at = 2025-12-09T23:34:25Z
+  token_expires_at = 0001-01-01T00:00:00Z
+  executor = "shell"
+  shell = "pwsh"
+  limit = 2
+  [runners.cache]
+    MaxUploadedArchiveSize = 0
+    [runners.cache.s3]
+    [runners.cache.gcs]
+    [runners.cache.azure]
+PS E:\anomaly_detection\anomaly-detection> Get-ChildItem G:\builds -Recurse -Depth 2 -ErrorAction SilentlyContinue | Select FullName
 
-
-PS E:\anomaly_detection\anomaly-detection> mountvol
-Creates, deletes, or lists a volume mount point.
-
-MOUNTVOL [drive:]path VolumeName
-MOUNTVOL [drive:]path /D
-MOUNTVOL [drive:]path /L
-MOUNTVOL [drive:]path /P
-MOUNTVOL /R
-MOUNTVOL /N
-MOUNTVOL /E
-
-    path        Specifies the existing NTFS directory where the mount
-                point will reside.
-    VolumeName  Specifies the volume name that is the target of the mount
-                point.
-    /D          Removes the volume mount point from the specified directory.
-    /L          Lists the mounted volume name for the specified directory.
-    /P          Removes the volume mount point from the specified directory,
-                dismounts the volume, and makes the volume not mountable.
-                You can make the volume mountable again by creating a volume
-                mount point.
-    /R          Removes volume mount point directories and registry settings
-                for volumes that are no longer in the system.
-    /N          Disables automatic mounting of new volumes.
-    /E          Re-enables automatic mounting of new volumes.
-
-Possible values for VolumeName along with current mount points are:
-
-    \\?\Volume{0ff5da5e-0000-0000-0000-100000000000}\
-        *** NO MOUNT POINTS ***
-
-    \\?\Volume{b9b7a755-b37c-4e38-a2b9-6abc50beef2e}\
-        E:\
-
-    \\?\Volume{0ff5da5e-0000-0000-0000-500600000000}\
-        C:\
-
-    \\?\Volume{0ff5da5e-0000-0000-0000-f0ca0c000000}\
-        G:\
-
-    \\?\Volume{fad070e6-40c8-4ff1-aa08-ce660dc4f1b4}\
-        *** NO MOUNT POINTS ***
-
-PS E:\anomaly_detection\anomaly-detection> net use
-New connections will be remembered.
-
-There are no entries in the list.
-
-PS E:\anomaly_detection\anomaly-detection> subst
-PS E:\anomaly_detection\anomaly-detection> New-Item -ItemType Directory -Force C:\temp | Out-Null
-PS E:\anomaly_detection\anomaly-detection> $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '/c (whoami & dir G:\) > C:\temp\gtest.txt 2>&1'
-PS E:\anomaly_detection\anomaly-detection> $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-PS E:\anomaly_detection\anomaly-detection> Register-ScheduledTask -TaskName SystemDriveTest -Action $action -Principal $principal -Force
-
-TaskPath                                       TaskName                          State
---------                                       --------                          -----
-\                                              SystemDriveTest                   Ready
-
-
-PS E:\anomaly_detection\anomaly-detection> Start-ScheduledTask -TaskName SystemDriveTest
-PS E:\anomaly_detection\anomaly-detection> Start-Sleep -Seconds 3
-PS E:\anomaly_detection\anomaly-detection> Get-Content C:\temp\gtest.txt
-nt authority\system
- Volume in drive G is Docker
- Volume Serial Number is E4A1-0DD4
-
- Directory of G:\
-
-11/17/2025  11:04 AM                14 .runner_system_id
-12/09/2025  06:21 PM               352 add-shell-runner.ps1
-01/28/2026  12:43 PM    <DIR>          builds
-03/05/2026  12:30 PM               550 config.toml
-11/14/2025  02:34 PM    <DIR>          docker
-07/27/2026  10:45 AM    <DIR>          docker-storage
-11/17/2025  10:58 AM       110,845,440 gitlab-runner.exe
-               4 File(s)    110,846,356 bytes
-               3 Dir(s)  12,113,350,656 bytes free
-PS E:\anomaly_detection\anomaly-detection> Unregister-ScheduledTask -TaskName SystemDriveTest -Confirm:$false
+FullName
+--------
+G:\builds\hqvDt2xrW
+G:\builds\hqvDt2xrW\0
+G:\builds\hqvDt2xrW\1
+G:\builds\hqvDt2xrW\0\sit_automation
+G:\builds\hqvDt2xrW\1\sit_automation

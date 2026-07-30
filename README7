@@ -1,45 +1,171 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/HighE_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 60 --window-stride 10 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide/GEODESIC/glide 
-There are 120 training trajs and 30 validation trajs.
-the shape of the timeseries to be transformed seems small. skipping this one (9, 7) [ 2.64245311e+02 -2.21618644e+06 -4.68840439e+06  3.73926052e+06
-  3.33451128e+03  2.49174647e+03  3.30483557e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (2, 7) [ 5.13355254e+02 -4.00796749e+05 -4.96768021e+06  4.00472295e+06
- -2.11725726e+02  3.46356979e+03  2.44161046e+03]
-the shape of the timeseries to be transformed seems small. skipping this one (7, 7) [ 5.18820504e+02  2.14043534e+05 -4.77732443e+06  4.24492594e+06
- -2.53746866e+03  3.40224301e+03  2.13890946e+03]
+# ensemble_sindy.py
+"""Ensemble-SINDy discovery module for sparse physical vector fields."""
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-Discovered Physics Matrix Xi:
- [[0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]
- [0. 0. 0. 0. 0.]]
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1033, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1012, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 299, in train_NEXT
-    node.model = APHYNITYGRUODEPredictorModel(
-                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/aphynity_gru_ode.py", line 34, in __init__
-    ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 0
+from __future__ import annotations
+
+import itertools
+import numpy as np
+import torch
+from torch import nn
+
+
+class PolynomialLibrary:
+    """Generates polynomial candidate feature matrices from physical state vectors."""
+
+    def __init__(self, degree: int = 2, include_bias: bool = True):
+        self.degree = degree
+        self.include_bias = include_bias
+
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        n_samples, n_features = Y.shape
+        combos = []
+        for d in range(0 if self.include_bias else 1, self.degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+
+        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
+        for i, combo in enumerate(combos):
+            if len(combo) == 0:
+                library[:, i] = 1.0
+            else:
+                library[:, i] = np.prod(Y[:, combo], axis=1)
+        return library
+
+
+def stridge(
+    Theta: np.ndarray,
+    Ydot: np.ndarray,
+    l1_threshold: float = 0.01,
+    ridge_kw: float = 1e-3,
+    max_iter: int = 25,
+) -> np.ndarray:
+    """Sequentially Thresholded Ridge Regression (STRidge) with column normalization."""
+    n_features = Theta.shape[1]
+    n_targets = Ydot.shape[1]
+
+    # Normalize library columns to prevent ill-conditioning
+    col_norms = np.linalg.norm(Theta, axis=0)
+    col_norms[col_norms < 1e-8] = 1.0
+    Theta_norm = Theta / col_norms
+
+    Xi_norm = np.linalg.lstsq(
+        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
+        Theta_norm.T @ Ydot,
+        rcond=None,
+    )[0]
+
+    for _ in range(max_iter):
+        small_inds = np.abs(Xi_norm) < l1_threshold
+        Xi_norm[small_inds] = 0.0
+        for i in range(n_targets):
+            big_inds = ~small_inds[:, i]
+            if np.any(big_inds):
+                Theta_sub = Theta_norm[:, big_inds]
+                Xi_norm[big_inds, i] = np.linalg.lstsq(
+                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
+                    Theta_sub.T @ Ydot[:, i],
+                    rcond=None,
+                )[0]
+
+    # Rescale coefficients back to feature space
+    Xi = Xi_norm / col_norms[:, None]
+    return Xi
+
+
+class EnsembleSINDyDiscoverer:
+    """Discovers sparse physical governing equations using bagging or bragging."""
+
+    def __init__(
+        self,
+        degree: int = 2,
+        n_bootstraps: int = 50,
+        subsample_ratio: float = 0.7,
+        l1_threshold: float = 0.01,
+        inclusion_prob_threshold: float = 0.40,
+        aggregation: str = "bragging",
+    ):
+        self.degree = degree
+        self.n_bootstraps = n_bootstraps
+        self.subsample_ratio = subsample_ratio
+        self.l1_threshold = l1_threshold
+        self.inclusion_prob_threshold = inclusion_prob_threshold
+        self.aggregation = aggregation
+        self.library_builder = PolynomialLibrary(degree=degree, include_bias=True)
+
+    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
+        """Runs Ensemble-SINDy across physical trajectories."""
+        Y_all, Ydot_all = [], []
+        for Y in Y_list:
+            if len(Y) < 5:
+                continue
+            Ydot = np.gradient(Y, dt, axis=0)
+            Y_all.append(Y[2:-2])
+            Ydot_all.append(Ydot[2:-2])
+
+        if len(Y_all) == 0:
+            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
+
+        Y_stacked = np.vstack(Y_all)
+        Ydot_stacked = np.vstack(Ydot_all)
+
+        Theta = self.library_builder.fit_transform(Y_stacked)
+        n_samples, n_terms = Theta.shape
+        n_targets = Ydot_stacked.shape[1]
+
+        bootstrap_coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
+        sub_size = int(n_samples * self.subsample_ratio)
+
+        for b in range(self.n_bootstraps):
+            indices = np.random.choice(n_samples, size=sub_size, replace=True)
+            Theta_b = Theta[indices]
+            Ydot_b = Ydot_stacked[indices]
+            bootstrap_coeffs[b] = stridge(
+                Theta_b, Ydot_b, l1_threshold=self.l1_threshold
+            )
+
+        active_masks = np.abs(bootstrap_coeffs) > 1e-8
+        inclusion_probs = np.mean(active_masks, axis=0)
+
+        if self.aggregation == "bragging":
+            Xi_agg = np.median(bootstrap_coeffs, axis=0)
+        else:
+            Xi_agg = np.mean(bootstrap_coeffs, axis=0)
+
+        Xi_agg[inclusion_probs < self.inclusion_prob_threshold] = 0.0
+        return Xi_agg, inclusion_probs
+
+
+class SINDyPhysicsModel(nn.Module):
+    """PyTorch module evaluating discovered sparse SINDy equations."""
+
+    def __init__(self, Xi: np.ndarray, state_vector_len: int = 5, degree: int = 2):
+        super().__init__()
+        self.degree = degree
+        self.state_vector_len = state_vector_len
+        self.register_buffer("Xi", torch.tensor(Xi, dtype=torch.float32))
+
+        combos = []
+        for d in range(degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
+        self.combos = combos
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        """Computes f_physics(y)."""
+        cols = []
+        for combo in self.combos:
+            if len(combo) == 0:
+                cols.append(torch.ones_like(y[..., :1]))
+            elif len(combo) == 1:
+                cols.append(y[..., combo[0] : combo[0] + 1])
+            elif len(combo) == 2:
+                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
+            elif len(combo) == 3:
+                cols.append(
+                    y[..., combo[0] : combo[0] + 1]
+                    * y[..., combo[1] : combo[1] + 1]
+                    * y[..., combo[2] : combo[2] + 1]
+                )
+            else:
+                raise NotImplementedError("Polynomial degree > 3 not supported.")
+
+        Theta = torch.cat(cols, dim=-1)
+        return torch.matmul(Theta, self.Xi)

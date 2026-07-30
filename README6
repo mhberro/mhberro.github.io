@@ -1,53 +1,66 @@
-# aphynity_loss.py
-"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
+# Corrected Indexing for 5-state Geodesic Frame
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]  # Fixed: [2, 4] (v_s, v_h)
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
+        else:
+            pos_idx, vel_idx = None, None
 
-from __future__ import annotations
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
 
-import torch
-from torch import nn
+        base_physics_loss = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            pos_indices=pos_idx,
+            vel_indices=vel_idx,
+            dt=trajectory_dt,
+            pos_weight=80.0,
+            vel_weight=1.0,
+            physics_weight=0.25,
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-6,
+            temporal_weighting=True,
+        )
 
+        if model_type == "aphynity-gruode":
+            print("\n--- Running Ensemble-SINDy Governing Equation Discovery ---")
+            # Fit Ensemble-SINDy on normalized scale space if use_scalar is active
+            if use_scalar:
+                sindy_train_data = [scaler_traj.transform(t.numpy()[:, 0 : model_states + 1])[:, :model_states] for t in traj_targets_train]
+            else:
+                sindy_train_data = [t.numpy()[:, 1 : model_states + 1] for t in traj_targets_train]
 
-class APHYNITYAdaptiveLossWrapper(nn.Module):
-    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
+            discoverer = EnsembleSINDyDiscoverer(
+                degree=2,
+                n_bootstraps=50,
+                subsample_ratio=0.7,
+                l1_threshold=0.01,
+                inclusion_prob_threshold=0.4,
+                aggregation="bragging",
+            )
+            Xi_sparse, inclusion_probs = discoverer.fit(sindy_train_data, dt=trajectory_dt)
+            physics_model = SINDyPhysicsModel(Xi_sparse, state_vector_len=model_states, degree=2).to(node.device)
+            print("Discovered Physics Matrix Xi:\n", Xi_sparse)
 
-    def __init__(
-        self,
-        base_criterion: nn.Module,
-        lambda_init: float = 1.0,
-        tau2: float = 20.0,
-        node_norm_weight: float = 1.0,
-    ):
-        super().__init__()
-        self.base_criterion = base_criterion
-        self.tau2 = float(tau2)
-        self.node_norm_weight = float(node_norm_weight)
-        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
-        self.model_ref = None
+            node.model = APHYNITYGRUODEPredictorModel(
+                func=gruode_func,
+                physics_model=physics_model,
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+                pos_scale=so_pos_scale,
+                vel_scale=so_vel_scale,
+                vel_mean=so_vel_mean,
+            ).to(node.device)
 
-    def set_model(self, model: nn.Module) -> None:
-        self.model_ref = model
-        if hasattr(self.base_criterion, "set_model"):
-            self.base_criterion.set_model(model)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        metrics = self.base_criterion(pred, target)
-        traj_loss = metrics["loss"]
-
-        node_norm = torch.tensor(0.0, device=pred.device)
-        if self.model_ref is not None and hasattr(self.model_ref, "last_node_norm"):
-            node_norm = self.model_ref.last_node_norm.to(pred.device)
-
-        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
-        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
-
-        out_metrics = dict(metrics)
-        out_metrics["loss"] = total_loss
-        out_metrics["traj_loss"] = traj_loss.detach()
-        out_metrics["node_norm"] = node_norm.detach()
-        out_metrics["lambda"] = self.lambda_val.detach()
-        return out_metrics
-
-    def update_lagrangian_multiplier(self, last_val_loss: float) -> None:
-        """Adaptive update: lambda_{j+1} = lambda_j + tau2 * L_traj"""
-        with torch.no_grad():
-            self.lambda_val += self.tau2 * last_val_loss
+            loss_func = APHYNITYAdaptiveLossWrapper(
+                base_criterion=base_physics_loss,
+                lambda_init=1.0,
+                tau2=20.0,
+                node_norm_weight=1.0,
+            )

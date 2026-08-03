@@ -1,171 +1,86 @@
-# ensemble_sindy.py
-"""Ensemble-SINDy discovery module for sparse physical vector fields."""
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
 from __future__ import annotations
 
-import itertools
-import numpy as np
 import torch
 from torch import nn
+from gru_ode import GRUODEFunc
 
 
-class PolynomialLibrary:
-    """Generates polynomial candidate feature matrices from physical state vectors."""
-
-    def __init__(self, degree: int = 2, include_bias: bool = True):
-        self.degree = degree
-        self.include_bias = include_bias
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n_samples, n_features = Y.shape
-        combos = []
-        for d in range(0 if self.include_bias else 1, self.degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
-
-        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
-        for i, combo in enumerate(combos):
-            if len(combo) == 0:
-                library[:, i] = 1.0
-            else:
-                library[:, i] = np.prod(Y[:, combo], axis=1)
-        return library
-
-
-def stridge(
-    Theta: np.ndarray,
-    Ydot: np.ndarray,
-    l1_threshold: float = 0.01,
-    ridge_kw: float = 1e-3,
-    max_iter: int = 25,
-) -> np.ndarray:
-    """Sequentially Thresholded Ridge Regression (STRidge) with column normalization."""
-    n_features = Theta.shape[1]
-    n_targets = Ydot.shape[1]
-
-    # Normalize library columns to prevent ill-conditioning
-    col_norms = np.linalg.norm(Theta, axis=0)
-    col_norms[col_norms < 1e-8] = 1.0
-    Theta_norm = Theta / col_norms
-
-    Xi_norm = np.linalg.lstsq(
-        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
-        Theta_norm.T @ Ydot,
-        rcond=None,
-    )[0]
-
-    for _ in range(max_iter):
-        small_inds = np.abs(Xi_norm) < l1_threshold
-        Xi_norm[small_inds] = 0.0
-        for i in range(n_targets):
-            big_inds = ~small_inds[:, i]
-            if np.any(big_inds):
-                Theta_sub = Theta_norm[:, big_inds]
-                Xi_norm[big_inds, i] = np.linalg.lstsq(
-                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
-                    Theta_sub.T @ Ydot[:, i],
-                    rcond=None,
-                )[0]
-
-    # Rescale coefficients back to feature space
-    Xi = Xi_norm / col_norms[:, None]
-    return Xi
-
-
-class EnsembleSINDyDiscoverer:
-    """Discovers sparse physical governing equations using bagging or bragging."""
-
+class APHYNITYGRUODEPredictorModel(nn.Module):
     def __init__(
         self,
-        degree: int = 2,
-        n_bootstraps: int = 50,
-        subsample_ratio: float = 0.7,
-        l1_threshold: float = 0.01,
-        inclusion_prob_threshold: float = 0.40,
-        aggregation: str = "bragging",
+        func: GRUODEFunc,
+        physics_model: nn.Module,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
     ):
-        self.degree = degree
-        self.n_bootstraps = n_bootstraps
-        self.subsample_ratio = subsample_ratio
-        self.l1_threshold = l1_threshold
-        self.inclusion_prob_threshold = inclusion_prob_threshold
-        self.aggregation = aggregation
-        self.library_builder = PolynomialLibrary(degree=degree, include_bias=True)
-
-    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
-        """Runs Ensemble-SINDy across physical trajectories."""
-        Y_all, Ydot_all = [], []
-        for Y in Y_list:
-            if len(Y) < 5:
-                continue
-            Ydot = np.gradient(Y, dt, axis=0)
-            Y_all.append(Y[2:-2])
-            Ydot_all.append(Ydot[2:-2])
-
-        if len(Y_all) == 0:
-            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
-
-        Y_stacked = np.vstack(Y_all)
-        Ydot_stacked = np.vstack(Ydot_all)
-
-        Theta = self.library_builder.fit_transform(Y_stacked)
-        n_samples, n_terms = Theta.shape
-        n_targets = Ydot_stacked.shape[1]
-
-        bootstrap_coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
-        sub_size = int(n_samples * self.subsample_ratio)
-
-        for b in range(self.n_bootstraps):
-            indices = np.random.choice(n_samples, size=sub_size, replace=True)
-            Theta_b = Theta[indices]
-            Ydot_b = Ydot_stacked[indices]
-            bootstrap_coeffs[b] = stridge(
-                Theta_b, Ydot_b, l1_threshold=self.l1_threshold
-            )
-
-        active_masks = np.abs(bootstrap_coeffs) > 1e-8
-        inclusion_probs = np.mean(active_masks, axis=0)
-
-        if self.aggregation == "bragging":
-            Xi_agg = np.median(bootstrap_coeffs, axis=0)
-        else:
-            Xi_agg = np.mean(bootstrap_coeffs, axis=0)
-
-        Xi_agg[inclusion_probs < self.inclusion_prob_threshold] = 0.0
-        return Xi_agg, inclusion_probs
-
-
-class SINDyPhysicsModel(nn.Module):
-    """PyTorch module evaluating discovered sparse SINDy equations."""
-
-    def __init__(self, Xi: np.ndarray, state_vector_len: int = 5, degree: int = 2):
         super().__init__()
-        self.degree = degree
-        self.state_vector_len = state_vector_len
-        self.register_buffer("Xi", torch.tensor(Xi, dtype=torch.float32))
+        self.func = func
+        self.physics_model = physics_model
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
 
-        combos = []
-        for d in range(degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
-        self.combos = combos
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            # Identify acceleration and rate indices (non-position channels)
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
 
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        """Computes f_physics(y)."""
-        cols = []
-        for combo in self.combos:
-            if len(combo) == 0:
-                cols.append(torch.ones_like(y[..., :1]))
-            elif len(combo) == 1:
-                cols.append(y[..., combo[0] : combo[0] + 1])
-            elif len(combo) == 2:
-                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
-            elif len(combo) == 3:
-                cols.append(
-                    y[..., combo[0] : combo[0] + 1]
-                    * y[..., combo[1] : combo[1] + 1]
-                    * y[..., combo[2] : combo[2] + 1]
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
                 )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
             else:
-                raise NotImplementedError("Polynomial degree > 3 not supported.")
+                self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
 
-        Theta = torch.cat(cols, dim=-1)
-        return torch.matmul(Theta, self.Xi)
+        self.last_node_norm = torch.tensor(0.0)
+
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+
+        y_read = state[..., : self.n_features]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
+        h = torch.tanh(h)
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh = self.func.cell(t, h, y_read)
+        else:
+            dh = self.func.cell(t, h)
+
+        f_phys = self.physics_model(y_read)
+        f_node = self.func.decode(h)
+
+        # Penalize neural residual ONLY on acceleration/rate channels
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        self.last_node_norm = torch.mean(f_node_acc ** 2)
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+
+        return torch.cat((xdot, dh), dim=-1)

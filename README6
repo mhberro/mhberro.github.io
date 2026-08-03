@@ -1,62 +1,269 @@
-# aphynity_loss.py
-"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
+# Inside NODEPredictor.fit() validation loop:
+if validation_data is not None:
+    # ... [validation batch accumulation] ...
+    for key, value in val_sums.items():
+        metrics[f"val_{key}"] = value / max(val_count, 1)
 
-from __future__ import annotations
+    # Adaptive dual update using true physical trajectory loss
+    if hasattr(self.criterion, "update_lagrangian_multiplier"):
+        val_traj_loss_epoch = metrics.get("val_traj_loss", metrics.get("val_loss", 0.0))
+        if isinstance(val_traj_loss_epoch, torch.Tensor):
+            val_traj_loss_epoch = val_traj_loss_epoch.item()
+        self.criterion.update_lagrangian_multiplier(val_traj_loss_epoch)
 
-import torch
-from torch import nn
 
+=============================
+=============================
 
-class APHYNITYAdaptiveLossWrapper(nn.Module):
-    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
+# NEXT_training.py (Excerpt showing train_NEXT model setup and loop resets)
 
-    def __init__(
-        self,
-        base_criterion: nn.Module,
-        lambda_init: float = 1.0,
-        tau2: float = 5.0,
-        max_lambda: float = 50.0,
-        node_norm_weight: float = 1.0,
-    ):
-        super().__init__()
-        self.base_criterion = base_criterion
-        self.tau2 = float(tau2)
-        self.max_lambda = float(max_lambda)
-        self.lambda_init = float(lambda_init)
-        self.node_norm_weight = float(node_norm_weight)
-        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
-        self.model_ref = None
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+    window_size: int = 0,
+    window_stride: int = 1,
+):
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=2,
+        verbose=True,
+    )
 
-    def set_model(self, model: nn.Module) -> None:
-        self.model_ref = model
-        if hasattr(self.base_criterion, "set_model"):
-            self.base_criterion.set_model(model)
+    ode_solver = TorchdiffeqSolver(dt=trajectory_dt, method="rk4", adjoint=False, substeps=4)
 
-    def reset_lagrangian((self) -> None:
-        """Resets dual multiplier at strategy phase boundaries."""
-        with torch.no_grad():
-            self.lambda_val.fill_(self.lambda_init)
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame in ("grdth", "geodesic"):
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("Unknown frame")
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        metrics = self.base_criterion(pred, target)
-        traj_loss = metrics["loss"]
+    # Monitor physical trajectory loss for early stopping
+    early_stop_metric_name = "val_traj_loss" if model_type == "aphynity-gruode" else "val_loss"
 
-        node_norm = torch.tensor(0.0, device=pred.device)
-        if self.model_ref is not None and hasattr(self.model_ref, "last_node_norm"):
-            node_norm = self.model_ref.last_node_norm.to(pred.device)
+    loss_func = WrappedMSELoss(
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+        position_loss_weight=80.0,
+        l2_reg=1e-4,
+    )
 
-        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
-        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(layer_channels=[5, 5], layer_activation=Activation.SILU),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
 
-        out_metrics = dict(metrics)
-        out_metrics["loss"] = total_loss
-        out_metrics["traj_loss"] = traj_loss.detach()
-        out_metrics["node_norm"] = node_norm.detach()
-        out_metrics["lambda"] = self.lambda_val.detach()
-        return out_metrics
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
 
-    def update_lagrangian_multiplier(self, last_val_traj_loss: float) -> None:
-        """Bounded adaptive update: lambda_{j+1} = min(max_lambda, lambda_j + tau2 * L_traj)"""
-        with torch.no_grad():
-            updated = self.lambda_val + self.tau2 * last_val_traj_loss
-            self.lambda_val.copy_(torch.clamp(updated, max=self.max_lambda))
+    if model_type in ("gruode", "aphynity-gruode"):
+        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+        enc_in_idx = None
+
+        gruode_func = GRUODEFunc(
+            state_vector_len=model_states,
+            nhidden=nhidden,
+            latent_dim=latent_dim,
+            minimal=False,
+            encoder_input_idx=enc_in_idx,
+            encoder_dropout=0.1,
+            cell_input_size=model_states,
+        ).to(node.device)
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
+        else:
+            pos_idx, vel_idx = None, None
+
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
+        base_physics_loss = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            pos_indices=pos_idx,
+            vel_indices=vel_idx,
+            dt=trajectory_dt,
+            pos_weight=80.0,
+            vel_weight=1.0,
+            physics_weight=0.25,
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-6,
+            temporal_weighting=True,
+        )
+
+        if model_type == "aphynity-gruode":
+            print("\n--- Running Ensemble-SINDy Governing Equation Discovery ---")
+            if use_scalar:
+                sindy_train_data = [scaler_traj.transform(t.numpy()[:, 0 : model_states + 1])[:, :model_states] for t in traj_targets_train]
+            else:
+                sindy_train_data = [t.numpy()[:, 1 : model_states + 1] for t in traj_targets_train]
+
+            discoverer = EnsembleSINDyDiscoverer(
+                degree=2,
+                n_bootstraps=50,
+                subsample_ratio=0.7,
+                l1_threshold=0.01,
+                inclusion_prob_threshold=0.4,
+                aggregation="bragging",
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+            )
+            Xi_sparse, inclusion_probs = discoverer.fit(sindy_train_data, dt=trajectory_dt)
+            physics_model = SINDyPhysicsModel(Xi_sparse, state_vector_len=model_states, degree=2).to(node.device)
+            print("Discovered Physics Matrix Xi:\n", Xi_sparse)
+
+            node.model = APHYNITYGRUODEPredictorModel(
+                func=gruode_func,
+                physics_model=physics_model,
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+                pos_scale=so_pos_scale,
+                vel_scale=so_vel_scale,
+                vel_mean=so_vel_mean,
+            ).to(node.device)
+
+            loss_func = APHYNITYAdaptiveLossWrapper(
+                base_criterion=base_physics_loss,
+                lambda_init=1.0,
+                tau2=5.0,
+                max_lambda=50.0,
+                node_norm_weight=1.0,
+            )
+        else:
+            node.model = GRUODEPredictorModel(
+                func=gruode_func,
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+                pos_scale=so_pos_scale,
+                vel_scale=so_vel_scale,
+                vel_mean=so_vel_mean,
+            ).to(node.device)
+            loss_func = base_physics_loss
+
+        node.aug_dim = latent_dim
+        aug_dim = latent_dim
+        node._initialize_losses(loss_func)
+
+    if hasattr(node.criterion, "set_model"):
+        node.criterion.set_model(node.model)
+
+    # Prepare trajectory targets...
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
+        ]
+        scaled_traj_targets_test_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
+        ]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+
+    if window_size > 0:
+        scaled_traj_targets_train_posvel = make_sliding_windows(
+            scaled_traj_targets_train_posvel, window_size, window_stride
+        )
+        scaled_traj_targets_test_posvel = make_sliding_windows(
+            scaled_traj_targets_test_posvel, window_size, window_stride
+        )
+
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
+
+    if gen_model:
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 2e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 1e-5, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+        for len_strat in length_strategies:
+            print("\nRunning length strategy:", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+
+            # RESET STATE AT STRATEGY BOUNDARIES
+            if hasattr(node.criterion, "reset_lagrangian"):
+                node.criterion.reset_lagrangian()
+            if node.checkpoint is not None:
+                node.checkpoint.min_metric = float("inf")
+
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs,
+                optimizer=AdamOptimizer(learning_rate=learning_rate),
+                batch_size=batch_size,
+                num_workers=2,
+                verbose=True,
+            )
+
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
+
+            min_states = 5
+            fraction_of_data = [
+                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                for x in scaled_traj_targets_train_posvel
+            ]
+            fraction_of_data_val = [
+                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                for x in scaled_traj_targets_test_posvel
+            ]
+
+            metrics = node.fit(
+                x=fraction_of_data,
+                validation_data=fraction_of_data_val,
+                enable_checkpoints=True if data_fraction == 1.0 else False,
+            )
+
+        p = Path(model_save_path, model_name + ".checkpoint.pt")
+        if p.exists():
+            p.rename(Path(p.parent, p.name.replace(".checkpoint", "")))
+
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.eval()
+
+    # ONNX Export routines...
+    return node, model_name

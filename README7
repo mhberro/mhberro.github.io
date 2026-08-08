@@ -1,8 +1,310 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python trajectory_evaluator.py -t trajectory_library/phases/HighE_HGV/glide/* -p simple_sim_output/SBI/esindy_aphynity_gruode_glide_simple_sim_esindy/GEODESIC/glide/HighE -o eval_plots_output
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/trajectory_evaluator.py", line 309, in <module>
+# trajectory_evaluator.py
+
+import argparse
+import glob
+import os
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+from mpl_toolkits.mplot3d import Axes3D
+
+# Import frame transformation utilities from the codebase
+from coordinate_transform_functions import ecef_to_ned, ecef_to_ned_velocity, ned_to_dcu
+from NEXT_geodesic_frame import ecef_to_geodetic
+from load_truth import load_single_truth
+from trajectory_helpers import POS_SLICE, VEL_SLICE, TIME_INDEX
+
+# Matplotlib global styling to match reference dashboard
+plt.rcParams["axes.formatter.limits"] = [-3, 4]
+plt.rcParams.update({
+    "lines.linewidth": 1.5,
+    "axes.formatter.useoffset": False,
+    "savefig.dpi": 200,
+    "font.size": 9,
+    "axes.titlesize": 10,
+    "axes.titleweight": "bold",
+})
+
+
+def align_trajectories(truth_traj: np.ndarray, pred_traj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Aligns truth states onto prediction timestamps via linear interpolation."""
+    pred_times = pred_traj[:, TIME_INDEX]
+    truth_times = truth_traj[:, TIME_INDEX]
+
+    # Clip prediction times to truth validity interval
+    valid_mask = (pred_times >= truth_times[0]) & (pred_times <= truth_times[-1])
+    pred_traj_clipped = pred_traj[valid_mask]
+    eval_times = pred_traj_clipped[:, TIME_INDEX]
+
+    # Interpolate truth states to prediction evaluation times
+    interp_fn = interp1d(truth_times, truth_traj[:, 1:7], axis=0, kind="linear", fill_value="extrapolate")
+    truth_aligned_states = interp_fn(eval_times)
+    truth_aligned = np.hstack([eval_times[:, None], truth_aligned_states])
+
+    return truth_aligned, pred_traj_clipped
+
+
+def compute_trajectory_metrics(truth_traj: np.ndarray, pred_traj: np.ndarray, traj_name: str) -> dict:
+    """Computes trajectory evaluation metrics and returns a dictionary."""
+    truth_aligned, pred_clipped = align_trajectories(truth_traj, pred_traj)
+
+    pos_truth = truth_aligned[:, POS_SLICE]
+    pos_pred = pred_clipped[:, POS_SLICE]
+    vel_truth = truth_aligned[:, VEL_SLICE]
+    vel_pred = pred_clipped[:, VEL_SLICE]
+
+    pos_errors = np.linalg.norm(pos_pred - pos_truth, axis=1)
+    vel_errors = np.linalg.norm(vel_pred - vel_truth, axis=1)
+
+    duration = float(pred_clipped[-1, TIME_INDEX] - pred_clipped[0, TIME_INDEX])
+
+    metrics = {
+        "trajectory": traj_name,
+        "mean_pos_error_m": float(np.mean(pos_errors)),
+        "mean_vel_error_ms": float(np.mean(vel_errors)),
+        "final_pos_error_m": float(pos_errors[-1]),
+        "max_pos_error_m": float(np.max(pos_errors)),
+        "rmse_pos_m": float(np.sqrt(np.mean(pos_errors**2))),
+        "duration_s": duration,
+        "_pos_errors_m": pos_errors,
+        "_truth_aligned": truth_aligned,
+        "_pred_clipped": pred_clipped,
+    }
+
+    return metrics
+
+
+def transform_to_dcu(p_ecef: np.ndarray, impact_ecef: np.ndarray, ref_angle: float) -> np.ndarray:
+    """Converts ECEF position matrix (N, 3) to local DCU frame [Downrange, Crossrange, Up]."""
+    N = p_ecef.shape[0]
+    dcu = np.empty((N, 3))
+    for i in range(N):
+        p_ned = ecef_to_ned(p_ecef[i], impact_ecef)
+        dcu[i] = ned_to_dcu(p_ned, ref_angle)
+    return dcu
+
+
+def plot_trajectory_dashboard(
+    metrics: dict,
+    impact_ecef: np.ndarray,
+    output_dir: str = None,
+    show_plot: bool = False,
+):
+    """Generates a 6-subplot evaluation dashboard matching the exact design layout."""
+    truth_traj = metrics["_truth_aligned"]
+    pred_traj = metrics["_pred_clipped"]
+    pos_errors = metrics["_pos_errors_m"]
+    traj_name = metrics["trajectory"]
+
+    ref_vel_ned = ecef_to_ned_velocity(truth_traj[0, VEL_SLICE], impact_ecef)
+    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
+
+    truth_dcu = transform_to_dcu(truth_traj[:, POS_SLICE], impact_ecef, ref_angle)
+    pred_dcu = transform_to_dcu(pred_traj[:, POS_SLICE], impact_ecef, ref_angle)
+
+    N_t = truth_traj.shape[0]
+    N_p = pred_traj.shape[0]
+    truth_alt_km = np.array([ecef_to_geodetic(*truth_traj[i, POS_SLICE])[2] for i in range(N_t)]) / 1000.0
+    pred_alt_km = np.array([ecef_to_geodetic(*pred_traj[i, POS_SLICE])[2] for i in range(N_p)]) / 1000.0
+
+    time_s = pred_traj[:, TIME_INDEX]
+    truth_dr_km = truth_dcu[:, 0] / 1000.0
+    pred_dr_km = pred_dcu[:, 0] / 1000.0
+    truth_cr_km = truth_dcu[:, 1] / 1000.0
+    pred_cr_km = pred_dcu[:, 1] / 1000.0
+
+    truth_speed = np.linalg.norm(truth_traj[:, VEL_SLICE], axis=1)
+    pred_speed = np.linalg.norm(pred_traj[:, VEL_SLICE], axis=1)
+    pos_errors_km = pos_errors / 1000.0
+
+    fig = plt.figure(figsize=(14, 8), constrained_layout=True)
+    fig.suptitle(f"{traj_name}", fontsize=13, fontweight="bold")
+
+    c_truth = "navy"
+    c_pred = "crimson"
+
+    # 1. Altitude vs Downrange
+    ax1 = fig.add_subplot(2, 3, 1)
+    ax1.plot(truth_dr_km, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
+    ax1.plot(pred_dr_km, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
+    ax1.set_title("Altitude vs Downrange")
+    ax1.set_xlabel("Downrange (km)")
+    ax1.set_ylabel("Altitude (km)")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="upper right")
+
+    # 2. Crossrange vs Downrange
+    ax2 = fig.add_subplot(2, 3, 2)
+    ax2.plot(truth_dr_km, truth_cr_km, color=c_truth, linestyle="-", label="Truth")
+    ax2.plot(pred_dr_km, pred_cr_km, color=c_pred, linestyle="--", label="Prediction")
+    ax2.set_title("Crossrange vs Downrange")
+    ax2.set_xlabel("Downrange (km)")
+    ax2.set_ylabel("Crossrange (km)")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc="upper left")
+
+    # 3. Position Error vs Time
+    mean_err_m = int(round(metrics["mean_pos_error_m"]))
+    ax3 = fig.add_subplot(2, 3, 3)
+    ax3.plot(time_s, pos_errors_km, color=c_pred, linestyle="-")
+    ax3.axhline(1.0, color="green", linestyle="--", label="1km target")
+    ax3.set_title(f"Position Error (Mean: {mean_err_m}m)")
+    ax3.set_xlabel("Time (s)")
+    ax3.set_ylabel("Position Error (km)")
+    ax3.grid(True, alpha=0.3)
+    ax3.legend(loc="upper left")
+
+    # 4. Altitude vs Time
+    ax4 = fig.add_subplot(2, 3, 4)
+    ax4.plot(time_s, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
+    ax4.plot(time_s, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
+    ax4.set_title("Altitude vs Time")
+    ax4.set_xlabel("Time (s)")
+    ax4.set_ylabel("Altitude (km)")
+    ax4.grid(True, alpha=0.3)
+    ax4.legend(loc="upper right")
+
+    # 5. Speed vs Time
+    ax5 = fig.add_subplot(2, 3, 5)
+    ax5.plot(time_s, truth_speed, color=c_truth, linestyle="-", label="Truth")
+    ax5.plot(time_s, pred_speed, color=c_pred, linestyle="--", label="Prediction")
+    ax5.set_title("Speed vs Time")
+    ax5.set_xlabel("Time (s)")
+    ax5.set_ylabel("Speed (m/s)")
+    ax5.grid(True, alpha=0.3)
+    ax5.legend(loc="upper right")
+
+    # 6. 3D Trajectory (ECEF)
+    ax6 = fig.add_subplot(2, 3, 6, projection="3d")
+    ax6.plot(
+        truth_traj[:, 1] / 1000.0,
+        truth_traj[:, 2] / 1000.0,
+        truth_traj[:, 3] / 1000.0,
+        color=c_truth,
+        linestyle="-",
+        label="Truth",
+    )
+    ax6.plot(
+        pred_traj[:, 1] / 1000.0,
+        pred_traj[:, 2] / 1000.0,
+        pred_traj[:, 3] / 1000.0,
+        color=c_pred,
+        linestyle="--",
+        label="Prediction",
+    )
+    ax6.set_title("3D Trajectory (ECEF)")
+    ax6.set_xlabel("X (km)", labelpad=2)
+    ax6.set_ylabel("Y (km)", labelpad=2)
+    ax6.set_zlabel("Z (km)", labelpad=2)
+    ax6.tick_params(axis="both", which="major", labelsize=7)
+    ax6.legend(loc="upper right")
+
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        out_file = os.path.join(output_dir, f"{traj_name}_dashboard.png")
+        fig.savefig(out_file, bbox_inches="tight")
+
+    if show_plot:
+        plt.show()
+    plt.close(fig)
+
+
+def print_csv_metrics_table(all_metrics: list[dict]):
+    """Outputs metrics formatted cleanly as CSV directly to the terminal."""
+    fieldnames = [
+        "trajectory",
+        "mean_pos_error_m",
+        "mean_vel_error_ms",
+        "final_pos_error_m",
+        "max_pos_error_m",
+        "rmse_pos_m",
+        "duration_s",
+    ]
+
+    print("\n" + ",".join(fieldnames))
+    for m in all_metrics:
+        row_str = f"{m['trajectory']},{m['mean_pos_error_m']},{m['mean_vel_error_ms']},{m['final_pos_error_m']},{m['max_pos_error_m']},{m['rmse_pos_m']},{m['duration_s']}"
+        print(row_str)
+
+
+def load_prediction_csv(pred_path: str) -> np.ndarray:
+    """Loads prediction CSV file generated by simple_sim.py / NEXT into numpy array."""
+    df = pd.read_csv(pred_path)
+    cols = ["time", "x_pos_ecef", "y_pos_ecef", "z_pos_ecef", "x_vel_ecef", "y_vel_ecef", "z_vel_ecef"]
+    return df[cols].to_numpy(dtype=np.float64)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Standalone Trajectory Evaluator & Dashboard Generator")
+    parser.add_argument(
+        "-t", "--truths", nargs="+", required=True, help="Path to truth CSV file(s) or directory containing truth CSVs"
+    )
+    parser.add_argument(
+        "-p", "--preds", nargs="+", required=True, help="Path to prediction CSV file(s) or directory containing prediction CSVs"
+    )
+    parser.add_argument("-o", "--output-dir", required=True, help="Directory to save output dashboard PNGs")
+    parser.add_argument("--show", action="store_true", help="Display interactive plots")
+
+    args = parser.parse_args()
+
+    # Expand truth files
+    truth_files = []
+    for entry in args.truths:
+        if os.path.isdir(entry):
+            truth_files.extend(glob.glob(os.path.join(entry, "**", "*.csv"), recursive=True))
+            truth_files.extend(glob.glob(os.path.join(entry, "*.csv")))
+        else:
+            truth_files.append(entry)
+
+    # Expand pred files
+    pred_files = []
+    for entry in args.preds:
+        if os.path.isdir(entry):
+            pred_files.extend(glob.glob(os.path.join(entry, "**", "*.csv"), recursive=True))
+            pred_files.extend(glob.glob(os.path.join(entry, "*.csv")))
+        else:
+            pred_files.append(entry)
+
+    truth_files = sorted(list(set(truth_files)))
+    pred_files = sorted(list(set(pred_files)))
+
+    all_metrics = []
+
+    # Process each truth file by matching against corresponding prediction file
+    for t_path in truth_files:
+        base_name = os.path.basename(t_path)
+        traj_name = base_name.replace(".csv", "")
+
+        # Find matching prediction file (matches filename containing target name)
+        matching_preds = [p for p in pred_files if traj_name in os.path.basename(p)]
+        if not matching_preds:
+            continue
+
+        p_path = matching_preds[0]
+
+        # Load states
+        truth_traj = load_single_truth(t_path)
+        pred_traj = load_prediction_csv(p_path)
+
+        # Reference impact point from truth
+        impact_ecef = truth_traj[-1, POS_SLICE]
+
+        # Compute metrics
+        metrics = compute_trajectory_metrics(truth_traj, pred_traj, traj_name)
+        all_metrics.append(metrics)
+
+        # Generate plot
+        plot_trajectory_dashboard(metrics, impact_ecef, output_dir=args.output_dir, show_plot=args.show)
+
+    if not all_metrics:
+        print("No matching truth and prediction trajectory pairs were found.")
+        sys.exit(1)
+
+    # Output terminal table
+    print_csv_metrics_table(all_metrics)
+
+
+if __name__ == "__main__":
     main()
-  File "/Users/e471302/lm_cm_repos/next/trajectory_evaluator.py", line 264, in main
-    pred_files.extend(glob.glob(os.path.join(entry, "**/*.csv", recursive=True)))
-                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: join() got an unexpected keyword argument 'recursive'

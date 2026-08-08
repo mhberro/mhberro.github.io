@@ -1,21 +1,818 @@
-.venv) e471302@usmk2tqq3hkk2 next % python simple_sim_esindy.py trajectory_library/phases/HighE_HGV/glide/* -o simple_sim_output/SBI/esindy_aphynity_gruode_glide_2_simple_sim_glide2/GEODESIC/glide/HighE -m model_outputs/SBI/esindy_aphynity_gruode_glide_2/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_60win_10stride.onnx -s model_outputs/SBI/esindy_aphynity_gruode_glide_2/GEODESIC/glide/HighE_HGV/NEXT_HighE_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_60win_10stride_scalar.pickle --gruode
-Running sim for trajectory_library/phases/HighE_HGV/glide/Albuqurque_lp10_ECEF.csv
-[warn] Could not load impact guide point trajectory_library/phases/HighE_HGV/impact/Albuqurque_lp10_ECEF.csv: Unable to parse truth file trajectory_library/phases/HighE_HGV/impact/Albuqurque_lp10_ECEF.csv
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 818, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 175, in main
+# simple_sim_esindy.py
+
+import argparse
+import json
+import math
+import os
+import pickle
+import re
+import traceback
+from copy import deepcopy
+
+import numpy as np
+import pandas as pd
+import torch
+import matplotlib.pyplot as plt
+import onnxruntime
+from matplotlib.collections import LineCollection
+from matplotlib.colors import LinearSegmentedColormap
+from scipy.signal import resample_poly
+from sklearn.metrics import mean_absolute_error
+
+from coordinate_transform_functions import (
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    ned_to_dcu,
+    frd_to_dcu,
+    dcu_to_ned,
+    ned_to_ecef_velocity,
+    ned_to_ecef,
+)
+from load_truth import load_single_truth
+from NEXT_training import (
+    ecef_to_next_grdth,
+    next_grdth_to_ecef,
+    ecef_to_next_dcu,
+    next_dcu_to_ecef,
+    ecef_to_local_geodesic_vec,
+    local_geodesic_to_ecef_vec,
+)
+from NEXT_geodesic_frame import (
+    ecef_to_geodetic,
+    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
+    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
+)
+from ibcs_tools_helpers import multiline, custom_cmap, add_classification_markings, add_lmpi_markings, Classification
+from trajectory_helpers import (
+    check_time_series,
+    resample_traj_data,
+    TIME_INDEX,
+    POS_SLICE,
+    VEL_SLICE,
+    ACC_SLICE,
+    GR_INDEX,
+    GR_DOT_INDEX,
+    THETA_DOT_INDEX,
+    DOWN_INDEX,
+    DOWN_DOT_INDEX,
+)
+
+measurement_dt = 1.0  # [s]
+extrapolation_dt = 1.0  # [s]
+max_traj_states = int(300 / extrapolation_dt)  # total time of 300 seconds
+
+plt.rcParams["axes.formatter.limits"] = [-3, 4]
+plt.rcParams["figure.figsize"] = [6, 5]
+plt.rcParams.update(
+    {
+        "lines.linewidth": 0.5,
+        "axes.formatter.useoffset": False,
+        "savefig.dpi": 200,
+    }
+)
+
+
+def _gruode_latent_dim(model_basename: str, state_size: int) -> int:
+    """Recover the GRU-ODE / APHYNITY-GRU-ODE latent width from model filename."""
+    m = re.findall(r"_(\d+)hid_", model_basename)
+    if not m:
+        return max(2 * state_size, 100)
+    nhidden = int(m[-1])
+    return max(2 * state_size, nhidden // 2 if nhidden >= 20 else 16)
+
+
+_encoder_sess_stash = {}
+
+
+def _load_encoder_session(model_path: str):
+    """Load (and cache) companion `<model>_encoder.onnx` next to the field graph."""
+    enc_path = re.sub(r"\.onnx$", "_encoder.onnx", model_path)
+    if enc_path in _encoder_sess_stash:
+        return _encoder_sess_stash[enc_path]
+    if not os.path.exists(enc_path):
+        raise FileNotFoundError(
+            f"Continuous-time GRU models require an encoder graph to seed latent states, but "
+            f"'{enc_path}' was not found. Ensure `<model>_encoder.onnx` exists alongside the model."
+        )
+    sess = onnxruntime.InferenceSession(enc_path)
+    _encoder_sess_stash[enc_path] = sess
+    return sess
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Simulator for continuous-time trajectory models.")
+    parser.add_argument(
+        "truths",
+        nargs="+",
+        type=str,
+        help="list of truth trajectory files to evaluate",
+    )
+    parser.add_argument("-o", dest="output", required=True, default=None, help="output directory")
+    parser.add_argument("-m", dest="model", required=True, default=None, help="onnx model file")
+    parser.add_argument(
+        "-s",
+        dest="scalar",
+        required=True,
+        default=None,
+        help="path to pickled scaler or model output folder containing scalar",
+    )
+    parser.add_argument(
+        "--sr-min",
+        type=int,
+        default=10000,
+        help="minimum slant range cutoff [m]",
+    )
+    parser.add_argument(
+        "--sr-max",
+        type=int,
+        default=150000000,
+        help="maximum slant range cutoff [m]",
+    )
+    parser.add_argument(
+        "--gruode",
+        action="store_true",
+        help="force continuous GRU-ODE / APHYNITY-GRU-ODE integration logic",
+    )
+    parser.add_argument(
+        "--time-cutoff",
+        type=float,
+        default=None,
+        help="absolute-time ceiling [s]",
+    )
+    parser.add_argument(
+        "--sub-steps",
+        type=int,
+        default=4,
+        help="RK4 sub-steps per training interval",
+    )
+
+    args = parser.parse_args()
+
+    if args.sr_min >= args.sr_max:
+        raise ValueError("sr-min must be strictly less than sr-max")
+    if args.sub_steps <= 0:
+        raise ValueError("--sub-steps must be positive")
+
+    if not os.path.exists(args.model):
+        raise ValueError(f"Model file not found at {args.model}")
+
+    model_path = os.path.dirname(args.model)
+    model_name = ".".join(os.path.basename(args.model).split(".")[:-1])
+
+    if os.path.isdir(args.scalar):
+        possible_scalar = os.path.join(args.scalar, f"{model_name}_scalar.pickle")
+        if not os.path.exists(possible_scalar):
+            base_model = re.sub(r"_\d+win_\d+stride", "", model_name)
+            possible_scalar = os.path.join(args.scalar, f"{base_model}_scalar.pickle")
+        args.scalar = possible_scalar
+
+    train_test_split_file = os.path.join(model_path, model_name + "_train_test_split.json")
+    train_test_trajs = None
+    if os.path.exists(train_test_split_file):
+        with open(train_test_split_file) as f:
+            train_test_trajs = json.load(f)
+
     sim_many_truths(args, model_name, train_test_trajs)
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 182, in sim_many_truths
-    t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 204, in sim_single_truth
+
+
+def sim_many_truths(args, model_name, train_test_trajs):
+    tgt_metric = []
+    for p in args.truths:
+        print("Running sim for", p, flush=True)
+        t = sim_single_truth(p, args.output, args, model_name, train_test_trajs)
+        if t is not None:
+            tgt_metric.append(t)
+
+
+def load_phase_guide_point(path_to_truth, truth):
+    phase_dir = os.path.dirname(path_to_truth)
+    target_dir = os.path.dirname(phase_dir)
+    impact_path = os.path.join(target_dir, "impact", os.path.basename(path_to_truth))
+    if os.path.exists(impact_path):
+        try:
+            impact_truth = load_single_truth(impact_path)
+            return deepcopy(impact_truth[-1, POS_SLICE])
+        except Exception as e:
+            print(f"[warn] Could not load impact guide point {impact_path}: {e}")
+    return deepcopy(truth[-1, POS_SLICE])
+
+
+def sim_single_truth(path_to_truth, output, args, model_name, train_test_trajs):
+    truth = load_single_truth(path_to_truth)
+    guide_point_ecef = load_phase_guide_point(path_to_truth, truth)
+
     truth_states_sr_cut, trajs, truth_trajs = sim_ingress(truth, guide_point_ecef, args)
-                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 507, in sim_ingress
-    traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, impact_time, args)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/simple_sim_esindy.py", line 597, in NEXT_tactical_interface
-    NEXT_extrap = NEXT_extrapolation(
-                  ^^^^^^^^^^^^^^^^^^^
-TypeError: NEXT_extrapolation() got multiple values for argument 'use_obsgeo'
+
+    truth_filename = os.path.basename(path_to_truth)
+    if len(trajs) == 0:
+        print(f"No extrapolations were created for {truth_filename}")
+        return None
+
+    if isinstance(truth_states_sr_cut, int) and truth_states_sr_cut == -1:
+        print("Skipping invalid truth file", path_to_truth)
+        return None
+
+    s = f"{model_name}_{truth_filename}"
+
+    if not os.path.exists(output):
+        os.makedirs(output, exist_ok=True)
+    plot_sim_result(
+        truth_states_sr_cut,
+        trajs,
+        guide_point_ecef,
+        args,
+        train_test_trajs,
+        model_name,
+        traj_number=truth_filename,
+        filename=s,
+        save=True,
+        show=False,
+        output=output,
+    )
+    save_sim_result(output, trajs, truth_filename)
+    try:
+        traj_metric = calc_sim_metric(output, trajs, truth_trajs, truth_filename)
+    except Exception:
+        traj_metric = None
+    return traj_metric
+
+
+def calc_sim_metric(output, trajs, truth_trajs, truth_filename):
+    ingress_metric = []
+    for next_traj, truth_traj in zip(trajs, truth_trajs):
+        ingress_metric.append(calc_sim_metric_for_one_pair(truth_traj, next_traj))
+    return np.mean(ingress_metric)
+
+
+def calc_sim_metric_for_one_pair(truth_traj, test_traj):
+    t = truth_traj
+    if len(truth_traj) != len(test_traj):
+        reduction_factor = np.gcd(len(test_traj), len(truth_traj))
+        t = resample_poly(
+            truth_traj,
+            len(test_traj) / reduction_factor,
+            len(truth_traj) / reduction_factor,
+            padtype="line",
+        )
+    return mean_absolute_error(t[:, POS_SLICE], test_traj[:, POS_SLICE])
+
+
+def save_sim_result(output, trajs, truth_filename):
+    print(f"Saving {len(trajs)} extrapolations to disk")
+    dfs = [None] * len(trajs)
+    for i, traj in enumerate(trajs):
+        df = pd.DataFrame(
+            traj,
+            columns=(
+                "time",
+                "x_pos_ecef",
+                "y_pos_ecef",
+                "z_pos_ecef",
+                "x_vel_ecef",
+                "y_vel_ecef",
+                "z_vel_ecef",
+                "x_acc_ecef",
+                "y_acc_ecef",
+                "z_acc_ecef",
+            ),
+        )
+        df["curr_time"] = df["time"][0]
+        df["pred_num"] = i + 1
+        df["validity_time"] = df["time"][0]
+        dfs[i] = df
+
+    big_df = pd.concat(dfs)
+    big_df["system_track_number"] = 1701
+    big_df["threat_id"] = 47
+    big_df["true_object_id"] = 31
+    big_df["hyp_id"] = 1
+    big_df["asset_id"] = 0
+    big_df["threat_genre"] = "HGV"
+    big_df["eng_status"] = "ELIGIBLE"
+    big_df["traj_genre"] = "MRV"
+    big_df["traj_genre_score"] = 0
+    big_df["reach_assess"] = 0
+    big_df["extrap_in_SR"] = "Y"
+
+    s = f"NEXT_extraps_{truth_filename}"
+    out_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}")
+    os.makedirs(out_dir, exist_ok=True)
+    big_df.to_csv(os.path.join(out_dir, s), index=False)
+
+
+def plot_sim_result(
+    truth,
+    trajs,
+    impact_guide_ecef,
+    args,
+    train_test_trajs,
+    model_name,
+    traj_number="",
+    filename="",
+    save=False,
+    show=False,
+    output=None,
+):
+    if save and not output:
+        raise ValueError("Cannot save figures without an output path")
+    fig, (ax11, ax12) = plt.subplots(2, 1, sharex=True)
+    fig2, ax21 = plt.subplots(1, 1)
+    fig3, ax31 = plt.subplots(1, 1)
+    fig4, (ax41, ax42, ax43) = plt.subplots(1, 3, sharex=True)
+    fig5, (ax51, ax52) = plt.subplots(2, 1, sharex=True)
+
+    impact_ecef = deepcopy(impact_guide_ecef)
+    ref_vel_ned = ecef_to_ned_velocity(truth[0, VEL_SLICE], impact_ecef)
+    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
+
+    plot_traj_truth = deepcopy(truth)
+    plot_trajs_next = deepcopy(trajs)
+
+    for i, traj in enumerate([plot_traj_truth] + plot_trajs_next):
+        for j in range(traj.shape[0]):
+            traj[j, POS_SLICE] = ecef_to_ned(traj[j, POS_SLICE], impact_ecef)
+            traj[j, VEL_SLICE] = ecef_to_ned_velocity(traj[j, VEL_SLICE], impact_ecef)
+
+            traj[j, POS_SLICE] = ned_to_dcu(traj[j, POS_SLICE], ref_angle)
+            traj[j, VEL_SLICE] = ned_to_dcu(traj[j, VEL_SLICE], ref_angle)
+
+        axes = (ax11, ax12, ax21, ax31, ax41, ax42, ax43)
+        plot_single_traj(i, traj, axes)
+
+    plot_color_trajs(plot_traj_truth, plot_trajs_next, ax51, ax52)
+
+    ax11.legend()
+    ax21.legend()
+    ax31.legend()
+    ax43.legend()
+    ax11.set_xlim([-10, args.sr_max / 1e3])
+    ax11.grid(True)
+    ax12.grid(True)
+    ax21.grid(True)
+    ax31.grid(True)
+    ax41.grid(True)
+    ax42.grid(True)
+    ax43.grid(True)
+    ax51.grid(True)
+    ax52.grid(True)
+
+    add_classification_markings(fig, Classification.UNCLASSIFIED)
+    add_classification_markings(fig2, Classification.UNCLASSIFIED)
+    add_classification_markings(fig3, Classification.UNCLASSIFIED)
+    add_classification_markings(fig4, Classification.UNCLASSIFIED)
+    add_classification_markings(fig5, Classification.UNCLASSIFIED)
+    add_lmpi_markings(fig)
+    add_lmpi_markings(fig2)
+    add_lmpi_markings(fig3)
+    add_lmpi_markings(fig4)
+    add_lmpi_markings(fig5)
+
+    title = f"{traj_number}"
+    if train_test_trajs is not None:
+        if title in train_test_trajs["test"]:
+            title = title + " (from test set)"
+        elif title in train_test_trajs["train"]:
+            title = title + " (from train set)"
+        else:
+            title = title + " (outside model scope)"
+
+    ax11.set_title(title, wrap=True)
+    ax21.set_title(title, wrap=True)
+    ax31.set_title(title, wrap=True)
+    ax51.set_title(title, wrap=True)
+    fig4.suptitle(title, wrap=True)
+
+    figure_dir = os.path.join(output, f"extrap-dt_{extrapolation_dt}", "plots")
+    os.makedirs(figure_dir, exist_ok=True)
+
+    if save:
+        fig2.savefig(os.path.join(figure_dir, filename + "_sim_Speed.png"), format="png")
+        fig3.savefig(os.path.join(figure_dir, filename + "_sim_Accel.png"), format="png")
+        fig4.savefig(os.path.join(figure_dir, filename + "_sim_Vel.png"), format="png")
+        fig5.savefig(os.path.join(figure_dir, filename + "_sim_DR_CR_color.png"), format="png")
+
+    if show:
+        plt.show()
+    plt.close("all")
+
+
+def plot_single_traj(i, traj, axes):
+    (ax11, ax12, ax21, ax31, ax41, ax42, ax43) = axes
+    if i == 0:
+        color = "k"
+        lw = 1
+        label = "Truth"
+        zorder = 8
+    elif i == 1:
+        color = "tab:orange"
+        lw = 0.5
+        label = "NEXT"
+        zorder = None
+    else:
+        color = "tab:orange"
+        lw = 0.5
+        label = "_nolegend_"
+        zorder = None
+
+    ax11.plot(traj[:, 1] / 1e3, traj[:, 3] / 1e3, label=label, color=color, lw=lw, zorder=zorder)
+    ax12.plot(traj[:, 1] / 1e3, traj[:, 2] / 1e3, label=label, color=color, lw=lw, zorder=zorder)
+    ax21.plot(traj[1:, 3] / 1e3, np.linalg.norm(traj[1:, VEL_SLICE], axis=1), label=label, color=color, lw=lw, zorder=zorder)
+    ax31.plot(traj[1:, 3] / 1e3, np.linalg.norm(traj[1:, ACC_SLICE], axis=1), label=label, color=color, lw=lw, zorder=zorder)
+    ax41.plot(traj[:, 3] / 1e3, traj[:, 4], color=color, lw=lw, zorder=zorder)
+    ax42.plot(traj[:, 3] / 1e3, traj[:, 5], color=color, lw=lw, zorder=zorder)
+    ax43.plot(traj[:, 3] / 1e3, traj[:, 6], label=label, color=color, lw=lw, zorder=zorder)
+
+    ax11.set_ylabel("Up [km]")
+    ax12.set_xlabel("Down [km]")
+    ax12.set_ylabel("Cross [km]")
+    ax21.set_xlabel("Up [km]")
+    ax21.set_ylabel("Speed [m/s]")
+    ax31.set_xlabel("Up [km]")
+    ax31.set_ylabel("Acceleration Magnitude [m/s/s]")
+    ax41.set_xlabel("Up [km]")
+    ax42.set_xlabel("Up [km]")
+    ax43.set_xlabel("Up [km]")
+    ax41.set_ylabel("Velocity [m/s]")
+    ax41.set_title("Down")
+    ax42.set_title("Cross")
+    ax43.set_title("Up")
+
+
+def plot_color_trajs(truth, extraps, ax51, ax52):
+    color = "lime"
+    linestyle = "--"
+    lw = 1
+    label = "Truth"
+    zorder = 8
+    ax51.plot(truth[:, 1] / 1e3, truth[:, 3] / 1e3, label=label, color=color, lw=lw, zorder=zorder, linestyle=linestyle)
+    ax52.plot(truth[:, 1] / 1e3, truth[:, 2] / 1e3, label=label, color=color, lw=lw, zorder=zorder, linestyle=linestyle)
+
+    tall, dall, call, uall = [], [], [], []
+    for i in range(len(extraps)):
+        ex = extraps[i]
+        t, d, c, u, *_ = ex.T
+        tall.append(t)
+        dall.append(d / 1e3)
+        call.append(c / 1e3)
+        uall.append(u / 1e3)
+
+    init_times = tuple(x[0][0] for x in extraps)
+    plot = multiline(dall, uall, init_times, ax=ax51, cmap="plasma", lw=0.5, label="NEXT")
+    multiline(dall, call, init_times, ax=ax52, cmap="plasma", lw=0.5)
+
+    cbar = ax51.get_figure().colorbar(plot, ax=[ax51, ax52])
+    cbar.set_label(label="Trajectory Initial Point Validity Time")
+
+    ax51.set_xlabel("Down [km]")
+    ax51.set_ylabel("Up [km]")
+    ax52.set_ylabel("Cross [km]")
+
+
+def _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE):
+    time_cutoff = getattr(args, "time_cutoff", None)
+    if time_cutoff is None:
+        rows = tuple(x for x in truth_states if not np.allclose(x[VEL_SLICE], [0, 0, 0]))
+    else:
+        rows = tuple(x for x in truth_states if x[TIME_INDEX] < time_cutoff and not np.allclose(x[VEL_SLICE], [0, 0, 0]))
+    return np.asarray(rows, dtype=np.float64)
+
+
+def sim_ingress(truth_states, guide_point_ecef, args):
+    impact_ecef = deepcopy(guide_point_ecef)
+    impact_time = truth_states[-1, 0]
+
+    truth_states_sr_cut = _sim_ingress_row_filter(truth_states, args, TIME_INDEX, VEL_SLICE)
+
+    if truth_states_sr_cut.shape[0] == 0:
+        print("[skip] no moving truth rows below time cutoff")
+        return -1, -1, -1
+
+    firm_track_time = truth_states_sr_cut[0][0]
+    sim_time = deepcopy(firm_track_time)
+    trajs, truth_trajs = [], []
+
+    while sim_time <= impact_time - measurement_dt:
+        tgt_state_ecef_index = np.where(truth_states_sr_cut[:, 0] == sim_time)
+        tgt_state_ecef_index_forward = np.where(truth_states_sr_cut[:, 0] >= sim_time)
+        if len(tgt_state_ecef_index[0]) == 0:
+            try:
+                tgt_state_ecef_index = np.array(tgt_state_ecef_index_forward[0][0])
+            except IndexError:
+                return truth_states_sr_cut, trajs, truth_trajs
+            sim_time = truth_states_sr_cut[tgt_state_ecef_index].squeeze()[0]
+        tgt_state_ecef = truth_states_sr_cut[tgt_state_ecef_index]
+        truth_traj_forward = truth_states_sr_cut[tgt_state_ecef_index_forward]
+
+        x0 = tgt_state_ecef.squeeze()
+        traj = NEXT_tactical_interface(x0[0:7], impact_ecef, extrapolation_dt, max_traj_states, impact_time, args)
+        if traj is not None:
+            if isinstance(traj, int) and traj == -1:
+                break
+            trajs.append(traj)
+            truth_trajs.append(truth_traj_forward)
+        sim_time += measurement_dt
+    return truth_states_sr_cut, trajs, truth_trajs
+
+
+def bound(low, high, x):
+    return max(low, min(high, x))
+
+
+def round_to(x, base):
+    return base * round(x / base)
+
+
+ort_sess_stash = None
+
+
+def NEXT_tactical_interface(initial_state_ecef, guide_point_ecef, dt, n_steps, extrap_stop_time, args):
+    initial_state_slant_range = np.linalg.norm(initial_state_ecef[POS_SLICE] - guide_point_ecef)
+    if initial_state_slant_range < args.sr_min:
+        print("Target too close", initial_state_slant_range, args.sr_min)
+        return -1
+
+    model_basename = os.path.basename(args.model)
+    use_obsgeo = "_obsgeo_" in model_basename
+    use_grdth = "_grdth_" in model_basename
+    use_geodesic = (
+        ("_geodesic_" in model_basename)
+        or ("_geod_" in model_basename)
+        or ("_geodesic-integrated_" in model_basename)
+        or ("_geodesic-original_" in model_basename)
+    )
+    use_geodesic_integrated = (
+        ("_geodesic-integrated_" in model_basename)
+        or (getattr(args, "frame", "") == "geodesic" and getattr(args, "geodesic_mode", "") == "integrated")
+    )
+
+    global ort_sess_stash
+    if use_grdth:
+        initial_state_NEXT_frame, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        initial_state_slant_range = np.hypot(initial_state_NEXT_frame[GR_INDEX], initial_state_NEXT_frame[DOWN_INDEX])
+        if not ort_sess_stash:
+            ort_sess_stash = onnxruntime.InferenceSession(args.model)
+        ort_sess = ort_sess_stash
+    elif use_obsgeo:
+        initial_point_heading = 0.0
+        if not ort_sess_stash:
+            ort_sess_stash = onnxruntime.InferenceSession(args.model)
+        ort_sess = ort_sess_stash
+        initial_state_NEXT_frame = initial_state_ecef
+    elif use_geodesic:
+        _, initial_point_heading = ecef_to_next_grdth(initial_state_ecef, guide_point_ecef)
+        if use_geodesic_integrated:
+            state5, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
+                np.atleast_2d(initial_state_ecef[POS_SLICE]),
+                np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+                guide_point_ecef,
+            )
+            state5 = np.atleast_2d(state5)[0]  # (5,)
+            initial_state_NEXT_frame = np.hstack([np.atleast_1d(initial_state_ecef[TIME_INDEX]), state5])  # (6,) = time + 5
+            initial_state_slant_range = np.hypot(initial_state_NEXT_frame[1], initial_state_NEXT_frame[2])
+            initial_point_heading = (initial_point_heading, float(np.ravel(initial_azimuth)[0]))
+        else:
+            initial_state_NEXT_frame = ecef_to_local_geodesic_vec(
+                np.atleast_2d(initial_state_ecef[POS_SLICE]),
+                np.atleast_2d(initial_state_ecef[VEL_SLICE]),
+                np.zeros_like(np.atleast_2d(initial_state_ecef[VEL_SLICE])),
+                guide_point_ecef,
+            )
+            initial_state_NEXT_frame = np.hstack(
+                [np.atleast_2d(initial_state_ecef[TIME_INDEX]), initial_state_NEXT_frame[:, :6]]
+            )[0]
+            initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+
+        if not ort_sess_stash:
+            ort_sess_stash = onnxruntime.InferenceSession(args.model)
+        ort_sess = ort_sess_stash
+    else:
+        initial_state_NEXT_frame, initial_point_heading, flip_c = ecef_to_next_dcu(initial_state_ecef, guide_point_ecef)
+        initial_state_slant_range = np.linalg.norm(initial_state_NEXT_frame[POS_SLICE])
+        bucket_range = 100000
+        rounded_sr = int(bound(bucket_range, args.sr_max, round_to(initial_state_slant_range, bucket_range)) / 1e3)
+        model_name_to_load = re.sub(r"_\d{1,3}sr_", f"_{rounded_sr}sr_", args.model)
+        ort_sess = onnxruntime.InferenceSession(model_name_to_load)
+
+    try:
+        NEXT_extrap = NEXT_extrapolation(
+            initial_state_NEXT_frame,
+            dt,
+            n_steps,
+            extrap_stop_time,
+            initial_point_heading,
+            use_grdth,
+            args,
+            ort_sess,
+            use_geodesic=use_geodesic,
+            use_obsgeo=use_obsgeo,
+        )
+    except ValueError as e:
+        print("Extrap failed", traceback.format_exc())
+        return None
+
+    if use_grdth:
+        NEXT_extrap_ecef = next_grdth_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading)
+    elif use_obsgeo:
+        NEXT_extrap_ecef = NEXT_extrap
+    elif use_geodesic:
+        if use_geodesic_integrated:
+            heading, init_az = initial_point_heading
+            ecef_pos_vel = local_geodesic_to_ecef_vec_frame_trick(
+                NEXT_extrap[:, 0:6], guide_point_ecef, init_az
+            )
+            NEXT_extrap_ecef = np.hstack([NEXT_extrap[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel])[:, :7]
+        else:
+            NEXT_extrap_ecef = np.hstack(
+                [
+                    NEXT_extrap[:, TIME_INDEX][..., np.newaxis],
+                    local_geodesic_to_ecef_vec(
+                        np.hstack([NEXT_extrap[:, 1:], np.zeros_like(NEXT_extrap[:, VEL_SLICE])]),
+                        guide_point_ecef,
+                    ),
+                ],
+            )[:, :7]
+    else:
+        NEXT_extrap_ecef = next_dcu_to_ecef(NEXT_extrap, guide_point_ecef, initial_point_heading, flip_c)
+
+    a = np.gradient(NEXT_extrap_ecef[:, VEL_SLICE], axis=0)
+    NEXT_extrap_ecef = np.hstack([NEXT_extrap_ecef, a])
+    return NEXT_extrap_ecef
+
+
+def _infer_training_dt(model_basename: str, default: float = 0.1) -> float:
+    m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
+    if m:
+        try:
+            return float(m[-1])
+        except ValueError:
+            pass
+    return default
+
+
+def _field_eval(ort_sess, state_full_scaled, state_size):
+    out = ort_sess.run(["output"], {"input": state_full_scaled.astype(np.float32)})[-1].reshape(-1)
+    return out
+
+
+def _integrate_one_step(
+    ort_sess,
+    x_full_scaled,
+    out_dt: float,
+    sub_dt: float,
+    integrator: str,
+    state_size: int,
+):
+    n_sub = max(1, int(round(out_dt / sub_dt)))
+    h_step = out_dt / n_sub
+
+    x = np.asarray(x_full_scaled, dtype=np.float64).reshape(-1).copy()
+
+    def f(state_full):
+        return _field_eval(ort_sess, state_full, state_size)
+
+    for _ in range(n_sub):
+        if integrator == "euler":
+            x = x + h_step * f(x)
+        else:  # rk4
+            k1 = f(x)
+            k2 = f(x + 0.5 * h_step * k1)
+            k3 = f(x + 0.5 * h_step * k2)
+            k4 = f(x + h_step * k3)
+            x = x + (h_step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    return x
+
+
+def NEXT_extrapolation(
+    initial_state_next_frame,
+    dt: float,
+    n_steps: int,
+    extrap_stop_time: float,
+    ref_angle,
+    use_grdth: bool,
+    args,
+    ort_sess: onnxruntime.InferenceSession,
+    use_geodesic: bool = False,
+    use_obsgeo: bool = False,
+):
+    model_basename = os.path.basename(args.model)
+    use_geodesic_integrated = (
+        ("_geodesic-integrated_" in model_basename)
+        or (getattr(args, "frame", "") == "geodesic" and getattr(args, "geodesic_mode", "") == "integrated")
+    )
+    is_gruode = (
+        getattr(args, "gruode", False)
+        or ("_gruode_" in model_basename)
+        or ("_gruode-min_" in model_basename)
+        or ("_aphynity-gruode_" in model_basename)
+    )
+
+    use_scalar = "_scalarOn" in model_basename
+    NEXT_scalar = None
+    if use_scalar:
+        scalar_path = args.scalar
+        if not os.path.exists(scalar_path):
+            clean_basename = re.sub(r"\.onnx$", "", model_basename)
+            scalar_path = os.path.join(os.path.dirname(args.model), f"{clean_basename}_scalar.pickle")
+        with open(scalar_path, "rb") as scalar_pickle:
+            NEXT_scalar = pickle.load(scalar_pickle)
+
+    if is_gruode:
+        enc_sess = _load_encoder_session(args.model)
+        enc_in_shape = enc_sess.get_inputs()[0].shape
+        state_size = int([d for d in enc_in_shape if isinstance(d, int)][-1])
+        integrator = "rk4"
+
+        sub_dt = _infer_training_dt(model_basename, default=0.1) / max(1, int(getattr(args, "sub_steps", 4)))
+        latent_dim = _gruode_latent_dim(model_basename, state_size)
+        aug_width = latent_dim
+        print(
+            f"Continuous GRU Model Detected: RK4 sub-step ~{sub_dt}s over dt {dt}s; "
+            f"state_size={state_size}, latent_dim={latent_dim}; seeding h0 from encoder graph"
+        )
+    else:
+        state_size = 5 if use_grdth else 6
+        integrator = "euler"
+        sub_dt = dt
+        aug_match = re.findall(r"_(\d+)aug_", args.model)
+        aug_width = int(aug_match[-1]) if aug_match else 0
+        enc_sess = None
+
+    extrap = np.array([np.hstack([initial_state_next_frame])])
+    validity_time = deepcopy(initial_state_next_frame[0])
+
+    y0_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
+    if use_scalar and NEXT_scalar is not None:
+        y0_seed = NEXT_scalar.transform(np.asarray([y0_phys]))[0]
+    else:
+        y0_seed = y0_phys
+
+    if is_gruode:
+        h_current = enc_sess.run(
+            ["h0"], {"y0": y0_seed.astype(np.float32).reshape(-1)}
+        )[-1].reshape(-1)
+        if h_current.shape[0] != latent_dim:
+            raise ValueError(
+                f"Encoder produced h0 of width {h_current.shape[0]} but model expected latent_dim={latent_dim}."
+            )
+    else:
+        h_current = np.zeros(aug_width, dtype=np.float64)
+
+    temp_iter = 0
+    _stop = float(extrap_stop_time)
+    _abs_cut = getattr(args, "time_cutoff", None)
+    if _abs_cut is not None:
+        _stop = min(_stop, float(_abs_cut))
+
+    while temp_iter < n_steps and float(validity_time) < _stop:
+        temp_iter += 1
+        validity_time += dt
+
+        cur_phys = np.asarray(extrap[-1][1 : state_size + 1], dtype=np.float64)
+
+        if use_scalar and NEXT_scalar is not None:
+            cur_scaled = NEXT_scalar.transform(np.asarray([cur_phys]))[0]
+        else:
+            cur_scaled = cur_phys
+
+        x_full = np.concatenate([cur_scaled, h_current])
+
+        next_full = _integrate_one_step(
+            ort_sess,
+            x_full,
+            out_dt=dt,
+            sub_dt=sub_dt,
+            integrator=integrator,
+            state_size=state_size,
+        )
+
+        next_scaled = next_full[:state_size]
+        h_current = next_full[state_size : state_size + aug_width]
+
+        if use_scalar and NEXT_scalar is not None:
+            next_state = NEXT_scalar.inverse_transform(next_scaled.reshape(1, -1))
+        else:
+            next_state = next_scaled.reshape(1, -1)
+
+        next_state = np.insert(next_state, 0, validity_time)
+
+        if use_grdth and (next_state[DOWN_INDEX + 1] > 0 or next_state[GR_INDEX + 1] < 2600e3):
+            print("grdth below ground")
+            break
+        elif use_geodesic:
+            if use_geodesic_integrated and next_state[2] <= 0.0:  # Altitude h <= 0
+                print("geodesic impact reached ground")
+                break
+            if not np.all(np.isfinite(next_state[1:6])):
+                print("geodesic trajectory diverged")
+                break
+
+        extrap = np.vstack([extrap, next_state])
+
+    if extrap.shape[0] < 3:
+        raise ValueError(f"Extrapolation output was too short ({extrap.shape[0]} states)")
+
+    return extrap
+
+
+if __name__ == "__main__":
+    main()

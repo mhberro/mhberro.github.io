@@ -1,106 +1,97 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 0 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_0winsize/GEODESIC/glide
-There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 66 training trajs
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-Discovered Physics Matrix Xi:
- [[ 1.09514004e-03  7.26180122e-04  7.62759847e-03  4.44417466e-04
-  -9.82182328e-03]
- [-1.02754905e-03  2.35890450e-03  5.16528607e-04 -2.03771200e-03
-   2.80804583e-02]
- [-1.99818732e-03 -1.70536720e-03 -1.10870870e-02 -1.91595657e-03
-  -3.44398392e-02]
- [ 9.92654620e-01  2.06891647e-03 -2.02455322e-03 -1.51111092e-03
-  -1.63413281e-02]
- [-1.28119257e-03  8.64863435e-04 -1.35815512e-03  4.07589672e-03
-  -2.87112739e-03]
- [ 2.49175090e-03  9.96818368e-01 -5.14914839e-03  1.42697474e-04
-   4.26382536e-04]
- [-2.48481812e-03  3.22826059e-04 -9.02894339e-04 -2.09980251e-04
-  -1.28750449e-02]
- [ 1.28168970e-03  0.00000000e+00 -2.07711364e-03  6.75990186e-04
-  -8.89401963e-03]
- [-5.07330759e-03  2.62581830e-03 -5.16195757e-03 -2.97511448e-03
-  -3.98477478e-03]
- [-6.87887322e-04  7.25545793e-04 -3.87699710e-03 -9.14990254e-03
-  -3.18360906e-03]
- [ 4.47654720e-03 -1.18125811e-03  5.22217244e-03  0.00000000e+00
-   7.55601616e-03]
- [-3.00450956e-03  5.66760966e-04  7.47279311e-03 -1.04196515e-03
-   2.10586898e-02]
- [-2.23881913e-03 -1.20023016e-03  8.44145075e-03 -1.61776291e-03
-   2.39453864e-02]
- [ 0.00000000e+00 -1.68734812e-04  4.00055480e-03  1.83111040e-02
-   3.08781031e-03]
- [-1.39272980e-03  0.00000000e+00 -4.39950864e-03 -8.87913341e-04
-  -4.85017526e-03]
- [-2.65745488e-04 -3.53989394e-04 -1.06930471e-04 -2.61573882e-03
-   1.49207004e-02]
- [ 2.82581402e-04 -2.10497554e-04  0.00000000e+00  5.77758762e-04
-   2.54709433e-03]
- [ 1.50115173e-03 -1.56210655e-03 -6.70153045e-03 -1.22113119e-03
-   5.51115878e-03]
- [ 3.81237958e-04 -4.79243231e-04 -8.91345961e-04 -2.32150237e-03
-   7.43006372e-03]
- [-3.50172442e-04  0.00000000e+00 -1.23016039e-03 -1.45911065e-02
-   3.49464935e-03]
- [-2.18145254e-03  5.23878950e-04  0.00000000e+00  1.53813859e-03
-  -1.05320314e-02]]
+from __future__ import annotations
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x30b4b45d0>, 0.0001)
-[INFO] Epoch 5: loss: nan pos_err: 2715.1169434 vel_err: 268.9360046 traj_loss: 0.0516915 node_norm: nan lambda: 1.0112404 val_loss: 0.0371995 val_pos_err: 2195.8583984 val_vel_err: 161.6450958 val_traj_loss: 0.0357856 val_node_norm: 0.0010117 val_lambda: 1.0112404
-[INFO] Epoch 10: loss: nan pos_err: 1958.1766357 vel_err: 201.7721252 traj_loss: 0.0267329 node_norm: nan lambda: 1.0183327 val_loss: 0.0218712 val_pos_err: 1564.9189453 val_vel_err: 142.6808167 val_traj_loss: 0.0202099 val_node_norm: 0.0012908 val_lambda: 1.0183327
-[INFO] Epoch 15: loss: nan pos_err: 1359.4617920 vel_err: 185.6024628 traj_loss: 0.0207954 node_norm: nan lambda: 1.0224645 val_loss: 0.0198376 val_pos_err: 1336.5980225 val_vel_err: 130.8021698 val_traj_loss: 0.0182344 val_node_norm: 0.0011936 val_lambda: 1.0224645
-[INFO] Epoch 20: loss: nan pos_err: 1392.8134766 vel_err: 203.3334351 traj_loss: 0.0192127 node_norm: nan lambda: 1.0259705 val_loss: 0.0160738 val_pos_err: 1194.4410400 val_vel_err: 126.4062881 val_traj_loss: 0.0146994 val_node_norm: 0.0009927 val_lambda: 1.0259705
-[INFO] Epoch 25: loss: nan pos_err: 1282.9099121 vel_err: 187.8778534 traj_loss: 0.0170521 node_norm: nan lambda: 1.0290459 val_loss: 0.0165680 val_pos_err: 1121.4985352 val_vel_err: 123.1329117 val_traj_loss: 0.0150052 val_node_norm: 0.0011269 val_lambda: 1.0290459
-[INFO] Epoch 30: loss: 0.0161779 pos_err: 1304.4985352 vel_err: 179.7928467 traj_loss: 0.0149923 node_norm: 0.0006984 lambda: 1.0324985 val_loss: 0.0120866 val_pos_err: 966.3152466 val_vel_err: 144.8226624 val_traj_loss: 0.0106802 val_node_norm: 0.0010593 val_lambda: 1.0324985
-[INFO] Epoch 35: loss: 0.0159909 pos_err: 1168.0098877 vel_err: 195.0097046 traj_loss: 0.0147974 node_norm: 0.0006747 lambda: 1.0350600 val_loss: 0.0130809 val_pos_err: 1020.9817505 val_vel_err: 138.5026855 val_traj_loss: 0.0115660 val_node_norm: 0.0011093 val_lambda: 1.0350600
-[INFO] Epoch 40: loss: nan pos_err: 1249.8009033 vel_err: 194.2107849 traj_loss: 0.0132120 node_norm: nan lambda: 1.0379196 val_loss: 0.0105216 val_pos_err: 699.3540649 val_vel_err: 180.8463135 val_traj_loss: 0.0091271 val_node_norm: 0.0010484 val_lambda: 1.0379196
-[INFO] Epoch 45: loss: 0.0143255 pos_err: 1051.9432373 vel_err: 177.1655579 traj_loss: 0.0131425 node_norm: 0.0006524 lambda: 1.0403649 val_loss: 0.0121908 val_pos_err: 946.7330933 val_vel_err: 133.4533081 val_traj_loss: 0.0106749 val_node_norm: 0.0010851 val_lambda: 1.0403649
-[INFO] Epoch 50: loss: 0.0191345 pos_err: 1237.2448730 vel_err: 166.5022430 traj_loss: 0.0179130 node_norm: 0.0004501 lambda: 1.0430602 val_loss: 0.0106312 val_pos_err: 850.1609497 val_vel_err: 145.6403656 val_traj_loss: 0.0091887 val_node_norm: 0.0010468 val_lambda: 1.0430602
-[INFO] Epoch 55: loss: 0.0150804 pos_err: 1222.5770264 vel_err: 177.4058380 traj_loss: 0.0139309 node_norm: 0.0005179 lambda: 1.0453402 val_loss: 0.0129315 val_pos_err: 1045.2341309 val_vel_err: 124.9921036 val_traj_loss: 0.0113655 val_node_norm: 0.0010507 val_lambda: 1.0453402
-[INFO] Epoch 60: loss: 0.0140127 pos_err: 1200.0941162 vel_err: 176.3734589 traj_loss: 0.0129378 node_norm: 0.0004585 lambda: 1.0476502 val_loss: 0.0093617 val_pos_err: 948.8095703 val_vel_err: 140.6785431 val_traj_loss: 0.0079977 val_node_norm: 0.0009829 val_lambda: 1.0476502
-[INFO] Epoch 65: loss: 0.0130498 pos_err: 1098.8798828 vel_err: 177.0545654 traj_loss: 0.0120209 node_norm: 0.0004317 lambda: 1.0496747 val_loss: 0.0088388 val_pos_err: 895.6636353 val_vel_err: 140.9765625 val_traj_loss: 0.0075015 val_node_norm: 0.0009647 val_lambda: 1.0496747
-[INFO] Epoch 70: loss: 0.0123236 pos_err: 1014.5432129 vel_err: 180.6477814 traj_loss: 0.0112616 node_norm: 0.0004764 lambda: 1.0519960 val_loss: 0.0087684 val_pos_err: 830.4124146 val_vel_err: 145.2004700 val_traj_loss: 0.0074259 val_node_norm: 0.0009563 val_lambda: 1.0519960
-[INFO] Epoch 75: loss: 0.0120421 pos_err: 982.9984741 vel_err: 174.4240570 traj_loss: 0.0109723 node_norm: 0.0004757 lambda: 1.0541470 val_loss: 0.0087989 val_pos_err: 800.5451050 val_vel_err: 141.3433228 val_traj_loss: 0.0073367 val_node_norm: 0.0010650 val_lambda: 1.0541470
-[INFO] Epoch 80: loss: 0.0120192 pos_err: 1032.5699463 vel_err: 175.2290955 traj_loss: 0.0109567 node_norm: 0.0004460 lambda: 1.0562689 val_loss: 0.0101176 val_pos_err: 894.2868652 val_vel_err: 124.0470047 val_traj_loss: 0.0086005 val_node_norm: 0.0010332 val_lambda: 1.0562689
-[INFO] Epoch 85: loss: 0.0141381 pos_err: 1020.8733521 vel_err: 171.6313019 traj_loss: 0.0129397 node_norm: 0.0004444 lambda: 1.0582695 val_loss: 0.0101487 val_pos_err: 836.3943481 val_vel_err: 135.1986847 val_traj_loss: 0.0086300 val_node_norm: 0.0010159 val_lambda: 1.0582695
-[INFO] Epoch 90: loss: 0.0149966 pos_err: 882.2553101 vel_err: 182.2697449 traj_loss: 0.0136903 node_norm: 0.0004801 lambda: 1.0603575 val_loss: 0.0153379 val_pos_err: 1082.0534668 val_vel_err: 107.6836319 val_traj_loss: 0.0134085 val_node_norm: 0.0011201 val_lambda: 1.0603575
-[INFO] Epoch 95: loss: 0.0143734 pos_err: 937.3662109 vel_err: 191.5478668 traj_loss: 0.0131669 node_norm: 0.0003814 lambda: 1.0626593 val_loss: 0.0090280 val_pos_err: 827.6043091 val_vel_err: 136.3625641 val_traj_loss: 0.0076992 val_node_norm: 0.0008464 val_lambda: 1.0626593
-[INFO] Epoch 100: loss: 0.0125866 pos_err: 1020.1387329 vel_err: 165.5864868 traj_loss: 0.0113849 node_norm: 0.0004652 lambda: 1.0646921 val_loss: 0.0085776 val_pos_err: 770.5549927 val_vel_err: 142.4450684 val_traj_loss: 0.0071947 val_node_norm: 0.0009174 val_lambda: 1.0646921
-[INFO] Epoch 105: loss: 0.0157165 pos_err: 1095.4599609 vel_err: 154.9161224 traj_loss: 0.0143036 node_norm: 0.0004579 lambda: 1.0667622 val_loss: 0.0084946 val_pos_err: 912.6720581 val_vel_err: 125.8867493 val_traj_loss: 0.0070853 val_node_norm: 0.0009363 val_lambda: 1.0667622
-[INFO] Epoch 110: loss: 0.0145300 pos_err: 1049.2583008 vel_err: 158.9657288 traj_loss: 0.0131889 node_norm: 0.0004359 lambda: 1.0686293 val_loss: 0.0082728 val_pos_err: 756.6860352 val_vel_err: 136.6542816 val_traj_loss: 0.0068708 val_node_norm: 0.0009305 val_lambda: 1.0686293
-[INFO] Epoch 115: loss: 0.0114833 pos_err: 901.1729736 vel_err: 172.6956329 traj_loss: 0.0103058 node_norm: 0.0004505 lambda: 1.0705372 val_loss: 0.0079138 val_pos_err: 791.5116577 val_vel_err: 131.1253052 val_traj_loss: 0.0065071 val_node_norm: 0.0009476 val_lambda: 1.0705372
-[INFO] Epoch 120: loss: 0.0116733 pos_err: 888.5402222 vel_err: 171.2984467 traj_loss: 0.0104958 node_norm: 0.0004194 lambda: 1.0722260 val_loss: 0.0091931 val_pos_err: 804.8742065 val_vel_err: 131.9945221 val_traj_loss: 0.0077687 val_node_norm: 0.0008634 val_lambda: 1.0722260
-[INFO] Epoch 125: loss: 0.0129877 pos_err: 928.5751953 vel_err: 150.4946747 traj_loss: 0.0116975 node_norm: 0.0004231 lambda: 1.0741273 val_loss: 0.0095546 val_pos_err: 862.6083984 val_vel_err: 120.9847336 val_traj_loss: 0.0081103 val_node_norm: 0.0008432 val_lambda: 1.0741273
-[INFO] Epoch 130: loss: 0.0113199 pos_err: 862.4159546 vel_err: 169.3782196 traj_loss: 0.0101862 node_norm: 0.0003601 lambda: 1.0759417 val_loss: 0.0083998 val_pos_err: 817.2531738 val_vel_err: 125.3366394 val_traj_loss: 0.0069613 val_node_norm: 0.0009099 val_lambda: 1.0759417
-[INFO] Epoch 135: loss: 0.0112980 pos_err: 882.5845337 vel_err: 162.6226654 traj_loss: 0.0101121 node_norm: 0.0003992 lambda: 1.0777872 val_loss: 0.0091820 val_pos_err: 785.0895996 val_vel_err: 132.9468231 val_traj_loss: 0.0076512 val_node_norm: 0.0009356 val_lambda: 1.0777872
-[INFO] Epoch 140: loss: 0.0113463 pos_err: 875.7488403 vel_err: 166.9552002 traj_loss: 0.0100801 node_norm: 0.0004642 lambda: 1.0795593 val_loss: 0.0073883 val_pos_err: 725.7586060 val_vel_err: 135.8231354 val_traj_loss: 0.0060466 val_node_norm: 0.0008607 val_lambda: 1.0795593
-[INFO] Epoch 145: loss: 0.0117807 pos_err: 862.7802734 vel_err: 161.7173309 traj_loss: 0.0104723 node_norm: 0.0004563 lambda: 1.0813669 val_loss: 0.0077595 val_pos_err: 739.6475220 val_vel_err: 132.2366943 val_traj_loss: 0.0063818 val_node_norm: 0.0008584 val_lambda: 1.0813669
-[INFO] Epoch 150: loss: 0.0109934 pos_err: 863.5344849 vel_err: 159.8239594 traj_loss: 0.0098150 node_norm: 0.0003633 lambda: 1.0830439 val_loss: 0.0084216 val_pos_err: 838.0338745 val_vel_err: 125.3782578 val_traj_loss: 0.0070330 val_node_norm: 0.0008045 val_lambda: 1.0830439
-[INFO] Epoch 155: loss: 0.0117769 pos_err: 937.9398804 vel_err: 151.9305725 traj_loss: 0.0104823 node_norm: 0.0004052 lambda: 1.0848496 val_loss: 0.0106533 val_pos_err: 1020.9826050 val_vel_err: 125.3810501 val_traj_loss: 0.0090641 val_node_norm: 0.0008201 val_lambda: 1.0848496
-[INFO] Epoch 160: loss: 0.0115259 pos_err: 949.6938477 vel_err: 157.0471954 traj_loss: 0.0102772 node_norm: 0.0003576 lambda: 1.0867089 val_loss: 0.0078289 val_pos_err: 834.9426880 val_vel_err: 133.3199005 val_traj_loss: 0.0065614 val_node_norm: 0.0006985 val_lambda: 1.0867089
-[INFO] Epoch 165: loss: 0.0103229 pos_err: 786.9835205 vel_err: 165.0228577 traj_loss: 0.0091564 node_norm: 0.0003569 lambda: 1.0884173 val_loss: 0.0077011 val_pos_err: 708.4904175 val_vel_err: 136.8149719 val_traj_loss: 0.0063865 val_node_norm: 0.0007499 val_lambda: 1.0884173
-[INFO] Epoch 170: loss: 0.0115392 pos_err: 830.5838623 vel_err: 159.9256287 traj_loss: 0.0102099 node_norm: 0.0004097 lambda: 1.0900681 val_loss: 0.0076971 val_pos_err: 727.4876099 val_vel_err: 134.5820923 val_traj_loss: 0.0063175 val_node_norm: 0.0008105 val_lambda: 1.0900681
-[INFO] Epoch 175: loss: 0.0113487 pos_err: 786.1453247 vel_err: 170.4634857 traj_loss: 0.0100625 node_norm: 0.0003631 lambda: 1.0917320 val_loss: 0.0076914 val_pos_err: 803.0048828 val_vel_err: 123.9360580 val_traj_loss: 0.0063910 val_node_norm: 0.0007141 val_lambda: 1.0917320
-[INFO] Epoch 180: loss: 0.0113556 pos_err: 877.4544067 vel_err: 158.0630493 traj_loss: 0.0100820 node_norm: 0.0003320 lambda: 1.0933874 val_loss: 0.0095957 val_pos_err: 843.4348755 val_vel_err: 121.5110168 val_traj_loss: 0.0081181 val_node_norm: 0.0007195 val_lambda: 1.0933874
-[INFO] Epoch 185: loss: 0.0138713 pos_err: 921.9661255 vel_err: 179.7219086 traj_loss: 0.0124231 node_norm: 0.0002605 lambda: 1.0956050 val_loss: 0.0096217 val_pos_err: 895.9756470 val_vel_err: 111.8334579 val_traj_loss: 0.0081076 val_node_norm: 0.0007390 val_lambda: 1.0956050
-[INFO] Epoch 190: loss: 0.0119966 pos_err: 714.7791138 vel_err: 169.8569183 traj_loss: 0.0105353 node_norm: 0.0004344 lambda: 1.0974809 val_loss: 0.0097668 val_pos_err: 860.2084351 val_vel_err: 119.7463379 val_traj_loss: 0.0082729 val_node_norm: 0.0006875 val_lambda: 1.0974809
-[INFO] Epoch 195: loss: 0.0102837 pos_err: 796.0985107 vel_err: 158.0200958 traj_loss: 0.0090465 node_norm: 0.0003377 lambda: 1.0994246 val_loss: 0.0071157 val_pos_err: 652.0918579 val_vel_err: 139.3320007 val_traj_loss: 0.0058237 val_node_norm: 0.0007130 val_lambda: 1.0994246
-[INFO] Epoch 200: loss: 0.0104629 pos_err: 766.7588501 vel_err: 166.7515411 traj_loss: 0.0092166 node_norm: 0.0003136 lambda: 1.1011893 val_loss: 0.0100530 val_pos_err: 924.7005005 val_vel_err: 118.7408142 val_traj_loss: 0.0084677 val_node_norm: 0.0007285 val_lambda: 1.1011893
-[INFO] Epoch 205: loss: 0.0111606 pos_err: 850.3200684 vel_err: 171.2753906 traj_loss: 0.0098657 node_norm: 0.0002779 lambda: 1.1030864 val_loss: 0.0075966 val_pos_err: 719.1969604 val_vel_err: 131.8688049 val_traj_loss: 0.0062571 val_node_norm: 0.0006944 val_lambda: 1.1030864
-[INFO] Epoch 210: loss: 0.0105237 pos_err: 838.1615601 vel_err: 156.7086792 traj_loss: 0.0092357 node_norm: 0.0003208 lambda: 1.1047202 val_loss: 0.0084623 val_pos_err: 800.6428833 val_vel_err: 125.0464096 val_traj_loss: 0.0070630 val_node_norm: 0.0006597 val_lambda: 1.1047202
-[INFO] Epoch 215: loss: 0.0113877 pos_err: 772.0343018 vel_err: 164.9450989 traj_loss: 0.0100045 node_norm: 0.0003188 lambda: 1.1063932 val_loss: 0.0083354 val_pos_err: 807.5031128 val_vel_err: 120.8835144 val_traj_loss: 0.0069275 val_node_norm: 0.0006709 val_lambda: 1.1063932
-[INFO] Epoch 220: loss: 0.0107366 pos_err: 786.1298828 vel_err: 163.5806427 traj_loss: 0.0094076 node_norm: 0.0003123 lambda: 1.1080747 val_loss: 0.0074636 val_pos_err: 750.6566772 val_vel_err: 133.9116669 val_traj_loss: 0.0061682 val_node_norm: 0.0006288 val_lambda: 1.1080747
-[INFO] Epoch 225: loss: 0.0107056 pos_err: 782.1890869 vel_err: 159.3950806 traj_loss: 0.0093500 node_norm: 0.0003290 lambda: 1.1097950 val_loss: 0.0073740 val_pos_err: 702.3179321 val_vel_err: 142.4295959 val_traj_loss: 0.0060688 val_node_norm: 0.0006389 val_lambda: 1.1097950
-[INFO] Epoch 230: loss: 0.0108094 pos_err: 762.9100952 vel_err: 159.9514923 traj_loss: 0.0094285 node_norm: 0.0003304 lambda: 1.1114209 val_loss: 0.0085692 val_pos_err: 800.0856323 val_vel_err: 122.7509689 val_traj_loss: 0.0071533 val_node_norm: 0.0006189 val_lambda: 1.1114209
-[INFO] Epoch 235: loss: 0.0104021 pos_err: 789.5322266 vel_err: 158.1707764 traj_loss: 0.0090846 node_norm: 0.0002904 lambda: 1.1130612 val_loss: 0.0109489 val_pos_err: 952.4767456 val_vel_err: 107.8902664 val_traj_loss: 0.0093104 val_node_norm: 0.0005859 val_lambda: 1.1130612
-[INFO] Epoch 240: loss: 0.0110117 pos_err: 840.1892700 vel_err: 151.5496826 traj_loss: 0.0095993 node_norm: 0.0003098 lambda: 1.1148610 val_loss: 0.0073252 val_pos_err: 741.6890259 val_vel_err: 123.4248123 val_traj_loss: 0.0059617 val_node_norm: 0.0006787 val_lambda: 1.1148610
-[INFO] Epoch 245: loss: 0.0106569 pos_err: 750.6513672 vel_err: 164.8841095 traj_loss: 0.0092753 node_norm: 0.0003006 lambda: 1.1165489 val_loss: 0.0091852 val_pos_err: 845.7013550 val_vel_err: 115.9188461 val_traj_loss: 0.0076910 val_node_norm: 0.0005979 val_lambda: 1.1165489
-[INFO] Epoch 250: loss: 0.0103928 pos_err: 728.0021362 vel_err: 160.1820068 traj_loss: 0.0089988 node_norm: 0.0003302 lambda: 1.1182122 val_loss: 0.0083482 val_pos_err: 780.6109009 val_vel_err: 122.5411072 val_traj_loss: 0.0069227 val_node_norm: 0.0006071 val_lambda: 1.1182122
-[INFO] Epoch 255: loss: 0.0114276 pos_err: 784.5203857 vel_err: 168.5885773 traj_loss: 0.0099529 node_norm: 0.0002819 lambda: 1.1198410 val_loss: 0.0117764 val_pos_err: 914.8681641 val_vel_err: 103.1867065 val_traj_loss: 0.0099317 val_node_norm: 0.0006544 val_lambda: 1.1198410
-[INFO] Early stopping triggered at 255
+import torch
+from torch import nn
+from gru_ode import GRUODEFunc
 
-Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x32885a710>, 0.0001)
-[INFO] Epoch 5: loss: 0.0482407 pos_err: 2981.6760254 vel_err: 212.8908691 traj_loss: 0.0465689 node_norm: 0.0011510 lambda: 1.0111814 val_loss: 0.0282931 val_pos_err: 1985.1153564 val_vel_err: 226.5461884 val_traj_loss: 0.0270992 val_node_norm: 0.0008909 val_lambda: 1.0111814
-[INFO] Epoch 10: loss: 0.0293532 pos_err: 1990.2424316 vel_err: 211.6155090 traj_loss: 0.0284115 node_norm: 0.0003581 lambda: 1.0205393 val_loss: 0.0206269 val_pos_err: 2058.1206055 val_vel_err: 222.5507355 val_traj_loss: 0.0198634 val_node_norm: 0.0003555 val_lambda: 1.0205393
+
+class APHYNITYGRUODEPredictorModel(nn.Module):
+    def __init__(
+        self,
+        func: GRUODEFunc,
+        physics_model: nn.Module,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        self.func = func
+        self.physics_model = physics_model
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            # Identify acceleration and rate indices (non-position channels)
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
+
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
+
+        self.last_node_norm = torch.tensor(0.0)
+
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+
+        y_read = state[..., : self.n_features]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
+        h = torch.tanh(h)
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh = self.func.cell(t, h, y_read)
+        else:
+            dh = self.func.cell(t, h)
+
+        f_phys = self.physics_model(y_read)
+        f_node = self.func.decode(h)
+
+        # Penalize neural residual ONLY on acceleration/rate channels.
+        # NOTE: this norm is a *metric/penalty* only -- the f_node used in xdot
+        # below is left untouched so the integrated dynamics are unchanged. During
+        # full-trajectory training the residual can grow very large as a trajectory
+        # transits the geodesic-frame singularity (s -> 0); squaring such a value
+        # overflows float32 (>~1e19) to inf, which made node_norm nan and forced
+        # the training step to be skipped -- disabling the APHYNITY least-action
+        # penalty on exactly the batches with the largest residual, where it is
+        # most needed. Clamp to a large finite magnitude before squaring so those
+        # batches instead contribute a large-but-finite penalty gradient.
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
+        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+        self.last_node_norm = torch.mean(f_node_acc ** 2)
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+
+        return torch.cat((xdot, dh), dim=-1)

@@ -1,511 +1,92 @@
-# standalone_direct_evaluator.py
+# load_truth.py
 
-import argparse
-import glob
 import os
-import pickle
-import re
-import sys
-import warnings
-from copy import deepcopy
+from pathlib import Path
 
-import matplotlib.pyplot as plt
-import numpy as np
-import onnxruntime
 import pandas as pd
-from scipy.interpolate import interp1d
-from mpl_toolkits.mplot3d import Axes3D
-
-# Import base loading and coordinate transform modules from codebase
-from load_truth import load_single_truth
-from coordinate_transform_functions import ecef_to_ned, ecef_to_ned_velocity, ned_to_dcu
-from NEXT_geodesic_frame import (
-    ecef_to_geodetic,
-    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
-    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
-)
-from trajectory_helpers import POS_SLICE, VEL_SLICE, TIME_INDEX
-
-# Suppress NumPy overflow warnings during integration guards
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
-
-# Matplotlib global styling to match dashboard standard
-plt.rcParams["axes.formatter.limits"] = [-3, 4]
-plt.rcParams.update({
-    "lines.linewidth": 1.5,
-    "axes.formatter.useoffset": False,
-    "savefig.dpi": 200,
-    "font.size": 9,
-    "axes.titlesize": 10,
-    "axes.titleweight": "bold",
-})
+import numpy as np
 
 
-def load_phase_guide_point(path_to_truth: str, truth_states: np.ndarray) -> np.ndarray:
-    """Finds reference ECEF impact point from impact directory or falls back to last row."""
-    phase_dir = os.path.dirname(path_to_truth)
-    target_dir = os.path.dirname(phase_dir)
-    impact_path = os.path.join(target_dir, "impact", os.path.basename(path_to_truth))
-    if os.path.exists(impact_path):
-        try:
-            impact_truth = load_single_truth(impact_path)
-            return deepcopy(impact_truth[-1, POS_SLICE])
-        except Exception:
-            pass
-    return deepcopy(truth_states[-1, POS_SLICE])
+def _check_truth_loading(truth_states: np.typing.ArrayLike, debug=False, min_state_vector_size=10):
+    # truth states are expected to be an array for format
+    # seconds from launch, position x3, velocity x3, acceleration x3, and then a bunch of other stuff
+    if len(truth_states.shape) != 2:
+        if debug:
+            print("the shape is not 2d", truth_states.shape)
+        return False
+    if not truth_states.shape[0] > 2 and not truth_states.shape[1] >= min_state_vector_size:
+        if debug:
+            print("the data is too small", truth_states.shape)
+        return False
+    try:
+        truth_states = truth_states.astype(np.float64)
+    except Exception as e:  # noqa: E722
+        if debug:
+            print("the data could not be cast to float64", truth_states)
+            print(e)
+        return False
+
+    # Validate the truth time states for repeated times or negative dt
+    diffs = np.diff(truth_states[:, 0])
+    if np.any(diffs <= 0):
+        if debug:
+            print("time is not incrementing correctly")
+        return False
+    return True
 
 
-def infer_training_dt(model_basename: str, default: float = 0.1) -> float:
-    """Infers training dt from model filename token (e.g. `_1.0sec_`)."""
-    m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
-    if m:
-        try:
-            return float(m[-1])
-        except ValueError:
-            pass
-    return default
-
-
-def infer_latent_dim(model_basename: str, state_size: int = 5) -> int:
-    """Parses GRU-ODE latent width from model filename."""
-    m = re.findall(r"_(\d+)hid_", model_basename)
-    if not m:
-        return max(2 * state_size, 100)
-    nhidden = int(m[-1])
-    return max(2 * state_size, nhidden // 2 if nhidden >= 20 else 16)
-
-
-def evaluate_field(ort_sess, state_full_scaled: np.ndarray) -> np.ndarray:
-    """Evaluates the ONNX autonomous field graph safely."""
-    out = ort_sess.run(["output"], {"input": state_full_scaled.astype(np.float32)})[-1].reshape(-1)
-    return out
-
-
-def integrate_one_step_rk4(
-    ort_sess,
-    x_full_scaled: np.ndarray,
-    out_dt: float,
-    sub_dt: float,
+def load_single_truth(
+    filepath: str, debug=False, low_memory=True, memory_map=False, min_state_vector_size=10
 ) -> np.ndarray:
-    """Advances continuous state [y_scaled, h] by out_dt using RK4 sub-stepping with divergence guards."""
-    n_sub = max(1, int(round(out_dt / sub_dt)))
-    h_step = out_dt / n_sub
-    x = np.asarray(x_full_scaled, dtype=np.float64).reshape(-1).copy()
-
-    for _ in range(n_sub):
-        if not np.all(np.isfinite(x)):
-            x[:] = np.nan
-            return x
-
-        k1 = evaluate_field(ort_sess, x)
-        if not np.all(np.isfinite(k1)):
-            x[:] = np.nan
-            return x
-
-        k2 = evaluate_field(ort_sess, x + 0.5 * h_step * k1)
-        if not np.all(np.isfinite(k2)):
-            x[:] = np.nan
-            return x
-
-        k3 = evaluate_field(ort_sess, x + 0.5 * h_step * k2)
-        if not np.all(np.isfinite(k3)):
-            x[:] = np.nan
-            return x
-
-        k4 = evaluate_field(ort_sess, x + h_step * k3)
-        if not np.all(np.isfinite(k4)):
-            x[:] = np.nan
-            return x
-
-        x = x + (h_step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-    return x
+    # there are various truth formats. take guesses at what the format is. check if it loaded correctly
+    # returns a numpy array of the truth data
+    truth = pd.read_csv(filepath, header=None, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+        return truth
+    truth = pd.read_csv(filepath, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+        return truth
+    try:
+        truth = np.loadtxt(filepath, skiprows=1, dtype=np.float64)
+        if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+            return truth
+    except Exception as e:
+        if debug:
+            print(e)
+    truth = pd.read_csv(filepath, sep="\t", header=None, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+        return truth
+    truth = pd.read_fwf(filepath, skiprows=1, header=None, infer_nrows=10000, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+        return truth
+    truth = pd.read_table(filepath).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size):
+        return truth
+    raise ValueError(f"Unable to parse truth file {filepath}")
 
 
-def rollout_single_trajectory(
-    truth_states: np.ndarray,
-    guide_point_ecef: np.ndarray,
-    ort_sess: onnxruntime.InferenceSession,
-    enc_sess: onnxruntime.InferenceSession,
-    scaler,
-    model_basename: str,
-    dt: float = 1.0,
-    sub_steps: int = 4,
-) -> np.ndarray:
-    """Performs in-memory trajectory rollout with strict pre-transform finiteness guards."""
-    state_size = 5  # Integrated geodesic frame
-    latent_dim = infer_latent_dim(model_basename, state_size)
-    training_dt = infer_training_dt(model_basename, default=1.0)
-    sub_dt = training_dt / max(1, sub_steps)
+def load_data_dir(path: str, trajectory_dt: float, use_grdth: bool, max_value=None, have_high_memory=False):
+    # max_value: sr or time
+    # create a list of the files that need to be loaded
+    traj_files = [Path(path, x) for x in sorted(os.listdir(path))]
 
-    # 1. Transform initial ECEF state (t0) to 5-state integrated geodesic frame
-    t0 = truth_states[0, TIME_INDEX]
-    p0_ecef = truth_states[0, POS_SLICE]
-    v0_ecef = truth_states[0, VEL_SLICE]
+    if len(traj_files) == 0:
+        raise ValueError("bad target path", path)
 
-    y0_phys, az0_rad = ecef_to_local_geodesic_vec_frame_trick(
-        np.atleast_2d(p0_ecef),
-        np.atleast_2d(v0_ecef),
-        guide_point_ecef,
-    )
-    y0_phys = np.atleast_2d(y0_phys)[0]  # [s, h, v_s, v_alpha, v_h]
-
-    # 2. Scale physical initial state & seed latent state h0 via encoder
-    y0_scaled = scaler.transform(np.asarray([y0_phys]))[0]
-    h_current = enc_sess.run(["h0"], {"y0": y0_scaled.astype(np.float32).reshape(-1)})[-1].reshape(-1)
-
-    # Initialize rollout trajectory array: [time, s, h, v_s, v_alpha, v_h]
-    current_time = float(t0)
-    max_stop_time = float(truth_states[-1, TIME_INDEX])
-    geodesic_records = [np.hstack([current_time, y0_phys])]
-
-    # 3. Continuous-time RK4 integration loop
-    while current_time < max_stop_time:
-        current_time += dt
-        cur_phys = geodesic_records[-1][1:6]
-        cur_scaled = scaler.transform(np.asarray([cur_phys]))[0]
-
-        x_full = np.concatenate([cur_scaled, h_current])
-        next_full = integrate_one_step_rk4(ort_sess, x_full, out_dt=dt, sub_dt=sub_dt)
-
-        next_scaled = next_full[:state_size]
-
-        # PRE-TRANSFORM GUARD: Stop rollout cleanly if state diverged to Inf or NaN
-        if not np.all(np.isfinite(next_scaled)):
-            break
-
-        h_current = next_full[state_size : state_size + latent_dim]
-        next_phys = scaler.inverse_transform(next_scaled.reshape(1, -1))[0]
-
-        # Stop condition: Ground impact (altitude h <= 0)
-        if next_phys[1] <= 0.0:
-            break
-
-        geodesic_records.append(np.hstack([current_time, next_phys]))
-
-    geodesic_matrix = np.vstack(geodesic_records)
-    if geodesic_matrix.shape[0] < 3:
-        return None
-
-    # 4. Convert predicted geodesic trajectory back to ECEF positions and velocities
-    ecef_pos_vel = local_geodesic_to_ecef_vec_frame_trick(
-        geodesic_matrix[:, 0:6], guide_point_ecef, az0_rad
-    )
-    pred_ecef_traj = np.hstack([geodesic_matrix[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel])[:, :7]
-    return pred_ecef_traj
-
-
-def align_trajectories(truth_traj: np.ndarray, pred_traj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Aligns truth states onto prediction timestamps via linear interpolation."""
-    pred_times = pred_traj[:, TIME_INDEX]
-    truth_times = truth_traj[:, TIME_INDEX]
-
-    valid_mask = (pred_times >= truth_times[0]) & (pred_times <= truth_times[-1])
-    pred_traj_clipped = pred_traj[valid_mask]
-    eval_times = pred_traj_clipped[:, TIME_INDEX]
-
-    interp_fn = interp1d(truth_times, truth_traj[:, 1:7], axis=0, kind="linear", fill_value="extrapolate")
-    truth_aligned_states = interp_fn(eval_times)
-    truth_aligned = np.hstack([eval_times[:, None], truth_aligned_states])
-
-    return truth_aligned, pred_traj_clipped
-
-
-def compute_trajectory_metrics(truth_traj: np.ndarray, pred_traj: np.ndarray, traj_name: str) -> dict:
-    """Computes quantitative evaluation metrics."""
-    truth_aligned, pred_clipped = align_trajectories(truth_traj, pred_traj)
-
-    pos_truth = truth_aligned[:, POS_SLICE]
-    pos_pred = pred_clipped[:, POS_SLICE]
-    vel_truth = truth_aligned[:, VEL_SLICE]
-    vel_pred = pred_clipped[:, VEL_SLICE]
-
-    pos_errors = np.linalg.norm(pos_pred - pos_truth, axis=1)
-    vel_errors = np.linalg.norm(vel_pred - vel_truth, axis=1)
-
-    duration = float(pred_clipped[-1, TIME_INDEX] - pred_clipped[0, TIME_INDEX])
-
-    return {
-        "trajectory": traj_name,
-        "mean_pos_error_m": float(np.mean(pos_errors)),
-        "mean_vel_error_ms": float(np.mean(vel_errors)),
-        "final_pos_error_m": float(pos_errors[-1]),
-        "max_pos_error_m": float(np.max(pos_errors)),
-        "rmse_pos_m": float(np.sqrt(np.mean(pos_errors**2))),
-        "duration_s": duration,
-        "_pos_errors_m": pos_errors,
-        "_truth_aligned": truth_aligned,
-        "_pred_clipped": pred_clipped,
-    }
-
-
-def transform_to_dcu(p_ecef: np.ndarray, impact_ecef: np.ndarray, ref_angle: float) -> np.ndarray:
-    """Converts ECEF positions to Downrange, Crossrange, Up (DCU)."""
-    N = p_ecef.shape[0]
-    dcu = np.empty((N, 3))
-    for i in range(N):
-        p_ned = ecef_to_ned(p_ecef[i], impact_ecef)
-        dcu[i] = ned_to_dcu(p_ned, ref_angle)
-    return dcu
-
-
-def plot_trajectory_dashboard(
-    metrics: dict,
-    impact_ecef: np.ndarray,
-    output_dir: str = None,
-    show_plot: bool = False,
-):
-    """Renders the 6-panel trajectory evaluation dashboard."""
-    truth_traj = metrics["_truth_aligned"]
-    pred_traj = metrics["_pred_clipped"]
-    pos_errors = metrics["_pos_errors_m"]
-    traj_name = metrics["trajectory"]
-
-    ref_vel_ned = ecef_to_ned_velocity(truth_traj[0, VEL_SLICE], impact_ecef)
-    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
-
-    truth_dcu = transform_to_dcu(truth_traj[:, POS_SLICE], impact_ecef, ref_angle)
-    pred_dcu = transform_to_dcu(pred_traj[:, POS_SLICE], impact_ecef, ref_angle)
-
-    N_t = truth_traj.shape[0]
-    N_p = pred_traj.shape[0]
-    truth_alt_km = np.array([ecef_to_geodetic(*truth_traj[i, POS_SLICE])[2] for i in range(N_t)]) / 1000.0
-    pred_alt_km = np.array([ecef_to_geodetic(*pred_traj[i, POS_SLICE])[2] for i in range(N_p)]) / 1000.0
-
-    time_s = pred_traj[:, TIME_INDEX]
-    truth_dr_km = truth_dcu[:, 0] / 1000.0
-    pred_dr_km = pred_dcu[:, 0] / 1000.0
-    truth_cr_km = truth_dcu[:, 1] / 1000.0
-    pred_cr_km = pred_dcu[:, 1] / 1000.0
-
-    truth_speed = np.linalg.norm(truth_traj[:, VEL_SLICE], axis=1)
-    pred_speed = np.linalg.norm(pred_traj[:, VEL_SLICE], axis=1)
-    pos_errors_km = pos_errors / 1000.0
-
-    fig = plt.figure(figsize=(14, 8), constrained_layout=True)
-    fig.suptitle(f"{traj_name}", fontsize=13, fontweight="bold")
-
-    c_truth = "navy"
-    c_pred = "crimson"
-
-    # 1. Altitude vs Downrange
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax1.plot(truth_dr_km, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
-    ax1.plot(pred_dr_km, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
-    ax1.set_title("Altitude vs Downrange")
-    ax1.set_xlabel("Downrange (km)")
-    ax1.set_ylabel("Altitude (km)")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="upper right")
-
-    # 2. Crossrange vs Downrange
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax2.plot(truth_dr_km, truth_cr_km, color=c_truth, linestyle="-", label="Truth")
-    ax2.plot(pred_dr_km, pred_cr_km, color=c_pred, linestyle="--", label="Prediction")
-    ax2.set_title("Crossrange vs Downrange")
-    ax2.set_xlabel("Downrange (km)")
-    ax2.set_ylabel("Crossrange (km)")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc="upper left")
-
-    # 3. Position Error vs Time
-    mean_err_m = int(round(metrics["mean_pos_error_m"]))
-    ax3 = fig.add_subplot(2, 3, 3)
-    ax3.plot(time_s, pos_errors_km, color=c_pred, linestyle="-")
-    ax3.axhline(1.0, color="green", linestyle="--", label="1km target")
-    ax3.set_title(f"Position Error (Mean: {mean_err_m}m)")
-    ax3.set_xlabel("Time (s)")
-    ax3.set_ylabel("Position Error (km)")
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc="upper left")
-
-    # 4. Altitude vs Time
-    ax4 = fig.add_subplot(2, 3, 4)
-    ax4.plot(time_s, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
-    ax4.plot(time_s, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
-    ax4.set_title("Altitude vs Time")
-    ax4.set_xlabel("Time (s)")
-    ax4.set_ylabel("Altitude (km)")
-    ax4.grid(True, alpha=0.3)
-    ax4.legend(loc="upper right")
-
-    # 5. Speed vs Time
-    ax5 = fig.add_subplot(2, 3, 5)
-    ax5.plot(time_s, truth_speed, color=c_truth, linestyle="-", label="Truth")
-    ax5.plot(time_s, pred_speed, color=c_pred, linestyle="--", label="Prediction")
-    ax5.set_title("Speed vs Time")
-    ax5.set_xlabel("Time (s)")
-    ax5.set_ylabel("Speed (m/s)")
-    ax5.grid(True, alpha=0.3)
-    ax5.legend(loc="upper right")
-
-    # 6. 3D Trajectory (ECEF)
-    ax6 = fig.add_subplot(2, 3, 6, projection="3d")
-    ax6.plot(
-        truth_traj[:, 1] / 1000.0,
-        truth_traj[:, 2] / 1000.0,
-        truth_traj[:, 3] / 1000.0,
-        color=c_truth,
-        linestyle="-",
-        label="Truth",
-    )
-    ax6.plot(
-        pred_traj[:, 1] / 1000.0,
-        pred_traj[:, 2] / 1000.0,
-        pred_traj[:, 3] / 1000.0,
-        color=c_pred,
-        linestyle="--",
-        label="Prediction",
-    )
-    ax6.set_title("3D Trajectory (ECEF)")
-    ax6.set_xlabel("X (km)", labelpad=2)
-    ax6.set_ylabel("Y (km)", labelpad=2)
-    ax6.set_zlabel("Z (km)", labelpad=2)
-    ax6.tick_params(axis="both", which="major", labelsize=7)
-    ax6.legend(loc="upper right")
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        out_file = os.path.join(output_dir, f"{traj_name}_dashboard.png")
-        fig.savefig(out_file, bbox_inches="tight")
-
-    if show_plot:
-        plt.show()
-    plt.close(fig)
-
-
-def print_csv_metrics_table(all_metrics: list[dict]):
-    """Outputs evaluation metrics formatted as CSV to the terminal."""
-    fieldnames = [
-        "trajectory",
-        "mean_pos_error_m",
-        "mean_vel_error_ms",
-        "final_pos_error_m",
-        "max_pos_error_m",
-        "rmse_pos_m",
-        "duration_s",
+    # create a tuple with the data plus metadata
+    # TODO: Turn this into an object rather than a tuple
+    traj_targets = []  # list of tuples (ecef traj tables data loaded from truth files, traj_number/filename)
+    traj_targets = [
+        (
+            load_single_truth(
+                x, debug=False, low_memory=not have_high_memory, memory_map=have_high_memory, min_state_vector_size=7
+            ),
+            x.name,
+            max_value,
+            trajectory_dt,
+            use_grdth,
+        )
+        for x in traj_files
     ]
 
-    print("\n" + ",".join(fieldnames))
-    for m in all_metrics:
-        row_str = f"{m['trajectory']},{m['mean_pos_error_m']},{m['mean_vel_error_ms']},{m['final_pos_error_m']},{m['max_pos_error_m']},{m['rmse_pos_m']},{m['duration_s']}"
-        print(row_str)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Standalone Model Evaluator (Pure In-Memory Evaluation, Zero simple_sim Dependencies)"
-    )
-    parser.add_argument(
-        "-t", "--truths", nargs="+", required=True, help="Path to truth CSV file(s) or directory"
-    )
-    parser.add_argument("-m", "--model", required=True, help="Path to trained ONNX model (.onnx)")
-    parser.add_argument(
-        "-s", "--scalar", default=None, help="Path to scalar pickle file (auto-inferred if omitted)"
-    )
-    parser.add_argument("-o", "--output-dir", required=True, help="Directory to save output dashboard PNGs")
-    parser.add_argument("--dt", type=float, default=1.0, help="Output time step [s]")
-    parser.add_argument("--sub-steps", type=int, default=10, help="RK4 sub-steps per interval")
-    parser.add_argument("--show", action="store_true", help="Display interactive plots")
-
-    args = parser.parse_args()
-
-    # 1. Resolve ONNX Model and Encoder Sessions
-    if not os.path.exists(args.model):
-        raise FileNotFoundError(f"ONNX model file not found at: {args.model}")
-
-    model_dir = os.path.dirname(args.model)
-    model_basename = os.path.basename(args.model)
-    enc_path = re.sub(r"\.onnx$", "_encoder.onnx", args.model)
-
-    if not os.path.exists(enc_path):
-        raise FileNotFoundError(f"Companion encoder graph not found at: {enc_path}")
-
-    ort_sess = onnxruntime.InferenceSession(args.model)
-    enc_sess = onnxruntime.InferenceSession(enc_path)
-
-    # 2. Resolve Scaler Pickle
-    if args.scalar is None or not os.path.exists(args.scalar):
-        clean_basename = re.sub(r"\.onnx$", "", model_basename)
-        possible_scalar = os.path.join(model_dir, f"{clean_basename}_scalar.pickle")
-        if os.path.exists(possible_scalar):
-            args.scalar = possible_scalar
-        else:
-            raise FileNotFoundError(f"Scaler pickle file not found at {possible_scalar}")
-
-    with open(args.scalar, "rb") as f:
-        scaler = pickle.load(f)
-
-    # 3. Expand Truth Trajectory Files
-    truth_files = []
-    for entry in args.truths:
-        if os.path.isdir(entry):
-            truth_files.extend(glob.glob(os.path.join(entry, "**", "*.csv"), recursive=True))
-            truth_files.extend(glob.glob(os.path.join(entry, "*.csv")))
-        else:
-            truth_files.append(entry)
-
-    truth_files = sorted(list(set(truth_files)))
-    if not truth_files:
-        print("No truth CSV files found matching input paths.")
-        sys.exit(1)
-
-    print(f"\n--- Running Standalone Direct Model Evaluation ---")
-    print(f"Model: {model_basename}")
-    print(f"Truth Trajectories: {len(truth_files)}\n")
-
-    all_metrics = []
-
-    # 4. Loop Through Trajectories and Evaluate (with Loading & Rollout Guards)
-    for t_path in truth_files:
-        base_name = os.path.basename(t_path)
-        traj_name = base_name.replace(".csv", "")
-
-        try:
-            truth_states = load_single_truth(t_path)
-        except Exception as e:
-            print(f"[Skip] Could not parse truth file {base_name}: {e}")
-            continue
-
-        if truth_states is None or len(truth_states) < 3:
-            print(f"[Skip] Truth trajectory {base_name} has too few states")
-            continue
-
-        guide_point_ecef = load_phase_guide_point(t_path, truth_states)
-
-        pred_ecef_traj = rollout_single_trajectory(
-            truth_states,
-            guide_point_ecef,
-            ort_sess,
-            enc_sess,
-            scaler,
-            model_basename,
-            dt=args.dt,
-            sub_steps=args.sub_steps,
-        )
-
-        if pred_ecef_traj is None or len(pred_ecef_traj) < 3:
-            print(f"[Skip] Trajectory rollout failed or was too short for {base_name}")
-            continue
-
-        # Compute metrics & generate dashboard
-        metrics = compute_trajectory_metrics(truth_states, pred_ecef_traj, traj_name)
-        all_metrics.append(metrics)
-
-        plot_trajectory_dashboard(
-            metrics,
-            guide_point_ecef,
-            output_dir=args.output_dir,
-            show_plot=args.show,
-        )
-
-    if not all_metrics:
-        print("Error: No trajectory evaluations completed successfully.")
-        sys.exit(1)
-
-    # 5. Output CSV Table to Terminal
-    print_csv_metrics_table(all_metrics)
-
-
-if __name__ == "__main__":
-    main()
+    return traj_targets

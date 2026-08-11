@@ -1,610 +1,150 @@
-# standalone_direct_evaluator.py
-
-import argparse
-import glob
-import os
-import pickle
-import re
-import sys
-import warnings
-from copy import deepcopy
-
-import matplotlib.pyplot as plt
-import numpy as np
-import onnxruntime
-import pandas as pd
-from scipy.interpolate import interp1d
-from mpl_toolkits.mplot3d import Axes3D
-
-# Import base loading and coordinate transform modules from codebase
-from load_truth import load_single_truth
-from coordinate_transform_functions import ecef_to_ned, ecef_to_ned_velocity, ned_to_dcu
-from NEXT_geodesic_frame import (
-    ecef_to_geodetic,
-    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
-    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
-)
-from trajectory_helpers import POS_SLICE, VEL_SLICE, TIME_INDEX
-
-# Suppress NumPy overflow warnings during integration guards
-warnings.filterwarnings("ignore", category=RuntimeWarning, module="numpy")
-
-# Matplotlib global styling to match dashboard standard
-plt.rcParams["axes.formatter.limits"] = [-3, 4]
-plt.rcParams.update({
-    "lines.linewidth": 1.5,
-    "axes.formatter.useoffset": False,
-    "savefig.dpi": 200,
-    "font.size": 9,
-    "axes.titlesize": 10,
-    "axes.titleweight": "bold",
-})
-
-
-def load_phase_guide_point(path_to_truth: str, truth_states: np.ndarray) -> np.ndarray:
-    """Finds reference ECEF impact point from impact directory or falls back to last row."""
-    phase_dir = os.path.dirname(path_to_truth)
-    target_dir = os.path.dirname(phase_dir)
-    impact_path = os.path.join(target_dir, "impact", os.path.basename(path_to_truth))
-    if os.path.exists(impact_path):
-        try:
-            impact_truth = load_single_truth(impact_path, min_state_vector_size=7)
-            return deepcopy(impact_truth[-1, POS_SLICE])
-        except Exception:
-            pass
-    return deepcopy(truth_states[-1, POS_SLICE])
-
-
-def infer_training_dt(model_basename: str, default: float = 0.1) -> float:
-    """Infers training dt from model filename token (e.g. `_1.0sec_`)."""
-    m = re.findall(r"_([0-9]*\.?[0-9]+)sec_", model_basename)
-    if m:
-        try:
-            return float(m[-1])
-        except ValueError:
-            pass
-    return default
-
-
-def infer_latent_dim(model_basename: str, state_size: int = 5) -> int:
-    """Parses GRU-ODE latent width from model filename (fallback only)."""
-    m = re.findall(r"_(\d+)hid_", model_basename)
-    if not m:
-        return max(2 * state_size, 100)
-    nhidden = int(m[-1])
-    return max(2 * state_size, nhidden // 2 if nhidden >= 20 else 16)
-
-
-def _static_dim(shape_entry) -> int | None:
-    """Returns an int if an ONNX shape entry is a concrete dimension, else None."""
-    if isinstance(shape_entry, int) and shape_entry > 0:
-        return shape_entry
-    return None
-
-
-def resolve_latent_dim(
-    ort_sess: onnxruntime.InferenceSession,
-    model_basename: str,
-    state_size: int = 5,
-) -> int:
-    """Determines the true latent width from the ONNX field graph.
-
-    The autonomous field graph has I/O width ``state_size + latent_dim``. Reading
-    it directly from the graph is authoritative and immune to filename-token drift,
-    so we prefer it and only fall back to parsing the filename when the graph
-    reports a dynamic/symbolic last axis.
-    """
-    for io in (ort_sess.get_outputs()[0], ort_sess.get_inputs()[0]):
-        last = _static_dim(io.shape[-1]) if io.shape else None
-        if last is not None and last > state_size:
-            return last - state_size
-    # Graph reported a symbolic axis; fall back to the filename token.
-    return infer_latent_dim(model_basename, state_size)
-
-
-def evaluate_field(ort_sess, state_full_scaled: np.ndarray) -> np.ndarray:
-    """Evaluates the ONNX autonomous field graph safely."""
-    out = ort_sess.run(["output"], {"input": state_full_scaled.astype(np.float32)})[-1].reshape(-1)
-    return out
-
-
-def integrate_one_step_rk4(
-    ort_sess,
-    x_full_scaled: np.ndarray,
-    out_dt: float,
-    sub_dt: float,
-) -> np.ndarray:
-    """Advances continuous state [y_scaled, h] by out_dt using RK4 sub-stepping with divergence guards."""
-    n_sub = max(1, int(round(out_dt / sub_dt)))
-    h_step = out_dt / n_sub
-    x = np.asarray(x_full_scaled, dtype=np.float64).reshape(-1).copy()
-
-    for _ in range(n_sub):
-        if not np.all(np.isfinite(x)):
-            x[:] = np.nan
-            return x
-
-        k1 = evaluate_field(ort_sess, x)
-        if not np.all(np.isfinite(k1)):
-            x[:] = np.nan
-            return x
-
-        k2 = evaluate_field(ort_sess, x + 0.5 * h_step * k1)
-        if not np.all(np.isfinite(k2)):
-            x[:] = np.nan
-            return x
-
-        k3 = evaluate_field(ort_sess, x + 0.5 * h_step * k2)
-        if not np.all(np.isfinite(k3)):
-            x[:] = np.nan
-            return x
-
-        k4 = evaluate_field(ort_sess, x + h_step * k3)
-        if not np.all(np.isfinite(k4)):
-            x[:] = np.nan
-            return x
-
-        x = x + (h_step / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
-
-    return x
-
-
-def rollout_single_trajectory(
-    truth_states: np.ndarray,
-    guide_point_ecef: np.ndarray,
-    ort_sess: onnxruntime.InferenceSession,
-    enc_sess: onnxruntime.InferenceSession,
-    scaler,
-    model_basename: str,
-    dt: float = 1.0,
-    sub_steps: int = 4,
-    max_steps: int | None = None,
-) -> np.ndarray:
-    """Performs in-memory trajectory rollout with strict pre-transform finiteness guards."""
-    state_size = 5  # Integrated geodesic frame
-    # Authoritative latent width comes from the ONNX field graph, not the filename.
-    latent_dim = resolve_latent_dim(ort_sess, model_basename, state_size)
-    field_width = state_size + latent_dim
-    training_dt = infer_training_dt(model_basename, default=1.0)
-    sub_dt = training_dt / max(1, sub_steps)
-
-    # 1. Transform initial ECEF state (t0) to 5-state integrated geodesic frame
-    t0 = truth_states[0, TIME_INDEX]
-    p0_ecef = truth_states[0, POS_SLICE]
-    v0_ecef = truth_states[0, VEL_SLICE]
-
-    y0_phys, az0_rad = ecef_to_local_geodesic_vec_frame_trick(
-        np.atleast_2d(p0_ecef),
-        np.atleast_2d(v0_ecef),
-        guide_point_ecef,
-    )
-    y0_phys = np.atleast_2d(y0_phys)[0]  # [s, h, v_s, v_alpha, v_h]
-
-    # 2. Scale physical initial state & seed latent state h0 via encoder
-    y0_scaled = scaler.transform(np.asarray([y0_phys]))[0]
-    h_current = enc_sess.run(["h0"], {"y0": y0_scaled.astype(np.float32).reshape(-1)})[-1].reshape(-1)
-
-    # Initialize rollout trajectory array: [time, s, h, v_s, v_alpha, v_h]
-    current_time = float(t0)
-    max_stop_time = float(truth_states[-1, TIME_INDEX])
-    geodesic_records = [np.hstack([current_time, y0_phys])]
-
-    # Carry the *scaled* physical state forward across steps. The evolved scaled
-    # partition produced by RK4 (next_full[:state_size]) is fed directly into the
-    # next step; scaler.inverse_transform is used only to record physical units.
-    cur_scaled = np.asarray(y0_scaled, dtype=np.float64).reshape(-1)
-
-    # 3. Continuous-time RK4 integration loop
-    #    Optionally cap the number of forward steps. The model here was trained on
-    #    fixed-length sliding windows (see `_<N>win_` in the model name), so its
-    #    free-run dynamics are only well-constrained within ~that horizon; capping
-    #    lets you evaluate within the trained regime instead of extrapolating.
-    step_count = 0
-    while current_time < max_stop_time:
-        if max_steps is not None and step_count >= max_steps:
-            break
-        current_time += dt
-        step_count += 1
-
-        x_full = np.concatenate([cur_scaled, h_current])
-        next_full = integrate_one_step_rk4(ort_sess, x_full, out_dt=dt, sub_dt=sub_dt)
-
-        # PRE-TRANSFORM GUARD: stop cleanly if *any* channel (physical or latent)
-        # diverged to Inf/NaN, before touching scaler.inverse_transform.
-        if next_full.shape[0] != field_width or not np.all(np.isfinite(next_full)):
-            break
-
-        next_scaled = next_full[:state_size]
-        h_current = next_full[state_size:field_width]
-        next_phys = scaler.inverse_transform(next_scaled.reshape(1, -1))[0]
-
-        # Stop condition: Ground impact (altitude h <= 0)
-        if next_phys[1] <= 0.0:
-            break
-
-        # Advance using the evolved scaled state (no re-scale round-trip).
-        cur_scaled = next_scaled
-        geodesic_records.append(np.hstack([current_time, next_phys]))
-
-    geodesic_matrix = np.vstack(geodesic_records)
-    if geodesic_matrix.shape[0] < 3:
-        return None
-
-    # 4. Convert predicted geodesic trajectory back to ECEF positions and velocities
-    ecef_pos_vel = local_geodesic_to_ecef_vec_frame_trick(
-        geodesic_matrix[:, 0:6], guide_point_ecef, az0_rad
-    )
-    pred_ecef_traj = np.hstack([geodesic_matrix[:, TIME_INDEX][..., np.newaxis], ecef_pos_vel])[:, :7]
-    return pred_ecef_traj
-
-
-def align_trajectories(truth_traj: np.ndarray, pred_traj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Aligns truth states onto prediction timestamps via linear interpolation."""
-    pred_times = pred_traj[:, TIME_INDEX]
-    truth_times = truth_traj[:, TIME_INDEX]
-
-    valid_mask = (pred_times >= truth_times[0]) & (pred_times <= truth_times[-1])
-    pred_traj_clipped = pred_traj[valid_mask]
-    eval_times = pred_traj_clipped[:, TIME_INDEX]
-
-    if eval_times.size == 0:
-        raise ValueError(
-            "No temporal overlap between prediction and truth after clipping to "
-            "truth support; nothing to align."
-        )
-
-    # eval_times is already clipped to [truth_times[0], truth_times[-1]], so no
-    # extrapolation is expected. Make it an error rather than silent garbage if a
-    # sample ever falls outside the truth support (e.g. floating-point drift).
-    interp_fn = interp1d(
-        truth_times,
-        truth_traj[:, 1:7],
-        axis=0,
-        kind="linear",
-        bounds_error=False,
-        fill_value=np.nan,
-    )
-    truth_aligned_states = interp_fn(eval_times)
-    if not np.all(np.isfinite(truth_aligned_states)):
-        # Clamp the (at most endpoint) out-of-range samples back onto the support
-        # and re-evaluate, so endpoint float drift doesn't NaN the whole run.
-        eval_times = np.clip(eval_times, truth_times[0], truth_times[-1])
-        truth_aligned_states = interp_fn(eval_times)
-    truth_aligned = np.hstack([eval_times[:, None], truth_aligned_states])
-
-    return truth_aligned, pred_traj_clipped
-
-
-def compute_trajectory_metrics(truth_traj: np.ndarray, pred_traj: np.ndarray, traj_name: str) -> dict:
-    """Computes quantitative evaluation metrics."""
-    truth_aligned, pred_clipped = align_trajectories(truth_traj, pred_traj)
-
-    pos_truth = truth_aligned[:, POS_SLICE]
-    pos_pred = pred_clipped[:, POS_SLICE]
-    vel_truth = truth_aligned[:, VEL_SLICE]
-    vel_pred = pred_clipped[:, VEL_SLICE]
-
-    pos_errors = np.linalg.norm(pos_pred - pos_truth, axis=1)
-    vel_errors = np.linalg.norm(vel_pred - vel_truth, axis=1)
-
-    duration = float(pred_clipped[-1, TIME_INDEX] - pred_clipped[0, TIME_INDEX])
-
-    return {
-        "trajectory": traj_name,
-        "mean_pos_error_m": float(np.mean(pos_errors)),
-        "mean_vel_error_ms": float(np.mean(vel_errors)),
-        "final_pos_error_m": float(pos_errors[-1]),
-        "max_pos_error_m": float(np.max(pos_errors)),
-        "rmse_pos_m": float(np.sqrt(np.mean(pos_errors**2))),
-        "duration_s": duration,
-        "_pos_errors_m": pos_errors,
-        "_truth_aligned": truth_aligned,
-        "_pred_clipped": pred_clipped,
-    }
-
-
-def transform_to_dcu(p_ecef: np.ndarray, impact_ecef: np.ndarray, ref_angle: float) -> np.ndarray:
-    """Converts ECEF positions to Downrange, Crossrange, Up (DCU)."""
-    N = p_ecef.shape[0]
-    dcu = np.empty((N, 3))
-    for i in range(N):
-        p_ned = ecef_to_ned(p_ecef[i], impact_ecef)
-        dcu[i] = ned_to_dcu(p_ned, ref_angle)
-    return dcu
-
-
-def plot_trajectory_dashboard(
-    metrics: dict,
-    impact_ecef: np.ndarray,
-    output_dir: str = None,
-    show_plot: bool = False,
-):
-    """Renders the 6-panel trajectory evaluation dashboard."""
-    truth_traj = metrics["_truth_aligned"]
-    pred_traj = metrics["_pred_clipped"]
-    pos_errors = metrics["_pos_errors_m"]
-    traj_name = metrics["trajectory"]
-
-    ref_vel_ned = ecef_to_ned_velocity(truth_traj[0, VEL_SLICE], impact_ecef)
-    ref_angle = np.arctan2(ref_vel_ned[1], ref_vel_ned[0]) + np.pi
-
-    truth_dcu = transform_to_dcu(truth_traj[:, POS_SLICE], impact_ecef, ref_angle)
-    pred_dcu = transform_to_dcu(pred_traj[:, POS_SLICE], impact_ecef, ref_angle)
-
-    N_t = truth_traj.shape[0]
-    N_p = pred_traj.shape[0]
-    truth_alt_km = np.array([ecef_to_geodetic(*truth_traj[i, POS_SLICE])[2] for i in range(N_t)]) / 1000.0
-    pred_alt_km = np.array([ecef_to_geodetic(*pred_traj[i, POS_SLICE])[2] for i in range(N_p)]) / 1000.0
-
-    time_s = pred_traj[:, TIME_INDEX]
-    truth_dr_km = truth_dcu[:, 0] / 1000.0
-    pred_dr_km = pred_dcu[:, 0] / 1000.0
-    truth_cr_km = truth_dcu[:, 1] / 1000.0
-    pred_cr_km = pred_dcu[:, 1] / 1000.0
-
-    truth_speed = np.linalg.norm(truth_traj[:, VEL_SLICE], axis=1)
-    pred_speed = np.linalg.norm(pred_traj[:, VEL_SLICE], axis=1)
-    pos_errors_km = pos_errors / 1000.0
-
-    fig = plt.figure(figsize=(14, 8), constrained_layout=True)
-    fig.suptitle(f"{traj_name}", fontsize=13, fontweight="bold")
-
-    c_truth = "navy"
-    c_pred = "crimson"
-
-    # 1. Altitude vs Downrange
-    ax1 = fig.add_subplot(2, 3, 1)
-    ax1.plot(truth_dr_km, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
-    ax1.plot(pred_dr_km, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
-    ax1.set_title("Altitude vs Downrange")
-    ax1.set_xlabel("Downrange (km)")
-    ax1.set_ylabel("Altitude (km)")
-    ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="upper right")
-
-    # 2. Crossrange vs Downrange
-    ax2 = fig.add_subplot(2, 3, 2)
-    ax2.plot(truth_dr_km, truth_cr_km, color=c_truth, linestyle="-", label="Truth")
-    ax2.plot(pred_dr_km, pred_cr_km, color=c_pred, linestyle="--", label="Prediction")
-    ax2.set_title("Crossrange vs Downrange")
-    ax2.set_xlabel("Downrange (km)")
-    ax2.set_ylabel("Crossrange (km)")
-    ax2.grid(True, alpha=0.3)
-    ax2.legend(loc="upper left")
-
-    # 3. Position Error vs Time
-    mean_err_m = int(round(metrics["mean_pos_error_m"]))
-    ax3 = fig.add_subplot(2, 3, 3)
-    ax3.plot(time_s, pos_errors_km, color=c_pred, linestyle="-")
-    ax3.axhline(1.0, color="green", linestyle="--", label="1km target")
-    ax3.set_title(f"Position Error (Mean: {mean_err_m}m)")
-    ax3.set_xlabel("Time (s)")
-    ax3.set_ylabel("Position Error (km)")
-    ax3.grid(True, alpha=0.3)
-    ax3.legend(loc="upper left")
-
-    # 4. Altitude vs Time
-    ax4 = fig.add_subplot(2, 3, 4)
-    ax4.plot(time_s, truth_alt_km, color=c_truth, linestyle="-", label="Truth")
-    ax4.plot(time_s, pred_alt_km, color=c_pred, linestyle="--", label="Prediction")
-    ax4.set_title("Altitude vs Time")
-    ax4.set_xlabel("Time (s)")
-    ax4.set_ylabel("Altitude (km)")
-    ax4.grid(True, alpha=0.3)
-    ax4.legend(loc="upper right")
-
-    # 5. Speed vs Time
-    ax5 = fig.add_subplot(2, 3, 5)
-    ax5.plot(time_s, truth_speed, color=c_truth, linestyle="-", label="Truth")
-    ax5.plot(time_s, pred_speed, color=c_pred, linestyle="--", label="Prediction")
-    ax5.set_title("Speed vs Time")
-    ax5.set_xlabel("Time (s)")
-    ax5.set_ylabel("Speed (m/s)")
-    ax5.grid(True, alpha=0.3)
-    ax5.legend(loc="upper right")
-
-    # 6. 3D Trajectory (ECEF)
-    ax6 = fig.add_subplot(2, 3, 6, projection="3d")
-    ax6.plot(
-        truth_traj[:, 1] / 1000.0,
-        truth_traj[:, 2] / 1000.0,
-        truth_traj[:, 3] / 1000.0,
-        color=c_truth,
-        linestyle="-",
-        label="Truth",
-    )
-    ax6.plot(
-        pred_traj[:, 1] / 1000.0,
-        pred_traj[:, 2] / 1000.0,
-        pred_traj[:, 3] / 1000.0,
-        color=c_pred,
-        linestyle="--",
-        label="Prediction",
-    )
-    ax6.set_title("3D Trajectory (ECEF)")
-    ax6.set_xlabel("X (km)", labelpad=2)
-    ax6.set_ylabel("Y (km)", labelpad=2)
-    ax6.set_zlabel("Z (km)", labelpad=2)
-    ax6.tick_params(axis="both", which="major", labelsize=7)
-    ax6.legend(loc="upper right")
-
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-        out_file = os.path.join(output_dir, f"{traj_name}_dashboard.png")
-        fig.savefig(out_file, bbox_inches="tight")
-
-    if show_plot:
-        plt.show()
-    plt.close(fig)
-
-
-def print_csv_metrics_table(all_metrics: list[dict]):
-    """Outputs evaluation metrics formatted as CSV to the terminal."""
-    fieldnames = [
-        "trajectory",
-        "mean_pos_error_m",
-        "mean_vel_error_ms",
-        "final_pos_error_m",
-        "max_pos_error_m",
-        "rmse_pos_m",
-        "duration_s",
-    ]
-
-    print("\n" + ",".join(fieldnames))
-    for m in all_metrics:
-        row_str = (
-            f"{m['trajectory']},"
-            f"{m['mean_pos_error_m']:.2f},"
-            f"{m['mean_vel_error_ms']:.2f},"
-            f"{m['final_pos_error_m']:.2f},"
-            f"{m['max_pos_error_m']:.2f},"
-            f"{m['rmse_pos_m']:.2f},"
-            f"{m['duration_s']:.1f}"
-        )
-        print(row_str)
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Standalone Model Evaluator (Pure In-Memory Evaluation, Zero simple_sim Dependencies)"
-    )
-    parser.add_argument(
-        "-t", "--truths", nargs="+", required=True, help="Path to truth CSV file(s) or directory"
-    )
-    parser.add_argument("-m", "--model", required=True, help="Path to trained ONNX model (.onnx)")
-    parser.add_argument(
-        "-s", "--scalar", default=None, help="Path to scalar pickle file (auto-inferred if omitted)"
-    )
-    parser.add_argument("-o", "--output-dir", required=True, help="Directory to save output dashboard PNGs")
-    parser.add_argument("--dt", type=float, default=1.0, help="Output time step [s]")
-    parser.add_argument(
-        "--sub-steps",
-        type=int,
-        default=4,
-        help="RK4 sub-steps per interval (default 4 to match training TorchdiffeqSolver substeps=4)",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="Cap the rollout at this many forward steps (e.g. the training window length "
-        "such as 60). Default: no cap (roll out to the end of the truth trajectory).",
-    )
-    parser.add_argument("--show", action="store_true", help="Display interactive plots")
-
-    args = parser.parse_args()
-
-    # 1. Resolve ONNX Model and Encoder Sessions
-    if not os.path.exists(args.model):
-        raise FileNotFoundError(f"ONNX model file not found at: {args.model}")
-
-    model_dir = os.path.dirname(args.model)
-    model_basename = os.path.basename(args.model)
-    enc_path = re.sub(r"\.onnx$", "_encoder.onnx", args.model)
-
-    if not os.path.exists(enc_path):
-        raise FileNotFoundError(f"Companion encoder graph not found at: {enc_path}")
-
-    ort_sess = onnxruntime.InferenceSession(args.model)
-    enc_sess = onnxruntime.InferenceSession(enc_path)
-
-    # 2. Resolve Scaler Pickle
-    if args.scalar is None or not os.path.exists(args.scalar):
-        clean_basename = re.sub(r"\.onnx$", "", model_basename)
-        possible_scalar = os.path.join(model_dir, f"{clean_basename}_scalar.pickle")
-        if os.path.exists(possible_scalar):
-            args.scalar = possible_scalar
-        else:
-            raise FileNotFoundError(f"Scaler pickle file not found at {possible_scalar}")
-
-    with open(args.scalar, "rb") as f:
-        scaler = pickle.load(f)
-
-    # 3. Expand Truth Trajectory Files
-    truth_files = []
-    for entry in args.truths:
-        if os.path.isdir(entry):
-            truth_files.extend(glob.glob(os.path.join(entry, "**", "*.csv"), recursive=True))
-            truth_files.extend(glob.glob(os.path.join(entry, "*.csv")))
-        else:
-            truth_files.append(entry)
-
-    truth_files = sorted(list(set(truth_files)))
-    if not truth_files:
-        print("No truth CSV files found matching input paths.")
-        sys.exit(1)
-
-    print(f"\n--- Running Standalone Direct Model Evaluation ---")
-    print(f"Model: {model_basename}")
-    print(f"Truth Trajectories: {len(truth_files)}\n")
-
-    all_metrics = []
-
-    # 4. Loop Through Trajectories and Evaluate (with Loading & Rollout Guards)
-    for t_path in truth_files:
-        base_name = os.path.basename(t_path)
-        traj_name = base_name.replace(".csv", "")
-
-        try:
-            # ECEF truth is [time, pos(3), vel(3)] = 7 columns; match load_data_dir.
-            truth_states = load_single_truth(t_path, min_state_vector_size=7)
-        except Exception as e:
-            print(f"[Skip] Could not parse truth file {base_name}: {e}")
-            continue
-
-        if truth_states is None or len(truth_states) < 3:
-            print(f"[Skip] Truth trajectory {base_name} has too few states")
-            continue
-
-        guide_point_ecef = load_phase_guide_point(t_path, truth_states)
-
-        try:
-            pred_ecef_traj = rollout_single_trajectory(
-                truth_states,
-                guide_point_ecef,
-                ort_sess,
-                enc_sess,
-                scaler,
-                model_basename,
-                dt=args.dt,
-                sub_steps=args.sub_steps,
-                max_steps=args.max_steps,
-            )
-        except Exception as e:
-            print(f"[Skip] Rollout raised for {base_name}: {e}")
-            continue
-
-        if pred_ecef_traj is None or len(pred_ecef_traj) < 3:
-            print(f"[Skip] Trajectory rollout failed or was too short for {base_name}")
-            continue
-
-        # Compute metrics & generate dashboard (guarded so one bad trajectory
-        # cannot abort the whole batch).
-        try:
-            metrics = compute_trajectory_metrics(truth_states, pred_ecef_traj, traj_name)
-        except Exception as e:
-            print(f"[Skip] Metric computation failed for {base_name}: {e}")
-            continue
-
-        all_metrics.append(metrics)
-
-        try:
-            plot_trajectory_dashboard(
-                metrics,
-                guide_point_ecef,
-                output_dir=args.output_dir,
-                show_plot=args.show,
-            )
-        except Exception as e:
-            print(f"[Warn] Dashboard rendering failed for {base_name}: {e}")
-
-    if not all_metrics:
-        print("Error: No trajectory evaluations completed successfully.")
-        sys.exit(1)
-
-    # 5. Output CSV Table to Terminal
-    print_csv_metrics_table(all_metrics)
-
-
-if __name__ == "__main__":
-    main()
+trajectory,mean_pos_error_m,mean_vel_error_ms,final_pos_error_m,max_pos_error_m,rmse_pos_m,duration_s
+Albuqurque_lp10_ECEF,425372.29,66018.81,3748175.98,3748175.98,908461.96,313.0
+Albuqurque_lp11_ECEF,37347.22,2026.42,229374.46,229374.46,59278.52,156.0
+Albuqurque_lp12_ECEF,1084632.92,211004.61,5831714.73,5977338.66,1808192.78,298.0
+Albuqurque_lp14_ECEF,1014883.32,230026.45,6000341.35,6139893.77,1807945.20,316.0
+Albuqurque_lp15_ECEF,972658.98,247869.05,6220527.67,6353463.26,1861718.23,320.0
+Albuqurque_lp16_ECEF,184641.22,8523.88,767880.87,767880.87,299114.14,292.0
+Albuqurque_lp17_ECEF,955926.43,270650.55,6368815.89,6472648.30,1941447.88,320.0
+Albuqurque_lp18_ECEF,13150.31,391.26,11730.36,18885.55,14307.08,80.0
+Albuqurque_lp19_ECEF,424978.92,67272.86,3520917.78,3520917.78,889474.56,271.0
+Albuqurque_lp20_ECEF,90128.78,3408.83,431202.82,431202.82,143940.11,193.0
+Albuqurque_lp2_ECEF,1001375.54,26410092.86,2367593.31,6386550.59,1790783.35,322.0
+Albuqurque_lp3_ECEF,20922.85,758.51,24561.24,37742.37,24389.20,165.0
+Albuqurque_lp6_ECEF,801255.55,238031.64,6488675.37,6488675.37,1722224.11,349.0
+Albuqurque_lp7_ECEF,96290.50,3457.72,516304.74,516304.74,157020.28,200.0
+Albuqurque_lp8_ECEF,1023139.71,211547.30,6227401.93,6365951.22,1804933.61,319.0
+Atlanta_lp10_ECEF,95894.48,3057.37,474785.03,474785.03,151364.34,211.0
+Atlanta_lp11_ECEF,1105061.84,58439818.29,2779248.32,6425988.90,1863375.15,302.0
+Atlanta_lp14_ECEF,885128.57,236124.77,6324278.03,6439580.97,1823985.76,344.0
+Atlanta_lp15_ECEF,991478.56,338457594.47,9370097.95,9370097.95,1871854.89,323.0
+Atlanta_lp19_ECEF,36011.16,1648.33,187629.94,187629.94,51606.35,163.0
+Atlanta_lp1_ECEF,1014462.49,237795.84,5864997.23,6045839.30,1818445.54,316.0
+Atlanta_lp20_ECEF,979041.11,234271.55,6058821.09,6203305.06,1810784.17,329.0
+Atlanta_lp2_ECEF,443016.34,77346.74,3853291.50,3853291.50,938524.27,282.0
+Atlanta_lp3_ECEF,999868.84,245716.24,6004040.45,6260999.12,1822830.11,312.0
+Atlanta_lp4_ECEF,23780.76,879.81,100820.77,100820.77,34795.46,166.0
+Atlanta_lp5_ECEF,373573.39,20057.30,1269351.81,1269351.81,593673.13,310.0
+Atlanta_lp6_ECEF,1008589.04,291259.34,6492604.61,6578117.67,2015157.59,315.0
+Atlanta_lp9_ECEF,679514.28,161289.08,5338254.37,5338254.37,1397292.47,293.0
+Boise_lp10_ECEF,929764.49,210958.20,6213811.48,6353226.25,1752270.04,338.0
+Boise_lp11_ECEF,805555.93,226909.90,6102656.07,6102656.07,1672460.98,304.0
+Boise_lp12_ECEF,288512.08,13796.10,1259364.40,1296371.89,523017.17,240.0
+Boise_lp13_ECEF,233677.51,10781.46,1018035.99,1037224.38,414850.04,230.0
+Boise_lp14_ECEF,23237.76,465.60,34466.77,34466.77,24618.07,133.0
+Boise_lp15_ECEF,177959.58,8441.00,1087052.86,1087052.86,346444.19,222.0
+Boise_lp16_ECEF,39866.22,1450.67,189126.58,189126.58,61802.82,179.0
+Boise_lp17_ECEF,69044.16,1173.76,198233.82,198363.34,92764.08,232.0
+Boise_lp18_ECEF,275230.03,13017.17,1038558.70,1114059.18,475446.27,241.0
+Boise_lp19_ECEF,314238.17,16102.67,935691.07,989692.06,490364.59,265.0
+Boise_lp1_ECEF,1543141.12,176535.86,6574861.35,6662679.79,2373958.45,287.0
+Boise_lp2_ECEF,1075528.40,366193949.46,9030943.68,9030943.68,1875169.26,312.0
+Boise_lp3_ECEF,1085324.84,209212.68,6295418.05,6447383.07,1866738.65,306.0
+Boise_lp4_ECEF,923235.52,221834.81,6299883.86,6412271.46,1779377.58,338.0
+Boise_lp5_ECEF,964927.28,208170.59,6224130.91,6357279.09,1770060.54,326.0
+Boise_lp6_ECEF,924513.48,218028.43,6292393.19,6409463.34,1769993.83,335.0
+Boise_lp7_ECEF,881716.54,232947.64,6383726.05,6503842.56,1818116.67,349.0
+Boise_lp8_ECEF,1070613.20,193251.41,6310828.32,6428370.72,1833432.25,314.0
+Boise_lp9_ECEF,854524.89,211648.02,6246434.01,6368169.80,1711968.21,363.0
+Cheyenne_lp10_ECEF,972720.32,244356.46,6327287.75,6465237.51,1876108.36,326.0
+Cheyenne_lp11_ECEF,6505.96,231.08,10405.48,10405.48,7403.49,51.0
+Cheyenne_lp12_ECEF,1039995.42,397815235.80,9047249.17,9047249.17,1866088.34,308.0
+Cheyenne_lp13_ECEF,1013691.62,227412.72,6024731.37,6172311.08,1807345.77,314.0
+Cheyenne_lp15_ECEF,977159.31,240773.36,6304437.84,6409241.02,1839172.58,316.0
+Cheyenne_lp16_ECEF,442530.23,71260.79,4043826.83,4043826.83,924891.47,338.0
+Cheyenne_lp17_ECEF,963514.98,246072.72,6206716.25,6338721.15,1853716.47,323.0
+Cheyenne_lp18_ECEF,995923.13,288554.65,6507614.31,6610045.20,2014381.59,319.0
+Cheyenne_lp19_ECEF,653222.74,153218.09,5426517.69,5426517.69,1368107.50,321.0
+Cheyenne_lp1_ECEF,1041608.18,203271.22,6368294.29,6467970.04,1822025.29,312.0
+Cheyenne_lp20_ECEF,397011.76,12722.44,1781600.65,1781600.65,677018.46,357.0
+Cheyenne_lp3_ECEF,137709.10,5169.31,478167.70,497310.61,209359.10,250.0
+Cheyenne_lp4_ECEF,57401.09,1169.66,141142.63,141221.32,71910.67,202.0
+Cheyenne_lp5_ECEF,308039.20,15245.24,900918.21,968843.90,469759.91,287.0
+Cheyenne_lp6_ECEF,983883.18,269208.09,6501080.79,6607399.05,1960257.38,328.0
+Cheyenne_lp7_ECEF,25578.49,813.83,32834.48,44755.68,29249.80,187.0
+Cheyenne_lp8_ECEF,367915.03,18593.83,1029544.49,1129830.21,553228.58,296.0
+Chicago_lp10_ECEF,993808.68,258095.05,6421008.41,6523959.26,1904284.42,310.0
+Chicago_lp12_ECEF,47228.51,1068.70,82922.32,98883.88,56105.11,211.0
+Chicago_lp13_ECEF,49390.80,1077.11,117156.34,117350.08,60680.44,209.0
+Chicago_lp18_ECEF,323554.14,17615.87,1001522.64,1028535.13,501659.37,299.0
+Chicago_lp19_ECEF,33378.75,1671.03,183303.69,183303.69,48334.17,157.0
+Chicago_lp20_ECEF,8451.14,289.80,10033.40,12331.97,9353.81,64.0
+Chicago_lp3_ECEF,91082.06,2888.36,332140.66,334889.76,132142.23,230.0
+Chicago_lp4_ECEF,809940.62,233818.08,6194470.22,6194470.22,1686874.74,309.0
+Chicago_lp5_ECEF,963592.36,265617.18,6271896.35,6425090.55,1900967.69,330.0
+Chicago_lp6_ECEF,1047350.73,287807.35,6595137.79,6711143.96,2030030.04,313.0
+Chicago_lp7_ECEF,753089.55,196596.52,5780908.77,5780908.77,1567437.03,297.0
+Chicago_lp8_ECEF,1020542.64,234181.44,5806473.67,5963758.93,1809204.97,315.0
+Chicago_lp9_ECEF,3163.72,1083.39,6964.35,6964.35,3850.03,6.0
+Dallas_lp11_ECEF,206934.60,9143.21,657252.99,705817.09,324347.34,256.0
+Dallas_lp15_ECEF,219442.68,9980.10,851157.12,888654.32,373817.02,234.0
+Dallas_lp16_ECEF,181695.10,8638.79,669383.38,692302.92,302881.84,237.0
+Dallas_lp17_ECEF,86865.69,1151.05,164084.40,170427.92,105000.58,256.0
+Dallas_lp18_ECEF,977986.24,260016.24,6498872.92,6587760.71,1911768.07,317.0
+Dallas_lp19_ECEF,974453.36,237908.35,6323495.05,6439451.89,1837076.64,318.0
+Dallas_lp1_ECEF,1330114.28,89570267.05,3183940.37,6200356.46,2027513.81,288.0
+Dallas_lp20_ECEF,107991.98,4333.10,493651.85,493651.85,182320.95,201.0
+Dallas_lp2_ECEF,118571.96,7522.68,1022529.51,1022529.51,217772.35,240.0
+Dallas_lp3_ECEF,25270.65,566.31,51153.12,51153.12,31392.92,164.0
+Dallas_lp4_ECEF,1018819.54,316926.24,6033030.93,6573976.87,1905885.97,309.0
+Dallas_lp5_ECEF,29630.32,937.46,32784.27,55322.86,34437.15,187.0
+Dallas_lp6_ECEF,19369.80,562.04,23697.81,33293.65,22387.92,163.0
+Dallas_lp7_ECEF,196917.04,8303.37,886696.25,888661.42,339126.46,221.0
+Dallas_lp8_ECEF,69239.61,2211.01,283413.53,283413.53,103566.63,204.0
+Dallas_lp9_ECEF,25673.05,674.42,42582.42,48453.36,30945.63,218.0
+Denver_lp10_ECEF,900187.75,252104.33,6364652.63,6458141.19,1879429.68,343.0
+Denver_lp12_ECEF,1035823.47,224004.83,6188369.05,6324724.18,1827153.06,307.0
+Denver_lp14_ECEF,1009036.77,87540751.25,4160257.48,6216127.38,1821122.20,315.0
+Denver_lp15_ECEF,976122.14,240948.92,6336389.33,6461364.68,1857016.90,319.0
+Denver_lp16_ECEF,687374.37,172582.62,5612898.01,5612898.01,1458896.33,312.0
+Denver_lp17_ECEF,969648.83,254571.30,6269286.12,6390605.91,1883818.46,316.0
+Denver_lp18_ECEF,77330.54,1024.58,168211.07,168211.07,93784.76,269.0
+Denver_lp19_ECEF,270121.87,9320.37,1254716.35,1254716.35,460292.39,337.0
+Denver_lp20_ECEF,250290.66,12183.42,900867.77,900867.77,393282.05,284.0
+Denver_lp2_ECEF,917969.01,261723.31,6211548.28,6462352.96,1844698.81,340.0
+Denver_lp4_ECEF,78678.17,2711.87,353141.26,353141.26,122469.28,199.0
+Denver_lp7_ECEF,173720.53,7172.65,570442.38,604355.99,266740.29,262.0
+Denver_lp9_ECEF,925468.58,233447.95,6331491.20,6467569.95,1825451.31,339.0
+KC_lp10_ECEF,121115.49,5259.69,578629.90,578629.90,209137.64,200.0
+KC_lp12_ECEF,29421.68,1491.12,151933.72,151933.72,41768.32,155.0
+KC_lp13_ECEF,163322.58,3041.80,154985.94,413185.21,216829.53,277.0
+KC_lp14_ECEF,86597.03,1811.25,93751.57,217592.16,112557.44,238.0
+KC_lp15_ECEF,34496.87,889.65,41653.09,56477.61,39928.45,198.0
+KC_lp16_ECEF,43799.87,1213.62,145059.58,145059.58,55966.38,199.0
+KC_lp19_ECEF,385235.92,53844.66,3098672.62,3098672.62,769378.98,253.0
+KC_lp20_ECEF,917520.76,244955.23,6383741.22,6479850.27,1851675.77,364.0
+KC_lp2_ECEF,125702.35,4356.77,425940.82,437596.47,182886.29,254.0
+KC_lp3_ECEF,116670.76,7446.83,982324.88,982324.88,208464.27,231.0
+KC_lp5_ECEF,74043.99,3424.90,443208.12,443208.12,128868.24,176.0
+KC_lp6_ECEF,1049324.62,224219.48,5854251.57,6016980.91,1808515.70,310.0
+KC_lp7_ECEF,282632.54,14425.86,885612.53,1057864.26,471481.94,268.0
+KC_lp9_ECEF,119051.80,5241.75,752687.35,752687.35,214651.15,198.0
+LasVegas_lp11_ECEF,1044685.37,237491.67,5961893.86,6299776.15,1842616.83,305.0
+LasVegas_lp12_ECEF,979342.97,251663.04,6266594.70,6403305.07,1884433.76,331.0
+LasVegas_lp14_ECEF,350832.96,18297.59,1060742.93,1293521.77,585569.08,267.0
+LasVegas_lp15_ECEF,152414.34,6896.68,941805.97,941805.97,289954.20,220.0
+LasVegas_lp16_ECEF,7246.31,676.80,15696.61,15696.61,8808.98,23.0
+LasVegas_lp17_ECEF,43815.49,2226.38,283820.52,283820.52,75082.27,176.0
+LasVegas_lp18_ECEF,35485.72,890.93,42671.84,63628.74,40695.12,151.0
+LasVegas_lp19_ECEF,3627.79,1017.94,8514.87,8514.87,4474.99,8.0
+LasVegas_lp20_ECEF,272373.83,13596.59,847322.14,890293.88,428954.40,254.0
+LasVegas_lp2_ECEF,974464.28,198908.67,6267320.07,6401996.67,1764753.28,332.0
+LasVegas_lp3_ECEF,970237.80,270161.04,6551645.29,6658255.54,1967359.21,336.0
+LasVegas_lp4_ECEF,942167.54,228964.07,6406486.77,6522334.60,1831574.25,331.0
+LasVegas_lp5_ECEF,903145.54,209360.20,6245500.80,6365061.38,1732726.05,344.0
+LasVegas_lp6_ECEF,1170291.94,189522.94,6220935.69,6366289.95,1926028.19,295.0
+LasVegas_lp7_ECEF,894229.76,218712.98,6290813.59,6414697.25,1761162.33,344.0
+LasVegas_lp8_ECEF,955515.61,193978.41,6256051.83,6377359.34,1738192.58,336.0
+Phoenix_lp10_ECEF,1184224.40,199061.09,6283051.65,6408342.09,1923594.12,295.0
+Phoenix_lp12_ECEF,33016.47,759.49,51314.79,62636.79,39901.17,187.0
+Phoenix_lp14_ECEF,963954.25,271089.75,6293774.13,6435209.20,1921214.68,320.0
+Phoenix_lp15_ECEF,448493.96,25277.58,1462984.43,1462984.43,702444.17,329.0
+Phoenix_lp17_ECEF,145122.85,6111.81,546906.27,558499.67,236963.99,230.0
+Phoenix_lp18_ECEF,19138.40,418.11,29816.00,30190.19,21939.12,152.0
+Phoenix_lp19_ECEF,7735.48,543.77,16356.81,16356.81,9342.36,30.0
+Phoenix_lp1_ECEF,1001592.57,190511.81,6098026.89,6260779.65,1758295.49,333.0
+Phoenix_lp20_ECEF,30810.79,1022.89,134120.80,134120.80,46176.99,176.0
+Phoenix_lp3_ECEF,67182.67,1752.20,224537.68,224537.68,89406.01,223.0
+Phoenix_lp4_ECEF,936491.14,240738.71,6353876.12,6468808.15,1852169.41,328.0
+Phoenix_lp6_ECEF,888227.08,7021372.61,4979780.29,6451557.26,1773768.73,348.0
+Phoenix_lp9_ECEF,929714.84,206011.37,6244759.35,6356129.26,1735098.97,338.0

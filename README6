@@ -1,5 +1,4 @@
-# Copyright 2026 Lockheed Martin Corporation
-# Lockheed Martin Proprietary Information
+# neural_ode_mod.py
 
 """Base training class for a Neural Ordinary Differential Equation model."""
 
@@ -218,9 +217,22 @@ class NODEPredictor(nn.Module):
                     max_norm=1.0,  # <-- change this if you need a tighter/looser clip
                     norm_type=2.0,
                 )
-                # # (optional) log the pre‑clip norm so you can monitor it
+                # NON-FINITE GUARD: norm-based clipping does NOT rescue nan/inf
+                # gradients -- the clip coefficient max_norm/nan is itself nan, so
+                # the bad grads survive and optimizer.step() would write nan into
+                # every weight, permanently killing the run (frozen metrics for all
+                # subsequent epochs). If the loss or the grad norm is non-finite,
+                # skip this step entirely so one diverged batch cannot poison the
+                # model. This can happen at full trajectory length when the state
+                # passes through the geodesic-frame singularity (s -> 0).
+                loss_is_finite = torch.isfinite(batch_metrics["loss"]).item()
+                grad_is_finite = torch.isfinite(total_norm).item()
+                if loss_is_finite and grad_is_finite:
+                    self.optimizer.step()
+                else:
+                    self.optimizer.zero_grad(set_to_none=True)
+                # # (optional) log the pre-clip norm so you can monitor it
                 # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-                self.optimizer.step()
 
                 # Accumulate detached, size-weighted metrics for the epoch mean.
                 n_in_batch = len(batch_idx)

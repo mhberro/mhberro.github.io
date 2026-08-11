@@ -1,170 +1,264 @@
-# ensemble_sindy.py
-"""Ensemble-SINDy discovery module for sparse physical vector fields."""
-
-from __future__ import annotations
-
-import itertools
 import numpy as np
-import torch
-from torch import nn
+import pandas as pd
+import scipy
+from geographiclib.geodesic import Geodesic
 
+WGS84 = Geodesic.WGS84
+a = WGS84.a  # semi-major axis (m)
+f = WGS84.f  # flattening
+b = a * (1 - f)  # semi-minor axis (m)
+# Numerical guards near the reference-point singularity (s -> 0)
+S_EPS_M = 100.0
+M12_EPS_M = 1e-3
 
-class PolynomialLibrary:
-    def __init__(self, degree: int = 2, include_bias: bool = True):
-        self.degree = degree
-        self.include_bias = include_bias
+def ecef_to_geodetic(x, y, z):
+    """Scalar conversion using GeographicLib's exact algorithm."""
+    # lat, lon, h = Geodesic.WGS84._LatLonFromXYZ(x, y, z)
+    # return lat, lon, h
+    # TODO: Vermeille has a better method that Karney suggested updates to and then Vermeille updated in 2011. Update to using that rather than this Bowrank-like iterative method.
+    from coordinate_transform_functions import _ecef_to_lla
 
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n_samples, n_features = Y.shape
-        combos = []
-        for d in range(0 if self.include_bias else 1, self.degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+    lat, lon, h, _ = _ecef_to_lla(np.hstack([x, y, z]), deg=True)
 
-        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
-        for i, combo in enumerate(combos):
-            if len(combo) == 0:
-                library[:, i] = 1.0
-            else:
-                library[:, i] = np.prod(Y[:, combo], axis=1)
-        return library
+    return lat, lon, h
 
+def inverse_geodesic(lat0, lon0, lat, lon):
+    """
+    Scalar inverse geodesic. Returns distance (m), forward azimuth (deg),
+    reverse azimuth (deg), reduced length m12 (m), geodesic scale M12 (-).
+    """
+    mask = Geodesic.DISTANCE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
+    inv = WGS84.Inverse(lat0, lon0, lat, lon, outmask=mask)
+    return inv["s12"], inv["azi1"], inv["azi2"], inv["m12"], inv["M12"]
 
-def stridge(
-    Theta: np.ndarray,
-    Ydot: np.ndarray,
-    l1_threshold: float = 0.01,
-    ridge_kw: float = 1e-3,
-    max_iter: int = 25,
-) -> np.ndarray:
-    n_features = Theta.shape[1]
-    n_targets = Ydot.shape[1]
+def enu_rotation_matrix(lat0_rad, lon0_rad):
+    """Scalar rotation matrix from ECEF → ENU at (lat0,lon0) [radians]."""
+    sin_phi = np.sin(lat0_rad)
+    cos_phi = np.cos(lat0_rad)
+    sin_lam = np.sin(lon0_rad)
+    cos_lam = np.cos(lon0_rad)
 
-    col_norms = np.linalg.norm(Theta, axis=0)
-    col_norms[col_norms < 1e-8] = 1.0
-    Theta_norm = Theta / col_norms
+    R = np.array(
+        [
+            [-sin_lam, cos_lam, 0.0],
+            [-sin_phi * cos_lam, -sin_phi * sin_lam, cos_phi],
+            [cos_phi * cos_lam, cos_phi * sin_lam, sin_phi],
+        ]
+    )
+    return R
 
-    Xi_norm = np.linalg.lstsq(
-        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
-        Theta_norm.T @ Ydot,
-        rcond=None,
-    )[0]
+def _apply_rotation(R, vec):
+    """
+    Apply the same (3×3) rotation matrix `R` to an (N,3) array `vec`.
+    """
+    # Using @ works with both (3,3) @ (3,) and (3,3) @ (N,3).T
+    return (R @ vec.T).T
 
-    for _ in range(max_iter):
-        small_inds = np.abs(Xi_norm) < l1_threshold
-        Xi_norm[small_inds] = 0.0
-        for i in range(n_targets):
-            big_inds = ~small_inds[:, i]
-            if np.any(big_inds):
-                Theta_sub = Theta_norm[:, big_inds]
-                Xi_norm[big_inds, i] = np.linalg.lstsq(
-                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
-                    Theta_sub.T @ Ydot[:, i],
-                    rcond=None,
-                )[0]
+def deg2rad(x):
+    return np.deg2rad(x)
 
-    Xi = Xi_norm / col_norms[:, None]
-    return Xi
+def ecef_to_local_geodesic_vec(p_ecef, v_ecef, impact_ecef):
+    """
+    Vectorised conversion of whole trajectories.
 
+    Parameters
+    ----------
+    p_ecef : (N,3) array of positions (m)
+    v_ecef : (N,3) array of velocities (m/s)
+    a_ecef : (N,3) array of accelerations (m/s²)
+    impact_ecef : (3,) array - impact point in ECEF
+    lat0_deg, lon0_deg : impact latitude/longitude (deg)
+    h0 : impact height above ellipsoid (m) - usually 0
 
-class EnsembleSINDyDiscoverer:
-    def __init__(
-        self,
-        degree: int = 2,
-        n_bootstraps: int = 50,
-        subsample_ratio: float = 0.7,
-        l1_threshold: float = 0.01,
-        inclusion_prob_threshold: float = 0.40,
-        aggregation: str = "bragging",
-        pos_idx: list[int] | None = None,
-        vel_idx: list[int] | None = None,
-    ):
-        self.degree = degree
-        self.n_bootstraps = n_bootstraps
-        self.subsample_ratio = subsample_ratio
-        self.l1_threshold = l1_threshold
-        self.inclusion_prob_threshold = inclusion_prob_threshold
-        self.aggregation = aggregation
-        self.pos_idx = pos_idx
-        self.vel_idx = vel_idx
-        self.library_builder = PolynomialLibrary(degree=degree, include_bias=True)
+    Returns
+    -------
+    A dictionary where each entry is an (N,) NumPy array:
+        s   - geodesic distance from impact (m)
+        h   - relative height (m)   (trajectory h - h0)
+        az  - forward azimuth from impact (deg)
+        v_s - along-track speed (m/s)
+        v_α - azimuth rate (rad/s)
+        v_h - vertical speed (m/s)
+    """
+    N = p_ecef.shape[0]
 
-    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
-        Y_all, Ydot_all = [], []
-        for Y in Y_list:
-            if len(Y) < 5:
-                continue
-            Ydot = np.gradient(Y, dt, axis=0)
-            
-            # Enforce exact velocity identity for position derivative targets
-            if self.pos_idx is not None and self.vel_idx is not None:
-                for p_i, v_i in zip(self.pos_idx, self.vel_idx):
-                    Ydot[:, p_i] = Y[:, v_i]
+    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
 
-            Y_all.append(Y[2:-2])
-            Ydot_all.append(Ydot[2:-2])
+    # ------------------------------------------------------------------
+    # 1) Convert positions to lat/lon/h (scalar loop - cheap)
+    # ------------------------------------------------------------------
+    lat = np.empty(N)
+    lon = np.empty(N)
+    h = np.empty(N)
 
-        if len(Y_all) == 0:
-            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
+    for i in range(N):
+        lat[i], lon[i], h[i] = ecef_to_geodetic(*p_ecef[i])
 
-        Y_stacked = np.vstack(Y_all)
-        Ydot_stacked = np.vstack(Ydot_all)
+    # ------------------------------------------------------------------
+    # 2) Inverse geodesic for each point (scalar loop - still fast)
+    # ------------------------------------------------------------------
+    s = np.empty(N)
+    az_deg = np.empty(N)  # forward azimuth (deg)
+    m12 = np.empty(N)
+    M12 = np.empty(N)
 
-        Theta = self.library_builder.fit_transform(Y_stacked)
-        n_samples, n_terms = Theta.shape
-        n_targets = Ydot_stacked.shape[1]
+    for i in range(N):
+        s[i], az_deg[i], _, m12[i], M12[i] = inverse_geodesic(lat0_deg, lon0_deg, lat[i], lon[i])
 
-        bootstrap_coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
-        sub_size = int(n_samples * self.subsample_ratio)
+    az_rad = np.deg2rad(az_deg)
+    # ------------------------------------------------------------------
+    # 3) Build ENU rotation matrix once (same for whole trajectory)
+    # ------------------------------------------------------------------
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
 
-        for b in range(self.n_bootstraps):
-            indices = np.random.choice(n_samples, size=sub_size, replace=True)
-            Theta_b = Theta[indices]
-            Ydot_b = Ydot_stacked[indices]
-            bootstrap_coeffs[b] = stridge(
-                Theta_b, Ydot_b, l1_threshold=self.l1_threshold
-            )
+    # ------------------------------------------------------------------
+    # 4) Rotate velocities to ENU (vectorised)
+    # ------------------------------------------------------------------
+    v_enu = _apply_rotation(R, v_ecef)  # (N,3)
 
-        active_masks = np.abs(bootstrap_coeffs) > 1e-8
-        inclusion_probs = np.mean(active_masks, axis=0)
+    # ------------------------------------------------------------------
+    # 5) Build unit vectors that follow each geodesic direction
+    # ------------------------------------------------------------------
 
-        if self.aggregation == "bragging":
-            Xi_agg = np.median(bootstrap_coeffs, axis=0)
-        else:
-            Xi_agg = np.mean(bootstrap_coeffs, axis=0)
+    # Tangent (east-north) unit vector along the geodesic
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
 
-        Xi_agg[inclusion_probs < self.inclusion_prob_threshold] = 0.0
-        return Xi_agg, inclusion_probs
+    # Lateral unit vector (perpendicular to t_hat in the ENU plane)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
 
+    # ------------------------------------------------------------------
+    # 6) Velocity decomposition
+    # ------------------------------------------------------------------
+    v_s = np.einsum("ij,ij->i", t_hat, v_enu)  # dot product (N,)
+    v_l = np.einsum("ij,ij->i", l_hat, v_enu)  # lateral component
+    v_h = v_enu[:, 2]  # vertical
 
-class SINDyPhysicsModel(nn.Module):
-    def __init__(self, Xi: np.ndarray, state_vector_len: int = 5, degree: int = 2):
-        super().__init__()
-        self.degree = degree
-        self.state_vector_len = state_vector_len
-        self.register_buffer("Xi", torch.tensor(Xi, dtype=torch.float32))
+    # Azimuth rate (rad/s), stable near s=0
+    v_alpha = np.divide(
+        v_l,
+        m12,
+        out=np.zeros_like(v_l),
+        where=np.abs(m12) > M12_EPS_M,
+    )
+    v_alpha[np.abs(s) <= S_EPS_M] = 0.0
 
-        combos = []
-        for d in range(degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
-        self.combos = combos
+    # ------------------------------------------------------------------
+    # 8) Assemble results
+    # ------------------------------------------------------------------
+    state = np.column_stack((s, h - h0, v_s, v_alpha, v_h))
+    az_initial_rad = float(az_rad[0]) if N > 0 else 0.0
 
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        cols = []
-        for combo in self.combos:
-            if len(combo) == 0:
-                cols.append(torch.ones_like(y[..., :1]))
-            elif len(combo) == 1:
-                cols.append(y[..., combo[0] : combo[0] + 1])
-            elif len(combo) == 2:
-                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
-            elif len(combo) == 3:
-                cols.append(
-                    y[..., combo[0] : combo[0] + 1]
-                    * y[..., combo[1] : combo[1] + 1]
-                    * y[..., combo[2] : combo[2] + 1]
-                )
-            else:
-                raise NotImplementedError("Polynomial degree > 3 not supported.")
+    return state, az_initial_rad
 
-        Theta = torch.cat(cols, dim=-1)
-        return torch.matmul(Theta, self.Xi)
+def geodetic_to_ecef(lat, lon, h):
+    """Scalar conversion (deg, deg, m) → (x, y, z) in metres."""
+    lat_rad = deg2rad(lat)
+    lon_rad = deg2rad(lon)
+
+    sin_phi = np.sin(lat_rad)
+    cos_phi = np.cos(lat_rad)
+    sin_lam = np.sin(lon_rad)
+    cos_lam = np.cos(lon_rad)
+
+    N = a / np.sqrt(1 - (2 * f - f**2) * sin_phi**2)
+    x = (N + h) * cos_phi * cos_lam
+    y = (N + h) * cos_phi * sin_lam
+    z = ((1 - f) ** 2 * N + h) * sin_phi
+    return x, y, z
+
+def forward_geodesic(lat0, lon0, s, azi):
+    """
+    Scalar forward geodesic. Returns destination lat, lon, reverse azimuth,
+    reduced length, geodesic scale.
+    """
+    mask = Geodesic.LATITUDE | Geodesic.LONGITUDE | Geodesic.AZIMUTH | Geodesic.REDUCEDLENGTH | Geodesic.GEODESICSCALE
+    dirc = WGS84.Direct(lat0, lon0, azi, s, outmask=mask)
+    return dirc["lat2"], dirc["lon2"], dirc["azi2"], dirc["m12"], dirc["M12"]
+
+def _integrate_azimuth_from_rate(v_alpha, time_s, az_initial_rad):
+    """Integrate azimuth rate (rad/s) over explicit time vector."""
+    v_alpha = np.asarray(v_alpha, dtype=float).reshape(-1)
+    time_s = np.asarray(time_s, dtype=float).reshape(-1)
+
+    if v_alpha.shape[0] != time_s.shape[0]:
+        raise ValueError("v_alpha and time_s must have the same length")
+    if v_alpha.shape[0] == 0:
+        return np.asarray([], dtype=float)
+    if np.any(np.diff(time_s) < 0):
+        raise ValueError("time_s must be monotonic non-decreasing")
+
+    if v_alpha.shape[0] == 1:
+        return np.asarray([float(az_initial_rad)], dtype=float)
+    if v_alpha.shape[0] == 2:
+        return scipy.integrate.cumulative_trapezoid(v_alpha, time_s, initial=0.0) + float(az_initial_rad)
+    
+    return scipy.integrate.cumulative_simpson(v_alpha, x=time_s, initial=float(az_initial_rad))
+    
+def local_geodesic_to_ecef_vec(state, impact_ecef, az_initial_rad):
+    """
+    Convert a batch of geodesic-based states (as returned by
+    `ecef_to_local_geodesic_vec`) back to ECEF positions, velocities and
+    accelerations.
+
+    Parameters
+    ----------
+    state : dict of (N,) arrays
+        ["s", "az", "h", "v_s", "v_α", "v_h", "a_s", "a_α", "a_h"]
+          0    1     2    3      4      5      6      7      8
+    impact_ecef : (3,) array
+    lat0_deg, lon0_deg : impact latitude/longitude (deg)
+    h0 : impact height (m) - usually 0
+
+    Returns
+    -------
+    p_ecef, v_ecef, a_ecef : each an (N,3) array
+    """
+    time_s = np.asarray(state[:, 0], dtype=float)
+    state = state[:, 1:]
+
+    N = state.shape[0]
+
+    lat0_deg, lon0_deg, h0 = ecef_to_geodetic(*impact_ecef)
+
+    s = state[:, 0]
+    h_rel = state[:, 1]
+    v_s = state[:, 2]
+    v_alpha = state[:, 3]
+    v_h = state[:, 4]
+
+    az_rad = _integrate_azimuth_from_rate(v_alpha, time_s, az_initial_rad)
+
+    lat = np.empty(N)
+    lon = np.empty(N)
+
+    m12 = np.empty(N)
+    for i in range(N):
+        lat[i], lon[i], _, m12[i], _ = forward_geodesic(
+            lat0_deg, lon0_deg, s[i], np.rad2deg(az_rad[i])
+        )
+
+    v_l = v_alpha * m12
+    v_l[np.abs(m12) <= M12_EPS_M] = 0.0
+
+    # Unit vectors per sample (same definitions as in the forward routine)
+    t_hat = np.column_stack((np.sin(az_rad), np.cos(az_rad), np.zeros(N)))  # (N,3)
+    l_hat = np.column_stack((np.cos(az_rad), -np.sin(az_rad), np.zeros(N)))  # (N,3)
+    up_hat = np.array([0.0, 0.0, 1.0])
+
+    v_l = v_alpha * m12
+    v_l[np.abs(s) <= S_EPS_M] = 0.0
+    v_enu = (v_s[:, None] * t_hat) + (v_l[:, None] * l_hat) + (v_h[:, None] * up_hat)    
+    
+    p_ecef = np.empty((N, 3))
+    for i in range(N):
+        p_ecef[i] = geodetic_to_ecef(lat[i], lon[i], h0 + h_rel[i])
+    
+    R = enu_rotation_matrix(deg2rad(lat0_deg), deg2rad(lon0_deg))
+    v_ecef = _apply_rotation(R.T, v_enu)
+
+    # Add impact offset to positions (the geodetic conversion already gives
+    # absolute coordinates, so no extra offset is needed)
+    # (If you had stored the impact point in ECEF already you could also do:)
+    # p_ecef += impact_ecef   # <-- not required here
+
+    return np.hstack([p_ecef, v_ecef])

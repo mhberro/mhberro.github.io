@@ -1,5 +1,101 @@
-(.venv) e471302@usmk2tqq3hkk2 next % wc -l trajectory_library/phases/LowE_555063a9_HGV/impact/Atlanta_lp10_ECEF.csv       
-head -5 trajectory_library/phases/LowE_555063a9_HGV/impact/Atlanta_lp10_ECEF.csv
-       2 trajectory_library/phases/LowE_555063a9_HGV/impact/Atlanta_lp10_ECEF.csv
-time,x,y,z,vx,vy,vz
-554.607157616388,534811.142438191,-5274704.5299731,3545715.8309958,-864.881887528991,1628.24879321125,565.669771505244
+# load_truth.py
+
+import os
+from pathlib import Path
+
+import pandas as pd
+import numpy as np
+
+
+def _check_truth_loading(truth_states: np.typing.ArrayLike, debug=False, min_state_vector_size=10, min_timesteps=3):
+    # truth states are expected to be an array for format
+    # seconds from launch, position x3, velocity x3, acceleration x3, and then a bunch of other stuff
+    if len(truth_states.shape) != 2:
+        if debug:
+            print("the shape is not 2d", truth_states.shape)
+        return False
+    # Reject data that is too small in EITHER dimension. The previous form
+    # `not A and not B` is `not (A or B)`, which only rejected when both the row
+    # AND column checks failed, letting e.g. a (2, 20) file (too few timesteps)
+    # pass. The correct guard is `not (A and B)` = reject unless both hold.
+    #
+    # `min_timesteps` is the minimum row count. It defaults to 3 for trajectories,
+    # but reference-point files (e.g. a single-row impact ECEF state used only to
+    # define the frame origin) are legitimately 1 row and pass min_timesteps=1.
+    if not (truth_states.shape[0] >= min_timesteps and truth_states.shape[1] >= min_state_vector_size):
+        if debug:
+            print("the data is too small", truth_states.shape)
+        return False
+    try:
+        truth_states = truth_states.astype(np.float64)
+    except Exception as e:  # noqa: E722
+        if debug:
+            print("the data could not be cast to float64", truth_states)
+            print(e)
+        return False
+
+    # Validate the truth time states for repeated times or negative dt.
+    # (For a single-row reference file np.diff is empty and this is a no-op.)
+    diffs = np.diff(truth_states[:, 0])
+    if np.any(diffs <= 0):
+        if debug:
+            print("time is not incrementing correctly")
+        return False
+    return True
+
+
+def load_single_truth(
+    filepath: str, debug=False, low_memory=True, memory_map=False, min_state_vector_size=10, min_timesteps=3
+) -> np.ndarray:
+    # there are various truth formats. take guesses at what the format is. check if it loaded correctly
+    # returns a numpy array of the truth data
+    truth = pd.read_csv(filepath, header=None, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+        return truth
+    truth = pd.read_csv(filepath, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+        return truth
+    try:
+        truth = np.loadtxt(filepath, skiprows=1, dtype=np.float64)
+        if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+            return truth
+    except Exception as e:
+        if debug:
+            print(e)
+    truth = pd.read_csv(filepath, sep="\t", header=None, low_memory=low_memory, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+        return truth
+    truth = pd.read_fwf(filepath, skiprows=1, header=None, infer_nrows=10000, memory_map=memory_map).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+        return truth
+    truth = pd.read_table(filepath).values
+    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
+        return truth
+    raise ValueError(f"Unable to parse truth file {filepath}")
+
+
+def load_data_dir(path: str, trajectory_dt: float, use_grdth: bool, max_value=None, have_high_memory=False):
+    # max_value: sr or time
+    # create a list of the files that need to be loaded
+    traj_files = [Path(path, x) for x in sorted(os.listdir(path))]
+
+    if len(traj_files) == 0:
+        raise ValueError("bad target path", path)
+
+    # create a tuple with the data plus metadata
+    # TODO: Turn this into an object rather than a tuple
+    traj_targets = []  # list of tuples (ecef traj tables data loaded from truth files, traj_number/filename)
+    traj_targets = [
+        (
+            load_single_truth(
+                x, debug=False, low_memory=not have_high_memory, memory_map=have_high_memory, min_state_vector_size=7
+            ),
+            x.name,
+            max_value,
+            trajectory_dt,
+            use_grdth,
+        )
+        for x in traj_files
+    ]
+
+    return traj_targets

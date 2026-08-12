@@ -1,36 +1,19 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python standalone_direct_evaluator.py -m model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_0winsize/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn.onnx -t trajectory_library/phases/LowE_555063a9_HGV/glide/* -o standalone_eval_plots_lowe555_0winsize --sub-steps 4
+# Neural Extrapolator
+Neural Extrapolator (NEXT) is an advanced threat extrapolator based on Neural Ordinary Differential Equation (NODE) research.
 
---- Running Standalone Direct Model Evaluation ---
-Model: NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn.onnx
-Truth Trajectories: 28
+https://laic.global.lmco.com/editor/collections/ai-solutions/1741
 
+## Model Training
+1. Make sure that you have Python installed. Python 3.12 is the newest, supported interpreter version at this time. Several Python versions is available from the Software Store.
+2. Set up a venv and install the required packages
+    ```sh
+    python -m venv .venv --clear --upgrade-deps
+    source .venv/bin/activate  # or .venv/Scripts/activate if you are on Windows
+    python -m pip install -r requirements.txt
+    python -m pip install --ignore-requires-python --no-deps -r requirements-no-deps.txt  # prediction core has python<3.12 rather than <=3.12
+    python -m pip install -r requirements-dev.txt  # if you want install the development packages (ruff and such)
+    ```
+3. Train a model by running `NEXT_training.py`. The high level script to train several new NEXT models is `doit_next_training_submission.py`. In this script, the type of model created is controlled by the matrix of options at the top. The doit submissions are running `NEXT_training.py` with some Intel CPU specific Torch options to load data, prepare the data, initialize the NODE model, train the model, and save the model.
 
-trajectory,mean_pos_error_m,mean_vel_error_ms,final_pos_error_m,max_pos_error_m,rmse_pos_m,duration_s
-Atlanta_lp10_ECEF,28135.00,418.09,26260.64,42680.17,30713.36,270.0
-Atlanta_lp2_ECEF,34191.88,502.68,19173.44,46500.02,36432.05,285.0
-Atlanta_lp4_ECEF,12878.57,441.34,16252.65,22646.85,14265.09,148.0
-Atlanta_lp9_ECEF,35189.51,477.63,54624.43,54822.18,38779.88,381.0
-Boston_lp10_ECEF,22869.74,405.14,46338.92,46338.92,27342.86,249.0
-Boston_lp2_ECEF,17685.49,348.98,18507.47,25080.48,18988.75,219.0
-Boston_lp5_ECEF,37338.79,617.70,52866.03,58210.65,40940.12,215.0
-Boston_lp6_ECEF,18406.81,463.72,47966.31,47966.31,23007.00,142.0
-Boston_lp7_ECEF,15278.35,383.38,20555.47,26579.10,17403.48,121.0
-Boston_lp8_ECEF,6028.02,338.85,17607.96,17607.96,7766.92,100.0
-Miami_lp1_ECEF,16467.47,424.53,17716.77,29425.34,17885.72,322.0
-Miami_lp2_ECEF,29385.47,440.24,17017.06,42647.14,31658.06,260.0
-Miami_lp4_ECEF,30413.02,562.30,55078.86,55078.86,35239.77,206.0
-Miami_lp7_ECEF,34600.17,517.60,30903.40,59661.93,38163.00,449.0
-Miami_lp8_ECEF,33519.76,540.49,36737.96,59393.71,36487.82,442.0
-NewYork_lp2_ECEF,14232.72,341.10,28759.15,28759.15,16920.23,179.0
-NewYork_lp4_ECEF,6544.49,293.25,17835.27,17835.27,7777.92,93.0
-NewYork_lp5_ECEF,7526.44,411.19,20088.14,20088.14,9748.64,128.0
-NewYork_lp6_ECEF,40245.81,493.39,72578.60,72578.60,45340.05,210.0
-NewYork_lp7_ECEF,27239.75,477.44,41013.92,41013.92,29464.00,208.0
-NewYork_lp9_ECEF,8795.10,320.86,17539.58,18809.44,11394.44,119.0
-WashingtonDC_lp10_ECEF,7955.72,278.34,18671.40,18671.40,10627.87,115.0
-WashingtonDC_lp1_ECEF,44390.48,568.55,14929.42,77266.44,49262.61,463.0
-WashingtonDC_lp2_ECEF,25848.25,453.99,24492.34,35002.83,27091.67,331.0
-WashingtonDC_lp4_ECEF,4594.98,311.03,18191.35,18191.35,6488.00,95.0
-WashingtonDC_lp7_ECEF,16860.44,542.31,22078.11,26245.53,17796.63,164.0
-WashingtonDC_lp8_ECEF,26805.56,564.12,17389.87,39704.88,28760.10,177.0
-WashingtonDC_lp9_ECEF,15313.95,295.10,20069.90,20425.56,16065.00,179.0
+## Model Simple Simulation
+An example of a tactical implementation using NEXT is shown in `Simple_Sim.py`. Here a single truth is loaded, "flown", and runs the specified algorithm on the truth data. In this case, the algorithm is NEXT. This simple sim has been used for test standalone DPSA, trajectory characteristic discovery, and other algorithms.

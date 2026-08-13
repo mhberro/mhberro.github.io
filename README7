@@ -1,101 +1,61 @@
-# load_truth.py
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep/GEODESIC/glide
+There are 22 training trajs and 6 validation trajs.
+Segment augmentation: 22 -> 110 training trajs
 
-import os
-from pathlib import Path
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+Discovered Physics Matrix Xi:
+ [[ 1.06619342e-03  6.50334516e-04  7.55259451e-03  9.07481206e-04
+  -9.77877041e-03]
+ [-9.07000080e-04  2.29326095e-03  4.46983989e-04 -3.61920680e-03
+   2.85675876e-02]
+ [-2.00304978e-03 -1.81470180e-03 -1.07056460e-02 -3.88577362e-04
+  -3.56771447e-02]
+ [ 9.93032367e-01  2.01281683e-03 -1.49900327e-03 -4.33991412e-04
+  -1.56462785e-02]
+ [-1.34319932e-03  9.60122837e-04 -1.15431672e-03  4.96057833e-03
+  -1.76339524e-03]
+ [ 2.30149367e-03  9.96868449e-01 -5.45158031e-03 -1.07289805e-03
+  -8.07518464e-04]
+ [-2.17812673e-03  3.02137290e-04 -1.24960664e-03  1.13760202e-04
+  -1.31932826e-02]
+ [ 1.09345575e-03  1.14544482e-04 -1.75134469e-03  6.45903482e-04
+  -8.84519528e-03]
+ [-4.59898853e-03  2.59117064e-03 -5.62600575e-03 -3.66001029e-03
+  -3.11891479e-03]
+ [-5.12708773e-04  6.69070080e-04 -4.60787775e-03 -8.62566181e-03
+  -1.08381603e-03]
+ [ 3.92349687e-03 -1.07578515e-03  5.09932934e-03  0.00000000e+00
+   6.58226121e-03]
+ [-3.02156086e-03  5.68127258e-04  7.50420951e-03 -6.57306830e-04
+   2.25312518e-02]
+ [-2.19597362e-03 -1.30763381e-03  8.76088233e-03 -2.30359707e-04
+   2.56075651e-02]
+ [-2.99892975e-04  0.00000000e+00  5.12054050e-03  1.90330447e-02
+   1.98495936e-03]
+ [-1.30803391e-03  0.00000000e+00 -4.69030046e-03 -1.48423603e-03
+  -4.38965297e-03]
+ [-1.31352030e-04 -4.05445554e-04 -1.85731722e-04 -3.15327907e-03
+   1.53923964e-02]
+ [ 2.59133292e-04 -2.11437594e-04  0.00000000e+00  4.51535470e-04
+   2.72443855e-03]
+ [ 1.19060311e-03 -1.42216514e-03 -6.57192483e-03 -2.09268855e-03
+   5.00454865e-03]
+ [ 3.52373919e-04 -4.63893150e-04 -9.58807817e-04 -2.63035797e-03
+   7.43967686e-03]
+ [-3.28262734e-04  0.00000000e+00 -1.15973512e-03 -1.48005434e-02
+   4.28917867e-03]
+ [-1.91836114e-03  3.93901500e-04  4.57804045e-04  2.23760069e-03
+  -1.03290177e-02]]
 
-import pandas as pd
-import numpy as np
-
-
-def _check_truth_loading(truth_states: np.typing.ArrayLike, debug=False, min_state_vector_size=10, min_timesteps=3):
-    # truth states are expected to be an array for format
-    # seconds from launch, position x3, velocity x3, acceleration x3, and then a bunch of other stuff
-    if len(truth_states.shape) != 2:
-        if debug:
-            print("the shape is not 2d", truth_states.shape)
-        return False
-    # Reject data that is too small in EITHER dimension. The previous form
-    # `not A and not B` is `not (A or B)`, which only rejected when both the row
-    # AND column checks failed, letting e.g. a (2, 20) file (too few timesteps)
-    # pass. The correct guard is `not (A and B)` = reject unless both hold.
-    #
-    # `min_timesteps` is the minimum row count. It defaults to 3 for trajectories,
-    # but reference-point files (e.g. a single-row impact ECEF state used only to
-    # define the frame origin) are legitimately 1 row and pass min_timesteps=1.
-    if not (truth_states.shape[0] >= min_timesteps and truth_states.shape[1] >= min_state_vector_size):
-        if debug:
-            print("the data is too small", truth_states.shape)
-        return False
-    try:
-        truth_states = truth_states.astype(np.float64)
-    except Exception as e:  # noqa: E722
-        if debug:
-            print("the data could not be cast to float64", truth_states)
-            print(e)
-        return False
-
-    # Validate the truth time states for repeated times or negative dt.
-    # (For a single-row reference file np.diff is empty and this is a no-op.)
-    diffs = np.diff(truth_states[:, 0])
-    if np.any(diffs <= 0):
-        if debug:
-            print("time is not incrementing correctly")
-        return False
-    return True
-
-
-def load_single_truth(
-    filepath: str, debug=False, low_memory=True, memory_map=False, min_state_vector_size=10, min_timesteps=3
-) -> np.ndarray:
-    # there are various truth formats. take guesses at what the format is. check if it loaded correctly
-    # returns a numpy array of the truth data
-    truth = pd.read_csv(filepath, header=None, low_memory=low_memory, memory_map=memory_map).values
-    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-        return truth
-    truth = pd.read_csv(filepath, low_memory=low_memory, memory_map=memory_map).values
-    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-        return truth
-    try:
-        truth = np.loadtxt(filepath, skiprows=1, dtype=np.float64)
-        if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-            return truth
-    except Exception as e:
-        if debug:
-            print(e)
-    truth = pd.read_csv(filepath, sep="\t", header=None, low_memory=low_memory, memory_map=memory_map).values
-    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-        return truth
-    truth = pd.read_fwf(filepath, skiprows=1, header=None, infer_nrows=10000, memory_map=memory_map).values
-    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-        return truth
-    truth = pd.read_table(filepath).values
-    if _check_truth_loading(truth, debug=debug, min_state_vector_size=min_state_vector_size, min_timesteps=min_timesteps):
-        return truth
-    raise ValueError(f"Unable to parse truth file {filepath}")
-
-
-def load_data_dir(path: str, trajectory_dt: float, use_grdth: bool, max_value=None, have_high_memory=False):
-    # max_value: sr or time
-    # create a list of the files that need to be loaded
-    traj_files = [Path(path, x) for x in sorted(os.listdir(path))]
-
-    if len(traj_files) == 0:
-        raise ValueError("bad target path", path)
-
-    # create a tuple with the data plus metadata
-    # TODO: Turn this into an object rather than a tuple
-    traj_targets = []  # list of tuples (ecef traj tables data loaded from truth files, traj_number/filename)
-    traj_targets = [
-        (
-            load_single_truth(
-                x, debug=False, low_memory=not have_high_memory, memory_map=have_high_memory, min_state_vector_size=7
-            ),
-            x.name,
-            max_value,
-            trajectory_dt,
-            use_grdth,
-        )
-        for x in traj_files
-    ]
-
-    return traj_targets
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x13fd9d0d0>, 0.0001)
+[INFO] Epoch 5: loss: 52.5603561 pos_err: 8396.7431641 vel_err: 1119.0030518 traj_loss: 1.4660331 node_norm: 0.0622827 lambda: 35.8095779 val_loss: 52.1796379 val_pos_err: 8226.0761719 val_vel_err: 1098.2546387 val_traj_loss: 1.4556990 val_node_norm: 0.0516422 val_lambda: 35.8096008
+[INFO] Epoch 10: loss: 69.1653442 pos_err: 8738.5244141 vel_err: 1138.3056641 traj_loss: 1.3821124 node_norm: 0.0597279 lambda: 50.0000000 val_loss: 69.6517410 val_pos_err: 8407.3339844 val_vel_err: 1111.4750977 val_traj_loss: 1.3920882 val_node_norm: 0.0473387 val_lambda: 50.0000000
+[INFO] Epoch 15: loss: 67.7488632 pos_err: 8853.8447266 vel_err: 1138.0748291 traj_loss: 1.3539109 node_norm: 0.0533073 lambda: 50.0000000 val_loss: 68.0756912 val_pos_err: 8516.7607422 val_vel_err: 1106.2683105 val_traj_loss: 1.3607030 val_node_norm: 0.0405483 val_lambda: 50.0000000
+[INFO] Epoch 20: loss: 66.9444427 pos_err: 8934.1210938 vel_err: 1138.8930664 traj_loss: 1.3378178 node_norm: 0.0535667 lambda: 50.0000000 val_loss: 67.2204285 val_pos_err: 8600.3535156 val_vel_err: 1116.6044922 val_traj_loss: 1.3435602 val_node_norm: 0.0424131 val_lambda: 50.0000000
+[INFO] Epoch 25: loss: 66.3439484 pos_err: 8965.2539062 vel_err: 1135.8908691 traj_loss: 1.3257543 node_norm: 0.0562318 lambda: 50.0000000 val_loss: 66.6256256 val_pos_err: 8709.9941406 val_vel_err: 1116.9251709 val_traj_loss: 1.3316050 val_node_norm: 0.0453821 val_lambda: 50.0000000
+[INFO] Epoch 30: loss: 65.8757477 pos_err: 9006.3271484 vel_err: 1136.5708008 traj_loss: 1.3163503 node_norm: 0.0582527 lambda: 50.0000000 val_loss: 66.2726746 val_pos_err: 8637.9775391 val_vel_err: 1111.6861572 val_traj_loss: 1.3245435 val_node_norm: 0.0454980 val_lambda: 50.0000000
+[INFO] Epoch 35: loss: 65.5378571 pos_err: 9028.3945312 vel_err: 1136.2103271 traj_loss: 1.3095558 node_norm: 0.0600698 lambda: 50.0000000 val_loss: 66.1652069 val_pos_err: 8566.9306641 val_vel_err: 1098.9647217 val_traj_loss: 1.3224155 val_node_norm: 0.0444275 val_lambda: 50.0000000
+[INFO] Epoch 40: loss: 65.1796951 pos_err: 9055.2353516 vel_err: 1134.6429443 traj_loss: 1.3023629 node_norm: 0.0615444 lambda: 50.0000000 val_loss: 65.5527725 val_pos_err: 8613.7949219 val_vel_err: 1104.9404297 val_traj_loss: 1.3101168 val_node_norm: 0.0469375 val_lambda: 50.0000000
+[INFO] Epoch 45: loss: 64.8653030 pos_err: 9060.7705078 vel_err: 1131.5874023 traj_loss: 1.2960532 node_norm: 0.0626450 lambda: 50.0000000 val_loss: 64.9351730 val_pos_err: 8801.7490234 val_vel_err: 1122.1623535 val_traj_loss: 1.2976907 val_node_norm: 0.0506306 val_lambda: 50.0000000
+[INFO] Epoch 50: loss: 64.5890656 pos_err: 9098.0605469 vel_err: 1132.7786865 traj_loss: 1.2905120 node_norm: 0.0634761 lambda: 50.0000000 val_loss: 64.7295609 val_pos_err: 8771.0136719 val_vel_err: 1115.4975586 val_traj_loss: 1.2935674 val_node_norm: 0.0511932 val_lambda: 50.0000000
+[INFO] Epoch 55: loss: 64.3414383 pos_err: 9121.4511719 vel_err: 1132.6676025 traj_loss: 1.2855368 node_norm: 0.0646088 lambda: 50.0000000 val_loss: 64.5412750 val_pos_err: 8786.8193359 val_vel_err: 1112.6165771 val_traj_loss: 1.2898163 val_node_norm: 0.0504646 val_lambda: 50.0000000

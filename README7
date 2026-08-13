@@ -192,13 +192,14 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         pos_indices: list[int] | tuple[int, ...],
         vel_indices: list[int] | tuple[int, ...],
         dt: float,
-        pos_weight: float = 80.0,
-        vel_weight: float = 0.0,
+        pos_weight: float = 10.0,
+        vel_weight: float = 1.0,
+        rate_weight: float | None = None,
         physics_weight: float = 0.5,
         scaler: StandardScaler | None = None,
         N_FEATURES: int = 6,
         l2_reg: float = 1e-4,
-        temporal_weighting: bool = True,
+        temporal_weighting: bool | str = "early",
     ) -> None:
         super().__init__()
         self.height_idx = height_idx
@@ -207,6 +208,10 @@ class PhysicsSplitMSELoss(torch.nn.Module):
         self.dt = float(dt)
         self.pos_weight = pos_weight
         self.vel_weight = vel_weight
+        # Weight for channels that are neither position nor velocity (e.g. v_alpha in
+        # the 5-state geodesic frame). Defaults to vel_weight so no channel is left at
+        # an accidental value.
+        self.rate_weight = vel_weight if rate_weight is None else rate_weight
         self.physics_weight = physics_weight
         self.scaler = scaler
         self.N_FEATURES = N_FEATURES
@@ -227,24 +232,55 @@ class PhysicsSplitMSELoss(torch.nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
         batch_size, n_timesteps, _ = pred.shape
-        
-        # generate a broadcastable valid sequence mask to eliminate padding pollution
-        valid_mask = (target != 0.0).any(dim=-1, keepdim=True).float()
-        
+
+        # Padding mask.
+        # NOTE: the previous test `(target != 0.0).any(-1)` assumed an all-zero state
+        # means padding. In StandardScaler space zero is the MEAN, i.e. an ordinary
+        # physical state -- and v_alpha is legitimately ~0 during non-manoeuvring
+        # flight and is explicitly zeroed near the frame origin. That test therefore
+        # silently dropped valid timesteps from training. Padding rows are exactly
+        # zero across every channel AND are non-finite-free; require an exact all-zero
+        # row rather than "not all near the mean", and only treat it as padding when
+        # it is genuinely a zero row.
+        exact_zero_row = (target == 0.0).all(dim=-1, keepdim=True)
+        valid_mask = (~exact_zero_row).float()
+
         # Compute  unreduced normalized loss
         elementwise_loss = torch.nn.functional.mse_loss(pred, target, reduction="none")
-        
-        # Construct normalized mapping weights across coordinates
-        weights = torch.ones(self.N_FEATURES, device=pred.device)
+
+        # Construct normalized mapping weights across coordinates.
+        # IMPORTANT: any channel not listed in pos_indices/vel_indices previously kept
+        # the default weight of 1.0. For the 5-state geodesic frame
+        # [s, h, v_s, v_alpha, v_h] with pos=[0,1] and vel=[2,4], index 3 (v_alpha)
+        # was never assigned, and with pos_weight=80/vel_weight=1 the three
+        # velocity/rate channels together received only ~1.8% of the loss.
+        # Because position is the time-integral of velocity, an underfit velocity
+        # produces position error that grows LINEARLY with horizon -- precisely the
+        # long-rollout degradation this model exhibits. `rate_weight` now covers all
+        # non-position channels explicitly so nothing is left at an accidental default.
+        weights = torch.full((self.N_FEATURES,), float(self.rate_weight), device=pred.device)
         weights[self.pos_indices] = self.pos_weight
         weights[self.vel_indices] = self.vel_weight
-        
+
         weights = weights / weights.mean()
         weights_view = weights.view(1, 1, -1)
-        
-        
+
         if self.temporal_weighting:
-            t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            # Ramp direction matters for autoregressive rollouts. Weighting LATE
+            # timesteps more (the previous linspace(1, 4)) is backwards: early errors
+            # compound into every later step, so early timesteps carry the most
+            # leverage. temporal_weighting="early" ramps DOWN (4 -> 1); "late"
+            # preserves the original behaviour; True defaults to "early".
+            mode = self.temporal_weighting
+            if mode is True:
+                mode = "early"
+            if mode == "late":
+                t_weights = torch.linspace(1.0, 4.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            elif mode == "flat":
+                t_weights = torch.ones(n_timesteps, device=pred.device).view(1, -1, 1)
+            else:  # "early"
+                t_weights = torch.linspace(4.0, 1.0, n_timesteps, device=pred.device).view(1, -1, 1)
+            t_weights = t_weights / t_weights.mean()
             combined_weights = weights_view * t_weights
         else:
             combined_weights = weights_view
@@ -269,9 +305,15 @@ class PhysicsSplitMSELoss(torch.nn.Module):
             dpos_dt = (pos_phys[:, 1:, :] - pos_phys[:, :-1, :]) / self.dt
             vel_true_mid = vel_phys[:, :-1, :]
 
-            # Re-normalize residual back to scaled spaces
-            if self.pos_scale is not None:
-                resid = (dpos_dt - vel_true_mid) / self.pos_scale.to(pred.device)
+            # Re-normalize residual back to scaled space.
+            # dpos_dt and vel_true_mid are both VELOCITIES (m/s), so the residual must
+            # be divided by the velocity sigma. Dividing by pos_scale (a position
+            # sigma, in metres) left the residual in units of 1/s and mis-scaled this
+            # term by the pos/vel sigma ratio -- typically orders of magnitude, which
+            # made the kinematic constraint either negligible or dominant rather than
+            # a balanced regulariser.
+            if self.vel_scale is not None:
+                resid = (dpos_dt - vel_true_mid) / self.vel_scale.to(pred.device)
             else:
                 resid = dpos_dt - vel_true_mid
 

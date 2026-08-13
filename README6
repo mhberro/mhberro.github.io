@@ -160,6 +160,8 @@ def train_NEXT(
     window_size: int = 0,
     window_stride: int = 1,
     solver_substeps: int = 4,
+    pos_weight: float = 30.0,
+    temporal_weighting: str = "early",
 ):
     training_configuration = TrainingConfiguration(
         n_epochs=1,
@@ -248,13 +250,14 @@ def train_NEXT(
             pos_indices=pos_idx,
             vel_indices=vel_idx,
             dt=trajectory_dt,
-            # Rebalanced from pos_weight=80/vel_weight=1, under which the three
+            # Rebalanced from the original pos_weight=80, under which the three
             # velocity/rate channels received only ~1.8% of the total loss. Position
-            # is the time-integral of velocity, so an underfit velocity yields position
-            # error growing linearly with rollout horizon -- the dominant long-rollout
-            # error mode for this model. 10:1 still prioritises position without
-            # starving the channels that drive it.
-            pos_weight=10.0,
+            # is the time-integral of velocity, so underfit velocity gives position
+            # error growing linearly with rollout horizon. 30:1 is a deliberately
+            # MODEST step from 80:1 (velocity share ~1.8% -> ~5%) so the change can be
+            # evaluated without also shifting the overall loss magnitude much;
+            # tune with --pos-weight.
+            pos_weight=pos_weight,
             vel_weight=1.0,
             rate_weight=1.0,  # v_alpha: previously left at an accidental default
             physics_weight=0.25,
@@ -262,9 +265,11 @@ def train_NEXT(
             N_FEATURES=model_states,
             l2_reg=1e-6,
             # Weight EARLY timesteps more: in an autoregressive rollout early errors
-            # compound into all later steps. The previous ramp (1 -> 4) emphasised late
-            # steps, which is backwards for compounding dynamics.
-            temporal_weighting="early",
+            # compound into all later steps. The original ramp (1 -> 4) emphasised late
+            # steps, which is backwards for compounding dynamics. Note this ramp is
+            # mean-normalised (the original was not, silently multiplying the loss by
+            # ~2.5), so loss magnitudes are comparable across settings.
+            temporal_weighting=temporal_weighting,
         )
 
         if model_type == "aphynity-gruode":
@@ -301,14 +306,17 @@ def train_NEXT(
             loss_func = APHYNITYAdaptiveLossWrapper(
                 base_criterion=base_physics_loss,
                 lambda_init=1.0,
-                # tau2/max_lambda retuned for FULL-trajectory training (window_size=0).
-                # The dual update is lambda += tau2 * L_traj. At full length L_traj is
-                # ~100x larger than over short windows, so tau2=5.0 drove lambda to its
-                # cap within a few epochs; lambda*traj_loss then dominated total_loss
-                # and training diverged to nan. These values make lambda climb at
-                # roughly the same per-update rate it does over windows.
-                tau2=(0.05 if window_size == 0 else 5.0),
-                max_lambda=(10.0 if window_size == 0 else 50.0),
+                # The dual update is lambda += tau2 * L_traj, capped at max_lambda.
+                # With tau2=5.0 this pins lambda to its cap within a few epochs
+                # whenever L_traj is O(0.1) or larger, after which lambda*traj_loss
+                # dominates total_loss and training stalls or diverges.
+                # This was previously conditioned on window_size == 0, but the
+                # runaway depends on the LOSS MAGNITUDE, not the window length -- a
+                # window_size=150 run with a rebalanced data loss hit the same cap.
+                # Use the gentle schedule unconditionally; it still lets lambda rise
+                # (it reached ~1.1 over 255 epochs in practice) without overdriving.
+                tau2=0.05,
+                max_lambda=10.0,
                 node_norm_weight=1.0,
             )
         else:
@@ -907,6 +915,22 @@ def main():
         "when the source trajectory count is small.",
     )
     parser.add_argument(
+        "--pos-weight",
+        default=30.0,
+        type=float,
+        help="Position:velocity loss weight ratio. Original 80 gave the velocity/rate "
+        "channels only ~1.8%% of the loss; 30 gives ~5%%, 10 gives ~13%%. Lower trains "
+        "velocity harder (which drives long-horizon position accuracy) but shifts the "
+        "overall loss magnitude, so change it in steps.",
+    )
+    parser.add_argument(
+        "--temporal-weighting",
+        default="early",
+        choices=["early", "late", "flat"],
+        help="Timestep emphasis. 'early' (4->1) suits autoregressive rollouts since "
+        "early errors compound; 'late' (1->4) reproduces the original behaviour.",
+    )
+    parser.add_argument(
         "--solver-substeps",
         default=4,
         type=int,
@@ -1080,6 +1104,8 @@ def main():
         args.window_size,
         args.window_stride,
         args.solver_substeps,
+        args.pos_weight,
+        args.temporal_weighting,
     )
 
 

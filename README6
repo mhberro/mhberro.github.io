@@ -1,54 +1,174 @@
-# trajectory_helpers.py
+"""Continuous-time GRU-ODE cell and predictor architecture for trajectory forecasting."""
 
-import numpy as np
-from scipy.interpolate import make_interp_spline
+from __future__ import annotations
 
-TIME_INDEX = 0
-POS_SLICE = slice(1, 4)
-VEL_SLICE = slice(4, 7)
-ACC_SLICE = slice(7, 10)
-
-# og
-# GR_INDEX = 1
-# GR_DOT_INDEX = 2
-# THETA_DOT_INDEX = 3
-# DOWN_INDEX = 4
-# DOWN_DOT_INDEX = 5
-
-# reindex
-GR_INDEX = 1
-DOWN_INDEX = 2
-GR_DOT_INDEX = 3
-DOWN_DOT_INDEX = 4
-THETA_DOT_INDEX = 5
+import torch
+from torch import nn
 
 
-def resample_traj_data(traj_data, dt):
-    # TODO: this resampling needs to move into a function so it can reused
-    # TODO: this needs to flip around so that the range is relative to the impact time (and flip sign again after)
-    new_times = np.arange(traj_data[0, 0], traj_data[-1, 0] + dt, dt)
+class FullGRUODECell(nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            if bias:
+                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
 
-    try:
-        resampled_data = np.hstack(
-            [np.atleast_2d(new_times).T]
-            + [
-                make_interp_spline(
-                    traj_data[:, 0],
-                    traj_data[:, 1:],
-                    bc_type="not-a-knot",
-                )(new_times, extrapolate=True)
-            ]
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
+
+
+class GRUODEFunc(nn.Module):
+    ORDER = "y_first"
+
+    def __init__(
+        self,
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+        encoder_dropout: float = 0.1,
+        cell_input_size: int = 0,
+    ):
+        super().__init__()
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
+        enc_in = len(encoder_input_idx)
+
+        # Expose active dropout on the initial mapping layer 
+        if encoder_dropout > 0.0:
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Dropout(p=encoder_dropout),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
+        self.encoder_dropout = float(encoder_dropout)
+
+        cell_cls = FullGRUODECell
+        self.cell_input_size = int(cell_input_size)
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=self.cell_input_size, bias=True)
+        
+        # Decoder accepts both dynamic latent state and invariant trajectory parameter (2 * latent_dim)
+        self.decoder = nn.Sequential(
+            nn.Linear(2 * self.latent_dim, enc_h),
+            nn.SiLU(),
+            nn.Linear(enc_h, state_vector_len),
         )
-    except Exception as e:
-        print("Hit an the error with interpolation")
-        raise e
-    return resampled_data
+        self.nfe = 0
+
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        if self.cell_input_size > 0:
+            raise RuntimeError(
+                "GRUODEFunc was built with cell_input_size > 0; integrate GRUODEPredictorModel instead."
+            )
+        return self.cell(t, h)
+
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
+
+    def decode(self, h_full: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h_full)
 
 
-def check_time_series(traj_data):
-    # diff the time column, run unique, print that if there is more than 1 unique
-    time_diff = np.diff(traj_data[:, TIME_INDEX])
-    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
-    if np.any(time_diff < 0):
-        raise ValueError(f"Found has time that goes backwards. Time diffs are {unique_time_diff}")
-    return unique_time_diff.squeeze()
+class GRUODEPredictorModel(nn.Module):
+    def __init__(
+        self,
+        func: GRUODEFunc,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        self.func = func
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+        
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+        
+        # Unpack physical state and split latent into dynamic and static partitions
+        y_read = state[..., : self.n_features]
+        h_dyn = state[..., self.n_features : self.n_features + self.hidden_size]
+        h_static = state[..., self.n_features + self.hidden_size : self.n_features + 2 * self.hidden_size]
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh_dyn = self.func.cell(t, h_dyn, y_read)
+        else:
+            dh_dyn = self.func.cell(t, h_dyn)
+
+        dh_static = torch.zeros_like(h_static)
+        dh = torch.cat([dh_dyn, dh_static], dim=-1)
+
+        xdot = self.func.decode(torch.cat([h_dyn, h_static], dim=-1))
+
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+
+        return torch.cat((xdot, dh), dim=-1)

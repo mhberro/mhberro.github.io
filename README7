@@ -1,6 +1,5 @@
-# gru_ode.py
-
-"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting."""
+# aphynity_loss.py
+"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
 
 from __future__ import annotations
 
@@ -8,185 +7,56 @@ import torch
 from torch import nn
 
 
-class FullGRUODECell(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
-        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
-            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            if bias:
-                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
-                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
-            else:
-                self.register_parameter("bias_rz", None)
-                self.register_parameter("bias_g", None)
-
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_rz = self.lin_hrz(h)
-        if self.input_size > 0:
-            pre_rz = pre_rz + self.lin_xrz(x)
-        elif self.bias_rz is not None:
-            pre_rz = pre_rz + self.bias_rz
-        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
-
-        pre_g = self.lin_hg(r * h)
-        if self.input_size > 0:
-            pre_g = pre_g + self.lin_xg(x)
-        elif self.bias_g is not None:
-            pre_g = pre_g + self.bias_g
-        g = torch.tanh(pre_g)
-
-        return (1.0 - z) * (g - h)
-
-
-class GRUODEFunc(nn.Module):
-    ORDER = "y_first"
+class APHYNITYAdaptiveLossWrapper(nn.Module):
+    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
 
     def __init__(
         self,
-        state_vector_len: int,
-        nhidden: int,
-        latent_dim: int | None = None,
-        minimal: bool = False,
-        encoder_hidden: int | None = None,
-        encoder_input_idx: list[int] | None = None,
-        encoder_dropout: float = 0.1,
-        cell_input_size: int = 0,
+        base_criterion: nn.Module,
+        lambda_init: float = 1.0,
+        tau2: float = 5.0,
+        max_lambda: float = 50.0,
+        node_norm_weight: float = 1.0,
     ):
         super().__init__()
-        self.state_vector_len = state_vector_len
-        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
-        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+        self.base_criterion = base_criterion
+        self.tau2 = float(tau2)
+        self.max_lambda = float(max_lambda)
+        self.lambda_init = float(lambda_init)
+        self.node_norm_weight = float(node_norm_weight)
+        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
+        self.model_ref = None
 
-        if encoder_input_idx is None:
-            encoder_input_idx = list(range(state_vector_len))
-        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
-        enc_in = len(encoder_input_idx)
+    def set_model(self, model: nn.Module) -> None:
+        self.model_ref = model
+        if hasattr(self.base_criterion, "set_model"):
+            self.base_criterion.set_model(model)
 
-        # Expose active dropout on the initial mapping layer 
-        if encoder_dropout > 0.0:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Dropout(p=encoder_dropout),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
-        else:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
-        self.encoder_dropout = float(encoder_dropout)
+    def reset_lagrangian(self) -> None:
+        """Resets dual multiplier at strategy phase boundaries."""
+        with torch.no_grad():
+            self.lambda_val.fill_(self.lambda_init)
 
-        cell_cls =  FullGRUODECell
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        metrics = self.base_criterion(pred, target)
+        traj_loss = metrics["loss"]
 
-        self.cell_input_size = int(cell_input_size)
-        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=self.cell_input_size, bias=True)
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim, enc_h),
-            nn.SiLU(),
-            nn.Linear(enc_h, state_vector_len),
-        )
-        self.nfe = 0
+        node_norm = torch.tensor(0.0, device=pred.device)
+        if self.model_ref is not None and hasattr(self.model_ref, "last_node_norm"):
+            node_norm = self.model_ref.last_node_norm.to(pred.device)
 
-    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
-        if self.cell_input_size > 0:
-            raise RuntimeError(
-                "GRUODEFunc was built with cell_input_size > 0 (physical-state coupling); integrate GRUODEPredictorModel instead, which passes "
-                "y(t) into the cell."
-            )
-        return self.cell(t, h)
+        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
+        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
 
-    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
-        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
-        return self.encoder(x_sel)
+        out_metrics = dict(metrics)
+        out_metrics["loss"] = total_loss
+        out_metrics["traj_loss"] = traj_loss.detach()
+        out_metrics["node_norm"] = node_norm.detach()
+        out_metrics["lambda"] = self.lambda_val.detach()
+        return out_metrics
 
-    def decode(self, h: torch.Tensor) -> torch.Tensor:
-        return self.decoder(h)
-
-
-class GRUODEPredictorModel(nn.Module):
-    def __init__(
-        self,
-        func: GRUODEFunc,
-        pos_idx: list[int] | None = None,
-        vel_idx: list[int] | None = None,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
-    ):
-        """Production wrapper implementing a stateless continuous integration field."""
-        super().__init__()
-        self.func = func
-        self.n_features = func.state_vector_len
-        self.hidden_size = func.latent_dim
-        self.second_order = pos_idx is not None and vel_idx is not None
-        
-        if self.second_order:
-            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-            if pos_scale is not None and vel_scale is not None:
-                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-                    pos_scale, dtype=torch.float32
-                )
-                offset = (
-                    torch.as_tensor(vel_mean, dtype=torch.float32)
-                    / torch.as_tensor(pos_scale, dtype=torch.float32)
-                    if vel_mean is not None
-                    else torch.zeros_like(ratio)
-                )
-                self.register_buffer("so_ratio", ratio)
-                self.register_buffer("so_offset", offset)
-                self.scaled_space = True
-            else:
-                self.scaled_space = False
-
-    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
-        self.func.nfe += 1
-        
-        # Unpack the absolute physical and latent partitions directly from the solver state
-        y_read = state[..., : self.n_features]
-        h = state[..., self.n_features : self.n_features + self.hidden_size]
-
-        # Enforce analytical bounding constraints cleanly on every evaluation step
-        # See APHYNITYGRUODEPredictorModel for the full rationale: applying tanh to
-        # the latent READ makes it differ from the latent the solver INTEGRATES, so
-        # raw |h| grows unbounded, tanh saturates within ~30 steps, and the decoder
-        # output becomes a constant derivative bias over long rollouts. Integrate and
-        # read the same variable; contain it with a leaky term on dh/dt instead.
-        mode = getattr(self, "latent_bounding", "soft")
-        if mode == "tanh":
-            h = torch.tanh(h)
-        if getattr(self.func, "cell_input_size", 0) > 0:
-            # Closed-loop latent dynamics: gates see the current (scaled)
-            # physical state, so the field is state-dependent rather than a
-            # memorized time-course of the initial condition.
-            dh = self.func.cell(t, h, y_read)
-        else:
-            dh = self.func.cell(t, h)
-
-        if mode != "tanh":
-            limit = float(getattr(self, "latent_clamp", 3.0))
-            decay = float(getattr(self, "latent_decay", 0.1))
-            excess = torch.clamp(h.abs() - limit, min=0.0)
-            dh = dh - decay * torch.sign(h) * excess
-
-        xdot = self.func.decode(h)
-
-        if self.second_order:
-            vel_now = y_read.index_select(-1, self.vel_idx)
-            if getattr(self, "scaled_space", False):
-                vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
-
-        return torch.cat((xdot, dh), dim=-1)
+    def update_lagrangian_multiplier(self, last_val_traj_loss: float) -> None:
+        """Bounded adaptive update: lambda_{j+1} = min(max_lambda, lambda_j + tau2 * L_traj)"""
+        with torch.no_grad():
+            updated = self.lambda_val + self.tau2 * last_val_traj_loss
+            self.lambda_val.copy_(torch.clamp(updated, max=self.max_lambda))

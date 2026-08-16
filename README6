@@ -1,176 +1,264 @@
-# gru_ode.py
+# ensemble_sindy.py
 
-"""Continuous-time GRU-ODE cell and predictor architecture for trajectory forecasting."""
+"""Ensemble-SINDy discovery module with aerodynamic basis candidate libraries."""
 
 from __future__ import annotations
 
+import itertools
+import numpy as np
 import torch
 from torch import nn
 
 
-class FullGRUODECell(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
-        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
-            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            if bias:
-                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
-                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
+class PolynomialLibrary:
+    def __init__(self, degree: int = 2, include_bias: bool = True):
+        self.degree = degree
+        self.include_bias = include_bias
+
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        n_samples, n_features = Y.shape
+        combos = []
+        for d in range(0 if self.include_bias else 1, self.degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+
+        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
+        for i, combo in enumerate(combos):
+            if len(combo) == 0:
+                library[:, i] = 1.0
             else:
-                self.register_parameter("bias_rz", None)
-                self.register_parameter("bias_g", None)
-
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_rz = self.lin_hrz(h)
-        if self.input_size > 0:
-            pre_rz = pre_rz + self.lin_xrz(x)
-        elif self.bias_rz is not None:
-            pre_rz = pre_rz + self.bias_rz
-        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
-
-        pre_g = self.lin_hg(r * h)
-        if self.input_size > 0:
-            pre_g = pre_g + self.lin_xg(x)
-        elif self.bias_g is not None:
-            pre_g = pre_g + self.bias_g
-        g = torch.tanh(pre_g)
-
-        return (1.0 - z) * (g - h)
+                library[:, i] = np.prod(Y[:, combo], axis=1)
+        return library
 
 
-class GRUODEFunc(nn.Module):
-    ORDER = "y_first"
+class HGVAerodynamicLibrary:
+    """Aerodynamic feature library for hypersonic glide trajectories."""
+    def __init__(self, h_scale_m: float = 7500.0, r_earth_m: float = 6371000.0, scaler=None):
+        self.h_scale = float(h_scale_m)
+        self.r_earth = float(r_earth_m)
+        self.scaler = scaler
 
-    def __init__(
-        self,
-        state_vector_len: int,
-        nhidden: int,
-        latent_dim: int | None = None,
-        minimal: bool = False,
-        encoder_hidden: int | None = None,
-        encoder_input_idx: list[int] | None = None,
-        encoder_dropout: float = 0.1,
-        cell_input_size: int = 0,
-    ):
-        super().__init__()
-        self.state_vector_len = state_vector_len
-        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
-        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
-
-        if encoder_input_idx is None:
-            encoder_input_idx = list(range(state_vector_len))
-        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
-        enc_in = len(encoder_input_idx)
-
-        # Expose active dropout on the initial mapping layer 
-        if encoder_dropout > 0.0:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Dropout(p=encoder_dropout),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        if self.scaler is not None and hasattr(self.scaler, "inverse_transform"):
+            Y_phys = self.scaler.inverse_transform(Y)
         else:
-            self.encoder = nn.Sequential(
-                nn.Linear(enc_in, enc_h),
-                nn.SiLU(),
-                nn.Linear(enc_h, self.latent_dim),
-                nn.Tanh(),
-            )
-        self.encoder_dropout = float(encoder_dropout)
+            Y_phys = Y
 
-        cell_cls = FullGRUODECell
-        self.cell_input_size = int(cell_input_size)
-        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=self.cell_input_size, bias=True)
-        
-        # Decoder accepts both dynamic latent state and invariant trajectory parameter (2 * latent_dim)
-        self.decoder = nn.Sequential(
-            nn.Linear(2 * self.latent_dim, enc_h),
-            nn.SiLU(),
-            nn.Linear(enc_h, state_vector_len),
-        )
-        self.nfe = 0
+        s = Y_phys[:, 0]
+        h = Y_phys[:, 1]
+        v_s = Y_phys[:, 2]
+        v_alpha = Y_phys[:, 3]
+        v_h = Y_phys[:, 4]
 
-    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
-        if self.cell_input_size > 0:
-            raise RuntimeError(
-                "GRUODEFunc was built with cell_input_size > 0; integrate GRUODEPredictorModel instead."
-            )
-        return self.cell(t, h)
+        v_total_sq = v_s**2 + (v_alpha * np.maximum(s, 100.0))**2 + v_h**2
+        rho_rel = np.exp(-np.clip(h, 0.0, 120000.0) / self.h_scale)
 
-    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
-        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
-        return self.encoder(x_sel)
-
-    def decode(self, h_full: torch.Tensor) -> torch.Tensor:
-        return self.decoder(h_full)
+        features = [
+            np.ones_like(s),                                                    # 0: Bias
+            rho_rel * v_total_sq,                                               # 1: Dynamic pressure proxy (~ Lift/Drag)
+            rho_rel * (v_s**2),                                                 # 2: Along-track aerodynamic drag
+            rho_rel * v_s * v_h,                                                # 3: Vertical aerodynamic lift coupling
+            v_total_sq / (self.r_earth + np.maximum(h, 0.0)),                   # 4: Centrifugal acceleration
+            -9.80665 * (self.r_earth / (self.r_earth + np.maximum(h, 0.0)))**2, # 5: Spherical gravity variation
+            v_s,                                                                # 6: Along-track velocity damping
+            v_alpha,                                                            # 7: Azimuth rate damping
+            v_h,                                                                # 8: Vertical velocity damping
+        ]
+        return np.column_stack(features)
 
 
-class GRUODEPredictorModel(nn.Module):
+def stridge(
+    Theta: np.ndarray,
+    Ydot: np.ndarray,
+    l1_threshold: float = 0.01,
+    ridge_kw: float = 1e-3,
+    max_iter: int = 25,
+) -> np.ndarray:
+    n_features = Theta.shape[1]
+    n_targets = Ydot.shape[1]
+
+    col_norms = np.linalg.norm(Theta, axis=0)
+    col_norms[col_norms < 1e-8] = 1.0
+    Theta_norm = Theta / col_norms
+
+    Xi_norm = np.linalg.lstsq(
+        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
+        Theta_norm.T @ Ydot,
+        rcond=None,
+    )[0]
+
+    for _ in range(max_iter):
+        small_inds = np.abs(Xi_norm) < l1_threshold
+        Xi_norm[small_inds] = 0.0
+        for i in range(n_targets):
+            big_inds = ~small_inds[:, i]
+            if np.any(big_inds):
+                Theta_sub = Theta_norm[:, big_inds]
+                Xi_norm[big_inds, i] = np.linalg.lstsq(
+                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
+                    Theta_sub.T @ Ydot[:, i],
+                    rcond=None,
+                )[0]
+
+    Xi = Xi_norm / col_norms[:, None]
+    return Xi
+
+
+class EnsembleSINDyDiscoverer:
     def __init__(
         self,
-        func: GRUODEFunc,
+        library_type: str = "aerodynamic",
+        degree: int = 2,
+        n_bootstraps: int = 50,
+        subsample_ratio: float = 0.7,
+        l1_threshold: float = 0.01,
+        inclusion_prob_threshold: float = 0.40,
+        aggregation: str = "bragging",
         pos_idx: list[int] | None = None,
         vel_idx: list[int] | None = None,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
+        scaler=None,
+    ):
+        self.library_type = library_type
+        self.degree = degree
+        self.n_bootstraps = n_bootstraps
+        self.subsample_ratio = subsample_ratio
+        self.l1_threshold = l1_threshold
+        self.inclusion_prob_threshold = inclusion_prob_threshold
+        self.aggregation = aggregation
+        self.pos_idx = pos_idx
+        self.vel_idx = vel_idx
+        self.scaler = scaler
+
+        if library_type == "aerodynamic":
+            self.library_builder = HGVAerodynamicLibrary(scaler=scaler)
+        else:
+            self.library_builder = PolynomialLibrary(degree=degree, include_bias=True)
+
+    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
+        Y_all, Ydot_all = [], []
+        for Y in Y_list:
+            if len(Y) < 5:
+                continue
+            Ydot = np.gradient(Y, dt, axis=0)
+            
+            # Enforce exact velocity identity for position derivative targets
+            if self.pos_idx is not None and self.vel_idx is not None:
+                for p_i, v_i in zip(self.pos_idx, self.vel_idx):
+                    Ydot[:, p_i] = Y[:, v_i]
+
+            Y_all.append(Y[2:-2])
+            Ydot_all.append(Ydot[2:-2])
+
+        if len(Y_all) == 0:
+            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
+
+        Y_stacked = np.vstack(Y_all)
+        Ydot_stacked = np.vstack(Ydot_all)
+
+        Theta = self.library_builder.fit_transform(Y_stacked)
+        n_samples, n_terms = Theta.shape
+        n_targets = Ydot_stacked.shape[1]
+
+        bootstrap_coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
+        sub_size = int(n_samples * self.subsample_ratio)
+
+        for b in range(self.n_bootstraps):
+            indices = np.random.choice(n_samples, size=sub_size, replace=True)
+            Theta_b = Theta[indices]
+            Ydot_b = Ydot_stacked[indices]
+            bootstrap_coeffs[b] = stridge(
+                Theta_b, Ydot_b, l1_threshold=self.l1_threshold
+            )
+
+        active_masks = np.abs(bootstrap_coeffs) > 1e-8
+        inclusion_probs = np.mean(active_masks, axis=0)
+
+        if self.aggregation == "bragging":
+            Xi_agg = np.median(bootstrap_coeffs, axis=0)
+        else:
+            Xi_agg = np.mean(bootstrap_coeffs, axis=0)
+
+        Xi_agg[inclusion_probs < self.inclusion_prob_threshold] = 0.0
+        return Xi_agg, inclusion_probs
+
+
+class SINDyPhysicsModel(nn.Module):
+    def __init__(
+        self,
+        Xi: np.ndarray,
+        state_vector_len: int = 5,
+        library_type: str = "aerodynamic",
+        degree: int = 2,
+        scaler=None,
+        h_scale_m: float = 7500.0,
+        r_earth_m: float = 6371000.0,
     ):
         super().__init__()
-        self.func = func
-        self.n_features = func.state_vector_len
-        self.hidden_size = func.latent_dim
-        self.second_order = pos_idx is not None and vel_idx is not None
-        
-        if self.second_order:
-            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
-            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-            if pos_scale is not None and vel_scale is not None:
-                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-                    pos_scale, dtype=torch.float32
-                )
-                offset = (
-                    torch.as_tensor(vel_mean, dtype=torch.float32)
-                    / torch.as_tensor(pos_scale, dtype=torch.float32)
-                    if vel_mean is not None
-                    else torch.zeros_like(ratio)
-                )
-                self.register_buffer("so_ratio", ratio)
-                self.register_buffer("so_offset", offset)
-                self.scaled_space = True
-            else:
-                self.scaled_space = False
+        self.library_type = library_type
+        self.degree = degree
+        self.state_vector_len = state_vector_len
+        self.h_scale = float(h_scale_m)
+        self.r_earth = float(r_earth_m)
+        self.register_buffer("Xi", torch.tensor(Xi, dtype=torch.float32))
 
-    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
-        self.func.nfe += 1
-        
-        # Unpack physical state and split latent into dynamic and static partitions
-        y_read = state[..., : self.n_features]
-        h_dyn = state[..., self.n_features : self.n_features + self.hidden_size]
-        h_static = state[..., self.n_features + self.hidden_size : self.n_features + 2 * self.hidden_size]
-
-        if getattr(self.func, "cell_input_size", 0) > 0:
-            dh_dyn = self.func.cell(t, h_dyn, y_read)
+        if scaler is not None and hasattr(scaler, "scale_"):
+            self.register_buffer("scaler_scale", torch.tensor(scaler.scale_, dtype=torch.float32))
+            self.register_buffer("scaler_mean", torch.tensor(scaler.mean_, dtype=torch.float32))
+            self.use_scaler = True
         else:
-            dh_dyn = self.func.cell(t, h_dyn)
+            self.use_scaler = False
 
-        dh_static = torch.zeros_like(h_static)
-        dh = torch.cat([dh_dyn, dh_static], dim=-1)
+        if library_type == "polynomial":
+            combos = []
+            for d in range(degree + 1):
+                combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
+            self.combos = combos
 
-        xdot = self.func.decode(torch.cat([h_dyn, h_static], dim=-1))
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        if self.library_type == "aerodynamic":
+            if self.use_scaler:
+                y_phys = y * self.scaler_scale + self.scaler_mean
+            else:
+                y_phys = y
 
-        if self.second_order:
-            vel_now = y_read.index_select(-1, self.vel_idx)
-            if getattr(self, "scaled_space", False):
-                vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+            s = y_phys[..., 0:1]
+            h = y_phys[..., 1:2]
+            v_s = y_phys[..., 2:3]
+            v_alpha = y_phys[..., 3:4]
+            v_h = y_phys[..., 4:5]
 
-        return torch.cat((xdot, dh), dim=-1)
+            v_total_sq = v_s**2 + (v_alpha * torch.clamp(s, min=100.0))**2 + v_h**2
+            rho_rel = torch.exp(-torch.clamp(h, min=0.0, max=120000.0) / self.h_scale)
+
+            features = [
+                torch.ones_like(s),
+                rho_rel * v_total_sq,
+                rho_rel * (v_s**2),
+                rho_rel * v_s * v_h,
+                v_total_sq / (self.r_earth + torch.clamp(h, min=0.0)),
+                -9.80665 * (self.r_earth / (self.r_earth + torch.clamp(h, min=0.0)))**2,
+                v_s,
+                v_alpha,
+                v_h,
+            ]
+            Theta = torch.cat(features, dim=-1)
+            return torch.matmul(Theta, self.Xi)
+
+        cols = []
+        for combo in self.combos:
+            if len(combo) == 0:
+                cols.append(torch.ones_like(y[..., :1]))
+            elif len(combo) == 1:
+                cols.append(y[..., combo[0] : combo[0] + 1])
+            elif len(combo) == 2:
+                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
+            elif len(combo) == 3:
+                cols.append(
+                    y[..., combo[0] : combo[0] + 1]
+                    * y[..., combo[1] : combo[1] + 1]
+                    * y[..., combo[2] : combo[2] + 1]
+                )
+            else:
+                raise NotImplementedError("Polynomial degree > 3 not supported.")
+
+        Theta = torch.cat(cols, dim=-1)
+        return torch.matmul(Theta, self.Xi)

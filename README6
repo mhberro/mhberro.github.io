@@ -1,36 +1,129 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python standalone_direct_evaluator.py -m model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_150win_5stride.onnx -t trajectory_library/phases/LowE_555063a9_HGV/glide/* -o standalone_eval_plots_lowe555_150winsize_5winstride_5augseg_8solvstep --sub-steps 8
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
---- Running Standalone Direct Model Evaluation ---
-Model: NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_150win_5stride.onnx
-Truth Trajectories: 28
+from __future__ import annotations
+
+import torch
+from torch import nn
+from gru_ode import GRUODEFunc
 
 
-trajectory,mean_pos_error_m,mean_vel_error_ms,final_pos_error_m,max_pos_error_m,rmse_pos_m,duration_s
-Atlanta_lp10_ECEF,13330.79,269.89,12883.19,22764.57,14975.88,270.0
-Atlanta_lp2_ECEF,16994.51,368.87,10764.58,23678.64,18166.99,285.0
-Atlanta_lp4_ECEF,15783.17,390.71,31316.06,31316.06,19680.66,148.0
-Atlanta_lp9_ECEF,15755.07,302.14,16099.82,21842.49,16761.86,381.0
-Boston_lp10_ECEF,13083.62,286.83,19890.36,21623.74,14896.84,249.0
-Boston_lp2_ECEF,12813.68,232.35,14972.27,21392.64,14571.21,219.0
-Boston_lp5_ECEF,9811.96,406.64,17864.38,18259.91,11515.99,215.0
-Boston_lp6_ECEF,10538.44,466.19,20554.31,20554.31,12439.19,142.0
-Boston_lp7_ECEF,15870.93,492.25,15442.24,31268.14,18890.85,121.0
-Boston_lp8_ECEF,6314.72,278.78,19081.31,19081.31,8616.31,100.0
-Miami_lp1_ECEF,14489.66,292.80,14074.00,21661.55,15603.36,322.0
-Miami_lp2_ECEF,12827.50,257.72,10965.63,20841.34,14160.64,260.0
-Miami_lp4_ECEF,12320.32,278.04,21228.97,23100.43,14370.25,206.0
-Miami_lp7_ECEF,22414.43,377.46,3778.10,34066.95,24164.04,449.0
-Miami_lp8_ECEF,15800.63,337.21,5716.91,22836.76,16804.56,442.0
-NewYork_lp2_ECEF,11667.20,239.33,20828.77,20828.77,13586.42,179.0
-NewYork_lp4_ECEF,5718.07,247.01,19995.18,19995.18,8067.96,93.0
-NewYork_lp5_ECEF,6690.36,288.20,18031.83,18031.83,8294.94,128.0
-NewYork_lp6_ECEF,7823.21,265.91,19659.45,19659.45,9821.54,210.0
-NewYork_lp7_ECEF,9044.96,385.38,10685.31,29021.67,12400.32,208.0
-NewYork_lp9_ECEF,12813.61,403.93,24009.92,25144.91,15822.54,119.0
-WashingtonDC_lp10_ECEF,10353.42,326.44,21240.12,21240.12,12965.69,115.0
-WashingtonDC_lp1_ECEF,17220.30,291.08,15180.44,25100.09,17962.53,463.0
-WashingtonDC_lp2_ECEF,14451.14,240.91,15910.87,19883.45,15354.26,331.0
-WashingtonDC_lp4_ECEF,4451.22,239.75,17540.61,17540.61,6395.32,95.0
-WashingtonDC_lp7_ECEF,13568.51,382.23,18089.11,31378.99,16929.47,164.0
-WashingtonDC_lp8_ECEF,11678.77,249.63,11362.65,20056.87,13224.67,177.0
-WashingtonDC_lp9_ECEF,10785.96,196.98,15316.75,18411.48,12461.76,179.0
+class APHYNITYGRUODEPredictorModel(nn.Module):
+    def __init__(
+        self,
+        func: GRUODEFunc,
+        physics_model: nn.Module,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+    ):
+        super().__init__()
+        self.func = func
+        self.physics_model = physics_model
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            # Identify acceleration and rate indices (non-position channels)
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
+
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
+
+        self.last_node_norm = torch.tensor(0.0)
+
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+
+        y_read = state[..., : self.n_features]
+        h_raw = state[..., self.n_features : self.n_features + self.hidden_size]
+
+        # LATENT BOUNDING -- see `latent_bounding`.
+        #
+        # The original code did `h = torch.tanh(h)` here on every function
+        # evaluation. That makes the variable the solver INTEGRATES (raw h) differ
+        # from the variable the network READS (tanh h), which is not a consistent
+        # ODE. Because dh/dt generically has a non-zero mean, raw |h| grows without
+        # bound; tanh(h) then saturates (empirically within ~30 steps), its Jacobian
+        # collapses to ~0, and decode(tanh(h)) becomes CONSTANT. The neural residual
+        # degenerates into a fixed derivative bias, which integrates into a roughly
+        # duration-independent position offset -- matching the tight ~17-22 km
+        # clustering of final_pos_error in long rollouts. Short (<=60 step) rollouts
+        # stay in the near-linear region of tanh, which is why this never showed up
+        # in windowed training metrics.
+        #
+        #   "soft" (default) - integrate h directly; keep it bounded with a leaky
+        #       containment term added to dh/dt. Read and integrated state are
+        #       IDENTICAL, so the latent stays informative for the whole rollout.
+        #   "tanh" - original behaviour, retained for A/B comparison.
+        mode = getattr(self, "latent_bounding", "soft")
+        if mode == "tanh":
+            h = torch.tanh(h_raw)
+        else:
+            h = h_raw
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh = self.func.cell(t, h, y_read)
+        else:
+            dh = self.func.cell(t, h)
+
+        if mode != "tanh":
+            # Leaky containment: pull h back toward 0 only once |h| exceeds
+            # latent_clamp, so it cannot run away, while leaving the latent fully
+            # responsive inside the operating band (no saturation, live Jacobian).
+            limit = float(getattr(self, "latent_clamp", 3.0))
+            decay = float(getattr(self, "latent_decay", 0.1))
+            excess = torch.clamp(h.abs() - limit, min=0.0)
+            dh = dh - decay * torch.sign(h) * excess
+
+        f_phys = self.physics_model(y_read)
+        f_node = self.func.decode(h)
+
+        # Penalize neural residual ONLY on acceleration/rate channels.
+        # NOTE: this norm is a *metric/penalty* only -- the f_node used in xdot
+        # below is left untouched so the integrated dynamics are unchanged. During
+        # full-trajectory training the residual can grow very large as a trajectory
+        # transits the geodesic-frame singularity (s -> 0); squaring such a value
+        # overflows float32 (>~1e19) to inf, which made node_norm nan and forced
+        # the training step to be skipped -- disabling the APHYNITY least-action
+        # penalty on exactly the batches with the largest residual, where it is
+        # most needed. Clamp to a large finite magnitude before squaring so those
+        # batches instead contribute a large-but-finite penalty gradient.
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
+        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+        self.last_node_norm = torch.mean(f_node_acc ** 2)
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+
+        return torch.cat((xdot, dh), dim=-1)

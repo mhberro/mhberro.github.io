@@ -1,40 +1,139 @@
-# aphynity_gru_ode.py
-"""APHYNITY + GRU-ODE hybrid prediction model."""
+# gru_ode.py
+
+"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
-from gru_ode import GRUODEFunc
 
 
-class APHYNITYGRUODEPredictorModel(nn.Module):
+class FullGRUODECell(nn.Module):
+    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.input_size = input_size
+        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
+        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
+        if input_size > 0:
+            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
+            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
+        else:
+            if bias:
+                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
+                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
+            else:
+                self.register_parameter("bias_rz", None)
+                self.register_parameter("bias_g", None)
+
+    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
+        pre_rz = self.lin_hrz(h)
+        if self.input_size > 0:
+            pre_rz = pre_rz + self.lin_xrz(x)
+        elif self.bias_rz is not None:
+            pre_rz = pre_rz + self.bias_rz
+        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
+
+        pre_g = self.lin_hg(r * h)
+        if self.input_size > 0:
+            pre_g = pre_g + self.lin_xg(x)
+        elif self.bias_g is not None:
+            pre_g = pre_g + self.bias_g
+        g = torch.tanh(pre_g)
+
+        return (1.0 - z) * (g - h)
+
+
+class GRUODEFunc(nn.Module):
+    ORDER = "y_first"
+
+    def __init__(
+        self,
+        state_vector_len: int,
+        nhidden: int,
+        latent_dim: int | None = None,
+        minimal: bool = False,
+        encoder_hidden: int | None = None,
+        encoder_input_idx: list[int] | None = None,
+        encoder_dropout: float = 0.1,
+        cell_input_size: int = 0,
+    ):
+        super().__init__()
+        self.state_vector_len = state_vector_len
+        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden)
+        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
+
+        if encoder_input_idx is None:
+            encoder_input_idx = list(range(state_vector_len))
+        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
+        enc_in = len(encoder_input_idx)
+
+        # Expose active dropout on the initial mapping layer 
+        if encoder_dropout > 0.0:
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Dropout(p=encoder_dropout),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
+        else:
+            self.encoder = nn.Sequential(
+                nn.Linear(enc_in, enc_h),
+                nn.SiLU(),
+                nn.Linear(enc_h, self.latent_dim),
+                nn.Tanh(),
+            )
+        self.encoder_dropout = float(encoder_dropout)
+
+        cell_cls =  FullGRUODECell
+
+        self.cell_input_size = int(cell_input_size)
+        self.cell = cell_cls(hidden_size=self.latent_dim, input_size=self.cell_input_size, bias=True)
+        
+        self.decoder = nn.Sequential(
+            nn.Linear(self.latent_dim, enc_h),
+            nn.SiLU(),
+            nn.Linear(enc_h, state_vector_len),
+        )
+        self.nfe = 0
+
+    def forward(self, t, h: torch.Tensor) -> torch.Tensor:
+        if self.cell_input_size > 0:
+            raise RuntimeError(
+                "GRUODEFunc was built with cell_input_size > 0 (physical-state coupling); integrate GRUODEPredictorModel instead, which passes "
+                "y(t) into the cell."
+            )
+        return self.cell(t, h)
+
+    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
+        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
+        return self.encoder(x_sel)
+
+    def decode(self, h: torch.Tensor) -> torch.Tensor:
+        return self.decoder(h)
+
+
+class GRUODEPredictorModel(nn.Module):
     def __init__(
         self,
         func: GRUODEFunc,
-        physics_model: nn.Module,
         pos_idx: list[int] | None = None,
         vel_idx: list[int] | None = None,
         pos_scale=None,
         vel_scale=None,
         vel_mean=None,
     ):
+        """Production wrapper implementing a stateless continuous integration field."""
         super().__init__()
         self.func = func
-        self.physics_model = physics_model
         self.n_features = func.state_vector_len
         self.hidden_size = func.latent_dim
         self.second_order = pos_idx is not None and vel_idx is not None
-
+        
         if self.second_order:
             self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
             self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
-            
-            # Identify acceleration and rate indices (non-position channels)
-            all_indices = set(range(self.n_features))
-            acc_indices = sorted(list(all_indices - set(pos_idx)))
-            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
-
             if pos_scale is not None and vel_scale is not None:
                 ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
                     pos_scale, dtype=torch.float32
@@ -50,74 +149,38 @@ class APHYNITYGRUODEPredictorModel(nn.Module):
                 self.scaled_space = True
             else:
                 self.scaled_space = False
-        else:
-            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
 
-        self.last_node_norm = torch.tensor(0.0)
-
-    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
         self.func.nfe += 1
-
+        
+        # Unpack the absolute physical and latent partitions directly from the solver state
         y_read = state[..., : self.n_features]
-        h_raw = state[..., self.n_features : self.n_features + self.hidden_size]
+        h = state[..., self.n_features : self.n_features + self.hidden_size]
 
-        # LATENT BOUNDING -- see `latent_bounding`.
-        #
-        # The original code did `h = torch.tanh(h)` here on every function
-        # evaluation. That makes the variable the solver INTEGRATES (raw h) differ
-        # from the variable the network READS (tanh h), which is not a consistent
-        # ODE. Because dh/dt generically has a non-zero mean, raw |h| grows without
-        # bound; tanh(h) then saturates (empirically within ~30 steps), its Jacobian
-        # collapses to ~0, and decode(tanh(h)) becomes CONSTANT. The neural residual
-        # degenerates into a fixed derivative bias, which integrates into a roughly
-        # duration-independent position offset -- matching the tight ~17-22 km
-        # clustering of final_pos_error in long rollouts. Short (<=60 step) rollouts
-        # stay in the near-linear region of tanh, which is why this never showed up
-        # in windowed training metrics.
-        #
-        #   "soft" (default) - integrate h directly; keep it bounded with a leaky
-        #       containment term added to dh/dt. Read and integrated state are
-        #       IDENTICAL, so the latent stays informative for the whole rollout.
-        #   "tanh" - original behaviour, retained for A/B comparison.
+        # Enforce analytical bounding constraints cleanly on every evaluation step
+        # See APHYNITYGRUODEPredictorModel for the full rationale: applying tanh to
+        # the latent READ makes it differ from the latent the solver INTEGRATES, so
+        # raw |h| grows unbounded, tanh saturates within ~30 steps, and the decoder
+        # output becomes a constant derivative bias over long rollouts. Integrate and
+        # read the same variable; contain it with a leaky term on dh/dt instead.
         mode = getattr(self, "latent_bounding", "soft")
         if mode == "tanh":
-            h = torch.tanh(h_raw)
-        else:
-            h = h_raw
-
+            h = torch.tanh(h)
         if getattr(self.func, "cell_input_size", 0) > 0:
+            # Closed-loop latent dynamics: gates see the current (scaled)
+            # physical state, so the field is state-dependent rather than a
+            # memorized time-course of the initial condition.
             dh = self.func.cell(t, h, y_read)
         else:
             dh = self.func.cell(t, h)
 
         if mode != "tanh":
-            # Leaky containment: pull h back toward 0 only once |h| exceeds
-            # latent_clamp, so it cannot run away, while leaving the latent fully
-            # responsive inside the operating band (no saturation, live Jacobian).
             limit = float(getattr(self, "latent_clamp", 3.0))
             decay = float(getattr(self, "latent_decay", 0.1))
             excess = torch.clamp(h.abs() - limit, min=0.0)
             dh = dh - decay * torch.sign(h) * excess
 
-        f_phys = self.physics_model(y_read)
-        f_node = self.func.decode(h)
-
-        # Penalize neural residual ONLY on acceleration/rate channels.
-        # NOTE: this norm is a *metric/penalty* only -- the f_node used in xdot
-        # below is left untouched so the integrated dynamics are unchanged. During
-        # full-trajectory training the residual can grow very large as a trajectory
-        # transits the geodesic-frame singularity (s -> 0); squaring such a value
-        # overflows float32 (>~1e19) to inf, which made node_norm nan and forced
-        # the training step to be skipped -- disabling the APHYNITY least-action
-        # penalty on exactly the batches with the largest residual, where it is
-        # most needed. Clamp to a large finite magnitude before squaring so those
-        # batches instead contribute a large-but-finite penalty gradient.
-        f_node_acc = f_node.index_select(-1, self.acc_idx)
-        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
-        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
-        self.last_node_norm = torch.mean(f_node_acc ** 2)
-
-        xdot = f_phys + f_node
+        xdot = self.func.decode(h)
 
         if self.second_order:
             vel_now = y_read.index_select(-1, self.vel_idx)

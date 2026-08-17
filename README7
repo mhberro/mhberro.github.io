@@ -1,25 +1,32 @@
-# In NEXT_training.py, replace lines 177-200 in train_NEXT:
-        base_physics_loss = PhysicsSplitMSELoss(
-            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
-            pos_indices=pos_idx,
-            vel_indices=vel_idx,
-            dt=trajectory_dt,
-            pos_weight=pos_weight,    # Configured to 1.0 (prevents position overfitting)
-            vel_weight=5.0,           # Elevated: 5 m/s velocity error creates 1.75 km drift
-            rate_weight=5.0,          # Elevated: v_alpha dictates cross-track accuracy
-            physics_weight=1.0,       # Strict kinematic coupling
-            scaler=scaler_traj if use_scalar else None,
-            N_FEATURES=model_states,
-            l2_reg=1e-4,              # Increased regularization for 22-trajectory regime
-            temporal_weighting=temporal_weighting,
-        )
+# In NEXT_training.py, line 198:
+discoverer = EnsembleSINDyDiscoverer(
+    library_type="polynomial",  # Revert to stable polynomial or use strict physical scaling
+    degree=2,
+    n_bootstraps=50,
+    subsample_ratio=0.7,
+    l1_threshold=0.05,          # Increase threshold to suppress noise terms
+    inclusion_prob_threshold=0.5,
+    aggregation="bragging",
+    pos_idx=pos_idx,
+    vel_idx=vel_idx,
+)
 
------------------
+--------------------
 
-# In NEXT_training.py inside main() (replace lines 524-530):
-    parser.add_argument(
-        "--pos-weight",
-        default=1.0,
-        type=float,
-        help="Position loss weight. Set to 1.0 to prioritize velocity and rate channel accuracy.",
-    )
+# In NEXT_training.py:
+base_physics_loss = PhysicsSplitMSELoss(
+    height_idx=1,
+    pos_indices=pos_idx,
+    vel_indices=vel_idx,
+    dt=trajectory_dt,
+    pos_weight=15.0,        # Restores strong position anchor
+    vel_weight=3.0,         # Keeps velocity training active (was 1.0)
+    rate_weight=3.0,        # Keeps v_alpha training active
+    physics_weight=0.5,     # Enforces kinematic consistency
+    scaler=scaler_traj if use_scalar else None,
+    N_FEATURES=model_states,
+    l2_reg=1e-4,
+    temporal_weighting="early",
+)
+
+----------------------

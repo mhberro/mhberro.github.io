@@ -1,141 +1,39 @@
-# gru_ode.py
-
-# gru_ode.py
-"""Continuous-time GRU-ODE cell for kinematic trajectory forecasting."""
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
+from gru_ode import GRUODEFunc
 
 
-class FullGRUODECell(nn.Module):
-    def __init__(self, hidden_size: int, input_size: int = 0, bias: bool = True):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.input_size = input_size
-        self.lin_hrz = nn.Linear(hidden_size, 2 * hidden_size, bias=False)
-        self.lin_hg = nn.Linear(hidden_size, hidden_size, bias=False)
-        if input_size > 0:
-            self.lin_xrz = nn.Linear(input_size, 2 * hidden_size, bias=bias)
-            self.lin_xg = nn.Linear(input_size, hidden_size, bias=bias)
-        else:
-            if bias:
-                self.bias_rz = nn.Parameter(torch.zeros(2 * hidden_size))
-                self.bias_g = nn.Parameter(torch.zeros(hidden_size))
-            else:
-                self.register_parameter("bias_rz", None)
-                self.register_parameter("bias_g", None)
-
-    def forward(self, t, h: torch.Tensor, x: torch.Tensor | None = None) -> torch.Tensor:
-        pre_rz = self.lin_hrz(h)
-        if self.input_size > 0:
-            pre_rz = pre_rz + self.lin_xrz(x)
-        elif self.bias_rz is not None:
-            pre_rz = pre_rz + self.bias_rz
-        r, z = torch.sigmoid(pre_rz).chunk(2, dim=-1)
-
-        pre_g = self.lin_hg(r * h)
-        if self.input_size > 0:
-            pre_g = pre_g + self.lin_xg(x)
-        elif self.bias_g is not None:
-            pre_g = pre_g + self.bias_g
-        g = torch.tanh(pre_g)
-
-        return (1.0 - z) * (g - h)
-
-
-class GRUODEFunc(nn.Module):
-    ORDER = "y_first"
-
-    def __init__(
-        self,
-        state_vector_len: int,
-        nhidden: int,
-        latent_dim: int | None = None,
-        context_dim: int = 16,
-        minimal: bool = False,
-        encoder_hidden: int | None = None,
-        encoder_input_idx: list[int] | None = None,
-        encoder_dropout: float = 0.15,
-        cell_input_size: int = 0,
-    ):
-        super().__init__()
-        self.state_vector_len = state_vector_len
-        self.latent_dim = latent_dim if latent_dim is not None else max(2 * state_vector_len, nhidden // 2)
-        self.context_dim = context_dim
-        enc_h = encoder_hidden if encoder_hidden is not None else nhidden
-
-        if encoder_input_idx is None:
-            encoder_input_idx = list(range(state_vector_len))
-        self.register_buffer("encoder_input_idx", torch.tensor(list(encoder_input_idx), dtype=torch.long))
-        enc_in = len(encoder_input_idx)
-
-        # Encoder outputs combined dynamic hidden state h0 AND invariant context c0
-        self.encoder = nn.Sequential(
-            nn.Linear(enc_in, enc_h),
-            nn.SiLU(),
-            nn.Dropout(p=encoder_dropout),
-            nn.Linear(enc_h, self.latent_dim + self.context_dim),
-            nn.Tanh(),
-        )
-        self.encoder_dropout = float(encoder_dropout)
-
-        # Ensure cell receives both the physical state and the static context
-        actual_cell_input_size = cell_input_size + self.context_dim if cell_input_size > 0 else self.context_dim
-
-        self.cell_input_size = int(actual_cell_input_size)
-        self.cell = FullGRUODECell(hidden_size=self.latent_dim, input_size=self.cell_input_size, bias=True)
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(self.latent_dim + self.context_dim, enc_h),
-            nn.SiLU(),
-            nn.Dropout(p=encoder_dropout),
-            nn.Linear(enc_h, state_vector_len),
-        )
-        self.nfe = 0
-
-    def forward(self, t, h: torch.Tensor, y: torch.Tensor | None = None, c: torch.Tensor | None = None) -> torch.Tensor:
-        if self.cell_input_size > 0:
-            inputs = []
-            if y is not None:
-                inputs.append(y)
-            if c is not None:
-                inputs.append(c)
-            cell_input = torch.cat(inputs, dim=-1)
-            return self.cell(t, h, cell_input)
-        return self.cell(t, h)
-
-    def encode(self, x_phys: torch.Tensor) -> torch.Tensor:
-        x_sel = x_phys.index_select(-1, self.encoder_input_idx)
-        return self.encoder(x_sel)
-
-    def decode(self, h: torch.Tensor, c: torch.Tensor | None = None) -> torch.Tensor:
-        if c is not None:
-            return self.decoder(torch.cat([h, c], dim=-1))
-        return self.decoder(h)
-
-
-class GRUODEPredictorModel(nn.Module):
+class APHYNITYGRUODEPredictorModel(nn.Module):
     def __init__(
         self,
         func: GRUODEFunc,
+        physics_model: nn.Module,
         pos_idx: list[int] | None = None,
         vel_idx: list[int] | None = None,
         pos_scale=None,
         vel_scale=None,
         vel_mean=None,
     ):
-        """Production wrapper implementing a stateless continuous integration field."""
         super().__init__()
         self.func = func
+        self.physics_model = physics_model
         self.n_features = func.state_vector_len
         self.hidden_size = func.latent_dim
         self.second_order = pos_idx is not None and vel_idx is not None
-        
+
         if self.second_order:
             self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
             self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
+
             if pos_scale is not None and vel_scale is not None:
                 ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
                     pos_scale, dtype=torch.float32
@@ -151,10 +49,14 @@ class GRUODEPredictorModel(nn.Module):
                 self.scaled_space = True
             else:
                 self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
 
-    def forward(self, t, state: torch.Tensor) -> torch.Tensor:
+        self.last_node_norm = torch.tensor(0.0)
+
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
         self.func.nfe += 1
-        
+
         y_read = state[..., : self.n_features]
         has_context = hasattr(self.func, "context_dim") and self.func.context_dim > 0
         
@@ -170,14 +72,20 @@ class GRUODEPredictorModel(nn.Module):
         else:
             dh = self.func.forward(t, h)
 
-        xdot = self.func.decode(h, c)
+        f_phys = self.physics_model(y_read)
+        f_node = self.func.decode(h, c)
+
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.clamp(torch.nan_to_num(f_node_acc, nan=0.0), min=-1e6, max=1e6)
+        self.last_node_norm = torch.mean(f_node_acc ** 2)
+
+        xdot = f_phys + f_node
 
         if self.second_order:
             vel_now = y_read.index_select(-1, self.vel_idx)
             if getattr(self, "scaled_space", False):
                 vel_now = vel_now * self.so_ratio + self.so_offset
-            pos_deriv = vel_now
-            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
 
         if has_context:
             dc = torch.zeros_like(c)

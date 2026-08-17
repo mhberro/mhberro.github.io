@@ -1,10 +1,3 @@
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 150 --nhidden 200 --dt 1 -o /tmp/sindy_scan --sindy-only \
-  --sindy-library physics --sindy-scan-scale-heights 5000,6500,7200,8500,10000,14000
-
-
 # physics_library.py
 """Physics-informed candidate library for Ensemble-SINDy on HGV glide dynamics.
 
@@ -125,6 +118,10 @@ class PhysicsInformedLibrary:
             "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
             "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
         }
+
+    def term_combos(self, n_features: int | None = None) -> list:
+        """Column layout: polynomial tuples first, then None for each physics term."""
+        return [tuple(c) for c in self.poly_combos] + [None] * len(self.physics_terms)
 
     def term_names(self) -> list[str]:
         names = ["s", "h", "v_s", "v_al", "v_h"][: self.state_vector_len]

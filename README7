@@ -1,17 +1,70 @@
-(.venv) e471302@usmk2tqq3hkk2 next copy_mo % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_2/GEODESIC/glide
-There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 110 training trajs
+class PySINDyDiscoverer:
+    def __init__(
+        self,
+        degree: int = 2,
+        l1_threshold: float = 0.01,
+        use_aero: bool = True,
+        ensemble: bool = True,
+        n_bootstraps: int = 50,
+        subsample_ratio: float = 0.7,
+        h_mean: float = 0.0,
+        h_scale: float = 1.0,
+    ):
+        self.degree = degree
+        self.l1_threshold = l1_threshold
+        self.use_aero = use_aero
+        self.ensemble = ensemble
+        self.n_bootstraps = n_bootstraps
+        self.subsample_ratio = subsample_ratio
+        self.h_mean = h_mean
+        self.h_scale = h_scale
 
---- Running PySINDy Governing Equation Discovery ---
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next copy_mo/NEXT_training.py", line 1061, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next copy_mo/NEXT_training.py", line 1037, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy_mo/NEXT_training.py", line 281, in train_NEXT
-    Xi_sparse, inclusion_probs = discoverer.fit(sindy_train_data, dt=trajectory_dt)
-                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy_mo/ensemble_sindy.py", line 107, in fit
-    model.fit(X_stacked, x_dot=X_dot_stacked)
-TypeError: SINDy.fit() missing 1 required positional argument: 't'
+    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
+        valid_Y = [Y[2:-2] for Y in Y_list if len(Y) >= 5]
+        if len(valid_Y) == 0:
+            raise ValueError("No valid trajectory samples provided to SINDy.")
+
+        # 1. Feature Library Configuration
+        if self.use_aero:
+            feature_library = AeroLibrary(h_mean=self.h_mean, h_scale=self.h_scale)
+        else:
+            feature_library = ps.PolynomialLibrary(degree=self.degree, include_bias=True)
+
+        # 2. Optimizer Configuration
+        base_opt = ps.STLSQ(threshold=self.l1_threshold, alpha=1e-3, max_iter=25)
+        
+        if self.ensemble:
+            opt = ps.EnsembleOptimizer(
+                opt=base_opt,
+                bagging=True,
+                n_models=self.n_bootstraps,
+            )
+        else:
+            opt = base_opt
+
+        model = ps.SINDy(feature_library=feature_library, optimizer=opt)
+        
+        # 3. Explicitly compute derivatives over the valid trajectories
+        X_stacked = np.vstack(valid_Y)
+        X_dot_stacked = np.vstack([np.gradient(y, dt, axis=0) for y in valid_Y])
+
+        # 4. Fit & Extract Coefficients
+        if self.ensemble:
+            # Pass t=dt to satisfy the PySINDy API requirements
+            model.fit(X_stacked, t=dt, x_dot=X_dot_stacked)
+            # PySINDy stores ensemble coefficients in coef_list of shape (n_models, n_targets, n_features)
+            bootstrap_coeffs = np.array(model.optimizer.coef_list) 
+            bootstrap_coeffs = bootstrap_coeffs.transpose(0, 2, 1) # Align to (n_models, n_features, n_targets)
+            
+            active_masks = np.abs(bootstrap_coeffs) > 1e-8
+            inclusion_probs = np.mean(active_masks, axis=0)
+            Xi_agg = np.median(bootstrap_coeffs, axis=0)
+            
+            inclusion_prob_threshold = 0.40
+            Xi_agg[inclusion_probs < inclusion_prob_threshold] = 0.0
+            return Xi_agg, inclusion_probs
+        else:
+            # Pass t=dt to satisfy the PySINDy API requirements
+            model.fit(X_stacked, t=dt, x_dot=X_dot_stacked)
+            Xi = model.coefficients().T 
+            return Xi, np.ones_like(Xi)

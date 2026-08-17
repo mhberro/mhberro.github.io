@@ -1,105 +1,171 @@
-(.venv) e471302@usmk2tqq3hkk2 next copy % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_2/GEODESIC/glide
-There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 110 training trajs
+# ensemble_sindy.py
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-Discovered Physics Matrix Xi:
- [[ 8.99551572e-04  9.20409531e-04  7.50740641e-03  9.04740695e-04
-  -9.80643014e-03]
- [-8.15905296e-04  2.34695144e-03  0.00000000e+00 -3.66227793e-03
-   2.85498606e-02]
- [-2.00185550e-03 -1.85133731e-03 -1.03984191e-02  0.00000000e+00
-  -3.56747182e-02]
- [ 9.93192280e-01  1.72668136e-03 -1.52500961e-03  0.00000000e+00
-  -1.56796323e-02]
- [-1.18966922e-03  9.02953904e-04 -1.19982919e-03  5.01319632e-03
-  -1.76560988e-03]
- [ 2.24266447e-03  9.96982379e-01 -5.31767324e-03 -1.13943325e-03
-  -8.07518464e-04]
- [-2.12445514e-03  0.00000000e+00 -1.20441427e-03  0.00000000e+00
-  -1.31934265e-02]
- [ 1.15275311e-03  0.00000000e+00 -1.78975434e-03  6.61590493e-04
-  -8.84066304e-03]
- [-4.33562281e-03  1.98379806e-03 -5.70448712e-03 -3.94967210e-03
-  -3.16400536e-03]
- [-9.37039122e-04  7.74246176e-04 -4.65105786e-03 -8.60593563e-03
-  -1.15880523e-03]
- [ 3.72404177e-03 -5.28135450e-04  5.04865983e-03  0.00000000e+00
-   6.66715339e-03]
- [-2.95966721e-03  5.10333661e-04  7.50715069e-03 -5.17071443e-04
-   2.25312518e-02]
- [-2.08211935e-03 -1.31569398e-03  9.01957174e-03  0.00000000e+00
-   2.55990991e-02]
- [ 0.00000000e+00  0.00000000e+00  5.11889648e-03  1.89397859e-02
-   1.95211385e-03]
- [-1.38102253e-03  0.00000000e+00 -4.73827516e-03 -1.34277678e-03
-  -4.38965297e-03]
- [ 0.00000000e+00 -5.16935973e-04  0.00000000e+00 -3.42340178e-03
-   1.53923964e-02]
- [ 0.00000000e+00  0.00000000e+00  0.00000000e+00  4.39392534e-04
-   2.73651385e-03]
- [ 1.01005686e-03 -1.01390328e-03 -6.62742073e-03 -1.86369437e-03
-   5.05774250e-03]
- [ 4.00246377e-04 -4.49578088e-04 -9.41219384e-04 -2.62505532e-03
-   7.45478016e-03]
- [ 0.00000000e+00  0.00000000e+00 -1.15393814e-03 -1.47988821e-02
-   4.28917867e-03]
- [-1.81105633e-03  0.00000000e+00  4.97188347e-04  2.32485281e-03
-  -1.03290177e-02]]
+"""Ensemble-SINDy discovery module for sparse physical vector fields."""
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x16a662910>, 0.0001)
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next copy/NEXT_training.py", line 1101, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next copy/NEXT_training.py", line 1077, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/NEXT_training.py", line 403, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/neural_ode_mod.py", line 149, in fit
-    batch_metrics = self.batch_loss(x=x_batch.to(self.device))
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/neural_ode_mod.py", line 289, in batch_loss
-    x_pred = self.solver.integrate(
-             ^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/torchdiffeq_solver.py", line 88, in integrate
-    x = self.odeint(func, x0, times, method=self.method)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/odeint.py", line 80, in odeint
-    solution = solver.integrate(t)
-               ^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/solvers.py", line 114, in integrate
-    dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/fixed_grid.py", line 28, in _step_func
-    f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/misc.py", line 197, in forward
-    return self.base_func(t, y)
-           ^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/aphynity_gru_ode.py", line 77, in forward
-    f_phys = self.physics_model(y_read)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next copy/ensemble_sindy.py", line 244, in forward
-    return torch.matmul(Theta, self.Xi)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-RuntimeError: mat1 and mat2 shapes cannot be multiplied (16x9 and 21x5)
+from __future__ import annotations
+
+import itertools
+import numpy as np
+import torch
+from torch import nn
+
+
+class PolynomialLibrary:
+    def __init__(self, degree: int = 2, include_bias: bool = True):
+        self.degree = degree
+        self.include_bias = include_bias
+
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        n_samples, n_features = Y.shape
+        combos = []
+        for d in range(0 if self.include_bias else 1, self.degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+
+        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
+        for i, combo in enumerate(combos):
+            if len(combo) == 0:
+                library[:, i] = 1.0
+            else:
+                library[:, i] = np.prod(Y[:, combo], axis=1)
+        return library
+
+
+def stridge(
+    Theta: np.ndarray,
+    Ydot: np.ndarray,
+    l1_threshold: float = 0.01,
+    ridge_kw: float = 1e-3,
+    max_iter: int = 25,
+) -> np.ndarray:
+    n_features = Theta.shape[1]
+    n_targets = Ydot.shape[1]
+
+    col_norms = np.linalg.norm(Theta, axis=0)
+    col_norms[col_norms < 1e-8] = 1.0
+    Theta_norm = Theta / col_norms
+
+    Xi_norm = np.linalg.lstsq(
+        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
+        Theta_norm.T @ Ydot,
+        rcond=None,
+    )[0]
+
+    for _ in range(max_iter):
+        small_inds = np.abs(Xi_norm) < l1_threshold
+        Xi_norm[small_inds] = 0.0
+        for i in range(n_targets):
+            big_inds = ~small_inds[:, i]
+            if np.any(big_inds):
+                Theta_sub = Theta_norm[:, big_inds]
+                Xi_norm[big_inds, i] = np.linalg.lstsq(
+                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
+                    Theta_sub.T @ Ydot[:, i],
+                    rcond=None,
+                )[0]
+
+    Xi = Xi_norm / col_norms[:, None]
+    return Xi
+
+
+class EnsembleSINDyDiscoverer:
+    def __init__(
+        self,
+        degree: int = 2,
+        n_bootstraps: int = 50,
+        subsample_ratio: float = 0.7,
+        l1_threshold: float = 0.01,
+        inclusion_prob_threshold: float = 0.40,
+        aggregation: str = "bragging",
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+    ):
+        self.degree = degree
+        self.n_bootstraps = n_bootstraps
+        self.subsample_ratio = subsample_ratio
+        self.l1_threshold = l1_threshold
+        self.inclusion_prob_threshold = inclusion_prob_threshold
+        self.aggregation = aggregation
+        self.pos_idx = pos_idx
+        self.vel_idx = vel_idx
+        self.library_builder = PolynomialLibrary(degree=degree, include_bias=True)
+
+    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
+        Y_all, Ydot_all = [], []
+        for Y in Y_list:
+            if len(Y) < 5:
+                continue
+            Ydot = np.gradient(Y, dt, axis=0)
+
+            # Enforce exact velocity identity for position derivative targets
+            if self.pos_idx is not None and self.vel_idx is not None:
+                for p_i, v_i in zip(self.pos_idx, self.vel_idx):
+                    Ydot[:, p_i] = Y[:, v_i]
+
+            Y_all.append(Y[2:-2])
+            Ydot_all.append(Ydot[2:-2])
+
+        if len(Y_all) == 0:
+            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
+
+        Y_stacked = np.vstack(Y_all)
+        Ydot_stacked = np.vstack(Ydot_all)
+
+        Theta = self.library_builder.fit_transform(Y_stacked)
+        n_samples, n_terms = Theta.shape
+        n_targets = Ydot_stacked.shape[1]
+
+        bootstrap_coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
+        sub_size = int(n_samples * self.subsample_ratio)
+
+        for b in range(self.n_bootstraps):
+            indices = np.random.choice(n_samples, size=sub_size, replace=True)
+            Theta_b = Theta[indices]
+            Ydot_b = Ydot_stacked[indices]
+            bootstrap_coeffs[b] = stridge(
+                Theta_b, Ydot_b, l1_threshold=self.l1_threshold
+            )
+
+        active_masks = np.abs(bootstrap_coeffs) > 1e-8
+        inclusion_probs = np.mean(active_masks, axis=0)
+
+        if self.aggregation == "bragging":
+            Xi_agg = np.median(bootstrap_coeffs, axis=0)
+        else:
+            Xi_agg = np.mean(bootstrap_coeffs, axis=0)
+
+        Xi_agg[inclusion_probs < self.inclusion_prob_threshold] = 0.0
+        return Xi_agg, inclusion_probs
+
+
+class SINDyPhysicsModel(nn.Module):
+    def __init__(self, Xi: np.ndarray, state_vector_len: int = 5, degree: int = 2):
+        super().__init__()
+        self.degree = degree
+        self.state_vector_len = state_vector_len
+        self.register_buffer("Xi", torch.tensor(Xi, dtype=torch.float32))
+
+        combos = []
+        for d in range(degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
+        self.combos = combos
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        cols = []
+        for combo in self.combos:
+            if len(combo) == 0:
+                cols.append(torch.ones_like(y[..., :1]))
+            elif len(combo) == 1:
+                cols.append(y[..., combo[0] : combo[0] + 1])
+            elif len(combo) == 2:
+                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
+            elif len(combo) == 3:
+                cols.append(
+                    y[..., combo[0] : combo[0] + 1]
+                    * y[..., combo[1] : combo[1] + 1]
+                    * y[..., combo[2] : combo[2] + 1]
+                )
+            else:
+                raise NotImplementedError("Polynomial degree > 3 not supported.")
+
+        Theta = torch.cat(cols, dim=-1)
+        return torch.matmul(Theta, self.Xi)

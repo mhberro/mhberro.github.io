@@ -1,374 +1,80 @@
-# neural_ode_mod.py
+e471302@usmk2tqq3hkk2 next copy %  source "/Users/e471302/lm_cm_repos/next copy/.venv/bin/activate"
+(.venv) e471302@usmk2tqq3hkk2 next copy % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_2/GEODESIC/glide
+There are 22 training trajs and 6 validation trajs.
+Segment augmentation: 22 -> 110 training trajs
 
-"""Base training class for a Neural Ordinary Differential Equation model."""
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+Discovered Physics Matrix Xi:
+ [[-2.61018022e-04  4.42594276e-04  6.41898069e-03  1.20801489e-03
+  -7.17719118e-03]
+ [ 1.33617850e-08 -1.66054907e-08  1.35257755e-08 -6.18002527e-08
+   4.01193350e-07]
+ [ 8.69155321e-04 -5.63126056e-04 -2.11468073e-03  0.00000000e+00
+   1.28928986e-03]
+ [-5.21103790e-04 -4.63154091e-04 -5.42746074e-03 -5.32864209e-03
+   6.94335626e-03]
+ [ 8.71941365e-02 -1.08759081e-01  8.58709876e-02 -3.89552667e-01
+   2.54271406e+00]
+ [ 2.82014626e-05 -4.51743985e-05 -6.53585454e-04 -1.23030708e-04
+   7.30732042e-04]
+ [ 9.97891921e-01  8.68972103e-04  2.08748055e-03  5.28369420e-04
+  -1.20147594e-02]
+ [-2.09326320e-04  1.00418054e-04 -1.26274354e-03  5.47939618e-03
+  -5.36095421e-03]
+ [ 1.00267803e-03  9.98230363e-01 -3.70087157e-03 -1.95753007e-04
+   9.79614461e-03]]
 
-from __future__ import annotations
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x159cabb10>, 0.0001)
+[INFO] Epoch 5: loss: 0.0045036 pos_err: 994.1732788 vel_err: 70.5754547 traj_loss: 0.0043569 node_norm: 0.0001425 lambda: 1.0009768 val_loss: 0.0050511 val_pos_err: 929.6435547 val_vel_err: 117.8358688 val_traj_loss: 0.0048601 val_node_norm: 0.0001862 val_lambda: 1.0009775
+[INFO] Epoch 10: loss: 0.0042169 pos_err: 973.4479370 vel_err: 67.7543488 traj_loss: 0.0041218 node_norm: 0.0000866 lambda: 1.0020713 val_loss: 0.0040122 val_pos_err: 976.4113770 val_vel_err: 94.2337418 val_traj_loss: 0.0038699 val_node_norm: 0.0001342 val_lambda: 1.0020713
+[INFO] Epoch 15: loss: 0.0040551 pos_err: 954.7126465 vel_err: 64.7769089 traj_loss: 0.0040016 node_norm: 0.0000412 lambda: 1.0030634 val_loss: 0.0039325 val_pos_err: 901.9129639 val_vel_err: 91.2095871 val_traj_loss: 0.0038451 val_node_norm: 0.0000757 val_lambda: 1.0030642
+[INFO] Epoch 20: loss: 0.0039919 pos_err: 945.9239502 vel_err: 63.6009598 traj_loss: 0.0039467 node_norm: 0.0000293 lambda: 1.0040168 val_loss: 0.0039557 val_pos_err: 870.5400391 val_vel_err: 94.4613647 val_traj_loss: 0.0038724 val_node_norm: 0.0000677 val_lambda: 1.0040164
+[INFO] Epoch 25: loss: 0.0039542 pos_err: 942.0878296 vel_err: 62.9606247 traj_loss: 0.0039119 node_norm: 0.0000229 lambda: 1.0049517 val_loss: 0.0036923 val_pos_err: 955.9648438 val_vel_err: 83.2716064 val_traj_loss: 0.0036013 val_node_norm: 0.0000731 val_lambda: 1.0049523
+[INFO] Epoch 30: loss: 0.0039262 pos_err: 941.4974365 vel_err: 61.8789215 traj_loss: 0.0038839 node_norm: 0.0000195 lambda: 1.0058596 val_loss: 0.0038682 val_pos_err: 906.5014648 val_vel_err: 89.6909103 val_traj_loss: 0.0037848 val_node_norm: 0.0000613 val_lambda: 1.0058602
+[INFO] Epoch 35: loss: 0.0039076 pos_err: 939.4094849 vel_err: 61.9474220 traj_loss: 0.0038638 node_norm: 0.0000176 lambda: 1.0067642 val_loss: 0.0037406 val_pos_err: 922.8515015 val_vel_err: 87.9622498 val_traj_loss: 0.0036600 val_node_norm: 0.0000558 val_lambda: 1.0067647
+[INFO] Epoch 40: loss: 0.0038982 pos_err: 937.0208740 vel_err: 61.6606064 traj_loss: 0.0038520 node_norm: 0.0000166 lambda: 1.0076678 val_loss: 0.0035941 val_pos_err: 944.0817871 val_vel_err: 80.4337158 val_traj_loss: 0.0034890 val_node_norm: 0.0000783 val_lambda: 1.0076684
+[INFO] Epoch 45: loss: 0.0038717 pos_err: 937.6349487 vel_err: 60.6417046 traj_loss: 0.0038238 node_norm: 0.0000153 lambda: 1.0085409 val_loss: 0.0035122 val_pos_err: 959.5477905 val_vel_err: 76.5829239 val_traj_loss: 0.0034210 val_node_norm: 0.0000619 val_lambda: 1.0085404
+[INFO] Epoch 50: loss: 0.0038556 pos_err: 936.1050415 vel_err: 60.6300812 traj_loss: 0.0038070 node_norm: 0.0000126 lambda: 1.0094261 val_loss: 0.0035001 val_pos_err: 962.3368530 val_vel_err: 76.2881775 val_traj_loss: 0.0034049 val_node_norm: 0.0000631 val_lambda: 1.0094259
+[INFO] Epoch 55: loss: 0.0038505 pos_err: 936.3411255 vel_err: 60.6831932 traj_loss: 0.0037990 node_norm: 0.0000125 lambda: 1.0102881 val_loss: 0.0035991 val_pos_err: 933.2480469 val_vel_err: 81.1758652 val_traj_loss: 0.0035015 val_node_norm: 0.0000615 val_lambda: 1.0102879
+[INFO] Epoch 60: loss: 0.0038379 pos_err: 934.7097778 vel_err: 60.5213242 traj_loss: 0.0037843 node_norm: 0.0000113 lambda: 1.0111579 val_loss: 0.0035653 val_pos_err: 958.4474487 val_vel_err: 74.6868820 val_traj_loss: 0.0034507 val_node_norm: 0.0000761 val_lambda: 1.0111579
+[INFO] Epoch 65: loss: 0.0038276 pos_err: 933.3885498 vel_err: 60.5051003 traj_loss: 0.0037716 node_norm: 0.0000108 lambda: 1.0120087 val_loss: 0.0034987 val_pos_err: 946.3903809 val_vel_err: 78.4242630 val_traj_loss: 0.0033749 val_node_norm: 0.0000833 val_lambda: 1.0120084
+[INFO] Epoch 70: loss: 0.0038202 pos_err: 932.8583374 vel_err: 60.1224251 traj_loss: 0.0037615 node_norm: 0.0000103 lambda: 1.0128527 val_loss: 0.0035519 val_pos_err: 955.3652954 val_vel_err: 80.1096649 val_traj_loss: 0.0034437 val_node_norm: 0.0000640 val_lambda: 1.0128535
+[INFO] Epoch 75: loss: 0.0038172 pos_err: 933.5465088 vel_err: 60.8633308 traj_loss: 0.0037549 node_norm: 0.0000108 lambda: 1.0136993 val_loss: 0.0034236 val_pos_err: 958.5551147 val_vel_err: 75.1584244 val_traj_loss: 0.0033017 val_node_norm: 0.0000766 val_lambda: 1.0136997
+[INFO] Epoch 80: loss: 0.0038058 pos_err: 933.6306152 vel_err: 60.0461464 traj_loss: 0.0037420 node_norm: 0.0000095 lambda: 1.0145311 val_loss: 0.0034272 val_pos_err: 978.0380859 val_vel_err: 71.6946182 val_traj_loss: 0.0033051 val_node_norm: 0.0000741 val_lambda: 1.0145317
+[INFO] Epoch 85: loss: 0.0038015 pos_err: 932.8859863 vel_err: 59.9682388 traj_loss: 0.0037353 node_norm: 0.0000088 lambda: 1.0153701 val_loss: 0.0035142 val_pos_err: 934.9163818 val_vel_err: 79.1146240 val_traj_loss: 0.0033844 val_node_norm: 0.0000777 val_lambda: 1.0153705
+[INFO] Epoch 90: loss: 0.0037958 pos_err: 931.4605103 vel_err: 60.2558517 traj_loss: 0.0037263 node_norm: 0.0000091 lambda: 1.0162134 val_loss: 0.0035138 val_pos_err: 956.3972168 val_vel_err: 74.7137527 val_traj_loss: 0.0033704 val_node_norm: 0.0000888 val_lambda: 1.0162140
+[INFO] Epoch 95: loss: 0.0037900 pos_err: 932.4786987 vel_err: 59.8430252 traj_loss: 0.0037180 node_norm: 0.0000087 lambda: 1.0170488 val_loss: 0.0035579 val_pos_err: 925.9664307 val_vel_err: 81.5814209 val_traj_loss: 0.0034235 val_node_norm: 0.0000760 val_lambda: 1.0170494
+[INFO] Early stopping triggered at 97
 
-import math
-import random
-from typing import TYPE_CHECKING
+Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x15a063d10>, 0.0001)
+[INFO] Epoch 5: loss: 0.0082318 pos_err: 1135.8823242 vel_err: 137.3972778 traj_loss: 0.0079211 node_norm: 0.0002939 lambda: 1.0021284 val_loss: 0.0099935 val_pos_err: 1672.6606445 val_vel_err: 162.1587982 val_traj_loss: 0.0095541 val_node_norm: 0.0004191 val_lambda: 1.0021278
+[INFO] Epoch 10: loss: 0.0079688 pos_err: 1110.0345459 vel_err: 134.6340332 traj_loss: 0.0076784 node_norm: 0.0002567 lambda: 1.0043838 val_loss: 0.0090945 val_pos_err: 1325.4356689 val_vel_err: 158.6949005 val_traj_loss: 0.0085054 val_node_norm: 0.0005519 val_lambda: 1.0043843
+[INFO] Epoch 15: loss: 0.0079929 pos_err: 1116.1928711 vel_err: 133.2699127 traj_loss: 0.0077028 node_norm: 0.0002395 lambda: 1.0065696 val_loss: 0.0085922 val_pos_err: 1131.7423096 val_vel_err: 153.6203308 val_traj_loss: 0.0079514 val_node_norm: 0.0005886 val_lambda: 1.0065700
+[INFO] Epoch 20: loss: 0.0079076 pos_err: 1102.7639160 vel_err: 132.7710266 traj_loss: 0.0076172 node_norm: 0.0002240 lambda: 1.0087194 val_loss: 0.0079455 val_pos_err: 1306.2803955 val_vel_err: 148.9608612 val_traj_loss: 0.0074240 val_node_norm: 0.0004568 val_lambda: 1.0087188
+[INFO] Epoch 25: loss: 0.0078769 pos_err: 1107.2137451 vel_err: 131.8567657 traj_loss: 0.0075919 node_norm: 0.0002032 lambda: 1.0107765 val_loss: 0.0097049 val_pos_err: 1480.8806152 val_vel_err: 156.0653381 val_traj_loss: 0.0091620 val_node_norm: 0.0004442 val_lambda: 1.0107768
+[INFO] Epoch 30: loss: 0.0078790 pos_err: 1103.0084229 vel_err: 132.7178192 traj_loss: 0.0075936 node_norm: 0.0001879 lambda: 1.0128478 val_loss: 0.0081572 val_pos_err: 1337.3243408 val_vel_err: 143.2529907 val_traj_loss: 0.0076837 val_node_norm: 0.0003748 val_lambda: 1.0128475
+[INFO] Epoch 35: loss: 0.0078188 pos_err: 1100.6307373 vel_err: 131.1233978 traj_loss: 0.0075315 node_norm: 0.0001754 lambda: 1.0148735 val_loss: 0.0086994 val_pos_err: 1316.5633545 val_vel_err: 143.7427979 val_traj_loss: 0.0081775 val_node_norm: 0.0004004 val_lambda: 1.0148736
+[INFO] Epoch 40: loss: 0.0078706 pos_err: 1099.5321045 vel_err: 131.4767914 traj_loss: 0.0075724 node_norm: 0.0001707 lambda: 1.0168374 val_loss: 0.0089323 val_pos_err: 1237.3796387 val_vel_err: 153.8306885 val_traj_loss: 0.0083770 val_node_norm: 0.0004143 val_lambda: 1.0168370
+[INFO] Epoch 45: loss: 0.0078817 pos_err: 1101.6879883 vel_err: 131.7530212 traj_loss: 0.0075757 node_norm: 0.0001627 lambda: 1.0189161 val_loss: 0.0085564 val_pos_err: 1337.1634521 val_vel_err: 150.9702606 val_traj_loss: 0.0079782 val_node_norm: 0.0004273 val_lambda: 1.0189155
+[INFO] Epoch 50: loss: 0.0078427 pos_err: 1101.9874268 vel_err: 131.2271271 traj_loss: 0.0075321 node_norm: 0.0001531 lambda: 1.0209007 val_loss: 0.0084344 val_pos_err: 1376.6910400 val_vel_err: 149.1684875 val_traj_loss: 0.0079560 val_node_norm: 0.0003122 val_lambda: 1.0209007
+[INFO] Epoch 55: loss: 0.0079010 pos_err: 1108.8371582 vel_err: 131.7764130 traj_loss: 0.0075803 node_norm: 0.0001474 lambda: 1.0228617 val_loss: 0.0084991 val_pos_err: 1177.7230225 val_vel_err: 147.8966370 val_traj_loss: 0.0078517 val_node_norm: 0.0004679 val_lambda: 1.0228623
+[INFO] Epoch 60: loss: 0.0078513 pos_err: 1108.5605469 vel_err: 131.4196625 traj_loss: 0.0075190 node_norm: 0.0001458 lambda: 1.0248146 val_loss: 0.0083184 val_pos_err: 1065.6373291 val_vel_err: 145.0807495 val_traj_loss: 0.0076691 val_node_norm: 0.0004590 val_lambda: 1.0248146
+[INFO] Epoch 65: loss: 0.0078178 pos_err: 1097.6730957 vel_err: 130.3889160 traj_loss: 0.0074789 node_norm: 0.0001388 lambda: 1.0267401 val_loss: 0.0081189 val_pos_err: 1224.8206787 val_vel_err: 139.7011566 val_traj_loss: 0.0075949 val_node_norm: 0.0003210 val_lambda: 1.0267395
+[INFO] Epoch 70: loss: 0.0081256 pos_err: 1123.5534668 vel_err: 131.6136322 traj_loss: 0.0077678 node_norm: 0.0001351 lambda: 1.0286711 val_loss: 0.0087882 val_pos_err: 1400.8522949 val_vel_err: 138.3565826 val_traj_loss: 0.0083561 val_node_norm: 0.0001925 val_lambda: 1.0286709
+[INFO] Epoch 75: loss: 0.0078913 pos_err: 1095.4556885 vel_err: 130.4517212 traj_loss: 0.0075315 node_norm: 0.0001289 lambda: 1.0306550 val_loss: 0.0087374 val_pos_err: 1265.9240723 val_vel_err: 144.7875366 val_traj_loss: 0.0080999 val_node_norm: 0.0003893 val_lambda: 1.0306554
+[INFO] Epoch 80: loss: 0.0079741 pos_err: 1098.6457520 vel_err: 131.4869537 traj_loss: 0.0075897 node_norm: 0.0001360 lambda: 1.0327189 val_loss: 0.0083148 val_pos_err: 1402.1876221 val_vel_err: 141.2176361 val_traj_loss: 0.0077204 val_node_norm: 0.0003418 val_lambda: 1.0327196
+[INFO] Early stopping triggered at 80
 
-import torch
-from torch import nn
-
-from cm_utilities.logger import logger
-from lm_ai_torch_training.device_type import DeviceType
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
-)
-from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
-from prediction.mlearn.neural_ode.loss_functions import (
-    ReverseLinearWeightingLoss,
-)
-
-if TYPE_CHECKING:  # pragma: no cover
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
-    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
-        OptimizerWithLossFunction,
-    )
-    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-    from prediction.mlearn.ffnn.model import FFNNModel
-    from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
-
-
-class EarlyStopper:
-    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float("inf")
-        self.previous_validation_loss = float("inf")
-        self.metric_name = metric_name
-
-    def early_stop(self, validation_loss: float):
-        if validation_loss < (self.min_validation_loss - self.min_delta):
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        else:
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        self.previous_validation_loss = validation_loss
-        return False
-
-
-class ModelCheckpoint:
-    def __init__(self, min_epochs: int, directory: str, model_name: str):
-        self.min_epochs = min_epochs
-        self.directory = directory
-        self.model_name = model_name
-        self.min_metric = float("inf")
-
-    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
-        if epoch > self.min_epochs and metric < self.min_metric:
-            self.min_metric = metric
-            model.save(
-                directory=self.directory,
-                model_name=self.model_name,
-            )
-            return True
-        return False
-
-
-class NODEPredictor(nn.Module):
-    """Neural Ordinary Differential Equation (NODE) Prediction Model."""
-
-    def __init__(
-        self,
-        architecture: FFNNArchitecture,
-        training_configuration: TrainingConfiguration,
-        solver: ODESolver,
-        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
-        logging_interval: int = 1,
-        early_stopper: EarlyStopper | None = None,
-        checkpoint: ModelCheckpoint | None = None,
-        aug_dim: int = 0,
-    ) -> None:
-        super().__init__()
-        self.architecture: FFNNArchitecture = architecture
-        self.training_configuration: TrainingConfiguration = training_configuration
-        self.logging_interval: int = logging_interval
-        self.solver = solver
-        self.early_stopper = early_stopper
-        self.checkpoint = checkpoint
-        self.aug_dim = aug_dim
-
-        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
-        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
-        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
-        self.verbose: bool = self.training_configuration.verbose
-        self.training_metrics: dict[str, list[float]] = {}
-
-        self._initialize_device()
-        self._initialize_losses(loss_func=loss_func)
-        self._initialize_model()
-        self._initialize_optimizer()
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-    ) -> dict[str, list[float]]:
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-
-            train_sums: dict[str, torch.Tensor] = {}
-            train_count = 0
-
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    batch_metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    batch_metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                batch_metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,
-                    norm_type=2.0,
-                )
-
-                loss_is_finite = torch.isfinite(batch_metrics["loss"]).item()
-                grad_is_finite = torch.isfinite(total_norm).item()
-                if loss_is_finite and grad_is_finite:
-                    self.optimizer.step()
-                else:
-                    self.optimizer.zero_grad(set_to_none=True)
-
-                n_in_batch = len(batch_idx)
-                train_count += n_in_batch
-                for key, value in batch_metrics.items():
-                    contribution = value.detach() * n_in_batch
-                    train_sums[key] = train_sums.get(key, 0.0) + contribution
-
-            metrics = {key: value / max(train_count, 1) for key, value in train_sums.items()}
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    pool_index_val = list(range(len(validation_data)))
-                    if shuffle:
-                        random.shuffle(pool_index_val)
-
-                    val_sums: dict[str, torch.Tensor] = {}
-                    val_count = 0
-
-                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
-                        batch_idx_val = [
-                            pool_index_val.pop(0)
-                            for _ in range(
-                                min(
-                                    len(pool_index_val),
-                                    self.batch_size,
-                                )
-                            )
-                        ]
-                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
-                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                        x_batch_val = float("nan") * torch.ones(
-                            (
-                                len(batch_idx_val),
-                                max_len_val,
-                                x_batch_list_val[0].size(dim=1),
-                            )
-                        )
-                        for i in range(len(x_batch_list_val)):
-                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                        if extra_feat is None:
-                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                        else:
-                            metrics_val = self.batch_loss(
-                                x=x_batch_val.to(self.device),
-                                extra_feat=extra_feat[batch_idx_val],
-                            )
-
-                        n_in_val_batch = len(batch_idx_val)
-                        val_count += n_in_val_batch
-                        for key, value in metrics_val.items():
-                            contribution = value.detach() * n_in_val_batch
-                            val_sums[key] = val_sums.get(key, 0.0) + contribution
-
-                    for key, value in val_sums.items():
-                        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-                    if hasattr(self.criterion, "update_lagrangian_multiplier"):
-                        val_traj_loss_epoch = metrics.get("val_traj_loss", metrics.get("val_loss", 0.0))
-                        if isinstance(val_traj_loss_epoch, torch.Tensor):
-                            val_traj_loss_epoch = val_traj_loss_epoch.item()
-                        self.criterion.update_lagrangian_multiplier(val_traj_loss_epoch)
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-            ):
-                logger.info(f"Early stopping triggered at {epoch}")
-                break
-
-        return self.training_metrics
-
-    def batch_loss(
-        self,
-        x: torch.Tensor,
-        extra_feat: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Calculates batch loss with dynamic + static invariant latent initialization."""
-        batch_size, time_steps, n_features = x.shape
-        x0_phys = x[:, 0, :]
-
-        # Derive valid mask before NaN imputation
-        valid_mask = (~torch.isnan(x[..., :1])).float()
-
-        if self.aug_dim == 0:
-            x0 = x0_phys
-        else:
-            if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                h0 = self.model.func.encode(x0_phys)
-                # Seed dynamic state and static invariant parameter
-                x0 = torch.cat((x0_phys, h0, h0), dim=-1)
-            else:
-                h0 = torch.zeros((batch_size, self.aug_dim), device=self.device)
-                x0 = torch.cat((x0_phys, h0), dim=-1)
-
-        if self.solver.adjoint:
-            x_pred = AdjointMethod.apply(
-                self.solver,
-                self.model,
-                x0,
-                time_steps - 1,
-                extra_feat,
-                *tuple(self.model.parameters()),
-            )[:, :, : n_features]
-        else:
-            x_pred = self.solver.integrate(
-                func=self.model,
-                x0=x0,
-                steps=time_steps - 1,
-                extra_feat=extra_feat,
-            )[:, :, : n_features]
-
-        x_pred = torch.nan_to_num(x_pred, nan=0.0)
-        x = torch.nan_to_num(x, nan=0.0)
-
-        # Pass non-padding mask directly to loss function
-        try:
-            return self.criterion(x_pred, x, mask=valid_mask)
-        except TypeError:
-            return self.criterion(x_pred, x)
-
-    def infer(
-        self,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Infers on a trained model with matched dynamic/static latent seeding."""
-        with torch.no_grad():
-            if self.aug_dim != 0:
-                if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                    h0 = self.model.func.encode(x0)
-                    x0 = torch.cat((x0, h0, h0), dim=-1)
-                else:
-                    h0 = torch.zeros(
-                        (x0.shape[0], self.aug_dim), device=x0.device, dtype=x0.dtype
-                    )
-                    x0 = torch.cat((x0, h0), dim=-1)
-            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
-
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
-    ) -> None:
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-
-    def save(self, directory: str, model_name: str) -> None:
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.save(directory, model_name)
-
-    def _initialize_device(self) -> None:
-        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
-        self.to(device=self.device)
-
-    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
-        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
-
-    def _initialize_model(self) -> None:
-        self.model: FFNNModel = self.architecture.get_model().to(self.device)
-
-    def _initialize_optimizer(self) -> None:
-        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
-            self.model
-        )
-
-    def _add_metrics_to_global_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        for metric, value in metrics.items():
-            if metric not in self.training_metrics:
-                self.training_metrics[metric] = []
-            self.training_metrics[metric].append(value.detach().cpu().numpy())
-
-    def _log_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-        iteration: int,
-        prefix: str = "Epoch",
-    ) -> None:
-        with torch.no_grad():
-            if self.verbose and iteration % self.logging_interval == 0:
-                metric_comps: list[str] = []
-                for metric, value in metrics.items():
-                    metric_comps.append(f"{metric}: {value.item():.7f}")
-                metric_str: str = " ".join(metric_comps)
-                logger.info(f"{prefix} {iteration}: {metric_str}")
+Running length strategy: (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x15dfa3290>, 0.0001)
+[INFO] Epoch 5: loss: 0.0082139 pos_err: 1304.0645752 vel_err: 141.7261658 traj_loss: 0.0079901 node_norm: 0.0002060 lambda: 1.0022275 val_loss: 0.0108095 val_pos_err: 1447.4700928 val_vel_err: 161.3993073 val_traj_loss: 0.0103137 val_node_norm: 0.0004728 val_lambda: 1.0022268
+[INFO] Epoch 10: loss: 0.0080987 pos_err: 1246.1881104 vel_err: 139.4356232 traj_loss: 0.0078363 node_norm: 0.0002241 lambda: 1.0048904 val_loss: 0.0120150 val_pos_err: 2493.1315918 val_vel_err: 174.1896973 val_traj_loss: 0.0116380 val_node_norm: 0.0003201 val_lambda: 1.0048907
+[INFO] Epoch 15: loss: 0.0083136 pos_err: 1308.2087402 vel_err: 142.8295288 traj_loss: 0.0080197 node_norm: 0.0002334 lambda: 1.0075380 val_loss: 0.0102570 val_pos_err: 1551.7172852 val_vel_err: 158.2466583 val_traj_loss: 0.0097549 val_node_norm: 0.0004286 val_lambda: 1.0075380
+[INFO] Epoch 20: loss: 0.0081486 pos_err: 1285.4090576 vel_err: 140.9351501 traj_loss: 0.0078424 node_norm: 0.0002265 lambda: 1.0101509 val_loss: 0.0106858 val_pos_err: 1719.4937744 val_vel_err: 158.7840118 val_traj_loss: 0.0102281 val_node_norm: 0.0003538 val_lambda: 1.0101509
+[INFO] Epoch 25: loss: 0.0080448 pos_err: 1228.3988037 vel_err: 137.6541901 traj_loss: 0.0077258 node_norm: 0.0002211 lambda: 1.0126733 val_loss: 0.0108362 val_pos_err: 1662.7821045 val_vel_err: 162.2942963 val_traj_loss: 0.0103433 val_node_norm: 0.0003618 val_lambda: 1.0126737
+[INFO] Epoch 30: loss: 0.0080302 pos_err: 1236.9588623 vel_err: 138.4875641 traj_loss: 0.0076884 node_norm: 0.0002244 lambda: 1.0152636 val_loss: 0.0113364 val_pos_err: 2410.6516113 val_vel_err: 165.3152618 val_traj_loss: 0.0108807 val_node_norm: 0.0002897 val_lambda: 1.0152643
+[INFO] Epoch 35: loss: 0.0079483 pos_err: 1213.9808350 vel_err: 138.6620026 traj_loss: 0.0075943 node_norm: 0.0002200 lambda: 1.0176437 val_loss: 0.0107680 val_pos_err: 2327.7531738 val_vel_err: 165.9930878 val_traj_loss: 0.0102920 val_node_norm: 0.0002943 val_lambda: 1.0176440
+[INFO] Epoch 40: loss: 0.0079744 pos_err: 1203.5270996 vel_err: 137.3699646 traj_loss: 0.0075943 node_norm: 0.0002266 lambda: 1.0202190 val_loss: 0.0102271 val_pos_err: 1745.0855713 val_vel_err: 152.7991943 val_traj_loss: 0.0097269 val_node_norm: 0.0003036 val_lambda: 1.0202198
+[INFO] Epoch 45: loss: 0.0079706 pos_err: 1201.2386475 vel_err: 137.8382263 traj_loss: 0.0075764 node_norm: 0.0002215 lambda: 1.0227860 val_loss: 0.0097232 val_pos_err: 1592.4311523 val_vel_err: 158.3797913 val_traj_loss: 0.0091956 val_node_norm: 0.0003181 val_lambda: 1.0227865
+[INFO] Epoch 50: loss: 0.0079814 pos_err: 1201.9248047 vel_err: 137.0869141 traj_loss: 0.0075629 node_norm: 0.0002280 lambda: 1.0251931 val_loss: 0.0102437 val_pos_err: 1842.7019043 val_vel_err: 153.6346893 val_traj_loss: 0.0097658 val_node_norm: 0.0002319 val_lambda: 1.0251936
+[INFO] Epoch 55: loss: 0.0079677 pos_err: 1196.0600586 vel_err: 137.7848358 traj_loss: 0.0075362 node_norm: 0.0002221 lambda: 1.0277746 val_loss: 0.0093316 val_pos_err: 1681.6433105 val_vel_err: 150.7384338 val_traj_loss: 0.0087974 val_node_norm: 0.0002899 val_lambda: 1.0277742
+[INFO] Epoch 60: loss: 0.0080280 pos_err: 1209.2524414 vel_err: 136.4849854 traj_loss: 0.0075859 node_norm: 0.0002130 lambda: 1.0301943 val_loss: 0.0108833 val_pos_err: 2300.2744141 val_vel_err: 161.9195709 val_traj_loss: 0.0103010 val_node_norm: 0.0002712 val_lambda: 1.0301948

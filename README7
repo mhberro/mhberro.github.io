@@ -232,18 +232,23 @@ def train_NEXT(
         node._initialize_optimizer()
 
     latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
-    if model_type in ("gruode", "aphynity-gruode"):
+    if model_type in ("gruode", "aphynity-gruode", "aphynity-node"):
         enc_in_idx = None
 
-        gruode_func = GRUODEFunc(
-            state_vector_len=model_states,
-            nhidden=nhidden,
-            latent_dim=latent_dim,
-            minimal=False,
-            encoder_input_idx=enc_in_idx,
-            encoder_dropout=0.1,
-            cell_input_size=model_states,
-        ).to(node.device)
+        # The GRU-ODE func/latent is only for the gruode variants. aphynity-node
+        # integrates the physical state directly (f_phys(y) + MLP(y)), so it has no
+        # latent func to build.
+        gruode_func = None
+        if model_type in ("gruode", "aphynity-gruode"):
+            gruode_func = GRUODEFunc(
+                state_vector_len=model_states,
+                nhidden=nhidden,
+                latent_dim=latent_dim,
+                minimal=False,
+                encoder_input_idx=enc_in_idx,
+                encoder_dropout=0.1,
+                cell_input_size=model_states,
+            ).to(node.device)
 
         if frame == "dcu" or (frame == "geodesic" and model_states == 6):
             pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]

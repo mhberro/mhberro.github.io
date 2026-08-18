@@ -1,267 +1,79 @@
-# physics_library.py
-"""Physics-informed candidate library for Ensemble-SINDy on HGV glide dynamics.
-
-Motivation
-----------
-A degree-2 polynomial library in [s, h, v_s, v_alpha, v_h] cannot express
-aerodynamic drag/lift, which scale as rho(h) * V^2 with rho(h) approximately
-exponential in altitude. Over a glide from ~108 km to ~22 km that factor spans
-about five orders of magnitude, so the least-squares projection of drag onto a
-polynomial basis is ~0 -- which is exactly what the polynomial-only discovery
-returned (all acceleration-channel coefficients at the 0.01-0.03 noise floor,
-smeared over ~20 terms, versus clean 2-term recovery on the position rows where
-the truth IS expressible).
-
-E-SINDy (Fasel et al.) is explicit that the library choice "is crucial" and that
-the strategy is to start simple and increase complexity until sparse and accurate
-models emerge. This module supplies the next rung: atmosphere/drag candidates.
-
-Units
------
-Physics terms are evaluated in PHYSICAL units. When the SINDy data is in
-StandardScaler space, pass `feature_mean` / `feature_scale` and the library
-unscales internally. Polynomial terms are left on the input (scaled) state so
-the polynomial block reproduces prior behaviour exactly. Mixing is harmless:
-the regression coefficients absorb the unit conversion, and `stridge` already
-column-normalises before thresholding.
-
-Scale-height uncertainty
-------------------------
-If the generating atmosphere model is unknown, do NOT dump many scale heights
-into one library: exp(-h/H) for nearby H are highly collinear, bootstrap
-selection flips between them, every inclusion probability lands below the
-threshold, and all of them get zeroed. Prefer ONE scale height per fit and
-scan H across separate fits (see `--sindy-scan-scale-heights`), reading off
-which H yields the strongest, sparsest acceleration-channel coefficients.
-"""
+# aphynity_loss.py
+"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
 
 from __future__ import annotations
 
-import itertools
-
-import numpy as np
-
-EARTH_RADIUS_M = 6371000.0
-_V_EPS = 1e-12
-# Cap the exponent so a below-reference altitude cannot overflow exp().
-_EXP_ARG_MAX = 10.0
+import torch
+from torch import nn
 
 
-class PhysicsInformedLibrary:
-    """Polynomial terms plus atmosphere/drag/curvature candidates.
-
-    Column order is: [polynomial block] + [physics block]. The same ordering is
-    reproduced by `SINDyPhysicsModel` in torch; `library_spec()` is the single
-    source of truth shared by both paths.
-    """
+class APHYNITYAdaptiveLossWrapper(nn.Module):
+    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
 
     def __init__(
         self,
-        state_vector_len: int = 5,
-        degree: int = 2,
-        include_bias: bool = True,
-        h_idx: int = 1,
-        vs_idx: int = 2,
-        va_idx: int = 3,
-        vh_idx: int = 4,
-        scale_heights: tuple[float, ...] = (7200.0,),
-        earth_radius: float = EARTH_RADIUS_M,
-        feature_mean=None,
-        feature_scale=None,
-        include_curvature: bool = True,
-        clip: float = 8.0,
+        base_criterion: nn.Module,
+        lambda_init: float = 1.0,
+        tau2: float = 5.0,
+        max_lambda: float = 50.0,
+        node_norm_weight: float = 1.0,
     ):
-        self.state_vector_len = state_vector_len
-        self.degree = degree
-        self.include_bias = include_bias
-        self.h_idx = h_idx
-        self.vs_idx = vs_idx
-        self.va_idx = va_idx
-        self.vh_idx = vh_idx
-        self.scale_heights = tuple(float(H) for H in scale_heights)
-        self.earth_radius = float(earth_radius)
-        self.include_curvature = bool(include_curvature)
-        # Physics columns are RMS-normalised using training-set statistics and then
-        # clipped to +/- `clip`. This is essential, not cosmetic: rho(h)=exp(-h/H) is
-        # an UNBOUNDED extrapolator. During early training the integrator wanders
-        # below the training altitude envelope, and an unnormalised drag column can
-        # exceed anything seen in data by ~1e6, sending the rollout to inf. Clipping
-        # in normalised space bounds f_phys to a fixed multiple of its in-data scale.
-        self.clip = float(clip)
-        self.physics_scale_ = None  # set on the first fit_transform, then frozen
+        """Adaptive dual multiplier for  min ||F_a||  s.t.  trajectory constraint.
 
-        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, dtype=float)
-        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, dtype=float)
+        NOTE on scaling: the dual update is lambda += tau2 * L_traj, so a sensible
+        tau2 depends entirely on the MAGNITUDE of L_traj. With L_traj ~ 4e-3
+        (the regime once the loss is correctly scaled) the paper's tau2 in the
+        0.1-100 range gives a gentle, useful ramp. With an inflated L_traj ~ 1.3
+        the same tau2 pins lambda at its cap within a few epochs and training
+        diverges. If you change the loss scale, re-check tau2.
+        """
+        super().__init__()
+        self.base_criterion = base_criterion
+        self.tau2 = float(tau2)
+        self.max_lambda = float(max_lambda)
+        self.lambda_init = float(lambda_init)
+        self.node_norm_weight = float(node_norm_weight)
+        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
+        self.model_ref = None
 
-        self.poly_combos = []
-        for d in range(0 if include_bias else 1, degree + 1):
-            self.poly_combos.extend(
-                itertools.combinations_with_replacement(range(state_vector_len), d)
-            )
+    def set_model(self, model: nn.Module) -> None:
+        self.model_ref = model
+        if hasattr(self.base_criterion, "set_model"):
+            self.base_criterion.set_model(model)
 
-        # (kind, scale_height_or_None) -- consumed identically by numpy and torch.
-        self.physics_terms: list[tuple[str, float | None]] = []
-        for H in self.scale_heights:
-            self.physics_terms.append(("drag_vs", H))   # rho(h) * V * v_s
-            self.physics_terms.append(("drag_vh", H))   # rho(h) * V * v_h
-            self.physics_terms.append(("drag_V2", H))   # rho(h) * V^2
-            self.physics_terms.append(("aero_va", H))   # rho(h) * V * v_alpha
-        if self.include_curvature:
-            self.physics_terms.append(("curv_vs2", None))  # v_s^2 / (Re + h)
+    def reset_lagrangian(self) -> None:
+        """Resets dual multiplier at strategy phase boundaries."""
+        with torch.no_grad():
+            self.lambda_val.fill_(self.lambda_init)
 
-    # ------------------------------------------------------------------ spec
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
+        metrics = self.base_criterion(pred, target)
+        traj_loss = metrics["loss"]
 
-    def library_spec(self) -> dict:
-        """Everything the torch evaluator needs to rebuild identical columns."""
-        return {
-            "state_vector_len": self.state_vector_len,
-            "degree": self.degree,
-            "include_bias": self.include_bias,
-            "poly_combos": [tuple(c) for c in self.poly_combos],
-            "physics_terms": list(self.physics_terms),
-            "h_idx": self.h_idx,
-            "vs_idx": self.vs_idx,
-            "va_idx": self.va_idx,
-            "vh_idx": self.vh_idx,
-            "earth_radius": self.earth_radius,
-            "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
-            "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
-            "clip": self.clip,
-            "physics_scale": None if self.physics_scale_ is None else list(self.physics_scale_),
-        }
+        node_norm = torch.tensor(0.0, device=pred.device)
+        if self.model_ref is not None:
+            # pop_node_norm() returns the residual magnitude AGGREGATED over every
+            # solver evaluation in this batch's rollout and resets the accumulator.
+            # Plain attribute access would leave the accumulator growing across
+            # batches (and, before accumulation existed, exposed only a single
+            # sub-step sample).
+            if hasattr(self.model_ref, "pop_node_norm"):
+                node_norm = self.model_ref.pop_node_norm().to(pred.device)
+            elif hasattr(self.model_ref, "last_node_norm"):
+                node_norm = self.model_ref.last_node_norm.to(pred.device)
 
-    def term_combos(self, n_features: int | None = None) -> list:
-        """Column layout: polynomial tuples first, then None for each physics term."""
-        return [tuple(c) for c in self.poly_combos] + [None] * len(self.physics_terms)
+        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
+        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
 
-    def term_names(self) -> list[str]:
-        names = ["s", "h", "v_s", "v_al", "v_h"][: self.state_vector_len]
-        out = []
-        for combo in self.poly_combos:
-            out.append("1" if len(combo) == 0 else "*".join(names[i] for i in combo))
-        for kind, H in self.physics_terms:
-            out.append(f"{kind}" if H is None else f"{kind}@H={int(H)}")
-        return out
+        out_metrics = dict(metrics)
+        out_metrics["loss"] = total_loss
+        out_metrics["traj_loss"] = traj_loss.detach()
+        out_metrics["node_norm"] = node_norm.detach()
+        out_metrics["lambda"] = self.lambda_val.detach()
+        return out_metrics
 
-    @property
-    def n_terms(self) -> int:
-        return len(self.poly_combos) + len(self.physics_terms)
-
-    # ------------------------------------------------------------- numpy path
-
-    def _to_physical(self, Y: np.ndarray) -> np.ndarray:
-        if self.feature_mean is None or self.feature_scale is None:
-            return Y
-        return Y * self.feature_scale + self.feature_mean
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n_samples = Y.shape[0]
-        cols = np.empty((n_samples, self.n_terms), dtype=float)
-        n_poly = len(self.poly_combos)
-
-        # --- polynomial block, on the input (scaled) state ---
-        for i, combo in enumerate(self.poly_combos):
-            cols[:, i] = 1.0 if len(combo) == 0 else np.prod(Y[:, combo], axis=1)
-
-        # --- physics block, on the PHYSICAL state ---
-        P = self._to_physical(Y)
-        h = P[:, self.h_idx]
-        vs = P[:, self.vs_idx]
-        va = P[:, self.va_idx]
-        vh = P[:, self.vh_idx]
-        V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-
-        off = len(self.poly_combos)
-        for j, (kind, H) in enumerate(self.physics_terms):
-            if kind == "curv_vs2":
-                cols[:, off + j] = vs * vs / (self.earth_radius + h)
-                continue
-            rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
-            if kind == "drag_vs":
-                cols[:, off + j] = rho * V * vs
-            elif kind == "drag_vh":
-                cols[:, off + j] = rho * V * vh
-            elif kind == "drag_V2":
-                cols[:, off + j] = rho * V * V
-            elif kind == "aero_va":
-                cols[:, off + j] = rho * V * va
-            else:
-                raise ValueError(f"unknown physics term kind: {kind}")
-
-        # Freeze RMS statistics on the first (training) call, then always normalise
-        # and clip so the torch evaluator can reproduce identical values.
-        if self.physics_terms:
-            block = cols[:, off:]
-            if self.physics_scale_ is None:
-                rms = np.sqrt(np.mean(block ** 2, axis=0))
-                rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
-                self.physics_scale_ = rms
-            cols[:, off:] = np.clip(
-                block / self.physics_scale_, -self.clip, self.clip
-            )
-        return cols
-
-
-def evaluate_library_torch(y, spec: dict):
-    """Torch mirror of `PhysicsInformedLibrary.fit_transform`.
-
-    Kept in this module, next to the numpy implementation, so the two cannot
-    drift apart. Column order is identical by construction.
-    """
-    import torch
-
-    cols = []
-    for combo in spec["poly_combos"]:
-        if len(combo) == 0:
-            cols.append(torch.ones_like(y[..., :1]))
-        else:
-            term = y[..., combo[0] : combo[0] + 1]
-            for k in combo[1:]:
-                term = term * y[..., k : k + 1]
-            cols.append(term)
-
-    physics_terms = spec["physics_terms"]
-    if physics_terms:
-        mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
-        if mean is not None and scale is not None:
-            mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
-            scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
-            P = y * scale_t + mean_t
-        else:
-            P = y
-
-        hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
-        h = P[..., hi : hi + 1]
-        vs = P[..., vsi : vsi + 1]
-        va = P[..., vai : vai + 1]
-        vh = P[..., vhi : vhi + 1]
-        V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
-        Re = spec["earth_radius"]
-
-        for kind, H in physics_terms:
-            if kind == "curv_vs2":
-                cols.append(vs * vs / (Re + h))
-                continue
-            rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
-            if kind == "drag_vs":
-                cols.append(rho * V * vs)
-            elif kind == "drag_vh":
-                cols.append(rho * V * vh)
-            elif kind == "drag_V2":
-                cols.append(rho * V * V)
-            elif kind == "aero_va":
-                cols.append(rho * V * va)
-            else:
-                raise ValueError(f"unknown physics term kind: {kind}")
-
-        # Same RMS normalisation + clipping as the numpy path. Without this the
-        # physics block is unbounded outside the training envelope.
-        ps = spec.get("physics_scale")
-        clip = float(spec.get("clip", 8.0))
-        n_poly = len(spec["poly_combos"])
-        if ps is not None:
-            for j in range(len(physics_terms)):
-                sc = float(ps[j]) if float(ps[j]) != 0.0 else 1.0
-                cols[n_poly + j] = torch.clamp(cols[n_poly + j] / sc, -clip, clip)
-
-    return torch.cat(cols, dim=-1)
+    def update_lagrangian_multiplier(self, last_val_traj_loss: float) -> None:
+        """Bounded adaptive update: lambda_{j+1} = min(max_lambda, lambda_j + tau2 * L_traj)"""
+        with torch.no_grad():
+            updated = self.lambda_val + self.tau2 * last_val_traj_loss
+            self.lambda_val.copy_(torch.clamp(updated, max=self.max_lambda))

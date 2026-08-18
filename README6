@@ -1,48 +1,152 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type node --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_5/GEODESIC/glide --sindy-library physics --sindy-scale-heights 5000 --sindy-l1-threshold .01
-There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 110 training trajs
+"""APHYNITY-NODE: f_phys(y) + f_NODE(y).
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x146eddb50>, 0.0001)
-Traceback (most recent call last):
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1414, in <module>
-    main()
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1373, in main
-    (node, model_name) = train_NEXT(
-                         ^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 598, in train_NEXT
-    metrics = node.fit(
-              ^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 206, in fit
-    batch_metrics = self.batch_loss(x=x_batch.to(self.device))
-                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 387, in batch_loss
-    x_pred = self.solver.integrate(
-             ^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/lm_cm_repos/next/torchdiffeq_solver.py", line 88, in integrate
-    x = self.odeint(func, x0, times, method=self.method)
-        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/odeint.py", line 80, in odeint
-    solution = solver.integrate(t)
-               ^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/solvers.py", line 114, in integrate
-    dy, f0 = self._step_func(self.func, t0, dt, t1, y0)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/fixed_grid.py", line 28, in _step_func
-    f0 = func(t0, y0, perturb=Perturb.NEXT if self.perturb else Perturb.NONE)
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torchdiffeq/_impl/misc.py", line 197, in forward
-    return self.base_func(t, y)
-           ^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
-    return self._call_impl(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
-    return forward_call(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: FFNNModel.forward() takes 2 positional arguments but 3 were given
+This is the architecture described by the APHYNITY paper (Table E2: F_a is an MLP
+on the STATE, e.g. MLP(in=2, units=200, layers=3, out=2)) and, per the team's
+account, the one Ben used: a physics backbone plus a neural network that learns
+residuals as a DIRECT function of the current state.
+
+Contrast with APHYNITYGRUODEPredictorModel, where the residual is decode(h) -- a
+function of an integrated LATENT rather than the state. A GRU-ODE latent is the
+right inductive bias for irregularly-sampled / partially-observed series, where a
+belief state must be maintained. For fully-observed, regularly-sampled trajectory
+data the state IS observed, so the latent adds a lagged bottleneck (the latent is
+a contraction and forgets its initial condition over long rollouts), integrates
+100 extra dimensions, and adds ~40k parameters of overfitting capacity against a
+tiny dataset -- all cost, no benefit.
+
+State vector here is just the physical state (e.g. 5 for the integrated geodesic
+frame). No encoder, no latent, no h0.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+
+
+class ResidualMLP(nn.Module):
+    """f_NODE(y): plain MLP on the physical state (paper's F_a)."""
+
+    def __init__(self, n_features: int, hidden: int = 200, n_layers: int = 3):
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(n_features, hidden), nn.Tanh()]
+        for _ in range(max(0, n_layers - 2)):
+            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
+        layers += [nn.Linear(hidden, n_features)]
+        self.net = nn.Sequential(*layers)
+        # Small init so the residual starts near zero and the physics backbone
+        # dominates early -- APHYNITY's least-action prior ("explain as much as
+        # possible with physics") expressed as an initialization.
+        with torch.no_grad():
+            last = self.net[-1]
+            last.weight.mul_(0.01)
+            last.bias.zero_()
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        return self.net(y)
+
+
+class APHYNITYNODEPredictorModel(nn.Module):
+    """dy/dt = f_phys(y) + f_NODE(y), with the second-order kinematic override.
+
+    Interface matches APHYNITYGRUODEPredictorModel where it matters (last_node_norm
+    / pop_node_norm for the APHYNITY loss wrapper, the pos/vel override, node_norm
+    accumulation), so the training loop and loss are unchanged. The state vector is
+    the physical state only -- there is no latent partition to carry.
+    """
+
+    _NODE_EVAL_CAP = 200000
+
+    def __init__(
+        self,
+        physics_model: nn.Module,
+        n_features: int,
+        pos_idx,
+        vel_idx,
+        acc_idx=None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        hidden: int = 200,
+        n_layers: int = 3,
+        second_order: bool = True,
+        scaled_space: bool = True,
+    ):
+        super().__init__()
+        self.physics_model = physics_model
+        self.residual = ResidualMLP(n_features, hidden=hidden, n_layers=n_layers)
+        self.n_features = n_features
+        self.second_order = second_order
+        self.scaled_space = bool(scaled_space)
+
+        self.register_buffer("pos_idx", torch.as_tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.as_tensor(list(vel_idx), dtype=torch.long))
+        if acc_idx is None:
+            acc_idx = sorted(set(range(n_features)) - set(int(i) for i in pos_idx))
+        self.register_buffer("acc_idx", torch.as_tensor(list(acc_idx), dtype=torch.long))
+
+        # Second-order override: d(pos_scaled)/dt = vel_scaled * so_ratio + so_offset.
+        if scaled_space and pos_scale is not None and vel_scale is not None:
+            so_ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                pos_scale, dtype=torch.float32
+            )
+            so_offset = (
+                torch.as_tensor(vel_mean, dtype=torch.float32)
+                / torch.as_tensor(pos_scale, dtype=torch.float32)
+                if vel_mean is not None
+                else torch.zeros_like(so_ratio)
+            )
+            self.register_buffer("so_ratio", so_ratio)
+            self.register_buffer("so_offset", so_offset)
+        else:
+            self.so_ratio = None
+            self.so_offset = None
+
+        self.node_norm_mode = "sqnorm"  # see APHYNITYGRUODEPredictorModel
+        self._node_sq_sum = None
+        self._node_evals = 0
+        self.nfe = 0
+
+    # ---- APHYNITY least-action bookkeeping (same contract as the GRU-ODE model) ----
+
+    @property
+    def last_node_norm(self) -> torch.Tensor:
+        if self._node_sq_sum is None or self._node_evals == 0:
+            return torch.zeros(())
+        mean_sq = self._node_sq_sum / float(self._node_evals)
+        if getattr(self, "node_norm_mode", "sqnorm") == "sqnorm":
+            return mean_sq
+        return torch.sqrt(mean_sq + 1e-12)
+
+    def pop_node_norm(self) -> torch.Tensor:
+        value = self.last_node_norm
+        self._node_sq_sum = None
+        self._node_evals = 0
+        return value
+
+    def forward(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        self.nfe += 1
+
+        f_phys = self.physics_model(y)
+        f_node = self.residual(y)
+
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
+        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+        sq = torch.mean(f_node_acc ** 2)
+        if self._node_sq_sum is None or self._node_evals >= self._NODE_EVAL_CAP:
+            self._node_sq_sum = sq
+            self._node_evals = 1
+        else:
+            self._node_sq_sum = self._node_sq_sum + sq
+            self._node_evals += 1
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y.index_select(-1, self.vel_idx)
+            if self.so_ratio is not None:
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
+
+        return xdot

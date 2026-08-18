@@ -1,79 +1,169 @@
-# aphynity_loss.py
-"""APHYNITY adaptive dual Lagrangian optimization wrapper."""
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
 from __future__ import annotations
 
 import torch
 from torch import nn
+from gru_ode import GRUODEFunc
 
 
-class APHYNITYAdaptiveLossWrapper(nn.Module):
-    """Adaptive Dual Multiplier loss enforcing the APHYNITY least-action constraint."""
-
+class APHYNITYGRUODEPredictorModel(nn.Module):
     def __init__(
         self,
-        base_criterion: nn.Module,
-        lambda_init: float = 1.0,
-        tau2: float = 5.0,
-        max_lambda: float = 50.0,
-        node_norm_weight: float = 1.0,
+        func: GRUODEFunc,
+        physics_model: nn.Module,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
     ):
-        """Adaptive dual multiplier for  min ||F_a||  s.t.  trajectory constraint.
-
-        NOTE on scaling: the dual update is lambda += tau2 * L_traj, so a sensible
-        tau2 depends entirely on the MAGNITUDE of L_traj. With L_traj ~ 4e-3
-        (the regime once the loss is correctly scaled) the paper's tau2 in the
-        0.1-100 range gives a gentle, useful ramp. With an inflated L_traj ~ 1.3
-        the same tau2 pins lambda at its cap within a few epochs and training
-        diverges. If you change the loss scale, re-check tau2.
-        """
         super().__init__()
-        self.base_criterion = base_criterion
-        self.tau2 = float(tau2)
-        self.max_lambda = float(max_lambda)
-        self.lambda_init = float(lambda_init)
-        self.node_norm_weight = float(node_norm_weight)
-        self.register_buffer("lambda_val", torch.tensor(lambda_init, dtype=torch.float32))
-        self.model_ref = None
+        self.func = func
+        self.physics_model = physics_model
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
 
-    def set_model(self, model: nn.Module) -> None:
-        self.model_ref = model
-        if hasattr(self.base_criterion, "set_model"):
-            self.base_criterion.set_model(model)
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            # Identify acceleration and rate indices (non-position channels)
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
 
-    def reset_lagrangian(self) -> None:
-        """Resets dual multiplier at strategy phase boundaries."""
-        with torch.no_grad():
-            self.lambda_val.fill_(self.lambda_init)
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-        metrics = self.base_criterion(pred, target)
-        traj_loss = metrics["loss"]
+        # "norm"   -> ||F_a||   (APHYNITY Eq. 4 / Algorithm 1 -- what the paper uses)
+        # "sqnorm" -> ||F_a||^2  (legacy; the paper reports this only as a diagnostic)
+        # Squaring shrinks a ~4e-3 residual to ~1.6e-5, making the least-action
+        # penalty ~200x smaller than the trajectory term and effectively inert -- so
+        # f_node is never pressured to defer to f_phys.
+        self.node_norm_mode = "norm"
+        self._node_sq_sum = None
+        self._node_evals = 0
 
-        node_norm = torch.tensor(0.0, device=pred.device)
-        if self.model_ref is not None:
-            # pop_node_norm() returns the residual magnitude AGGREGATED over every
-            # solver evaluation in this batch's rollout and resets the accumulator.
-            # Plain attribute access would leave the accumulator growing across
-            # batches (and, before accumulation existed, exposed only a single
-            # sub-step sample).
-            if hasattr(self.model_ref, "pop_node_norm"):
-                node_norm = self.model_ref.pop_node_norm().to(pred.device)
-            elif hasattr(self.model_ref, "last_node_norm"):
-                node_norm = self.model_ref.last_node_norm.to(pred.device)
+    _NODE_EVAL_CAP = 200000  # guard against unbounded growth if pop() is never called
 
-        # Dual Lagrangian formulation: L_total = node_norm + lambda * L_traj
-        total_loss = self.node_norm_weight * node_norm + self.lambda_val * traj_loss
+    @property
+    def last_node_norm(self) -> torch.Tensor:
+        """Aggregate neural-residual magnitude over the current rollout."""
+        if self._node_sq_sum is None or self._node_evals == 0:
+            return torch.zeros(())
+        mean_sq = self._node_sq_sum / float(self._node_evals)
+        if getattr(self, "node_norm_mode", "norm") == "sqnorm":
+            return mean_sq
+        return torch.sqrt(mean_sq + 1e-12)
 
-        out_metrics = dict(metrics)
-        out_metrics["loss"] = total_loss
-        out_metrics["traj_loss"] = traj_loss.detach()
-        out_metrics["node_norm"] = node_norm.detach()
-        out_metrics["lambda"] = self.lambda_val.detach()
-        return out_metrics
+    def pop_node_norm(self) -> torch.Tensor:
+        """Read the aggregate and reset for the next batch."""
+        value = self.last_node_norm
+        self._node_sq_sum = None
+        self._node_evals = 0
+        return value
 
-    def update_lagrangian_multiplier(self, last_val_traj_loss: float) -> None:
-        """Bounded adaptive update: lambda_{j+1} = min(max_lambda, lambda_j + tau2 * L_traj)"""
-        with torch.no_grad():
-            updated = self.lambda_val + self.tau2 * last_val_traj_loss
-            self.lambda_val.copy_(torch.clamp(updated, max=self.max_lambda))
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
+
+        y_read = state[..., : self.n_features]
+        h_raw = state[..., self.n_features : self.n_features + self.hidden_size]
+
+        # LATENT BOUNDING -- see `latent_bounding`.
+        #
+        # The original code did `h = torch.tanh(h)` here on every function
+        # evaluation. That makes the variable the solver INTEGRATES (raw h) differ
+        # from the variable the network READS (tanh h), which is not a consistent
+        # ODE. Because dh/dt generically has a non-zero mean, raw |h| grows without
+        # bound; tanh(h) then saturates (empirically within ~30 steps), its Jacobian
+        # collapses to ~0, and decode(tanh(h)) becomes CONSTANT. The neural residual
+        # degenerates into a fixed derivative bias, which integrates into a roughly
+        # duration-independent position offset -- matching the tight ~17-22 km
+        # clustering of final_pos_error in long rollouts. Short (<=60 step) rollouts
+        # stay in the near-linear region of tanh, which is why this never showed up
+        # in windowed training metrics.
+        #
+        #   "soft" (default) - integrate h directly; keep it bounded with a leaky
+        #       containment term added to dh/dt. Read and integrated state are
+        #       IDENTICAL, so the latent stays informative for the whole rollout.
+        #   "tanh" - original behaviour, retained for A/B comparison.
+        mode = getattr(self, "latent_bounding", "soft")
+        if mode == "tanh":
+            h = torch.tanh(h_raw)
+        else:
+            h = h_raw
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh = self.func.cell(t, h, y_read)
+        else:
+            dh = self.func.cell(t, h)
+
+        if mode != "tanh":
+            # Leaky containment: pull h back toward 0 only once |h| exceeds
+            # latent_clamp, so it cannot run away, while leaving the latent fully
+            # responsive inside the operating band (no saturation, live Jacobian).
+            limit = float(getattr(self, "latent_clamp", 3.0))
+            decay = float(getattr(self, "latent_decay", 0.1))
+            excess = torch.clamp(h.abs() - limit, min=0.0)
+            dh = dh - decay * torch.sign(h) * excess
+
+        f_phys = self.physics_model(y_read)
+        f_node = self.func.decode(h)
+
+        # Penalize neural residual ONLY on acceleration/rate channels.
+        # NOTE: this norm is a *metric/penalty* only -- the f_node used in xdot
+        # below is left untouched so the integrated dynamics are unchanged. During
+        # full-trajectory training the residual can grow very large as a trajectory
+        # transits the geodesic-frame singularity (s -> 0); squaring such a value
+        # overflows float32 (>~1e19) to inf, which made node_norm nan and forced
+        # the training step to be skipped -- disabling the APHYNITY least-action
+        # penalty on exactly the batches with the largest residual, where it is
+        # most needed. Clamp to a large finite magnitude before squaring so those
+        # batches instead contribute a large-but-finite penalty gradient.
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
+        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+
+        # ACCUMULATE over every solver evaluation in the current rollout.
+        # APHYNITY defines ||F||^2 ~= sum_{i,k} ||F(X_k^(i))||^2 -- over all
+        # trajectories AND all timesteps. Previously this line OVERWROTE the value
+        # on every call, so the loss saw only the final RK4 sub-step of the final
+        # timestep: roughly 1 of ~4800 evaluations per batch, a high-variance sample
+        # biased toward the end state. The aggregate is read (and reset) once per
+        # batch by the loss wrapper via pop_node_norm().
+        sq = torch.mean(f_node_acc ** 2)
+        if self._node_sq_sum is None or self._node_evals >= self._NODE_EVAL_CAP:
+            self._node_sq_sum = sq
+            self._node_evals = 1
+        else:
+            self._node_sq_sum = self._node_sq_sum + sq
+            self._node_evals += 1
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
+
+        return torch.cat((xdot, dh), dim=-1)

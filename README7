@@ -556,6 +556,11 @@ def train_NEXT(
         scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
         scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
 
+    # Full-length validation trajectories, captured BEFORE windowing, so the
+    # free-rollout probe evaluates end-to-end autonomous rollout (the real target)
+    # rather than 150-step teacher-forced windows.
+    full_val_trajectories = [t.clone() for t in scaled_traj_targets_test_posvel]
+
     if window_size > 0:
         scaled_traj_targets_train_posvel = make_sliding_windows(
             scaled_traj_targets_train_posvel, window_size, window_stride
@@ -620,6 +625,14 @@ def train_NEXT(
                 x=fraction_of_data,
                 validation_data=fraction_of_data_val,
                 enable_checkpoints=True if data_fraction == 1.0 else False,
+                # Free-rollout probe on FULL (un-windowed, un-fractioned) validation
+                # trajectories, in physical units. This is the metric that predicts
+                # the standalone-evaluator number; logging it during training lets a
+                # candidate be judged within a stage instead of after a full run.
+                rollout_probe_data=full_val_trajectories,
+                rollout_probe_every=25,
+                rollout_probe_scaler=(scaler_traj if use_scalar else None),
+                rollout_probe_pos_slice=slice(0, 2),  # geodesic-frame [s, h]
             )
 
         p = Path(model_save_path, model_name + ".checkpoint.pt")

@@ -1,618 +1,78 @@
-# neural_ode_mod.py
-
-"""Base training class for a Neural Ordinary Differential Equation model."""
-
-from __future__ import annotations
-
-import math
-import random
-from typing import TYPE_CHECKING
-
-import torch
-from torch import nn
-
-from cm_utilities.logger import logger
-from lm_ai_torch_training.device_type import DeviceType
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
-)
-from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
-from prediction.mlearn.neural_ode.loss_functions import (
-    ReverseLinearWeightingLoss,
-)
-
-if TYPE_CHECKING:  # pragma: no cover
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
-    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
-        OptimizerWithLossFunction,
-    )
-    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-    from prediction.mlearn.ffnn.model import FFNNModel
-    from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
-
-
-# TODO: This needs to move somewhere that is more useful to PCM
-class EarlyStopper:
-    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
-        # TODO: What about a percent rise stopper rather and a absolute value? Both?
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float("inf")
-        self.previous_validation_loss = float("inf")
-        self.metric_name = metric_name
-
-    def early_stop(self, validation_loss: float):
-        # Improvement must beat best by at least min_delta
-        if validation_loss < (self.min_validation_loss - self.min_delta):
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        else:
-            # No meaningful improvement (same, tiny change, or worse)
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        self.previous_validation_loss = validation_loss
-        return False
-
-class ModelCheckpoint:
-    def __init__(self, min_epochs: int, directory: str, model_name: str):
-        self.min_epochs = min_epochs
-        self.directory = directory
-        self.model_name = model_name
-        self.min_metric = float("inf")
-
-    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
-        if epoch > self.min_epochs and metric < self.min_metric:
-            self.min_metric = metric
-            model.save(
-                directory=self.directory,
-                model_name=self.model_name,
-            )
-            return True
-        return False
-
-
-class NODEPredictor(nn.Module):
-    """Neural Ordinary Differential Equation (NODE) Prediction Model.
-
-    The Neural Ordinary Differential Equation (NODE) is a neural network that
-    parameterizes the derivative of the hidden state instead of specifying a
-    discrete sequence of hidden layers. Essentially, it extends a residual
-    network model [EQ 1], adding more layers and decreasing the step size to the
-    limit to yield an ODE [EQ 2]. This is shown by the equations below:
-
-            h_t+1 = h_t + f(h_t,Θ_t)          [EQ 1]
-            dh(t)/dt = f(h(t),t,Θ)            [EQ 2]
-
-    f is a feed-forward neural network. Then, with some given initial
-    conditions, an ODE solver can be used to integrate forward the dynamics
-    captured by the network.
-
-    For more information, refer to the original paper given below
-    (https://arxiv.org/pdf/1806.07366.pdf)
-    """
-
-    def __init__(
-        self,
-        architecture: FFNNArchitecture,
-        training_configuration: TrainingConfiguration,
-        solver: ODESolver,
-        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
-        logging_interval: int = 1,  # Default to log every epoch/iteration.
-        early_stopper: EarlyStopper | None = None,
-        checkpoint: ModelCheckpoint | None = None,
-        aug_dim: int = 0,
-    ) -> None:
-        """Initializes a NODE from an input configuration.
-
-        Args:
-            architecture: A configuration defining the underlying node model.
-            training_configuration: The model training hyperparameters.
-            logging_interval: How often to log training epochs or iterations.
-                This is used if verbose is True in the training configuration.
-                Logging statements will be printed to the console every
-                logging_interval epochs or optimizer iterations.
-            solver: The ODESolver used in the NODE.
-            loss_func: The loss function optimized for training the node model.
-        """
-        super().__init__()
-        self.architecture: FFNNArchitecture = architecture
-        self.training_configuration: TrainingConfiguration = training_configuration
-        self.logging_interval: int = logging_interval
-        self.solver = solver
-        self.early_stopper = early_stopper
-        self.checkpoint = checkpoint
-        self.aug_dim = aug_dim
-
-        # Parse parameters from the training configuration.
-        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
-        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
-        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
-        self.verbose: bool = self.training_configuration.verbose
-
-        # Set the iteration parameter for required optimizers.
-        self.training_metrics: dict[str, list[float]] = {}
-
-        # Setup the model for training and inference.
-        self._initialize_device()
-        self._initialize_losses(loss_func=loss_func)
-        self._initialize_model()
-        self._initialize_optimizer()
-
-    @torch.no_grad()
-    def rollout_probe(
-        self,
-        trajectories: list[torch.Tensor],
-        scaler=None,
-        pos_slice: slice = slice(1, 4),
-    ) -> dict[str, float]:
-        """Free-running rollout error over FULL validation trajectories.
-
-        This is the metric that actually matters and that windowed `val_pos_err`
-        cannot see: seed once from the initial state, integrate the entire
-        trajectory autonomously, and compare in PHYSICAL units. It mirrors what
-        the standalone evaluator does, so it tracks the eventual rollout number --
-        letting architectures be compared within one training stage instead of
-        after a multi-day full run.
-
-        `scaler` (a fitted StandardScaler) unscales predictions to metres; if
-        None, error is reported in scaled units. `pos_slice` selects the position
-        columns of the physical state (default [s, h, v_s...] -> cols 1:4 assume a
-        leading time column is NOT present in the model state, i.e. the 5-wide
-        physical state's first 3 entries are positions -> use slice(0, 3) for the
-        geodesic frame; the caller passes the correct slice).
-        """
-        was_training = self.model.training
-        self.model.eval()
-        errs = []
-        finite = 0
-        for traj in trajectories:
-            traj = traj.to(self.device)
-            n_steps = traj.size(0)
-            if n_steps < 3:
-                continue
-            x0_phys = traj[0:1, :]  # (1, n_features)
-            if self.aug_dim == 0:
-                x0 = x0_phys
-            elif hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                x0 = torch.cat((x0_phys, self.model.func.encode(x0_phys)), dim=-1)
-            else:
-                x0 = torch.cat(
-                    (x0_phys, torch.zeros((1, self.aug_dim), device=self.device)), dim=-1
-                )
-            n_features = x0_phys.size(-1)
-            try:
-                pred = self.solver.integrate(
-                    func=self.model, x0=x0, steps=n_steps - 1, extra_feat=None
-                )[:, 0, :n_features]
-            except Exception:
-                continue
-            if not torch.isfinite(pred).all():
-                continue
-            finite += 1
-            p = pred.detach().cpu().numpy()
-            t = traj[:, :n_features].detach().cpu().numpy()
-            if scaler is not None:
-                p = scaler.inverse_transform(p)
-                t = scaler.inverse_transform(t)
-            pos_err = np.linalg.norm(p[:, pos_slice] - t[:, pos_slice], axis=1)
-            errs.append(float(np.mean(pos_err)))
-        if was_training:
-            self.model.train()
-        if not errs:
-            return {"rollout_pos_err": float("nan"), "rollout_frac_finite": 0.0}
-        return {
-            "rollout_pos_err": float(np.mean(errs)),
-            "rollout_pos_err_worst": float(np.max(errs)),
-            "rollout_frac_finite": finite / max(1, len(trajectories)),
-        }
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-        rollout_probe_data: list[torch.Tensor] | None = None,
-        rollout_probe_every: int = 25,
-        rollout_probe_scaler=None,
-        rollout_probe_pos_slice: slice = slice(1, 4),
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
-
-        Args:
-            x: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-            extra_feat: Extra features used in training.
-                This will be passed to the extra features of the Neural ODE. It
-                should be of shape (len(x), n_extra_features).
-            shuffle: Flag to shuffle the data for batching.
-                The data will not be shuffled when set to False.
-            validation_data: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-
-        Returns:
-            A dictionary of training losses and metrics.
-        """
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-
-            # Size-weighted accumulators so the reported epoch metrics are a
-            # true dataset mean, not the metrics of whichever batch happened
-            # to come last. Early stopping / checkpointing depend on this.
-            train_sums: dict[str, torch.Tensor] = {}
-            train_count = 0
-
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    batch_metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    batch_metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                batch_metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
-                    norm_type=2.0,
-                )
-                # NON-FINITE GUARD: norm-based clipping does NOT rescue nan/inf
-                # gradients -- the clip coefficient max_norm/nan is itself nan, so
-                # the bad grads survive and optimizer.step() would write nan into
-                # every weight, permanently killing the run (frozen metrics for all
-                # subsequent epochs). If the loss or the grad norm is non-finite,
-                # skip this step entirely so one diverged batch cannot poison the
-                # model. This can happen at full trajectory length when the state
-                # passes through the geodesic-frame singularity (s -> 0).
-                loss_is_finite = torch.isfinite(batch_metrics["loss"]).item()
-                grad_is_finite = torch.isfinite(total_norm).item()
-                if loss_is_finite and grad_is_finite:
-                    self.optimizer.step()
-                else:
-                    self.optimizer.zero_grad(set_to_none=True)
-                # # (optional) log the pre-clip norm so you can monitor it
-                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-
-                # Accumulate detached, size-weighted metrics for the epoch mean.
-                n_in_batch = len(batch_idx)
-                train_count += n_in_batch
-                for key, value in batch_metrics.items():
-                    contribution = value.detach() * n_in_batch
-                    train_sums[key] = train_sums.get(key, 0.0) + contribution
-
-            metrics = {key: value / max(train_count, 1) for key, value in train_sums.items()}
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    # repeating the above...it should be another function
-                    pool_index_val = list(range(len(validation_data)))
-                    if shuffle:
-                        random.shuffle(pool_index_val)
-
-                    # Size-weighted accumulators: val_loss must be the mean over
-                    # the FULL validation set. Previously only the last (random)
-                    # batch survived, so early stopping and checkpointing were
-                    # comparing single-batch noise against single-batch noise.
-                    val_sums: dict[str, torch.Tensor] = {}
-                    val_count = 0
-
-                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
-                        batch_idx_val = [
-                            pool_index_val.pop(0)
-                            for _ in range(
-                                min(
-                                    len(pool_index_val),
-                                    self.batch_size,
-                                )
-                            )
-                        ]
-                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
-                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                        x_batch_val = float("nan") * torch.ones(
-                            (
-                                len(batch_idx_val),
-                                max_len_val,
-                                x_batch_list_val[0].size(dim=1),
-                            )
-                        )
-                        for i in range(len(x_batch_list_val)):
-                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                        if extra_feat is None:
-                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                        else:
-                            metrics_val = self.batch_loss(
-                                x=x_batch_val.to(self.device),
-                                extra_feat=extra_feat[batch_idx_val],
-                            )
-
-                        n_in_val_batch = len(batch_idx_val)
-                        val_count += n_in_val_batch
-                        for key, value in metrics_val.items():
-                            contribution = value.detach() * n_in_val_batch
-                            val_sums[key] = val_sums.get(key, 0.0) + contribution
-
-                    for key, value in val_sums.items():
-                        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-                    # update the position and velocity weights only for the loss functions that support this
-                    # and only when looking at the full trajectory
-                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
-                    if hasattr(self.criterion, "wp") and enable_checkpoints:
-                        if epoch % 50 == 0:
-                            if (
-                                metrics["pos_err_scaled"] > self.criterion.delta_pos
-                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
-                            ):
-                                pass
-                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
-                                self.criterion.wp *= 1.2  # amplify position focus
-                                logger.info(
-                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
-                                self.criterion.wv *= 1.2
-                                logger.info(
-                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                    
-                    for key, value in val_sums.items():
-                        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-                    # Adaptive dual update using true physical trajectory loss
-                    if hasattr(self.criterion, "update_lagrangian_multiplier"):
-                        val_traj_loss_epoch = metrics.get("val_traj_loss", metrics.get("val_loss", 0.0))
-                        if isinstance(val_traj_loss_epoch, torch.Tensor):
-                            val_traj_loss_epoch = val_traj_loss_epoch.item()
-                        self.criterion.update_lagrangian_multiplier(val_traj_loss_epoch)
-
-            # Free-rollout probe on FULL validation trajectories: the real target
-            # metric, computed cheaply during training so architectures/settings can
-            # be judged within a stage instead of after a multi-day full run.
-            if (
-                rollout_probe_data is not None
-                and rollout_probe_every > 0
-                and (epoch % rollout_probe_every == 0)
-            ):
-                probe = self.rollout_probe(
-                    rollout_probe_data,
-                    scaler=rollout_probe_scaler,
-                    pos_slice=rollout_probe_pos_slice,
-                )
-                metrics.update(probe)
-                logger.info(
-                    f"[rollout probe @ epoch {epoch}] "
-                    f"mean_pos_err={probe['rollout_pos_err']:.1f} "
-                    f"worst={probe.get('rollout_pos_err_worst', float('nan')):.1f} "
-                    f"finite={probe['rollout_frac_finite']:.0%}"
-                )
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-                # and metrics["pos_err"] < 5000
-            ):
-                logger.info(f"Early stopping triggered at {epoch}")
-                break
-
-        return self.training_metrics
-
-    def batch_loss(
-        self,
-        x: torch.Tensor,
-        extra_feat: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Calculates the loss of the batch using stateless latent seeding."""
-        batch_size, time_steps, n_features = x.shape
-        x0_phys = x[:, 0, :]
-
-        if self.aug_dim == 0:
-            x0 = x0_phys
-        else:
-            # Check if the underlying model is a GRU-ODE network exposing an encode mechanism
-            if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                h0 = self.model.func.encode(x0_phys)
-            else:
-                # Fallback path for standard zero-augmented ANODE structures
-                h0 = torch.zeros((batch_size, self.aug_dim), device=self.device)
-
-            x0 = torch.cat((x0_phys, h0), dim=-1)
-
-        if self.solver.adjoint:
-            x_pred = AdjointMethod.apply(
-                self.solver,
-                self.model,
-                x0,
-                time_steps - 1,
-                extra_feat,
-                *tuple(self.model.parameters()),
-            )[:, :, : n_features]
-        else:
-            x_pred = self.solver.integrate(
-                func=self.model,
-                x0=x0,
-                steps=time_steps - 1,
-                extra_feat=extra_feat,
-            )[:, :, : n_features]
-
-        x_pred = torch.nan_to_num(x_pred, nan=0.0)
-        x = torch.nan_to_num(x, nan=0.0)
-
-        return self.criterion(x_pred, x)
-
-
-    def infer(
-        self,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Infers on a trained model with a predefined dataset.
-
-        Args:
-            x0: An input tensor with the initial conditions for the ODE Solver.
-                This is a shape (batch_size, n_features).
-            extra_feat: A tensor with the extra features of the NODE.
-                This is of shape (batch_size, n_extra_features).
-            steps: Number of steps the ODE Solver will take.
-
-        Returns:
-            A tensor containing the predicted data from the trained model.
-        """
-        with torch.no_grad():
-            if self.aug_dim != 0:
-                # Seed the latent state exactly the way training does
-                # (batch_loss): encoder-derived h0 for GRU-ODE models,
-                # zeros only for plain zero-augmented ANODE structures.
-                # The previous zero-seeding here was a train/inference
-                # mismatch: the model never learned to integrate from h0=0.
-                if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                    h0 = self.model.func.encode(x0)
-                else:
-                    h0 = torch.zeros(
-                        (x0.shape[0], self.aug_dim), device=x0.device, dtype=x0.dtype
-                    )
-                x0 = torch.cat((x0, h0), dim=-1)
-            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
-
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
-    ) -> None:
-        """Loads a model from file.
-
-        Args:
-            directory: The directory to load the model from.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when searching
-                for the model file.
-            device_type: The hardware device to use for model loading.
-        """
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-
-    def save(self, directory: str, model_name: str) -> None:
-        """Saves a model to one torch file.
-
-        Args:
-            directory: The directory to save the model to.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when creating
-                the model file.
-        """
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.save(directory, model_name)
-
-    def _initialize_device(self) -> None:
-        """Sets torch device based on whether GPU is available or not."""
-        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
-        self.to(device=self.device)
-
-    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
-        """Initializes the losses for the NODE.
-
-        Args:
-            loss_func: The loss function optimized for training the node model.
-        """
-        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
-
-    def _initialize_model(self) -> None:
-        """Initialize the NODE."""
-        self.model: FFNNModel = self.architecture.get_model().to(self.device)
-
-    def _initialize_optimizer(self) -> None:
-        """Initialize the optimizer for the NODE from the model parameters."""
-        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
-            self.model
-        )
-
-    def _add_metrics_to_global_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        """Adds metrics generated from training to the global metrics.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-        """
-        # Add losses and metrics to global metrics.
-        for metric, value in metrics.items():
-            if metric not in self.training_metrics:
-                self.training_metrics[metric] = []
-            self.training_metrics[metric].append(value.detach().cpu().numpy())
-
-    def _log_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-        iteration: int,
-        prefix: str = "Epoch",
-    ) -> None:
-        """Logs metrics generated during a training epoch or iteration.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-            iteration: The current epoch or optimizer iteration.
-            prefix: The prefix for the logging statement reported to console.
-        """
-        with torch.no_grad():
-            if self.verbose and iteration % self.logging_interval == 0:
-                metric_comps: list[str] = []
-                for metric, value in metrics.items():
-                    metric_comps.append(f"{metric}: {value.item():.7f}")
-
-                metric_str: str = " ".join(metric_comps)
-                logger.info(f"{prefix} {iteration}: {metric_str}")
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_5/GEODESIC/glide --sindy-library physics --sindy-scale-heights 5000 --sindy-l1-threshold .01
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+Discovered Physics Matrix Xi:
+ [[-0.0102762  -0.0045725   0.00488339 -0.00033671 -0.00832145]
+ [ 0.          0.          0.00115946 -0.00059375  0.0257041 ]
+ [ 0.          0.         -0.00428218 -0.00124263 -0.03852057]
+ [ 0.00156238  0.          0.00108051 -0.00042583 -0.01740571]
+ [ 0.          0.         -0.00103819  0.00486027 -0.00313938]
+ [ 0.          0.0210313  -0.00647923  0.00046234 -0.00534469]
+ [ 0.          0.         -0.00132249 -0.00025596 -0.00799613]
+ [ 0.          0.         -0.00185945 -0.0003256  -0.0049813 ]
+ [ 0.          0.         -0.00560422 -0.00212738  0.00240128]
+ [ 0.          0.         -0.00410217 -0.0135722  -0.00093294]
+ [ 0.          0.          0.00539328 -0.00038025  0.00844568]
+ [ 0.          0.          0.00330478 -0.00025611  0.02256722]
+ [ 0.          0.          0.00751176 -0.00251033  0.0252725 ]
+ [ 0.          0.          0.00128941  0.00281103  0.00353971]
+ [ 0.          0.         -0.00348767  0.0003519  -0.00125648]
+ [ 0.          0.         -0.00061611 -0.00203654  0.01740873]
+ [ 0.          0.         -0.00054021 -0.00270989  0.00351384]
+ [ 0.          0.         -0.00685475  0.         -0.00216475]
+ [ 0.          0.         -0.00120246 -0.0011139   0.00695222]
+ [ 0.          0.         -0.00092463 -0.01046178  0.00383887]
+ [ 0.          0.         -0.00025344  0.00118353 -0.01098796]
+ [ 0.          0.         -0.00150932 -0.00629455 -0.01801836]
+ [ 0.          0.          0.00202715  0.00070324  0.01023329]
+ [ 0.          0.          0.00566458 -0.00691623 -0.02111349]
+ [ 0.          0.         -0.00279953 -0.01660563  0.00209597]
+ [ 0.          0.          0.00424002 -0.00023865 -0.00200438]]
+[SINDy] active terms: 81/130 | max|coef| per target: [0.01028 0.02103 0.00751 0.01661 0.03852]
+[SINDy] R2 per target: [1.     1.     0.7481 0.6631 0.7112]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7075 | max relative term contribution 0.9808
+[SINDy] library: physics | scale heights: [5000.0]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     1                  contrib=0.9886 coef=-1.028e-02 ip=1.00
+          ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
+          dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
+          dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
+          dv_s/dt   h*v_s              contrib=0.4862 coef=+7.512e-03 ip=1.00
+          dv_s/dt   v_h                contrib=0.3841 coef=-6.479e-03 ip=1.00
+          dv_s/dt   s*v_s              contrib=0.3768 coef=-5.604e-03 ip=1.00
+          dv_s/dt   s*v_h              contrib=0.3418 coef=+5.393e-03 ip=1.00
+          dv_al/dt  aero_va@H=5000     contrib=0.7868 coef=-1.661e-02 ip=1.00
+          dv_al/dt  s*v_al             contrib=0.5855 coef=-1.357e-02 ip=1.00
+          dv_al/dt  v_al*v_h           contrib=0.4601 coef=-1.046e-02 ip=1.00
+          dv_al/dt  drag_V2@H=5000     contrib=0.3281 coef=-6.916e-03 ip=1.00
+          dv_h/dt   h                  contrib=0.9808 coef=-3.852e-02 ip=1.00
+          dv_h/dt   h*h                contrib=0.9094 coef=+2.257e-02 ip=1.00
+          dv_h/dt   h*v_s              contrib=0.7165 coef=+2.527e-02 ip=1.00
+          dv_h/dt   s                  contrib=0.6624 coef=+2.570e-02 ip=1.00
+
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x31dabea50>, 0.0001)
+[INFO] Epoch 5: loss: 0.0056205 pos_err: 1187.2529297 vel_err: 67.0932083 traj_loss: 0.0053076 node_norm: 0.0003081 lambda: 1.0009141 val_loss: 0.0047558 val_pos_err: 1095.8497314 val_vel_err: 96.8982391 val_traj_loss: 0.0044228 val_node_norm: 0.0003290 val_lambda: 1.0009142
+[INFO] Epoch 10: loss: 0.0054705 pos_err: 1177.0958252 vel_err: 68.3292542 traj_loss: 0.0051852 node_norm: 0.0002750 lambda: 1.0019647 val_loss: 0.0045750 val_pos_err: 1095.2178955 val_vel_err: 95.0048370 val_traj_loss: 0.0043037 val_node_norm: 0.0002629 val_lambda: 1.0019649
+[INFO] Epoch 15: loss: 0.0054042 pos_err: 1174.0930176 vel_err: 67.9430389 traj_loss: 0.0051203 node_norm: 0.0002686 lambda: 1.0029793 val_loss: 0.0041817 val_pos_err: 1100.8424072 val_vel_err: 82.5158081 val_traj_loss: 0.0039127 val_node_norm: 0.0002574 val_lambda: 1.0029792
+[INFO] Epoch 20: loss: 0.0053900 pos_err: 1175.2661133 vel_err: 66.9102402 traj_loss: 0.0051051 node_norm: 0.0002646 lambda: 1.0039554 val_loss: 0.0041888 val_pos_err: 1086.0391846 val_vel_err: 85.0284119 val_traj_loss: 0.0039539 val_node_norm: 0.0002193 val_lambda: 1.0039550
+Traceback (most recent call last):
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1448, in <module>
+    main()
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1407, in main
+    (node, model_name) = train_NEXT(
+                         ^^^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 624, in train_NEXT
+    metrics = node.fit(
+              ^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 412, in fit
+    probe = self.rollout_probe(
+            ^^^^^^^^^^^^^^^^^^^
+  File "/Users/e471302/Library/Python/3.11/lib/python/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/neural_ode_mod.py", line 204, in rollout_probe
+    pos_err = np.linalg.norm(p[:, pos_slice] - t[:, pos_slice], axis=1)
+              ^^
+NameError: name 'np' is not defined. Did you mean: 'p'?

@@ -88,6 +88,7 @@ from trajectory_helpers import (
 from ensemble_sindy import EnsembleSINDyDiscoverer, SINDyPhysicsModel
 from physics_library import PhysicsInformedLibrary
 from aphynity_gru_ode import APHYNITYGRUODEPredictorModel
+from aphynity_node import APHYNITYNODEPredictorModel
 from aphynity_loss import APHYNITYAdaptiveLossWrapper
 
 
@@ -172,10 +173,10 @@ def train_NEXT(
     sindy_library_bagging: bool = False,
     sindy_analytic_pos_rows: bool = True,
     sindy_scan_l1: tuple = (),
-    aphynity_tau2: float = 10.0,
-    aphynity_max_lambda: float = 50.0,
+    aphynity_tau2: float = 0.05,
+    aphynity_max_lambda: float = 10.0,
     aphynity_node_weight: float = 1.0,
-    aphynity_node_norm_mode: str = "norm",
+    aphynity_node_norm_mode: str = "sqnorm",
 ):
     training_configuration = TrainingConfiguration(
         n_epochs=1,
@@ -202,7 +203,7 @@ def train_NEXT(
         raise ValueError("Unknown frame")
 
     # Monitor physical trajectory loss for early stopping
-    early_stop_metric_name = "val_traj_loss" if model_type == "aphynity-gruode" else "val_loss"
+    early_stop_metric_name = "val_traj_loss" if model_type in ("aphynity-gruode", "aphynity-node") else "val_loss"
 
     loss_func = WrappedMSELoss(
         height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
@@ -230,8 +231,8 @@ def train_NEXT(
         node._initialize_model()
         node._initialize_optimizer()
 
+    latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
     if model_type in ("gruode", "aphynity-gruode"):
-        latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
         enc_in_idx = None
 
         gruode_func = GRUODEFunc(
@@ -286,7 +287,7 @@ def train_NEXT(
             temporal_weighting=temporal_weighting,
         )
 
-        if model_type == "aphynity-gruode":
+        if model_type in ("aphynity-gruode", "aphynity-node"):
             print("\n--- Running Ensemble-SINDy Governing Equation Discovery ---")
             if use_scalar:
                 sindy_train_data = [scaler_traj.transform(t.numpy()[:, 0 : model_states + 1])[:, :model_states] for t in traj_targets_train]
@@ -470,15 +471,31 @@ def train_NEXT(
                 print("\n[--sindy-only] Discovery complete; skipping model training.")
                 return None, None
 
-            node.model = APHYNITYGRUODEPredictorModel(
-                func=gruode_func,
-                physics_model=physics_model,
-                pos_idx=pos_idx,
-                vel_idx=vel_idx,
-                pos_scale=so_pos_scale,
-                vel_scale=so_vel_scale,
-                vel_mean=so_vel_mean,
-            ).to(node.device)
+            if model_type == "aphynity-node":
+                # Ben / paper architecture: f_phys(y) + MLP(y). No latent, 5-dim state.
+                node.model = APHYNITYNODEPredictorModel(
+                    physics_model=physics_model,
+                    n_features=model_states,
+                    pos_idx=pos_idx,
+                    vel_idx=vel_idx,
+                    pos_scale=so_pos_scale,
+                    vel_scale=so_vel_scale,
+                    vel_mean=so_vel_mean,
+                    hidden=nhidden,
+                    n_layers=3,
+                ).to(node.device)
+                aphynity_is_node = True
+            else:
+                node.model = APHYNITYGRUODEPredictorModel(
+                    func=gruode_func,
+                    physics_model=physics_model,
+                    pos_idx=pos_idx,
+                    vel_idx=vel_idx,
+                    pos_scale=so_pos_scale,
+                    vel_scale=so_vel_scale,
+                    vel_mean=so_vel_mean,
+                ).to(node.device)
+                aphynity_is_node = False
 
             loss_func = APHYNITYAdaptiveLossWrapper(
                 base_criterion=base_physics_loss,
@@ -516,8 +533,12 @@ def train_NEXT(
             ).to(node.device)
             loss_func = base_physics_loss
 
-        node.aug_dim = latent_dim
-        aug_dim = latent_dim
+        if model_type == "aphynity-node":
+            node.aug_dim = 0        # no latent: state vector is the physical state
+            aug_dim = 0
+        else:
+            node.aug_dim = latent_dim
+            aug_dim = latent_dim
         node._initialize_losses(loss_func)
 
     if hasattr(node.criterion, "set_model"):
@@ -1064,7 +1085,7 @@ def main():
     parser.add_argument(
         "--model-type",
         default="node",
-        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min", "aphynity-gruode"],
+        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min", "aphynity-gruode", "aphynity-node"],
         help="Which ODE architecture to train: regular NODE, ANODE, SONODE, LatentODE, GRU-ODE, or APHYNITY-GRUODE",
     )
     parser.add_argument(
@@ -1149,14 +1170,15 @@ def main():
     )
     parser.add_argument(
         "--aphynity-tau2",
-        default=10.0,
+        default=0.05,
         type=float,
-        help="Dual ascent rate: lambda += tau2 * L_traj. Scale-dependent -- tune "
-        "against your L_traj magnitude (~4e-3 here). 10 ramps lambda 1->9 over "
-        "200 epochs; too large pins it at max-lambda and stalls training.",
+        help="Dual ascent rate: lambda += tau2 * L_traj. Scale-dependent (tune "
+        "against your L_traj magnitude, ~4e-3 here). Default 0.05 keeps lambda ~1, "
+        "i.e. the least-action constraint effectively OFF -- see "
+        "--aphynity-node-norm-mode for why. Use ~10 for the paper-faithful ramp.",
     )
     parser.add_argument(
-        "--aphynity-max-lambda", default=50.0, type=float,
+        "--aphynity-max-lambda", default=10.0, type=float,
         help="Cap on the dual multiplier. The paper has no cap; this is a safety rail.",
     )
     parser.add_argument(
@@ -1165,9 +1187,17 @@ def main():
     )
     parser.add_argument(
         "--aphynity-node-norm-mode",
-        default="norm", choices=["norm", "sqnorm"],
-        help="'norm' = ||F_a|| (paper Eq. 4). 'sqnorm' = ||F_a||^2 (legacy). Squaring "
-        "makes the penalty ~200x smaller and effectively inert.",
+        default="sqnorm", choices=["norm", "sqnorm"],
+        help="'norm' = ||F_a|| (paper Eq. 4, constraint ACTIVE). 'sqnorm' = ||F_a||^2 "
+        "(~200x smaller, constraint effectively OFF) -- the DEFAULT, deliberately. "
+        "APHYNITY's least-action argument assumes F_p is a genuine low-dimensional "
+        "PHYSICAL model whose parameters are being identified; here F_p is ~81 "
+        "trainable regression coefficients (R2~0.68), so forcing f_node to defer to "
+        "it just moves capacity between two empirical fits and measurably costs "
+        "accuracy (val_traj_loss plateaued 0.0040 vs 0.0033 unconstrained). Switch "
+        "to 'norm' (with --aphynity-tau2 10) only once F_p is genuinely sparse and "
+        "physical -- e.g. a high --sindy-l1-threshold leaving ~5-10 drag/gravity "
+        "terms rather than the full polynomial basis.",
     )
     parser.add_argument(
         "--sindy-l1-threshold",

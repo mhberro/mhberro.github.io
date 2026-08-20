@@ -1,116 +1,302 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 50 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library physics --sindy-only --sindy-scale-heights 5000 --sindy-scan-l1 .05,.1,.15,.2,.3
-There are 22 training trajs and 6 validation trajs.
+# physics_library.py
+"""Physics-informed candidate library for Ensemble-SINDy on HGV glide dynamics.
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
+Motivation
+----------
+A degree-2 polynomial library in [s, h, v_s, v_alpha, v_h] cannot express
+aerodynamic drag/lift, which scale as rho(h) * V^2 with rho(h) approximately
+exponential in altitude. Over a glide from ~108 km to ~22 km that factor spans
+about five orders of magnitude, so the least-squares projection of drag onto a
+polynomial basis is ~0 -- which is exactly what the polynomial-only discovery
+returned (all acceleration-channel coefficients at the 0.01-0.03 noise floor,
+smeared over ~20 terms, versus clean 2-term recovery on the position rows where
+the truth IS expressible).
 
-[SINDy scan] l1_threshold sweep
-  Ranked by ROLLOUT STABILITY, not R2. R2 measures one-step fit and
-  does not predict whether the equation stays bounded when integrated:
-  positive-feedback terms (h*h, h*v_s) can give a high R2 and still
-  explode over hundreds of steps. Fewest divergences wins, then lowest
-  median rollout error. R2 is shown for context only.
-        l1   active   %dense    meanR2   diverged   medianErr_m    worstErr_m
-     0.050       67     52%    0.7060        2/6       17440.3       92564.2
-     0.100       53     41%    0.6982        2/6       20229.7       64139.1
-     0.150       46     35%    0.6917        1/6       25812.9       49567.6
-     0.200       37     28%    0.6601        2/6       25760.2       58930.9
-     0.300       28     22%    0.4638        0/6       46548.0       80656.1
-  -> most STABLE backbone: l1 = 0.300 (28 terms, R2 0.4638, 0/6 diverged, median 46548.0 m)
-Discovered Physics Matrix Xi:
- [[-0.0102762  -0.0045725   0.00488339 -0.00033671 -0.00832145]
- [ 0.          0.          0.00115946 -0.00059375  0.0257041 ]
- [ 0.          0.         -0.00428218 -0.00124263 -0.03852057]
- [ 0.00156238  0.          0.00108051 -0.00042583 -0.01740571]
- [ 0.          0.         -0.00103819  0.00486027 -0.00313938]
- [ 0.          0.0210313  -0.00647923  0.00046234 -0.00534469]
- [ 0.          0.         -0.00132249 -0.00025596 -0.00799613]
- [ 0.          0.         -0.00185945 -0.0003256  -0.0049813 ]
- [ 0.          0.         -0.00560422 -0.00212738  0.00240128]
- [ 0.          0.         -0.00410217 -0.0135722  -0.00093294]
- [ 0.          0.          0.00539328 -0.00038025  0.00844568]
- [ 0.          0.          0.00330478 -0.00025611  0.02256722]
- [ 0.          0.          0.00751176 -0.00251033  0.0252725 ]
- [ 0.          0.          0.00128941  0.00281103  0.00353971]
- [ 0.          0.         -0.00348767  0.0003519  -0.00125648]
- [ 0.          0.         -0.00061611 -0.00203654  0.01740873]
- [ 0.          0.         -0.00054021 -0.00270989  0.00351384]
- [ 0.          0.         -0.00685475  0.         -0.00216475]
- [ 0.          0.         -0.00120246 -0.0011139   0.00695222]
- [ 0.          0.         -0.00092463 -0.01046178  0.00383887]
- [ 0.          0.         -0.00025344  0.00118353 -0.01098796]
- [ 0.          0.         -0.00150932 -0.00629455 -0.01801836]
- [ 0.          0.          0.00202715  0.00070324  0.01023329]
- [ 0.          0.          0.00566458 -0.00691623 -0.02111349]
- [ 0.          0.         -0.00279953 -0.01660563  0.00209597]
- [ 0.          0.          0.00424002 -0.00023865 -0.00200438]]
-[SINDy] active terms: 81/130 | max|coef| per target: [0.01028 0.02103 0.00751 0.01661 0.03852]
-[SINDy] R2 per target: [1.     1.     0.7481 0.6631 0.7112]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7075 | max relative term contribution 0.9808
-[SINDy] library: physics | scale heights: [5000.0]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     1                  contrib=0.9886 coef=-1.028e-02 ip=1.00
-          ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
-          dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
-          dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
-          dv_s/dt   h*v_s              contrib=0.4862 coef=+7.512e-03 ip=1.00
-          dv_s/dt   v_h                contrib=0.3841 coef=-6.479e-03 ip=1.00
-          dv_s/dt   s*v_s              contrib=0.3768 coef=-5.604e-03 ip=1.00
-          dv_s/dt   s*v_h              contrib=0.3418 coef=+5.393e-03 ip=1.00
-          dv_al/dt  aero_va@H=5000     contrib=0.7868 coef=-1.661e-02 ip=1.00
-          dv_al/dt  s*v_al             contrib=0.5855 coef=-1.357e-02 ip=1.00
-          dv_al/dt  v_al*v_h           contrib=0.4601 coef=-1.046e-02 ip=1.00
-          dv_al/dt  drag_V2@H=5000     contrib=0.3281 coef=-6.916e-03 ip=1.00
-          dv_h/dt   h                  contrib=0.9808 coef=-3.852e-02 ip=1.00
-          dv_h/dt   h*h                contrib=0.9094 coef=+2.257e-02 ip=1.00
-          dv_h/dt   h*v_s              contrib=0.7165 coef=+2.527e-02 ip=1.00
-          dv_h/dt   s                  contrib=0.6624 coef=+2.570e-02 ip=1.00
+E-SINDy (Fasel et al.) is explicit that the library choice "is crucial" and that
+the strategy is to start simple and increase complexity until sparse and accurate
+models emerge. This module supplies the next rung: atmosphere/drag candidates.
 
-=== DISCOVERED SINDy EQUATIONS ===
-ds/dt = - 0.0102762*1 [ip=1.00] + 0.00156238*v_s [ip=1.00]
-dh/dt = 0.0210313*v_h [ip=1.00] - 0.0045725*1 [ip=1.00]
-dv_s/dt = 0.00751176*h*v_s [ip=1.00] - 0.00685475*v_s*v_h [ip=1.00] - 0.00647923*v_h [ip=1.00] + 0.00566458*drag_V2@H=5000 [ip=1.00] - 0.00560422*s*v_s [ip=1.00] + 0.00539328*s*v_h [ip=1.00] + 0.00488339*1 [ip=1.00] - 0.00428218*h [ip=1.00] + 0.00424002*curv_vs2 [ip=1.00] - 0.00410217*s*v_al [ip=1.00] - 0.00348767*h*v_h [ip=1.00] + 0.00330478*h*h [ip=1.00] - 0.00279953*aero_va@H=5000 [ip=1.00] + 0.00202715*drag_vh@H=5000 [ip=1.00] - 0.00185945*s*h [ip=1.00] - 0.00150932*drag_vs@H=5000 [ip=0.96] - 0.00132249*s*s [ip=1.00] + 0.00128941*h*v_al [ip=1.00] - 0.00120246*v_al*v_al [ip=1.00] + 0.00115946*s [ip=1.00] + 0.00108051*v_s [ip=1.00] - 0.00103819*v_al [ip=1.00] - 0.000924626*v_al*v_h [ip=1.00] - 0.000616112*v_s*v_s [ip=1.00] - 0.000540212*v_s*v_al [ip=0.94] - 0.000253444*v_h*v_h [ip=0.84]
-dv_al/dt = - 0.0166056*aero_va@H=5000 [ip=1.00] - 0.0135722*s*v_al [ip=1.00] - 0.0104618*v_al*v_h [ip=1.00] - 0.00691623*drag_V2@H=5000 [ip=1.00] - 0.00629455*drag_vs@H=5000 [ip=1.00] + 0.00486027*v_al [ip=1.00] + 0.00281103*h*v_al [ip=1.00] - 0.00270989*v_s*v_al [ip=1.00] - 0.00251033*h*v_s [ip=1.00] - 0.00212738*s*v_s [ip=1.00] - 0.00203654*v_s*v_s [ip=1.00] - 0.00124263*h [ip=1.00] + 0.00118353*v_h*v_h [ip=1.00] - 0.0011139*v_al*v_al [ip=1.00] + 0.000703242*drag_vh@H=5000 [ip=0.94] - 0.000593748*s [ip=0.90] + 0.000462335*v_h [ip=0.90] - 0.000425832*v_s [ip=0.82] - 0.000380249*s*v_h [ip=0.88] + 0.000351895*h*v_h [ip=0.86] - 0.000336714*1 [ip=0.80] - 0.000325597*s*h [ip=0.84] - 0.000256107*h*h [ip=0.84] - 0.000255964*s*s [ip=0.80] - 0.000238649*curv_vs2 [ip=0.74]
-dv_h/dt = - 0.0385206*h [ip=1.00] + 0.0257041*s [ip=1.00] + 0.0252725*h*v_s [ip=1.00] + 0.0225672*h*h [ip=1.00] - 0.0211135*drag_V2@H=5000 [ip=1.00] - 0.0180184*drag_vs@H=5000 [ip=1.00] + 0.0174087*v_s*v_s [ip=1.00] - 0.0174057*v_s [ip=1.00] - 0.010988*v_h*v_h [ip=1.00] + 0.0102333*drag_vh@H=5000 [ip=1.00] + 0.00844568*s*v_h [ip=1.00] - 0.00832145*1 [ip=1.00] - 0.00799613*s*s [ip=1.00] + 0.00695222*v_al*v_al [ip=1.00] - 0.00534469*v_h [ip=1.00] - 0.0049813*s*h [ip=1.00] + 0.00383887*v_al*v_h [ip=1.00] + 0.00353971*h*v_al [ip=1.00] + 0.00351384*v_s*v_al [ip=1.00] - 0.00313938*v_al [ip=1.00] + 0.00240128*s*v_s [ip=1.00] - 0.00216475*v_s*v_h [ip=1.00] + 0.00209597*aero_va@H=5000 [ip=0.96] - 0.00200438*curv_vs2 [ip=1.00] - 0.00125648*h*v_h [ip=0.96] - 0.000932941*s*v_al [ip=0.94]
+Units
+-----
+Physics terms are evaluated in PHYSICAL units. When the SINDy data is in
+StandardScaler space, pass `feature_mean` / `feature_scale` and the library
+unscales internally. Polynomial terms are left on the input (scaled) state so
+the polynomial block reproduces prior behaviour exactly. Mixing is harmless:
+the regression coefficients absorb the unit conversion, and `stridge` already
+column-normalises before thresholding.
 
-[SINDy] equations written to: model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_50win_5stride_equations.txt
+Scale-height uncertainty
+------------------------
+If the generating atmosphere model is unknown, do NOT dump many scale heights
+into one library: exp(-h/H) for nearby H are highly collinear, bootstrap
+selection flips between them, every inclusion probability lands below the
+threshold, and all of them get zeroed. Prefer ONE scale height per fit and
+scan H across separate fits (see `--sindy-scan-scale-heights`), reading off
+which H yields the strongest, sparsest acceleration-channel coefficients.
+"""
 
-[pure-SINDy rollout — train]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251    614019.3   4742552.4   4742552.4
-  train_1                         324    301     60065.1    253979.3    253979.3  DIVERGED
-  train_2                         465     63     20567.2    133526.9    133526.9  DIVERGED
-  train_3                         181    181    105141.5    470030.2    470030.2
-  train_4                         383    383    294032.0   2421614.9   2421614.9
-  train_5                          95     73     13951.8    189359.5    189359.5  DIVERGED
-  train_6                         166    166    100216.8    325755.4    325755.4
-  train_7                          97     97      8183.5     15652.0     15652.0
-  train_8                         181    181     24552.6    100823.6    100823.6
-  train_9                         210    210     31441.8    104129.5    104129.5
-  train_10                        121    121     40395.0    171815.8    171815.8
-  train_11                        102    102     13739.0     62553.8     62637.6
-  train_12                        451     62     22855.2    154198.3    154198.3  DIVERGED
-  train_13                        212    212     43113.7    157047.9    157047.9
-  train_14                        208    208     27057.6    116696.5    116696.5
-  train_15                        217    217    128307.5    803628.7    803628.7
-  train_16                        117    117     18917.7     92657.5     92657.5
-  train_17                        333    289   3791591.5  35919939.5  35919939.5  DIVERGED
-  train_18                        272    272    370148.0   2795011.5   2795011.5
-  train_19                        221    221     76802.4    405557.2    405557.2
-  train_20                        444    431   2523403.9  34636062.3  34636062.3  DIVERGED
-  train_21                        262    262     70836.3    208577.1    208577.1
-  SUMMARY: mean=381788.2 m | median=51589.4 m | worst=3791591.5 m | diverged 6/22
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+from __future__ import annotations
 
-[pure-SINDy rollout — validation]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     49251.4    144732.9    144732.9
-  validation_1                    123    123     17132.9     33347.4     33347.4
-  validation_2                    179     79     15099.2    167577.5    167577.5  DIVERGED
-  validation_3                    150    150     95374.7    418357.9    418357.9
-  validation_4                    144    144     16839.7     52619.6     52619.6
-  validation_5                    287     76     22360.1    202841.9    202841.9  DIVERGED
-  SUMMARY: mean=36009.7 m | median=19746.5 m | worst=95374.7 m | diverged 2/6
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+import itertools
 
-[--sindy-only] Discovery complete; skipping model training.
+import numpy as np
+
+EARTH_RADIUS_M = 6371000.0
+_V_EPS = 1e-12
+# Cap the exponent so a below-reference altitude cannot overflow exp().
+_EXP_ARG_MAX = 10.0
+
+
+class PhysicsInformedLibrary:
+    """Polynomial terms plus atmosphere/drag/curvature candidates.
+
+    Column order is: [polynomial block] + [physics block]. The same ordering is
+    reproduced by `SINDyPhysicsModel` in torch; `library_spec()` is the single
+    source of truth shared by both paths.
+    """
+
+    def __init__(
+        self,
+        state_vector_len: int = 5,
+        degree: int = 2,
+        include_bias: bool = True,
+        h_idx: int = 1,
+        vs_idx: int = 2,
+        va_idx: int = 3,
+        vh_idx: int = 4,
+        scale_heights: tuple[float, ...] = (7200.0,),
+        earth_radius: float = EARTH_RADIUS_M,
+        feature_mean=None,
+        feature_scale=None,
+        include_curvature: bool = True,
+        clip: float = 8.0,
+        pos_idx: tuple[int, ...] = (0, 1),
+        vel_idx: tuple[int, ...] = (2, 4),
+        poly_mode: str = "full",
+    ):
+        self.state_vector_len = state_vector_len
+        self.degree = degree
+        self.include_bias = include_bias
+        self.h_idx = h_idx
+        self.vs_idx = vs_idx
+        self.va_idx = va_idx
+        self.vh_idx = vh_idx
+        self.scale_heights = tuple(float(H) for H in scale_heights)
+        self.earth_radius = float(earth_radius)
+        self.include_curvature = bool(include_curvature)
+        # Physics columns are RMS-normalised using training-set statistics and then
+        # clipped to +/- `clip`. This is essential, not cosmetic: rho(h)=exp(-h/H) is
+        # an UNBOUNDED extrapolator. During early training the integrator wanders
+        # below the training altitude envelope, and an unnormalised drag column can
+        # exceed anything seen in data by ~1e6, sending the rollout to inf. Clipping
+        # in normalised space bounds f_phys to a fixed multiple of its in-data scale.
+        self.clip = float(clip)
+        self.physics_scale_ = None  # set on the first fit_transform, then frozen
+
+        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, dtype=float)
+        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, dtype=float)
+
+        self.pos_idx = tuple(int(i) for i in pos_idx)
+        self.vel_idx = tuple(int(i) for i in vel_idx)
+        # poly_mode controls which polynomial candidates are OFFERED to SINDy:
+        #   "full"   -- every combination up to `degree` (the original behaviour).
+        #   "stable" -- exclude polynomial terms that create positive feedback in a
+        #               long rollout. Concretely: no product that contains a POSITION
+        #               variable (s, h). A term like h*h or h*v_s or s*v_s means "an
+        #               acceleration that grows with position", which has no physical
+        #               basis here and compounds without bound when integrated -- these
+        #               are exactly the ip=1.00 terms that fit one-step (high R^2) yet
+        #               blow the rollout up past ~200 steps. Gravity's dependence on
+        #               altitude enters through the dedicated physics terms instead
+        #               (first-order `h` is still allowed; it is linear and bounded by
+        #               the drag that opposes it). Velocity-only products (v*v) are
+        #               kept: they feed drag-like damping, not positional feedback.
+        self.poly_mode = str(poly_mode)
+
+        self.poly_combos = []
+        for d in range(0 if include_bias else 1, degree + 1):
+            for combo in itertools.combinations_with_replacement(range(state_vector_len), d):
+                if self.poly_mode == "stable" and not self._combo_is_stable(combo):
+                    continue
+                self.poly_combos.append(combo)
+
+        # (kind, scale_height_or_None) -- consumed identically by numpy and torch.
+        self.physics_terms: list[tuple[str, float | None]] = []
+        for H in self.scale_heights:
+            self.physics_terms.append(("drag_vs", H))   # rho(h) * V * v_s
+            self.physics_terms.append(("drag_vh", H))   # rho(h) * V * v_h
+            self.physics_terms.append(("drag_V2", H))   # rho(h) * V^2
+            self.physics_terms.append(("aero_va", H))   # rho(h) * V * v_alpha
+        if self.include_curvature:
+            self.physics_terms.append(("curv_vs2", None))  # v_s^2 / (Re + h)
+
+    def _combo_is_stable(self, combo: tuple) -> bool:
+        """Reject polynomial terms that create positional positive feedback.
+
+        A term is disallowed in "stable" mode when it is a PRODUCT (degree >= 2)
+        that involves any position variable. First-order position (`h`, `s`) is
+        allowed -- it is linear and physically corresponds to gravity gradients,
+        and is held in check by the opposing drag terms. Pure velocity products
+        (e.g. v_s*v_s, v_s*v_h) are allowed -- they act like damping, not
+        positional runaway.
+        """
+        if len(combo) < 2:
+            return True
+        return not any(i in self.pos_idx for i in combo)
+
+    # ------------------------------------------------------------------ spec
+
+    def library_spec(self) -> dict:
+        """Everything the torch evaluator needs to rebuild identical columns."""
+        return {
+            "state_vector_len": self.state_vector_len,
+            "degree": self.degree,
+            "include_bias": self.include_bias,
+            "poly_combos": [tuple(c) for c in self.poly_combos],
+            "physics_terms": list(self.physics_terms),
+            "h_idx": self.h_idx,
+            "vs_idx": self.vs_idx,
+            "va_idx": self.va_idx,
+            "vh_idx": self.vh_idx,
+            "earth_radius": self.earth_radius,
+            "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
+            "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
+            "clip": self.clip,
+            "physics_scale": None if self.physics_scale_ is None else list(self.physics_scale_),
+        }
+
+    def term_combos(self, n_features: int | None = None) -> list:
+        """Column layout: polynomial tuples first, then None for each physics term."""
+        return [tuple(c) for c in self.poly_combos] + [None] * len(self.physics_terms)
+
+    def term_names(self) -> list[str]:
+        names = ["s", "h", "v_s", "v_al", "v_h"][: self.state_vector_len]
+        out = []
+        for combo in self.poly_combos:
+            out.append("1" if len(combo) == 0 else "*".join(names[i] for i in combo))
+        for kind, H in self.physics_terms:
+            out.append(f"{kind}" if H is None else f"{kind}@H={int(H)}")
+        return out
+
+    @property
+    def n_terms(self) -> int:
+        return len(self.poly_combos) + len(self.physics_terms)
+
+    # ------------------------------------------------------------- numpy path
+
+    def _to_physical(self, Y: np.ndarray) -> np.ndarray:
+        if self.feature_mean is None or self.feature_scale is None:
+            return Y
+        return Y * self.feature_scale + self.feature_mean
+
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        n_samples = Y.shape[0]
+        cols = np.empty((n_samples, self.n_terms), dtype=float)
+        n_poly = len(self.poly_combos)
+
+        # --- polynomial block, on the input (scaled) state ---
+        for i, combo in enumerate(self.poly_combos):
+            cols[:, i] = 1.0 if len(combo) == 0 else np.prod(Y[:, combo], axis=1)
+
+        # --- physics block, on the PHYSICAL state ---
+        P = self._to_physical(Y)
+        h = P[:, self.h_idx]
+        vs = P[:, self.vs_idx]
+        va = P[:, self.va_idx]
+        vh = P[:, self.vh_idx]
+        V = np.sqrt(vs * vs + vh * vh + _V_EPS)
+
+        off = len(self.poly_combos)
+        for j, (kind, H) in enumerate(self.physics_terms):
+            if kind == "curv_vs2":
+                cols[:, off + j] = vs * vs / (self.earth_radius + h)
+                continue
+            rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
+            if kind == "drag_vs":
+                cols[:, off + j] = rho * V * vs
+            elif kind == "drag_vh":
+                cols[:, off + j] = rho * V * vh
+            elif kind == "drag_V2":
+                cols[:, off + j] = rho * V * V
+            elif kind == "aero_va":
+                cols[:, off + j] = rho * V * va
+            else:
+                raise ValueError(f"unknown physics term kind: {kind}")
+
+        # Freeze RMS statistics on the first (training) call, then always normalise
+        # and clip so the torch evaluator can reproduce identical values.
+        if self.physics_terms:
+            block = cols[:, off:]
+            if self.physics_scale_ is None:
+                rms = np.sqrt(np.mean(block ** 2, axis=0))
+                rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
+                self.physics_scale_ = rms
+            cols[:, off:] = np.clip(
+                block / self.physics_scale_, -self.clip, self.clip
+            )
+        return cols
+
+
+def evaluate_library_torch(y, spec: dict):
+    """Torch mirror of `PhysicsInformedLibrary.fit_transform`.
+
+    Kept in this module, next to the numpy implementation, so the two cannot
+    drift apart. Column order is identical by construction.
+    """
+    import torch
+
+    cols = []
+    for combo in spec["poly_combos"]:
+        if len(combo) == 0:
+            cols.append(torch.ones_like(y[..., :1]))
+        else:
+            term = y[..., combo[0] : combo[0] + 1]
+            for k in combo[1:]:
+                term = term * y[..., k : k + 1]
+            cols.append(term)
+
+    physics_terms = spec["physics_terms"]
+    if physics_terms:
+        mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
+        if mean is not None and scale is not None:
+            mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
+            scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
+            P = y * scale_t + mean_t
+        else:
+            P = y
+
+        hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
+        h = P[..., hi : hi + 1]
+        vs = P[..., vsi : vsi + 1]
+        va = P[..., vai : vai + 1]
+        vh = P[..., vhi : vhi + 1]
+        V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
+        Re = spec["earth_radius"]
+
+        for kind, H in physics_terms:
+            if kind == "curv_vs2":
+                cols.append(vs * vs / (Re + h))
+                continue
+            rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
+            if kind == "drag_vs":
+                cols.append(rho * V * vs)
+            elif kind == "drag_vh":
+                cols.append(rho * V * vh)
+            elif kind == "drag_V2":
+                cols.append(rho * V * V)
+            elif kind == "aero_va":
+                cols.append(rho * V * va)
+            else:
+                raise ValueError(f"unknown physics term kind: {kind}")
+
+        # Same RMS normalisation + clipping as the numpy path. Without this the
+        # physics block is unbounded outside the training envelope.
+        ps = spec.get("physics_scale")
+        clip = float(spec.get("clip", 8.0))
+        n_poly = len(spec["poly_combos"])
+        if ps is not None:
+            for j in range(len(physics_terms)):
+                sc = float(ps[j]) if float(ps[j]) != 0.0 else 1.0
+                cols[n_poly + j] = torch.clamp(cols[n_poly + j] / sc, -clip, clip)
+
+    return torch.cat(cols, dim=-1)

@@ -1,37 +1,45 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library physics --sindy-only --sindy-scale-heights 5000 --sindy-l1-threshold .05
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 50 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library physics --sindy-only --sindy-scale-heights 5000 --sindy-scan-l1 .05,.1,.15,.2,.3
 There are 22 training trajs and 6 validation trajs.
 
 --- Running Ensemble-SINDy Governing Equation Discovery ---
+
+[SINDy scan] l1_threshold sweep (want: few active terms at little R2 cost)
+        l1   active   %dense   kept lib   meanR2(acc)
+     0.050       67     52%         26       0.70597
+     0.100       53     41%         26       0.69823
+     0.150       46     35%         26       0.69171
+     0.200       37     28%         26       0.66008
+     0.300       28     22%         26       0.46379
 Discovered Physics Matrix Xi:
- [[-0.0102762  -0.0045725   0.00510555  0.         -0.00831292]
- [ 0.          0.          0.0012235   0.          0.02573731]
- [ 0.          0.         -0.00430728 -0.00180283 -0.03851486]
- [ 0.00156238  0.          0.00106098  0.         -0.01736265]
- [ 0.          0.         -0.00107824  0.00495588 -0.00315607]
- [ 0.          0.0210313  -0.00641314  0.         -0.00533479]
- [ 0.          0.         -0.0012322   0.         -0.00799021]
- [ 0.          0.         -0.00179796  0.         -0.00500527]
- [ 0.          0.         -0.00526968 -0.00158884  0.00243399]
- [ 0.          0.         -0.00417231 -0.01336109 -0.00087119]
- [ 0.          0.          0.0051386   0.          0.00834745]
- [ 0.          0.          0.00335313  0.          0.02260914]
- [ 0.          0.          0.00770182 -0.00221657  0.02528639]
- [ 0.          0.          0.00158585  0.00276825  0.00343462]
- [ 0.          0.         -0.00357422  0.         -0.00125174]
- [ 0.          0.          0.         -0.00210174  0.01738303]
- [ 0.          0.          0.         -0.00268372  0.00348361]
- [ 0.          0.         -0.00706715  0.         -0.00208154]
- [ 0.          0.         -0.00120807 -0.00124143  0.00694354]
- [ 0.          0.         -0.00096297 -0.01047974  0.00384169]
- [ 0.          0.          0.          0.00087785 -0.01097478]
- [ 0.          0.         -0.00160757 -0.00648483 -0.01802674]
- [ 0.          0.          0.0020383   0.          0.01033359]
- [ 0.          0.          0.0054969  -0.0071684  -0.02111464]
- [ 0.          0.         -0.00276157 -0.0165163   0.0020879 ]
- [ 0.          0.          0.00386418  0.         -0.00200223]]
-[SINDy] active terms: 67/130 | max|coef| per target: [0.01028 0.02103 0.0077  0.01652 0.03851]
-[SINDy] R2 per target: [1.     1.     0.7463 0.6605 0.7112]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7060 | max relative term contribution 0.9807
+ [[-0.0102762  -0.0045725   0.00488339 -0.00033671 -0.00832145]
+ [ 0.          0.          0.00115946 -0.00059375  0.0257041 ]
+ [ 0.          0.         -0.00428218 -0.00124263 -0.03852057]
+ [ 0.00156238  0.          0.00108051 -0.00042583 -0.01740571]
+ [ 0.          0.         -0.00103819  0.00486027 -0.00313938]
+ [ 0.          0.0210313  -0.00647923  0.00046234 -0.00534469]
+ [ 0.          0.         -0.00132249 -0.00025596 -0.00799613]
+ [ 0.          0.         -0.00185945 -0.0003256  -0.0049813 ]
+ [ 0.          0.         -0.00560422 -0.00212738  0.00240128]
+ [ 0.          0.         -0.00410217 -0.0135722  -0.00093294]
+ [ 0.          0.          0.00539328 -0.00038025  0.00844568]
+ [ 0.          0.          0.00330478 -0.00025611  0.02256722]
+ [ 0.          0.          0.00751176 -0.00251033  0.0252725 ]
+ [ 0.          0.          0.00128941  0.00281103  0.00353971]
+ [ 0.          0.         -0.00348767  0.0003519  -0.00125648]
+ [ 0.          0.         -0.00061611 -0.00203654  0.01740873]
+ [ 0.          0.         -0.00054021 -0.00270989  0.00351384]
+ [ 0.          0.         -0.00685475  0.         -0.00216475]
+ [ 0.          0.         -0.00120246 -0.0011139   0.00695222]
+ [ 0.          0.         -0.00092463 -0.01046178  0.00383887]
+ [ 0.          0.         -0.00025344  0.00118353 -0.01098796]
+ [ 0.          0.         -0.00150932 -0.00629455 -0.01801836]
+ [ 0.          0.          0.00202715  0.00070324  0.01023329]
+ [ 0.          0.          0.00566458 -0.00691623 -0.02111349]
+ [ 0.          0.         -0.00279953 -0.01660563  0.00209597]
+ [ 0.          0.          0.00424002 -0.00023865 -0.00200438]]
+[SINDy] active terms: 81/130 | max|coef| per target: [0.01028 0.02103 0.00751 0.01661 0.03852]
+[SINDy] R2 per target: [1.     1.     0.7481 0.6631 0.7112]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7075 | max relative term contribution 0.9808
 [SINDy] library: physics | scale heights: [5000.0]
 [SINDy] physics coefficients trainable: True
 [SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
@@ -39,27 +47,27 @@ Discovered Physics Matrix Xi:
           ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
           dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
           dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
-          dv_s/dt   h*v_s              contrib=0.4985 coef=+7.702e-03 ip=1.00
-          dv_s/dt   v_h                contrib=0.3802 coef=-6.413e-03 ip=1.00
-          dv_s/dt   s*v_s              contrib=0.3543 coef=-5.270e-03 ip=1.00
-          dv_s/dt   v_s*v_h            contrib=0.3490 coef=-7.067e-03 ip=1.00
-          dv_al/dt  aero_va@H=5000     contrib=0.7826 coef=-1.652e-02 ip=1.00
-          dv_al/dt  s*v_al             contrib=0.5764 coef=-1.336e-02 ip=1.00
-          dv_al/dt  v_al*v_h           contrib=0.4609 coef=-1.048e-02 ip=1.00
-          dv_al/dt  drag_V2@H=5000     contrib=0.3400 coef=-7.168e-03 ip=1.00
-          dv_h/dt   h                  contrib=0.9807 coef=-3.851e-02 ip=1.00
-          dv_h/dt   h*h                contrib=0.9111 coef=+2.261e-02 ip=1.00
-          dv_h/dt   h*v_s              contrib=0.7169 coef=+2.529e-02 ip=1.00
-          dv_h/dt   s                  contrib=0.6632 coef=+2.574e-02 ip=1.00
+          dv_s/dt   h*v_s              contrib=0.4862 coef=+7.512e-03 ip=1.00
+          dv_s/dt   v_h                contrib=0.3841 coef=-6.479e-03 ip=1.00
+          dv_s/dt   s*v_s              contrib=0.3768 coef=-5.604e-03 ip=1.00
+          dv_s/dt   s*v_h              contrib=0.3418 coef=+5.393e-03 ip=1.00
+          dv_al/dt  aero_va@H=5000     contrib=0.7868 coef=-1.661e-02 ip=1.00
+          dv_al/dt  s*v_al             contrib=0.5855 coef=-1.357e-02 ip=1.00
+          dv_al/dt  v_al*v_h           contrib=0.4601 coef=-1.046e-02 ip=1.00
+          dv_al/dt  drag_V2@H=5000     contrib=0.3281 coef=-6.916e-03 ip=1.00
+          dv_h/dt   h                  contrib=0.9808 coef=-3.852e-02 ip=1.00
+          dv_h/dt   h*h                contrib=0.9094 coef=+2.257e-02 ip=1.00
+          dv_h/dt   h*v_s              contrib=0.7165 coef=+2.527e-02 ip=1.00
+          dv_h/dt   s                  contrib=0.6624 coef=+2.570e-02 ip=1.00
 
 === DISCOVERED SINDy EQUATIONS ===
 ds/dt = - 0.0102762*1 [ip=1.00] + 0.00156238*v_s [ip=1.00]
 dh/dt = 0.0210313*v_h [ip=1.00] - 0.0045725*1 [ip=1.00]
-dv_s/dt = 0.00770182*h*v_s [ip=1.00] - 0.00706715*v_s*v_h [ip=1.00] - 0.00641314*v_h [ip=1.00] + 0.0054969*drag_V2@H=5000 [ip=1.00] - 0.00526968*s*v_s [ip=1.00] + 0.0051386*s*v_h [ip=1.00] + 0.00510555*1 [ip=1.00] - 0.00430728*h [ip=1.00] - 0.00417231*s*v_al [ip=1.00] + 0.00386418*curv_vs2 [ip=1.00] - 0.00357422*h*v_h [ip=1.00] + 0.00335313*h*h [ip=1.00] - 0.00276157*aero_va@H=5000 [ip=1.00] + 0.0020383*drag_vh@H=5000 [ip=1.00] - 0.00179796*s*h [ip=1.00] - 0.00160757*drag_vs@H=5000 [ip=0.82] + 0.00158585*h*v_al [ip=1.00] - 0.0012322*s*s [ip=1.00] + 0.0012235*s [ip=0.96] - 0.00120807*v_al*v_al [ip=1.00] - 0.00107824*v_al [ip=0.88] + 0.00106098*v_s [ip=0.88] - 0.000962968*v_al*v_h [ip=0.78]
-dv_al/dt = - 0.0165163*aero_va@H=5000 [ip=1.00] - 0.0133611*s*v_al [ip=1.00] - 0.0104797*v_al*v_h [ip=1.00] - 0.0071684*drag_V2@H=5000 [ip=1.00] - 0.00648483*drag_vs@H=5000 [ip=1.00] + 0.00495588*v_al [ip=1.00] + 0.00276825*h*v_al [ip=1.00] - 0.00268372*v_s*v_al [ip=1.00] - 0.00221657*h*v_s [ip=0.98] - 0.00210174*v_s*v_s [ip=1.00] - 0.00180283*h [ip=0.88] - 0.00158884*s*v_s [ip=0.98] - 0.00124143*v_al*v_al [ip=1.00] + 0.000877847*v_h*v_h [ip=0.96]
-dv_h/dt = - 0.0385149*h [ip=1.00] + 0.0257373*s [ip=1.00] + 0.0252864*h*v_s [ip=1.00] + 0.0226091*h*h [ip=1.00] - 0.0211146*drag_V2@H=5000 [ip=1.00] - 0.0180267*drag_vs@H=5000 [ip=1.00] + 0.017383*v_s*v_s [ip=1.00] - 0.0173627*v_s [ip=1.00] - 0.0109748*v_h*v_h [ip=1.00] + 0.0103336*drag_vh@H=5000 [ip=1.00] + 0.00834745*s*v_h [ip=1.00] - 0.00831292*1 [ip=1.00] - 0.00799021*s*s [ip=1.00] + 0.00694354*v_al*v_al [ip=1.00] - 0.00533479*v_h [ip=1.00] - 0.00500527*s*h [ip=1.00] + 0.00384169*v_al*v_h [ip=1.00] + 0.00348361*v_s*v_al [ip=1.00] + 0.00343462*h*v_al [ip=1.00] - 0.00315607*v_al [ip=1.00] + 0.00243399*s*v_s [ip=0.96] + 0.0020879*aero_va@H=5000 [ip=0.90] - 0.00208154*v_s*v_h [ip=0.88] - 0.00200223*curv_vs2 [ip=1.00] - 0.00125174*h*v_h [ip=0.70] - 0.000871188*s*v_al [ip=0.64]
+dv_s/dt = 0.00751176*h*v_s [ip=1.00] - 0.00685475*v_s*v_h [ip=1.00] - 0.00647923*v_h [ip=1.00] + 0.00566458*drag_V2@H=5000 [ip=1.00] - 0.00560422*s*v_s [ip=1.00] + 0.00539328*s*v_h [ip=1.00] + 0.00488339*1 [ip=1.00] - 0.00428218*h [ip=1.00] + 0.00424002*curv_vs2 [ip=1.00] - 0.00410217*s*v_al [ip=1.00] - 0.00348767*h*v_h [ip=1.00] + 0.00330478*h*h [ip=1.00] - 0.00279953*aero_va@H=5000 [ip=1.00] + 0.00202715*drag_vh@H=5000 [ip=1.00] - 0.00185945*s*h [ip=1.00] - 0.00150932*drag_vs@H=5000 [ip=0.96] - 0.00132249*s*s [ip=1.00] + 0.00128941*h*v_al [ip=1.00] - 0.00120246*v_al*v_al [ip=1.00] + 0.00115946*s [ip=1.00] + 0.00108051*v_s [ip=1.00] - 0.00103819*v_al [ip=1.00] - 0.000924626*v_al*v_h [ip=1.00] - 0.000616112*v_s*v_s [ip=1.00] - 0.000540212*v_s*v_al [ip=0.94] - 0.000253444*v_h*v_h [ip=0.84]
+dv_al/dt = - 0.0166056*aero_va@H=5000 [ip=1.00] - 0.0135722*s*v_al [ip=1.00] - 0.0104618*v_al*v_h [ip=1.00] - 0.00691623*drag_V2@H=5000 [ip=1.00] - 0.00629455*drag_vs@H=5000 [ip=1.00] + 0.00486027*v_al [ip=1.00] + 0.00281103*h*v_al [ip=1.00] - 0.00270989*v_s*v_al [ip=1.00] - 0.00251033*h*v_s [ip=1.00] - 0.00212738*s*v_s [ip=1.00] - 0.00203654*v_s*v_s [ip=1.00] - 0.00124263*h [ip=1.00] + 0.00118353*v_h*v_h [ip=1.00] - 0.0011139*v_al*v_al [ip=1.00] + 0.000703242*drag_vh@H=5000 [ip=0.94] - 0.000593748*s [ip=0.90] + 0.000462335*v_h [ip=0.90] - 0.000425832*v_s [ip=0.82] - 0.000380249*s*v_h [ip=0.88] + 0.000351895*h*v_h [ip=0.86] - 0.000336714*1 [ip=0.80] - 0.000325597*s*h [ip=0.84] - 0.000256107*h*h [ip=0.84] - 0.000255964*s*s [ip=0.80] - 0.000238649*curv_vs2 [ip=0.74]
+dv_h/dt = - 0.0385206*h [ip=1.00] + 0.0257041*s [ip=1.00] + 0.0252725*h*v_s [ip=1.00] + 0.0225672*h*h [ip=1.00] - 0.0211135*drag_V2@H=5000 [ip=1.00] - 0.0180184*drag_vs@H=5000 [ip=1.00] + 0.0174087*v_s*v_s [ip=1.00] - 0.0174057*v_s [ip=1.00] - 0.010988*v_h*v_h [ip=1.00] + 0.0102333*drag_vh@H=5000 [ip=1.00] + 0.00844568*s*v_h [ip=1.00] - 0.00832145*1 [ip=1.00] - 0.00799613*s*s [ip=1.00] + 0.00695222*v_al*v_al [ip=1.00] - 0.00534469*v_h [ip=1.00] - 0.0049813*s*h [ip=1.00] + 0.00383887*v_al*v_h [ip=1.00] + 0.00353971*h*v_al [ip=1.00] + 0.00351384*v_s*v_al [ip=1.00] - 0.00313938*v_al [ip=1.00] + 0.00240128*s*v_s [ip=1.00] - 0.00216475*v_s*v_h [ip=1.00] + 0.00209597*aero_va@H=5000 [ip=0.96] - 0.00200438*curv_vs2 [ip=1.00] - 0.00125648*h*v_h [ip=0.96] - 0.000932941*s*v_al [ip=0.94]
 
-[SINDy] equations written to: model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_150win_5stride_equations.txt
+[SINDy] equations written to: model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_50win_5stride_equations.txt
 
 /Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
   return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
@@ -79,6 +87,12 @@ dv_h/dt = - 0.0385149*h [ip=1.00] + 0.0257373*s [ip=1.00] + 0.0252864*h*v_s [ip=
   V = np.sqrt(vs * vs + vh * vh + _V_EPS)
 /Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
   cols[:, off + j] = vs * vs / (self.earth_radius + h)
+/Users/e471302/lm_cm_repos/next/physics_library.py:139: RuntimeWarning: overflow encountered in multiply
+  cols[:, off + j] = rho * V * vs
+/Users/e471302/lm_cm_repos/next/physics_library.py:141: RuntimeWarning: overflow encountered in multiply
+  cols[:, off + j] = rho * V * vh
+/Users/e471302/lm_cm_repos/next/physics_library.py:143: RuntimeWarning: overflow encountered in multiply
+  cols[:, off + j] = rho * V * V
 /Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
   return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
 /Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
@@ -91,48 +105,60 @@ dv_h/dt = - 0.0385149*h [ip=1.00] + 0.0257373*s [ip=1.00] + 0.0252864*h*v_s [ip=
   V = np.sqrt(vs * vs + vh * vh + _V_EPS)
 /Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
   cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
 /Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
   return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
+/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
+  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
 /Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
   cols[:, off + j] = vs * vs / (self.earth_radius + h)
 [pure-SINDy rollout — train]
   trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251    449465.8   2920392.6   2920392.6
-  train_1                         324    324     45780.3     57800.0     74177.0
-  train_2                         465     62     19431.3    128963.0    128963.0  DIVERGED
-  train_3                         181    117     23844.7    203121.8    203121.8  DIVERGED
-  train_4                         383    383    111325.1    209216.5    223444.4
-  train_5                          95     73     14976.6    238403.3    238403.3  DIVERGED
-  train_6                         166    166     98189.2    307482.8    307482.8
-  train_7                          97     97      8270.2     22035.8     22035.8
-  train_8                         181    181     27603.6     98657.1     98657.1
-  train_9                         210    210     28053.0     80281.9     84135.0
-  train_10                        121    121     37965.4    157781.7    157781.7
-  train_11                        102    102     14676.9     72519.9     72519.9
-  train_12                        451     61     24447.8    302464.7    302464.7  DIVERGED
-  train_13                        212    212     36315.2    111163.3    111163.3
-  train_14                        208    208     22419.0     82275.4     82275.4
-  train_15                        217    217    110585.6    610618.9    610618.9
-  train_16                        117    117     15807.1     78725.7     78725.7
-  train_17                        333    317   4522440.2  39704508.2  39704508.2  DIVERGED
-  train_18                        272    272    278679.9   1738872.0   1738872.0
-  train_19                        221    221     70511.4    347521.1    347521.1
-  train_20                        444     79     28795.6    315202.0    315202.0  DIVERGED
-  train_21                        262    262     65997.5    183644.0    183644.0
-  SUMMARY: mean=275253.7 m | median=32555.4 m | worst=4522440.2 m | diverged 6/22
+  train_0                         251    251    614019.3   4742552.4   4742552.4
+  train_1                         324    301     60065.1    253979.3    253979.3  DIVERGED
+  train_2                         465     63     20567.2    133526.9    133526.9  DIVERGED
+  train_3                         181    181    105141.5    470030.2    470030.2
+  train_4                         383    383    294032.0   2421614.9   2421614.9
+  train_5                          95     73     13951.8    189359.5    189359.5  DIVERGED
+  train_6                         166    166    100216.8    325755.4    325755.4
+  train_7                          97     97      8183.5     15652.0     15652.0
+  train_8                         181    181     24552.6    100823.6    100823.6
+  train_9                         210    210     31441.8    104129.5    104129.5
+  train_10                        121    121     40395.0    171815.8    171815.8
+  train_11                        102    102     13739.0     62553.8     62637.6
+  train_12                        451     62     22855.2    154198.3    154198.3  DIVERGED
+  train_13                        212    212     43113.7    157047.9    157047.9
+  train_14                        208    208     27057.6    116696.5    116696.5
+  train_15                        217    217    128307.5    803628.7    803628.7
+  train_16                        117    117     18917.7     92657.5     92657.5
+  train_17                        333    289   3791591.5  35919939.5  35919939.5  DIVERGED
+  train_18                        272    272    370148.0   2795011.5   2795011.5
+  train_19                        221    221     76802.4    405557.2    405557.2
+  train_20                        444    431   2523403.9  34636062.3  34636062.3  DIVERGED
+  train_21                        262    262     70836.3    208577.1    208577.1
+  SUMMARY: mean=381788.2 m | median=51589.4 m | worst=3791591.5 m | diverged 6/22
   (in-plane geodesic error: range + altitude; excludes cross-range)
 
+/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
+  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
+/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
+  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
+/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
+  cols[:, off + j] = vs * vs / (self.earth_radius + h)
+/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
+  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
+/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
+  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
+/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
+  cols[:, off + j] = vs * vs / (self.earth_radius + h)
 [pure-SINDy rollout — validation]
   trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     47117.4    130633.0    130633.0
-  validation_1                    123    123     16474.8     30965.3     30965.3
-  validation_2                    179     79     14191.4    132859.8    132859.8  DIVERGED
-  validation_3                    150    150     92564.2    383813.3    383813.3
-  validation_4                    144    144     15008.9     45671.7     45671.7
-  validation_5                    287     73     18405.9    129980.9    129980.9  DIVERGED
-  SUMMARY: mean=33960.4 m | median=17440.3 m | worst=92564.2 m | diverged 2/6
+  validation_0                    130    130     49251.4    144732.9    144732.9
+  validation_1                    123    123     17132.9     33347.4     33347.4
+  validation_2                    179     79     15099.2    167577.5    167577.5  DIVERGED
+  validation_3                    150    150     95374.7    418357.9    418357.9
+  validation_4                    144    144     16839.7     52619.6     52619.6
+  validation_5                    287     76     22360.1    202841.9    202841.9  DIVERGED
+  SUMMARY: mean=36009.7 m | median=19746.5 m | worst=95374.7 m | diverged 2/6
   (in-plane geodesic error: range + altitude; excludes cross-range)
 
 [--sindy-only] Discovery complete; skipping model training.

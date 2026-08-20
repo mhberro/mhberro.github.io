@@ -1,164 +1,322 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 50 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library physics --sindy-only --sindy-scale-heights 5000 --sindy-scan-l1 .05,.1,.15,.2,.3
-There are 22 training trajs and 6 validation trajs.
+# sindy_standalone.py
+"""Standalone evaluation of the discovered SINDy physics model, on its own.
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
+Why this exists
+---------------
+The agreed order of operations is to nail the physics backbone FIRST, before
+layering APHYNITY or a neural residual on top: if the physics isn't good enough,
+there is no reason to believe the residual learner will rescue it. That means we
+need to judge the discovered physics *by itself* -- integrate `f_phys` forward
+with no neural network at all and measure how far it drifts from truth.
 
-[SINDy scan] l1_threshold sweep (want: few active terms at little R2 cost)
-        l1   active   %dense   kept lib   meanR2(acc)
-     0.050       67     52%         26       0.70597
-     0.100       53     41%         26       0.69823
-     0.150       46     35%         26       0.69171
-     0.200       37     28%         26       0.66008
-     0.300       28     22%         26       0.46379
-Discovered Physics Matrix Xi:
- [[-0.0102762  -0.0045725   0.00488339 -0.00033671 -0.00832145]
- [ 0.          0.          0.00115946 -0.00059375  0.0257041 ]
- [ 0.          0.         -0.00428218 -0.00124263 -0.03852057]
- [ 0.00156238  0.          0.00108051 -0.00042583 -0.01740571]
- [ 0.          0.         -0.00103819  0.00486027 -0.00313938]
- [ 0.          0.0210313  -0.00647923  0.00046234 -0.00534469]
- [ 0.          0.         -0.00132249 -0.00025596 -0.00799613]
- [ 0.          0.         -0.00185945 -0.0003256  -0.0049813 ]
- [ 0.          0.         -0.00560422 -0.00212738  0.00240128]
- [ 0.          0.         -0.00410217 -0.0135722  -0.00093294]
- [ 0.          0.          0.00539328 -0.00038025  0.00844568]
- [ 0.          0.          0.00330478 -0.00025611  0.02256722]
- [ 0.          0.          0.00751176 -0.00251033  0.0252725 ]
- [ 0.          0.          0.00128941  0.00281103  0.00353971]
- [ 0.          0.         -0.00348767  0.0003519  -0.00125648]
- [ 0.          0.         -0.00061611 -0.00203654  0.01740873]
- [ 0.          0.         -0.00054021 -0.00270989  0.00351384]
- [ 0.          0.         -0.00685475  0.         -0.00216475]
- [ 0.          0.         -0.00120246 -0.0011139   0.00695222]
- [ 0.          0.         -0.00092463 -0.01046178  0.00383887]
- [ 0.          0.         -0.00025344  0.00118353 -0.01098796]
- [ 0.          0.         -0.00150932 -0.00629455 -0.01801836]
- [ 0.          0.          0.00202715  0.00070324  0.01023329]
- [ 0.          0.          0.00566458 -0.00691623 -0.02111349]
- [ 0.          0.         -0.00279953 -0.01660563  0.00209597]
- [ 0.          0.          0.00424002 -0.00023865 -0.00200438]]
-[SINDy] active terms: 81/130 | max|coef| per target: [0.01028 0.02103 0.00751 0.01661 0.03852]
-[SINDy] R2 per target: [1.     1.     0.7481 0.6631 0.7112]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7075 | max relative term contribution 0.9808
-[SINDy] library: physics | scale heights: [5000.0]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     1                  contrib=0.9886 coef=-1.028e-02 ip=1.00
-          ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
-          dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
-          dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
-          dv_s/dt   h*v_s              contrib=0.4862 coef=+7.512e-03 ip=1.00
-          dv_s/dt   v_h                contrib=0.3841 coef=-6.479e-03 ip=1.00
-          dv_s/dt   s*v_s              contrib=0.3768 coef=-5.604e-03 ip=1.00
-          dv_s/dt   s*v_h              contrib=0.3418 coef=+5.393e-03 ip=1.00
-          dv_al/dt  aero_va@H=5000     contrib=0.7868 coef=-1.661e-02 ip=1.00
-          dv_al/dt  s*v_al             contrib=0.5855 coef=-1.357e-02 ip=1.00
-          dv_al/dt  v_al*v_h           contrib=0.4601 coef=-1.046e-02 ip=1.00
-          dv_al/dt  drag_V2@H=5000     contrib=0.3281 coef=-6.916e-03 ip=1.00
-          dv_h/dt   h                  contrib=0.9808 coef=-3.852e-02 ip=1.00
-          dv_h/dt   h*h                contrib=0.9094 coef=+2.257e-02 ip=1.00
-          dv_h/dt   h*v_s              contrib=0.7165 coef=+2.527e-02 ip=1.00
-          dv_h/dt   s                  contrib=0.6624 coef=+2.570e-02 ip=1.00
+Two capabilities live here:
 
-=== DISCOVERED SINDy EQUATIONS ===
-ds/dt = - 0.0102762*1 [ip=1.00] + 0.00156238*v_s [ip=1.00]
-dh/dt = 0.0210313*v_h [ip=1.00] - 0.0045725*1 [ip=1.00]
-dv_s/dt = 0.00751176*h*v_s [ip=1.00] - 0.00685475*v_s*v_h [ip=1.00] - 0.00647923*v_h [ip=1.00] + 0.00566458*drag_V2@H=5000 [ip=1.00] - 0.00560422*s*v_s [ip=1.00] + 0.00539328*s*v_h [ip=1.00] + 0.00488339*1 [ip=1.00] - 0.00428218*h [ip=1.00] + 0.00424002*curv_vs2 [ip=1.00] - 0.00410217*s*v_al [ip=1.00] - 0.00348767*h*v_h [ip=1.00] + 0.00330478*h*h [ip=1.00] - 0.00279953*aero_va@H=5000 [ip=1.00] + 0.00202715*drag_vh@H=5000 [ip=1.00] - 0.00185945*s*h [ip=1.00] - 0.00150932*drag_vs@H=5000 [ip=0.96] - 0.00132249*s*s [ip=1.00] + 0.00128941*h*v_al [ip=1.00] - 0.00120246*v_al*v_al [ip=1.00] + 0.00115946*s [ip=1.00] + 0.00108051*v_s [ip=1.00] - 0.00103819*v_al [ip=1.00] - 0.000924626*v_al*v_h [ip=1.00] - 0.000616112*v_s*v_s [ip=1.00] - 0.000540212*v_s*v_al [ip=0.94] - 0.000253444*v_h*v_h [ip=0.84]
-dv_al/dt = - 0.0166056*aero_va@H=5000 [ip=1.00] - 0.0135722*s*v_al [ip=1.00] - 0.0104618*v_al*v_h [ip=1.00] - 0.00691623*drag_V2@H=5000 [ip=1.00] - 0.00629455*drag_vs@H=5000 [ip=1.00] + 0.00486027*v_al [ip=1.00] + 0.00281103*h*v_al [ip=1.00] - 0.00270989*v_s*v_al [ip=1.00] - 0.00251033*h*v_s [ip=1.00] - 0.00212738*s*v_s [ip=1.00] - 0.00203654*v_s*v_s [ip=1.00] - 0.00124263*h [ip=1.00] + 0.00118353*v_h*v_h [ip=1.00] - 0.0011139*v_al*v_al [ip=1.00] + 0.000703242*drag_vh@H=5000 [ip=0.94] - 0.000593748*s [ip=0.90] + 0.000462335*v_h [ip=0.90] - 0.000425832*v_s [ip=0.82] - 0.000380249*s*v_h [ip=0.88] + 0.000351895*h*v_h [ip=0.86] - 0.000336714*1 [ip=0.80] - 0.000325597*s*h [ip=0.84] - 0.000256107*h*h [ip=0.84] - 0.000255964*s*s [ip=0.80] - 0.000238649*curv_vs2 [ip=0.74]
-dv_h/dt = - 0.0385206*h [ip=1.00] + 0.0257041*s [ip=1.00] + 0.0252725*h*v_s [ip=1.00] + 0.0225672*h*h [ip=1.00] - 0.0211135*drag_V2@H=5000 [ip=1.00] - 0.0180184*drag_vs@H=5000 [ip=1.00] + 0.0174087*v_s*v_s [ip=1.00] - 0.0174057*v_s [ip=1.00] - 0.010988*v_h*v_h [ip=1.00] + 0.0102333*drag_vh@H=5000 [ip=1.00] + 0.00844568*s*v_h [ip=1.00] - 0.00832145*1 [ip=1.00] - 0.00799613*s*s [ip=1.00] + 0.00695222*v_al*v_al [ip=1.00] - 0.00534469*v_h [ip=1.00] - 0.0049813*s*h [ip=1.00] + 0.00383887*v_al*v_h [ip=1.00] + 0.00353971*h*v_al [ip=1.00] + 0.00351384*v_s*v_al [ip=1.00] - 0.00313938*v_al [ip=1.00] + 0.00240128*s*v_s [ip=1.00] - 0.00216475*v_s*v_h [ip=1.00] + 0.00209597*aero_va@H=5000 [ip=0.96] - 0.00200438*curv_vs2 [ip=1.00] - 0.00125648*h*v_h [ip=0.96] - 0.000932941*s*v_al [ip=0.94]
+1. `format_sindy_equations` -- turn the coefficient table `Xi` into readable
+   equations (e.g. "dv_h/dt = -0.0385*h + 0.0226*h*h + ..."), so discovered models
+   can be compared term-by-term against another implementation.
 
-[SINDy] equations written to: model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_50win_5stride_equations.txt
+2. `sindy_rollout` / `evaluate_sindy` -- integrate the pure physics model forward
+   from a single initial state (RK4, matching training) and report position error
+   against truth in physical units.
 
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/lm_cm_repos/next/physics_library.py:139: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = rho * V * vs
-/Users/e471302/lm_cm_repos/next/physics_library.py:141: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = rho * V * vh
-/Users/e471302/lm_cm_repos/next/physics_library.py:143: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = rho * V * V
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-[pure-SINDy rollout — train]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251    614019.3   4742552.4   4742552.4
-  train_1                         324    301     60065.1    253979.3    253979.3  DIVERGED
-  train_2                         465     63     20567.2    133526.9    133526.9  DIVERGED
-  train_3                         181    181    105141.5    470030.2    470030.2
-  train_4                         383    383    294032.0   2421614.9   2421614.9
-  train_5                          95     73     13951.8    189359.5    189359.5  DIVERGED
-  train_6                         166    166    100216.8    325755.4    325755.4
-  train_7                          97     97      8183.5     15652.0     15652.0
-  train_8                         181    181     24552.6    100823.6    100823.6
-  train_9                         210    210     31441.8    104129.5    104129.5
-  train_10                        121    121     40395.0    171815.8    171815.8
-  train_11                        102    102     13739.0     62553.8     62637.6
-  train_12                        451     62     22855.2    154198.3    154198.3  DIVERGED
-  train_13                        212    212     43113.7    157047.9    157047.9
-  train_14                        208    208     27057.6    116696.5    116696.5
-  train_15                        217    217    128307.5    803628.7    803628.7
-  train_16                        117    117     18917.7     92657.5     92657.5
-  train_17                        333    289   3791591.5  35919939.5  35919939.5  DIVERGED
-  train_18                        272    272    370148.0   2795011.5   2795011.5
-  train_19                        221    221     76802.4    405557.2    405557.2
-  train_20                        444    431   2523403.9  34636062.3  34636062.3  DIVERGED
-  train_21                        262    262     70836.3    208577.1    208577.1
-  SUMMARY: mean=381788.2 m | median=51589.4 m | worst=3791591.5 m | diverged 6/22
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+Note on the error metric: this reports IN-PLANE error in the geodesic frame --
+range (s) and altitude (h). It deliberately does NOT reconstruct cross-range,
+which would require integrating the azimuth rate and a full frame inversion (that
+is what `standalone_direct_evaluator.py` does for a trained model). In-plane error
+is a fast, honest screen for "is the physics backbone any good"; it will read
+slightly optimistic versus a full 3D ECEF error.
+"""
 
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-/Users/e471302/Library/Python/3.11/lib/python/site-packages/numpy/_core/fromnumeric.py:83: RuntimeWarning: overflow encountered in reduce
-  return ufunc.reduce(obj, axis, dtype, out, **passkwargs)
-/Users/e471302/lm_cm_repos/next/physics_library.py:130: RuntimeWarning: overflow encountered in multiply
-  V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-/Users/e471302/lm_cm_repos/next/physics_library.py:135: RuntimeWarning: overflow encountered in multiply
-  cols[:, off + j] = vs * vs / (self.earth_radius + h)
-[pure-SINDy rollout — validation]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     49251.4    144732.9    144732.9
-  validation_1                    123    123     17132.9     33347.4     33347.4
-  validation_2                    179     79     15099.2    167577.5    167577.5  DIVERGED
-  validation_3                    150    150     95374.7    418357.9    418357.9
-  validation_4                    144    144     16839.7     52619.6     52619.6
-  validation_5                    287     76     22360.1    202841.9    202841.9  DIVERGED
-  SUMMARY: mean=36009.7 m | median=19746.5 m | worst=95374.7 m | diverged 2/6
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+from __future__ import annotations
 
-[--sindy-only] Discovery complete; skipping model training.
+import numpy as np
+
+DEFAULT_STATE_NAMES = ["s", "h", "v_s", "v_al", "v_h"]
+DEFAULT_TARGET_NAMES = ["ds/dt", "dh/dt", "dv_s/dt", "dv_al/dt", "dv_h/dt"]
+
+
+# --------------------------------------------------------------------- naming
+
+def library_term_names(library, n_features: int, state_names=None) -> list[str]:
+    """Human-readable name for every library column.
+
+    Uses the library's own `term_names()` when it has one (the physics library);
+    otherwise derives names from the polynomial combination tuples.
+    """
+    if hasattr(library, "term_names"):
+        try:
+            return list(library.term_names())
+        except TypeError:
+            pass
+    names = list(state_names or DEFAULT_STATE_NAMES)[:n_features]
+    combos = library.term_combos(n_features)
+    out = []
+    for combo in combos:
+        if combo is None:
+            out.append("<physics>")
+        elif len(combo) == 0:
+            out.append("1")
+        else:
+            out.append("*".join(names[i] for i in combo))
+    return out
+
+
+# ------------------------------------------------------------------ equations
+
+def format_sindy_equations(
+    Xi: np.ndarray,
+    term_names: list[str],
+    target_names=None,
+    min_coef: float = 0.0,
+    inclusion_probs: np.ndarray | None = None,
+) -> str:
+    """Render `Xi` as readable equations, one per state derivative.
+
+    `min_coef` hides terms whose |coefficient| is below the cutoff (0 shows all
+    non-zero terms). If `inclusion_probs` is given, each term is annotated with the
+    fraction of bootstrap fits that selected it -- the ensemble's confidence.
+    """
+    targets = list(target_names or DEFAULT_TARGET_NAMES)[: Xi.shape[1]]
+    lines = []
+    for c in range(Xi.shape[1]):
+        target = targets[c] if c < len(targets) else f"d(x{c})/dt"
+        pieces = []
+        # Show the biggest contributors first.
+        order = np.argsort(-np.abs(Xi[:, c]))
+        for r in order:
+            coef = float(Xi[r, c])
+            if coef == 0.0 or abs(coef) < min_coef:
+                continue
+            sign = "-" if coef < 0 else "+"
+            piece = f"{sign} {abs(coef):.6g}*{term_names[r]}"
+            if inclusion_probs is not None:
+                piece += f" [ip={inclusion_probs[r, c]:.2f}]"
+            pieces.append(piece)
+        if not pieces:
+            lines.append(f"{target} = 0")
+            continue
+        body = " ".join(pieces)
+        if body.startswith("+ "):
+            body = body[2:]
+        lines.append(f"{target} = {body}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- rollout
+
+def _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset):
+    """Build the pure-physics derivative function d(scaled state)/dt.
+
+    The kinematic identity for the position channels is enforced explicitly. When
+    the discovery used analytic position rows, `Xi` already encodes exactly this,
+    so the override is a no-op; when it didn't, this keeps the rollout physically
+    consistent either way.
+    """
+    use_override = (
+        pos_idx is not None and vel_idx is not None and so_ratio is not None
+    )
+
+    def rhs(y: np.ndarray) -> np.ndarray:
+        # A diverging physics model overflows by design; that is the signal we are
+        # measuring, not an error to shout about. Suppress the numpy warnings and
+        # let the finiteness check below detect divergence cleanly.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            Theta = library.fit_transform(y.reshape(1, -1))
+            dy = np.asarray(Theta @ Xi, dtype=float).reshape(-1)
+        if use_override:
+            for k, (p_i, v_i) in enumerate(zip(pos_idx, vel_idx)):
+                dy[p_i] = y[v_i] * so_ratio[k] + so_offset[k]
+        return dy
+
+    return rhs
+
+
+def sindy_rollout(
+    library,
+    Xi: np.ndarray,
+    y0_scaled: np.ndarray,
+    n_steps: int,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=None,
+    vel_idx=None,
+    so_ratio=None,
+    so_offset=None,
+    diverge_limit: float = 1e6,
+) -> np.ndarray:
+    """Integrate the pure physics model forward with RK4.
+
+    Returns the predicted scaled states, shape (n_steps, n_features). Stops early
+    and pads with NaN if the state goes non-finite or explodes, so a diverging
+    physics model is visible rather than crashing the caller.
+    """
+    n_features = y0_scaled.shape[-1]
+    rhs = _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset)
+
+    out = np.full((n_steps, n_features), np.nan, dtype=float)
+    y = np.asarray(y0_scaled, dtype=float).copy()
+    out[0] = y
+    h = dt / float(substeps)
+
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        for step in range(1, n_steps):
+            for _ in range(substeps):
+                k1 = rhs(y)
+                k2 = rhs(y + 0.5 * h * k1)
+                k3 = rhs(y + 0.5 * h * k2)
+                k4 = rhs(y + h * k3)
+                y = y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > diverge_limit:
+                break
+            out[step] = y
+    return out
+
+
+# ------------------------------------------------------------------ evaluation
+
+def evaluate_sindy(
+    library,
+    Xi: np.ndarray,
+    trajectories: list[np.ndarray],
+    scaler,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=(0, 1),
+    vel_idx=(2, 4),
+    so_ratio=None,
+    so_offset=None,
+    names: list[str] | None = None,
+    max_steps: int | None = None,
+) -> dict:
+    """Roll out the pure physics model on each trajectory and score it.
+
+    `trajectories` are SCALED state arrays (n_steps, n_features), the same form
+    SINDy was fitted on. Returns per-trajectory rows plus an aggregate summary,
+    with errors converted back to metres.
+    """
+    rows = []
+    for i, traj in enumerate(trajectories):
+        traj = np.asarray(traj, dtype=float)
+        n_steps = traj.shape[0]
+        if max_steps is not None:
+            n_steps = min(n_steps, max_steps)
+        if n_steps < 3:
+            continue
+
+        pred = sindy_rollout(
+            library, Xi, traj[0], n_steps, dt, substeps,
+            pos_idx, vel_idx, so_ratio, so_offset,
+        )
+
+        truth_phys = scaler.inverse_transform(traj[:n_steps])
+        finite_mask = np.all(np.isfinite(pred), axis=1)
+        n_valid = int(finite_mask.sum())
+        if n_valid < 2:
+            rows.append({
+                "name": (names[i] if names else f"traj_{i}"),
+                "steps": n_steps, "valid_steps": n_valid,
+                "mean_pos_err_m": float("nan"), "final_pos_err_m": float("nan"),
+                "max_pos_err_m": float("nan"), "diverged": True,
+            })
+            continue
+
+        pred_phys = np.full_like(truth_phys, np.nan)
+        pred_phys[finite_mask] = scaler.inverse_transform(pred[finite_mask])
+
+        p = np.asarray(pos_idx, dtype=int)
+        err = np.linalg.norm(pred_phys[finite_mask][:, p] - truth_phys[finite_mask][:, p], axis=1)
+        rows.append({
+            "name": (names[i] if names else f"traj_{i}"),
+            "steps": n_steps,
+            "valid_steps": n_valid,
+            "mean_pos_err_m": float(np.mean(err)),
+            "final_pos_err_m": float(err[-1]),
+            "max_pos_err_m": float(np.max(err)),
+            "diverged": bool(n_valid < n_steps),
+        })
+
+    finite_rows = [r for r in rows if np.isfinite(r["mean_pos_err_m"])]
+    summary = {
+        "n_trajectories": len(rows),
+        "n_diverged": sum(1 for r in rows if r["diverged"]),
+        "mean_pos_err_m": float(np.mean([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "median_pos_err_m": float(np.median([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "worst_pos_err_m": float(np.max([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+    }
+    return {"rows": rows, "summary": summary}
+
+
+def format_evaluation(result: dict, label: str = "") -> str:
+    """Render the evaluation as a readable table."""
+    rows, s = result["rows"], result["summary"]
+    out = []
+    header = f"[pure-SINDy rollout{(' — ' + label) if label else ''}]"
+    out.append(header)
+    out.append(f"  {'trajectory':<28}{'steps':>7}{'valid':>7}{'mean_m':>12}{'final_m':>12}{'max_m':>12}")
+    for r in rows:
+        flag = "  DIVERGED" if r["diverged"] else ""
+        out.append(
+            f"  {r['name'][:28]:<28}{r['steps']:>7}{r['valid_steps']:>7}"
+            f"{r['mean_pos_err_m']:>12.1f}{r['final_pos_err_m']:>12.1f}{r['max_pos_err_m']:>12.1f}{flag}"
+        )
+    out.append(
+        f"  SUMMARY: mean={s['mean_pos_err_m']:.1f} m | median={s['median_pos_err_m']:.1f} m | "
+        f"worst={s['worst_pos_err_m']:.1f} m | diverged {s['n_diverged']}/{s['n_trajectories']}"
+    )
+    out.append("  (in-plane geodesic error: range + altitude; excludes cross-range)")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------- stability scoring
+
+def stability_score(
+    library,
+    Xi: np.ndarray,
+    trajectories: list[np.ndarray],
+    scaler,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=(0, 1),
+    vel_idx=(2, 4),
+    so_ratio=None,
+    so_offset=None,
+    max_steps: int | None = None,
+) -> dict:
+    """Score a candidate physics model by how well it ROLLS OUT, not how well it fits.
+
+    This is the metric that matters for a backbone. R^2 measures one-step derivative
+    accuracy; it is measured against the data and says nothing about whether the
+    equation is stable when integrated. A model can hit R^2 = 0.71 and still explode
+    over a few hundred steps, because a free rollout compounds every small error and
+    any positive-feedback term (h*h, h*v_s, ...) grows without bound.
+
+    Ranking therefore puts DIVERGENCE FIRST and error second: a slightly less
+    accurate model that never runs away is a far better backbone than an accurate
+    one that occasionally shoots to the moon.
+    """
+    res = evaluate_sindy(
+        library, Xi, trajectories, scaler, dt, substeps,
+        pos_idx, vel_idx, so_ratio, so_offset, max_steps=max_steps,
+    )
+    s = res["summary"]
+    n = max(1, s["n_trajectories"])
+    return {
+        "frac_diverged": s["n_diverged"] / n,
+        "n_diverged": s["n_diverged"],
+        "n_trajectories": s["n_trajectories"],
+        "median_pos_err_m": s["median_pos_err_m"],
+        "mean_pos_err_m": s["mean_pos_err_m"],
+        "worst_pos_err_m": s["worst_pos_err_m"],
+    }
+
+
+def stability_rank_key(score: dict):
+    """Sort key: fewest divergences first, then lowest MEDIAN rollout error.
+
+    Median rather than mean, because a single exploded trajectory would otherwise
+    dominate the average and mask a model that is good on everything else.
+    """
+    med = score.get("median_pos_err_m", float("inf"))
+    if med is None or not np.isfinite(med):
+        med = float("inf")
+    return (score.get("frac_diverged", 1.0), med)

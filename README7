@@ -1,110 +1,262 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-node --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_5/GEODESIC/glide --sindy-library physics --sindy-scale-heights 5000 --sindy-l1-threshold .01  
-There are 22 training trajs and 6 validation trajs.
+# sindy_standalone.py
+"""Standalone evaluation of the discovered SINDy physics model, on its own.
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-Discovered Physics Matrix Xi:
- [[-0.0102762  -0.0045725   0.00488339 -0.00033671 -0.00832145]
- [ 0.          0.          0.00115946 -0.00059375  0.0257041 ]
- [ 0.          0.         -0.00428218 -0.00124263 -0.03852057]
- [ 0.00156238  0.          0.00108051 -0.00042583 -0.01740571]
- [ 0.          0.         -0.00103819  0.00486027 -0.00313938]
- [ 0.          0.0210313  -0.00647923  0.00046234 -0.00534469]
- [ 0.          0.         -0.00132249 -0.00025596 -0.00799613]
- [ 0.          0.         -0.00185945 -0.0003256  -0.0049813 ]
- [ 0.          0.         -0.00560422 -0.00212738  0.00240128]
- [ 0.          0.         -0.00410217 -0.0135722  -0.00093294]
- [ 0.          0.          0.00539328 -0.00038025  0.00844568]
- [ 0.          0.          0.00330478 -0.00025611  0.02256722]
- [ 0.          0.          0.00751176 -0.00251033  0.0252725 ]
- [ 0.          0.          0.00128941  0.00281103  0.00353971]
- [ 0.          0.         -0.00348767  0.0003519  -0.00125648]
- [ 0.          0.         -0.00061611 -0.00203654  0.01740873]
- [ 0.          0.         -0.00054021 -0.00270989  0.00351384]
- [ 0.          0.         -0.00685475  0.         -0.00216475]
- [ 0.          0.         -0.00120246 -0.0011139   0.00695222]
- [ 0.          0.         -0.00092463 -0.01046178  0.00383887]
- [ 0.          0.         -0.00025344  0.00118353 -0.01098796]
- [ 0.          0.         -0.00150932 -0.00629455 -0.01801836]
- [ 0.          0.          0.00202715  0.00070324  0.01023329]
- [ 0.          0.          0.00566458 -0.00691623 -0.02111349]
- [ 0.          0.         -0.00279953 -0.01660563  0.00209597]
- [ 0.          0.          0.00424002 -0.00023865 -0.00200438]]
-[SINDy] active terms: 81/130 | max|coef| per target: [0.01028 0.02103 0.00751 0.01661 0.03852]
-[SINDy] R2 per target: [1.     1.     0.7481 0.6631 0.7112]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.7075 | max relative term contribution 0.9808
-[SINDy] library: physics | scale heights: [5000.0]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     1                  contrib=0.9886 coef=-1.028e-02 ip=1.00
-          ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
-          dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
-          dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
-          dv_s/dt   h*v_s              contrib=0.4862 coef=+7.512e-03 ip=1.00
-          dv_s/dt   v_h                contrib=0.3841 coef=-6.479e-03 ip=1.00
-          dv_s/dt   s*v_s              contrib=0.3768 coef=-5.604e-03 ip=1.00
-          dv_s/dt   s*v_h              contrib=0.3418 coef=+5.393e-03 ip=1.00
-          dv_al/dt  aero_va@H=5000     contrib=0.7868 coef=-1.661e-02 ip=1.00
-          dv_al/dt  s*v_al             contrib=0.5855 coef=-1.357e-02 ip=1.00
-          dv_al/dt  v_al*v_h           contrib=0.4601 coef=-1.046e-02 ip=1.00
-          dv_al/dt  drag_V2@H=5000     contrib=0.3281 coef=-6.916e-03 ip=1.00
-          dv_h/dt   h                  contrib=0.9808 coef=-3.852e-02 ip=1.00
-          dv_h/dt   h*h                contrib=0.9094 coef=+2.257e-02 ip=1.00
-          dv_h/dt   h*v_s              contrib=0.7165 coef=+2.527e-02 ip=1.00
-          dv_h/dt   s                  contrib=0.6624 coef=+2.570e-02 ip=1.00
+Why this exists
+---------------
+The agreed order of operations is to nail the physics backbone FIRST, before
+layering APHYNITY or a neural residual on top: if the physics isn't good enough,
+there is no reason to believe the residual learner will rescue it. That means we
+need to judge the discovered physics *by itself* -- integrate `f_phys` forward
+with no neural network at all and measure how far it drifts from truth.
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x16c4bbfd0>, 0.0001)
-[INFO] Epoch 5: loss: 0.0055977 pos_err: 1260.1132812 vel_err: 63.5485687 traj_loss: 0.0055732 node_norm: 0.0000192 lambda: 1.0009612 val_loss: 0.0048701 val_pos_err: 1079.1812744 val_vel_err: 96.3753815 val_traj_loss: 0.0048515 val_node_norm: 0.0000140 val_lambda: 1.0009608
-[INFO] Epoch 10: loss: 0.0054936 pos_err: 1244.9401855 vel_err: 65.5363770 traj_loss: 0.0054729 node_norm: 0.0000089 lambda: 1.0021434 val_loss: 0.0045131 val_pos_err: 1123.4451904 val_vel_err: 86.9290619 val_traj_loss: 0.0044990 val_node_norm: 0.0000045 val_lambda: 1.0021430
-[INFO] Epoch 15: loss: 0.0054347 pos_err: 1236.3179932 vel_err: 66.5070953 traj_loss: 0.0054111 node_norm: 0.0000059 lambda: 1.0032730 val_loss: 0.0043596 val_pos_err: 1142.3830566 val_vel_err: 82.4263535 val_traj_loss: 0.0043385 val_node_norm: 0.0000068 val_lambda: 1.0032732
-[INFO] Epoch 20: loss: 0.0053960 pos_err: 1230.4016113 vel_err: 67.4588852 traj_loss: 0.0053647 node_norm: 0.0000080 lambda: 1.0043486 val_loss: 0.0042879 val_pos_err: 1135.9536133 val_vel_err: 78.8314285 val_traj_loss: 0.0042488 val_node_norm: 0.0000206 val_lambda: 1.0043486
-[INFO] [rollout probe @ epoch 25] mean_pos_err=32291.9 worst=61359.0 finite=100%
-[INFO] Epoch 25: loss: 0.0053549 pos_err: 1228.5280762 vel_err: 66.2815933 traj_loss: 0.0053142 node_norm: 0.0000120 lambda: 1.0053998 val_loss: 0.0042055 val_pos_err: 1154.7200928 val_vel_err: 78.2649155 val_traj_loss: 0.0041633 val_node_norm: 0.0000197 val_lambda: 1.0053999 rollout_pos_err: 32291.9234212 rollout_pos_err_worst: 61358.9960938 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0053382 pos_err: 1225.5076904 vel_err: 66.8202362 traj_loss: 0.0052858 node_norm: 0.0000185 lambda: 1.0064355 val_loss: 0.0042378 val_pos_err: 1160.8599854 val_vel_err: 73.5913849 val_traj_loss: 0.0041671 val_node_norm: 0.0000438 val_lambda: 1.0064358
-[INFO] Epoch 35: loss: 0.0053277 pos_err: 1221.7252197 vel_err: 67.1376953 traj_loss: 0.0052649 node_norm: 0.0000234 lambda: 1.0074750 val_loss: 0.0043300 val_pos_err: 1179.8259277 val_vel_err: 68.1658020 val_traj_loss: 0.0042252 val_node_norm: 0.0000732 val_lambda: 1.0074754
-[INFO] Epoch 40: loss: 0.0053196 pos_err: 1218.9614258 vel_err: 67.2006836 traj_loss: 0.0052487 node_norm: 0.0000262 lambda: 1.0085206 val_loss: 0.0042990 val_pos_err: 1186.6983643 val_vel_err: 64.0114670 val_traj_loss: 0.0041910 val_node_norm: 0.0000723 val_lambda: 1.0085208
-[INFO] Epoch 45: loss: 0.0053149 pos_err: 1213.4659424 vel_err: 68.1868668 traj_loss: 0.0052364 node_norm: 0.0000284 lambda: 1.0095668 val_loss: 0.0042583 val_pos_err: 1184.0649414 val_vel_err: 62.9792633 val_traj_loss: 0.0041498 val_node_norm: 0.0000688 val_lambda: 1.0095664
-[INFO] [rollout probe @ epoch 50] mean_pos_err=17772.1 worst=25686.3 finite=100%
-[INFO] Epoch 50: loss: 0.0053127 pos_err: 1211.3529053 vel_err: 67.8649597 traj_loss: 0.0052284 node_norm: 0.0000288 lambda: 1.0106215 val_loss: 0.0043553 val_pos_err: 1193.0930176 val_vel_err: 61.1759415 val_traj_loss: 0.0042280 val_node_norm: 0.0000824 val_lambda: 1.0106213 rollout_pos_err: 17772.1276042 rollout_pos_err_worst: 25686.3457031 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0053110 pos_err: 1208.1444092 vel_err: 68.3569336 traj_loss: 0.0052200 node_norm: 0.0000301 lambda: 1.0116715 val_loss: 0.0043640 val_pos_err: 1216.7818604 val_vel_err: 58.2548904 val_traj_loss: 0.0042295 val_node_norm: 0.0000851 val_lambda: 1.0116718
-[INFO] Epoch 60: loss: 0.0053072 pos_err: 1207.0163574 vel_err: 68.3489532 traj_loss: 0.0052107 node_norm: 0.0000302 lambda: 1.0127397 val_loss: 0.0043297 val_pos_err: 1205.9603271 val_vel_err: 58.5465469 val_traj_loss: 0.0042042 val_node_norm: 0.0000719 val_lambda: 1.0127399
-[INFO] Epoch 65: loss: 0.0053103 pos_err: 1208.6822510 vel_err: 68.0823364 traj_loss: 0.0052080 node_norm: 0.0000305 lambda: 1.0137919 val_loss: 0.0043746 val_pos_err: 1232.8199463 val_vel_err: 55.6686630 val_traj_loss: 0.0042311 val_node_norm: 0.0000851 val_lambda: 1.0137917
-[INFO] Epoch 70: loss: 0.0053207 pos_err: 1207.7982178 vel_err: 69.0443344 traj_loss: 0.0052115 node_norm: 0.0000318 lambda: 1.0148529 val_loss: 0.0043889 val_pos_err: 1234.2271729 val_vel_err: 59.0602951 val_traj_loss: 0.0042420 val_node_norm: 0.0000838 val_lambda: 1.0148531
-[INFO] [rollout probe @ epoch 75] mean_pos_err=16457.2 worst=23496.2 finite=100%
-[INFO] Epoch 75: loss: 0.0053076 pos_err: 1204.0783691 vel_err: 68.5868301 traj_loss: 0.0051922 node_norm: 0.0000328 lambda: 1.0159131 val_loss: 0.0044501 val_pos_err: 1241.2109375 val_vel_err: 51.1022911 val_traj_loss: 0.0042864 val_node_norm: 0.0000955 val_lambda: 1.0159131 rollout_pos_err: 16457.1642253 rollout_pos_err_worst: 23496.2109375 rollout_frac_finite: 1.0000000
-[INFO] Epoch 80: loss: 0.0053188 pos_err: 1200.3911133 vel_err: 69.6550369 traj_loss: 0.0051961 node_norm: 0.0000345 lambda: 1.0169870 val_loss: 0.0044129 val_pos_err: 1250.1614990 val_vel_err: 51.1833611 val_traj_loss: 0.0042573 val_node_norm: 0.0000833 val_lambda: 1.0169871
-[INFO] Epoch 85: loss: 0.0053068 pos_err: 1200.5548096 vel_err: 69.0963516 traj_loss: 0.0051795 node_norm: 0.0000338 lambda: 1.0180627 val_loss: 0.0045498 val_pos_err: 1241.0980225 val_vel_err: 51.6516876 val_traj_loss: 0.0043697 val_node_norm: 0.0001012 val_lambda: 1.0180629
-[INFO] Early stopping triggered at 88
+Two capabilities live here:
 
-Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x1509cd910>, 0.0001)
-[INFO] Epoch 5: loss: 0.0146900 pos_err: 1585.4681396 vel_err: 188.0182953 traj_loss: 0.0145344 node_norm: 0.0001075 lambda: 1.0033034 val_loss: 0.0159080 val_pos_err: 1913.3326416 val_vel_err: 161.1061096 val_traj_loss: 0.0156643 val_node_norm: 0.0001919 val_lambda: 1.0033032
-[INFO] Epoch 10: loss: 0.0145626 pos_err: 1590.1229248 vel_err: 186.3786316 traj_loss: 0.0143420 node_norm: 0.0001144 lambda: 1.0074028 val_loss: 0.0158813 val_pos_err: 2099.3835449 val_vel_err: 163.4758148 val_traj_loss: 0.0155974 val_node_norm: 0.0001685 val_lambda: 1.0074030
-[INFO] Epoch 15: loss: 0.0141748 pos_err: 1542.1990967 vel_err: 186.0693512 traj_loss: 0.0138926 node_norm: 0.0001206 lambda: 1.0116305 val_loss: 0.0178056 val_pos_err: 2116.0139160 val_vel_err: 149.8713531 val_traj_loss: 0.0174403 val_node_norm: 0.0001624 val_lambda: 1.0116302
-[INFO] Epoch 20: loss: 0.0141333 pos_err: 1537.8641357 vel_err: 185.6192780 traj_loss: 0.0137759 node_norm: 0.0001344 lambda: 1.0161954 val_loss: 0.0191824 val_pos_err: 2193.8244629 val_vel_err: 156.9430084 val_traj_loss: 0.0187110 val_node_norm: 0.0001684 val_lambda: 1.0161957
-[INFO] [rollout probe @ epoch 25] mean_pos_err=17556.5 worst=37890.2 finite=100%
-[INFO] Epoch 25: loss: 0.0141424 pos_err: 1567.0146484 vel_err: 182.7555389 traj_loss: 0.0137135 node_norm: 0.0001411 lambda: 1.0209848 val_loss: 0.0186017 val_pos_err: 2238.1037598 val_vel_err: 155.0630035 val_traj_loss: 0.0180565 val_node_norm: 0.0001663 val_lambda: 1.0209849 rollout_pos_err: 17556.5004883 rollout_pos_err_worst: 37890.2500000 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0141125 pos_err: 1550.7945557 vel_err: 182.3205109 traj_loss: 0.0136131 node_norm: 0.0001546 lambda: 1.0253295 val_loss: 0.0186418 val_pos_err: 2278.8400879 val_vel_err: 150.2371368 val_traj_loss: 0.0180000 val_node_norm: 0.0001859 val_lambda: 1.0253292
-[INFO] Epoch 35: loss: 0.0141514 pos_err: 1536.3591309 vel_err: 182.7901001 traj_loss: 0.0135733 node_norm: 0.0001681 lambda: 1.0302027 val_loss: 0.0190526 val_pos_err: 2264.9272461 val_vel_err: 149.9491730 val_traj_loss: 0.0183273 val_node_norm: 0.0001717 val_lambda: 1.0302025
-[INFO] Epoch 40: loss: 0.0139453 pos_err: 1509.0749512 vel_err: 182.9840698 traj_loss: 0.0133095 node_norm: 0.0001754 lambda: 1.0345969 val_loss: 0.0215412 val_pos_err: 2336.0925293 val_vel_err: 155.2331085 val_traj_loss: 0.0206402 val_node_norm: 0.0001869 val_lambda: 1.0345967
-[INFO] Epoch 45: loss: 0.0139111 pos_err: 1512.1297607 vel_err: 182.4354553 traj_loss: 0.0132033 node_norm: 0.0001867 lambda: 1.0394651 val_loss: 0.0234157 val_pos_err: 2368.7197266 val_vel_err: 161.0578766 val_traj_loss: 0.0223548 val_node_norm: 0.0001786 val_lambda: 1.0394654
-[INFO] [rollout probe @ epoch 50] mean_pos_err=24675.1 worst=61112.2 finite=100%
-[INFO] Epoch 50: loss: 0.0141316 pos_err: 1543.9974365 vel_err: 180.6219635 traj_loss: 0.0133416 node_norm: 0.0001996 lambda: 1.0442523 val_loss: 0.0209555 val_pos_err: 2251.3972168 val_vel_err: 152.7595367 val_traj_loss: 0.0198904 val_node_norm: 0.0001849 val_lambda: 1.0442520 rollout_pos_err: 24675.0620117 rollout_pos_err_worst: 61112.2460938 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0138554 pos_err: 1502.9554443 vel_err: 181.3514709 traj_loss: 0.0130106 node_norm: 0.0002064 lambda: 1.0490661 val_loss: 0.0201363 val_pos_err: 2326.1352539 val_vel_err: 154.3064728 val_traj_loss: 0.0190078 val_node_norm: 0.0001959 val_lambda: 1.0490658
-[INFO] Epoch 60: loss: 0.0139455 pos_err: 1519.5272217 vel_err: 181.9070740 traj_loss: 0.0130209 node_norm: 0.0002175 lambda: 1.0542998 val_loss: 0.0197535 val_pos_err: 2263.3061523 val_vel_err: 157.8571014 val_traj_loss: 0.0185424 val_node_norm: 0.0002042 val_lambda: 1.0542996
-[INFO] Early stopping triggered at 61
+1. `format_sindy_equations` -- turn the coefficient table `Xi` into readable
+   equations (e.g. "dv_h/dt = -0.0385*h + 0.0226*h*h + ..."), so discovered models
+   can be compared term-by-term against another implementation.
 
-Running length strategy: (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x16c4bbf90>, 0.0001)
-[INFO] Epoch 5: loss: 0.0157992 pos_err: 2140.0449219 vel_err: 188.5346375 traj_loss: 0.0154708 node_norm: 0.0002280 lambda: 1.0064920 val_loss: 0.0299438 val_pos_err: 3464.8815918 val_vel_err: 210.8400879 val_traj_loss: 0.0295255 val_node_norm: 0.0002266 val_lambda: 1.0064917
-[INFO] Epoch 10: loss: 0.0155387 pos_err: 2066.3632812 vel_err: 186.1463623 traj_loss: 0.0150960 node_norm: 0.0002296 lambda: 1.0141139 val_loss: 0.0302822 val_pos_err: 3505.8037109 val_vel_err: 211.3530884 val_traj_loss: 0.0296330 val_node_norm: 0.0002310 val_lambda: 1.0141138
-[INFO] Epoch 15: loss: 0.0160212 pos_err: 2049.0629883 vel_err: 188.4865875 traj_loss: 0.0154594 node_norm: 0.0002349 lambda: 1.0211501 val_loss: 0.0253323 val_pos_err: 3277.7307129 val_vel_err: 198.7023926 val_traj_loss: 0.0245753 val_node_norm: 0.0002372 val_lambda: 1.0211498
-[INFO] Epoch 20: loss: 0.0154147 pos_err: 2057.3730469 vel_err: 186.9401855 traj_loss: 0.0147578 node_norm: 0.0002431 lambda: 1.0280362 val_loss: 0.0320743 val_pos_err: 3548.2548828 val_vel_err: 212.5303497 val_traj_loss: 0.0309728 val_node_norm: 0.0002332 val_lambda: 1.0280366
-[INFO] [rollout probe @ epoch 25] mean_pos_err=11176.0 worst=16069.6 finite=100%
-[INFO] Epoch 25: loss: 0.0159321 pos_err: 2046.5916748 vel_err: 186.7234344 traj_loss: 0.0151552 node_norm: 0.0002466 lambda: 1.0349923 val_loss: 0.0308454 val_pos_err: 3437.2036133 val_vel_err: 205.4390564 val_traj_loss: 0.0295779 val_node_norm: 0.0002325 val_lambda: 1.0349925 rollout_pos_err: 11175.9938151 rollout_pos_err_worst: 16069.5771484 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0155771 pos_err: 2044.4254150 vel_err: 187.5796509 traj_loss: 0.0147161 node_norm: 0.0002445 lambda: 1.0418944 val_loss: 0.0336444 val_pos_err: 3600.9165039 val_vel_err: 209.2726440 val_traj_loss: 0.0320675 val_node_norm: 0.0002334 val_lambda: 1.0418941
-[INFO] Epoch 35: loss: 0.0156565 pos_err: 2064.2692871 vel_err: 187.2368774 traj_loss: 0.0146861 node_norm: 0.0002485 lambda: 1.0491618 val_loss: 0.0265002 val_pos_err: 3166.9865723 val_vel_err: 196.6215210 val_traj_loss: 0.0250180 val_node_norm: 0.0002523 val_lambda: 1.0491617
-[INFO] Epoch 40: loss: 0.0165547 pos_err: 2234.6816406 vel_err: 188.0577698 traj_loss: 0.0154354 node_norm: 0.0002601 lambda: 1.0556639 val_loss: 0.0270282 val_pos_err: 3256.2143555 val_vel_err: 199.3603973 val_traj_loss: 0.0253576 val_node_norm: 0.0002591 val_lambda: 1.0556638
-[INFO] Epoch 45: loss: 0.0158694 pos_err: 2050.0085449 vel_err: 188.7821503 traj_loss: 0.0147051 node_norm: 0.0002551 lambda: 1.0618306 val_loss: 0.0277303 val_pos_err: 3376.8222656 val_vel_err: 198.9162598 val_traj_loss: 0.0258646 val_node_norm: 0.0002664 val_lambda: 1.0618306
-[INFO] [rollout probe @ epoch 50] mean_pos_err=13145.1 worst=25028.0 finite=83%
-[INFO] Epoch 50: loss: 0.0157341 pos_err: 2057.5268555 vel_err: 187.8938904 traj_loss: 0.0144869 node_norm: 0.0002593 lambda: 1.0681952 val_loss: 0.0226742 val_pos_err: 3261.6215820 val_vel_err: 192.2803040 val_traj_loss: 0.0209351 val_node_norm: 0.0003114 val_lambda: 1.0681950 rollout_pos_err: 13145.1415039 rollout_pos_err_worst: 25028.0468750 rollout_frac_finite: 0.8333333
-[INFO] Epoch 55: loss: 0.0158117 pos_err: 2005.5389404 vel_err: 186.6271820 traj_loss: 0.0144784 node_norm: 0.0002618 lambda: 1.0740072 val_loss: 0.0274999 val_pos_err: 3189.8259277 val_vel_err: 194.8750916 val_traj_loss: 0.0253512 val_node_norm: 0.0002726 val_lambda: 1.0740075
-[INFO] Epoch 60: loss: 0.0158802 pos_err: 2037.4288330 vel_err: 185.4460602 traj_loss: 0.0144550 node_norm: 0.0002684 lambda: 1.0800246 val_loss: 0.0293825 val_pos_err: 3349.9282227 val_vel_err: 202.9834747 val_traj_loss: 0.0269688 val_node_norm: 0.0002555 val_lambda: 1.0800242
-[INFO] Epoch 65: loss: 0.0161216 pos_err: 2009.1146240 vel_err: 188.4302826 traj_loss: 0.0145884 node_norm: 0.0002709 lambda: 1.0865312 val_loss: 0.0337669 val_pos_err: 3339.2683105 val_vel_err: 202.5054474 val_traj_loss: 0.0308559 val_node_norm: 0.0002410 val_lambda: 1.0865315
+2. `sindy_rollout` / `evaluate_sindy` -- integrate the pure physics model forward
+   from a single initial state (RK4, matching training) and report position error
+   against truth in physical units.
+
+Note on the error metric: this reports IN-PLANE error in the geodesic frame --
+range (s) and altitude (h). It deliberately does NOT reconstruct cross-range,
+which would require integrating the azimuth rate and a full frame inversion (that
+is what `standalone_direct_evaluator.py` does for a trained model). In-plane error
+is a fast, honest screen for "is the physics backbone any good"; it will read
+slightly optimistic versus a full 3D ECEF error.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+DEFAULT_STATE_NAMES = ["s", "h", "v_s", "v_al", "v_h"]
+DEFAULT_TARGET_NAMES = ["ds/dt", "dh/dt", "dv_s/dt", "dv_al/dt", "dv_h/dt"]
+
+
+# --------------------------------------------------------------------- naming
+
+def library_term_names(library, n_features: int, state_names=None) -> list[str]:
+    """Human-readable name for every library column.
+
+    Uses the library's own `term_names()` when it has one (the physics library);
+    otherwise derives names from the polynomial combination tuples.
+    """
+    if hasattr(library, "term_names"):
+        try:
+            return list(library.term_names())
+        except TypeError:
+            pass
+    names = list(state_names or DEFAULT_STATE_NAMES)[:n_features]
+    combos = library.term_combos(n_features)
+    out = []
+    for combo in combos:
+        if combo is None:
+            out.append("<physics>")
+        elif len(combo) == 0:
+            out.append("1")
+        else:
+            out.append("*".join(names[i] for i in combo))
+    return out
+
+
+# ------------------------------------------------------------------ equations
+
+def format_sindy_equations(
+    Xi: np.ndarray,
+    term_names: list[str],
+    target_names=None,
+    min_coef: float = 0.0,
+    inclusion_probs: np.ndarray | None = None,
+) -> str:
+    """Render `Xi` as readable equations, one per state derivative.
+
+    `min_coef` hides terms whose |coefficient| is below the cutoff (0 shows all
+    non-zero terms). If `inclusion_probs` is given, each term is annotated with the
+    fraction of bootstrap fits that selected it -- the ensemble's confidence.
+    """
+    targets = list(target_names or DEFAULT_TARGET_NAMES)[: Xi.shape[1]]
+    lines = []
+    for c in range(Xi.shape[1]):
+        target = targets[c] if c < len(targets) else f"d(x{c})/dt"
+        pieces = []
+        # Show the biggest contributors first.
+        order = np.argsort(-np.abs(Xi[:, c]))
+        for r in order:
+            coef = float(Xi[r, c])
+            if coef == 0.0 or abs(coef) < min_coef:
+                continue
+            sign = "-" if coef < 0 else "+"
+            piece = f"{sign} {abs(coef):.6g}*{term_names[r]}"
+            if inclusion_probs is not None:
+                piece += f" [ip={inclusion_probs[r, c]:.2f}]"
+            pieces.append(piece)
+        if not pieces:
+            lines.append(f"{target} = 0")
+            continue
+        body = " ".join(pieces)
+        if body.startswith("+ "):
+            body = body[2:]
+        lines.append(f"{target} = {body}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- rollout
+
+def _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset):
+    """Build the pure-physics derivative function d(scaled state)/dt.
+
+    The kinematic identity for the position channels is enforced explicitly. When
+    the discovery used analytic position rows, `Xi` already encodes exactly this,
+    so the override is a no-op; when it didn't, this keeps the rollout physically
+    consistent either way.
+    """
+    use_override = (
+        pos_idx is not None and vel_idx is not None and so_ratio is not None
+    )
+
+    def rhs(y: np.ndarray) -> np.ndarray:
+        Theta = library.fit_transform(y.reshape(1, -1))
+        dy = np.asarray(Theta @ Xi, dtype=float).reshape(-1)
+        if use_override:
+            for k, (p_i, v_i) in enumerate(zip(pos_idx, vel_idx)):
+                dy[p_i] = y[v_i] * so_ratio[k] + so_offset[k]
+        return dy
+
+    return rhs
+
+
+def sindy_rollout(
+    library,
+    Xi: np.ndarray,
+    y0_scaled: np.ndarray,
+    n_steps: int,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=None,
+    vel_idx=None,
+    so_ratio=None,
+    so_offset=None,
+    diverge_limit: float = 1e6,
+) -> np.ndarray:
+    """Integrate the pure physics model forward with RK4.
+
+    Returns the predicted scaled states, shape (n_steps, n_features). Stops early
+    and pads with NaN if the state goes non-finite or explodes, so a diverging
+    physics model is visible rather than crashing the caller.
+    """
+    n_features = y0_scaled.shape[-1]
+    rhs = _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset)
+
+    out = np.full((n_steps, n_features), np.nan, dtype=float)
+    y = np.asarray(y0_scaled, dtype=float).copy()
+    out[0] = y
+    h = dt / float(substeps)
+
+    for step in range(1, n_steps):
+        for _ in range(substeps):
+            k1 = rhs(y)
+            k2 = rhs(y + 0.5 * h * k1)
+            k3 = rhs(y + 0.5 * h * k2)
+            k4 = rhs(y + h * k3)
+            y = y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+        if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > diverge_limit:
+            break
+        out[step] = y
+    return out
+
+
+# ------------------------------------------------------------------ evaluation
+
+def evaluate_sindy(
+    library,
+    Xi: np.ndarray,
+    trajectories: list[np.ndarray],
+    scaler,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=(0, 1),
+    vel_idx=(2, 4),
+    so_ratio=None,
+    so_offset=None,
+    names: list[str] | None = None,
+    max_steps: int | None = None,
+) -> dict:
+    """Roll out the pure physics model on each trajectory and score it.
+
+    `trajectories` are SCALED state arrays (n_steps, n_features), the same form
+    SINDy was fitted on. Returns per-trajectory rows plus an aggregate summary,
+    with errors converted back to metres.
+    """
+    rows = []
+    for i, traj in enumerate(trajectories):
+        traj = np.asarray(traj, dtype=float)
+        n_steps = traj.shape[0]
+        if max_steps is not None:
+            n_steps = min(n_steps, max_steps)
+        if n_steps < 3:
+            continue
+
+        pred = sindy_rollout(
+            library, Xi, traj[0], n_steps, dt, substeps,
+            pos_idx, vel_idx, so_ratio, so_offset,
+        )
+
+        truth_phys = scaler.inverse_transform(traj[:n_steps])
+        finite_mask = np.all(np.isfinite(pred), axis=1)
+        n_valid = int(finite_mask.sum())
+        if n_valid < 2:
+            rows.append({
+                "name": (names[i] if names else f"traj_{i}"),
+                "steps": n_steps, "valid_steps": n_valid,
+                "mean_pos_err_m": float("nan"), "final_pos_err_m": float("nan"),
+                "max_pos_err_m": float("nan"), "diverged": True,
+            })
+            continue
+
+        pred_phys = np.full_like(truth_phys, np.nan)
+        pred_phys[finite_mask] = scaler.inverse_transform(pred[finite_mask])
+
+        p = np.asarray(pos_idx, dtype=int)
+        err = np.linalg.norm(pred_phys[finite_mask][:, p] - truth_phys[finite_mask][:, p], axis=1)
+        rows.append({
+            "name": (names[i] if names else f"traj_{i}"),
+            "steps": n_steps,
+            "valid_steps": n_valid,
+            "mean_pos_err_m": float(np.mean(err)),
+            "final_pos_err_m": float(err[-1]),
+            "max_pos_err_m": float(np.max(err)),
+            "diverged": bool(n_valid < n_steps),
+        })
+
+    finite_rows = [r for r in rows if np.isfinite(r["mean_pos_err_m"])]
+    summary = {
+        "n_trajectories": len(rows),
+        "n_diverged": sum(1 for r in rows if r["diverged"]),
+        "mean_pos_err_m": float(np.mean([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "median_pos_err_m": float(np.median([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "worst_pos_err_m": float(np.max([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+    }
+    return {"rows": rows, "summary": summary}
+
+
+def format_evaluation(result: dict, label: str = "") -> str:
+    """Render the evaluation as a readable table."""
+    rows, s = result["rows"], result["summary"]
+    out = []
+    header = f"[pure-SINDy rollout{(' — ' + label) if label else ''}]"
+    out.append(header)
+    out.append(f"  {'trajectory':<28}{'steps':>7}{'valid':>7}{'mean_m':>12}{'final_m':>12}{'max_m':>12}")
+    for r in rows:
+        flag = "  DIVERGED" if r["diverged"] else ""
+        out.append(
+            f"  {r['name'][:28]:<28}{r['steps']:>7}{r['valid_steps']:>7}"
+            f"{r['mean_pos_err_m']:>12.1f}{r['final_pos_err_m']:>12.1f}{r['max_pos_err_m']:>12.1f}{flag}"
+        )
+    out.append(
+        f"  SUMMARY: mean={s['mean_pos_err_m']:.1f} m | median={s['median_pos_err_m']:.1f} m | "
+        f"worst={s['worst_pos_err_m']:.1f} m | diverged {s['n_diverged']}/{s['n_trajectories']}"
+    )
+    out.append("  (in-plane geodesic error: range + altitude; excludes cross-range)")
+    return "\n".join(out)

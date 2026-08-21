@@ -1,245 +1,213 @@
-"""APHYNITY-NODE: f_phys(y) + f_NODE(y).
-
-This is the architecture described by the APHYNITY paper (Table E2: F_a is an MLP
-on the STATE, e.g. MLP(in=2, units=200, layers=3, out=2)) and, per the team's
-account, the one Ben used: a physics backbone plus a neural network that learns
-residuals as a DIRECT function of the current state.
-
-Contrast with APHYNITYGRUODEPredictorModel, where the residual is decode(h) -- a
-function of an integrated LATENT rather than the state. A GRU-ODE latent is the
-right inductive bias for irregularly-sampled / partially-observed series, where a
-belief state must be maintained. For fully-observed, regularly-sampled trajectory
-data the state IS observed, so the latent adds a lagged bottleneck (the latent is
-a contraction and forgets its initial condition over long rollouts), integrates
-100 extra dimensions, and adds ~40k parameters of overfitting capacity against a
-tiny dataset -- all cost, no benefit.
-
-State vector here is just the physical state (e.g. 5 for the integrated geodesic
-frame). No encoder, no latent, no h0.
-"""
+# aphynity_gru_ode.py
+"""APHYNITY + GRU-ODE hybrid prediction model."""
 
 from __future__ import annotations
 
-import numpy as np
 import torch
-import torch.nn as nn
+from torch import nn
+from gru_ode import GRUODEFunc
 
 
-class ResidualMLP(nn.Module):
-    """f_NODE(y): plain MLP on the physical state (paper's F_a)."""
-
-    def __init__(self, n_features: int, hidden: int = 200, n_layers: int = 3):
-        super().__init__()
-        layers: list[nn.Module] = [nn.Linear(n_features, hidden), nn.Tanh()]
-        for _ in range(max(0, n_layers - 2)):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, n_features)]
-        self.net = nn.Sequential(*layers)
-        # Small init so the residual starts near zero and the physics backbone
-        # dominates early -- APHYNITY's least-action prior ("explain as much as
-        # possible with physics") expressed as an initialization.
-        with torch.no_grad():
-            last = self.net[-1]
-            last.weight.mul_(0.01)
-            last.bias.zero_()
-
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        return self.net(y)
-
-
-class DissipativeResidual(nn.Module):
-    """A neural residual constrained to be strictly ENERGY-DISSIPATIVE.
-
-    Motivation
-    ----------
-    An unconstrained residual MLP can inject energy into the rollout: it is free to
-    produce a force aligned with velocity, which accelerates the vehicle and, over a
-    long integration, compounds into divergence. This is the measured failure mode --
-    high one-step R^2, catastrophic rollout. Hand-restricting the SINDy library to
-    non-feedback terms removed the divergence but cost accuracy, because it also threw
-    away expressivity the residual legitimately needs.
-
-    This module keeps the expressivity but forbids energy injection *by construction*.
-    The residual force on the velocity channels is
-
-        f_diss(y) = -(L(y) L(y)^T) @ v
-
-    where L(y) is a lower-triangular matrix produced by a small network, so
-    D(y) = L L^T is symmetric positive semi-definite. The power the residual delivers
-    to the vehicle is then
-
-        v . f_diss = -v^T D v  <=  0     (always non-positive)
-
-    i.e. the residual can only remove kinetic energy, never add it -- a damping /
-    drag-like force. Positive-feedback runaway becomes mathematically impossible while
-    the network is still free to shape the *amount* and *direction* of damping from the
-    full state. Only matrix products are used, so this traces to ONNX cleanly (unlike a
-    port-Hamiltonian gradient, which needs autograd inside the vector field).
-
-    A small unconstrained additive term on the non-velocity channels is allowed so the
-    residual can still correct, e.g., the turn-rate channel; that channel is not part
-    of the kinetic-energy argument and is separately bounded by the APHYNITY penalty.
-    """
-
+class APHYNITYGRUODEPredictorModel(nn.Module):
     def __init__(
         self,
-        n_features: int,
-        vel_idx,
-        hidden: int = 200,
-        n_layers: int = 3,
-        allow_offdiag_channels: bool = True,
-    ):
-        super().__init__()
-        self.n_features = n_features
-        self.vel_idx = list(int(i) for i in vel_idx)
-        self.n_vel = len(self.vel_idx)
-        # Non-velocity channels the residual may still nudge (e.g. turn-rate v_alpha).
-        self.other_idx = [i for i in range(n_features) if i not in self.vel_idx]
-        self.allow_offdiag_channels = bool(allow_offdiag_channels)
-
-        # Number of free entries in an n_vel x n_vel lower-triangular matrix.
-        self.n_tril = self.n_vel * (self.n_vel + 1) // 2
-        self.tril_rows, self.tril_cols = np.tril_indices(self.n_vel)
-
-        out_dim = self.n_tril + (len(self.other_idx) if allow_offdiag_channels else 0)
-
-        layers: list[nn.Module] = [nn.Linear(n_features, hidden), nn.Tanh()]
-        for _ in range(max(0, n_layers - 2)):
-            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
-        layers += [nn.Linear(hidden, out_dim)]
-        self.net = nn.Sequential(*layers)
-
-        # Start near zero: little damping, backbone dominates early.
-        with torch.no_grad():
-            last = self.net[-1]
-            last.weight.mul_(0.01)
-            last.bias.zero_()
-
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        raw = self.net(y)                      # (..., out_dim)
-        batch_shape = y.shape[:-1]
-
-        tril_vals = raw[..., : self.n_tril]
-
-        # Assemble L (lower-triangular), then D = L L^T (symmetric PSD).
-        L = y.new_zeros(batch_shape + (self.n_vel, self.n_vel))
-        L[..., self.tril_rows, self.tril_cols] = tril_vals
-        D = L @ L.transpose(-1, -2)            # (..., n_vel, n_vel), PSD by construction
-
-        v = y[..., self.vel_idx].unsqueeze(-1)  # (..., n_vel, 1)
-        f_vel = -(D @ v).squeeze(-1)            # (..., n_vel): -D v, power <= 0
-
-        out = y.new_zeros(y.shape)
-        for j, idx in enumerate(self.vel_idx):
-            out[..., idx] = f_vel[..., j]
-
-        if self.allow_offdiag_channels and self.other_idx:
-            other = raw[..., self.n_tril :]
-            for j, idx in enumerate(self.other_idx):
-                out[..., idx] = other[..., j]
-        return out
-
-
-class APHYNITYNODEPredictorModel(nn.Module):
-    """dy/dt = f_phys(y) + f_NODE(y), with the second-order kinematic override.
-
-    Interface matches APHYNITYGRUODEPredictorModel where it matters (last_node_norm
-    / pop_node_norm for the APHYNITY loss wrapper, the pos/vel override, node_norm
-    accumulation), so the training loop and loss are unchanged. The state vector is
-    the physical state only -- there is no latent partition to carry.
-    """
-
-    _NODE_EVAL_CAP = 200000
-
-    def __init__(
-        self,
+        func: GRUODEFunc,
         physics_model: nn.Module,
-        n_features: int,
-        pos_idx,
-        vel_idx,
-        acc_idx=None,
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
         pos_scale=None,
         vel_scale=None,
         vel_mean=None,
-        hidden: int = 200,
-        n_layers: int = 3,
-        second_order: bool = True,
-        scaled_space: bool = True,
-        residual_type: str = "mlp",
+        residual_type: str = "decode",
     ):
         super().__init__()
+        self.func = func
         self.physics_model = physics_model
         # residual_type:
-        #   "mlp"         -- unconstrained residual (original).
-        #   "dissipative" -- structurally energy-removing residual: cannot inject
-        #                    energy into the velocity channels, so positive-feedback
-        #                    rollout divergence is impossible by construction while
-        #                    keeping full expressivity. ONNX-safe (matrix ops only).
+        #   "decode"      -- original: f_node = decode(h), an unconstrained force read
+        #                    out of the latent.
+        #   "dissipative" -- the latent instead parameterises a positive-semi-definite
+        #                    damping matrix: f_node = -L(h)L(h)^T v, evaluated against
+        #                    the PHYSICAL velocity. The latent still supplies the
+        #                    trajectory-specific context that helps long-horizon
+        #                    extrapolation, but the residual can now only REMOVE
+        #                    kinetic energy (power = -||L^T v||^2 <= 0), so it can
+        #                    never drive a positive-feedback runaway. Matrix ops only,
+        #                    so ONNX tracing is unaffected.
         self.residual_type = str(residual_type)
+        self.n_features = func.state_vector_len
+        self.hidden_size = func.latent_dim
+        self.second_order = pos_idx is not None and vel_idx is not None
+
+        if self.second_order:
+            self.register_buffer("pos_idx", torch.tensor(list(pos_idx), dtype=torch.long))
+            self.register_buffer("vel_idx", torch.tensor(list(vel_idx), dtype=torch.long))
+            
+            # Identify acceleration and rate indices (non-position channels)
+            all_indices = set(range(self.n_features))
+            acc_indices = sorted(list(all_indices - set(pos_idx)))
+            self.register_buffer("acc_idx", torch.tensor(acc_indices, dtype=torch.long))
+
+            if pos_scale is not None and vel_scale is not None:
+                ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                    pos_scale, dtype=torch.float32
+                )
+                offset = (
+                    torch.as_tensor(vel_mean, dtype=torch.float32)
+                    / torch.as_tensor(pos_scale, dtype=torch.float32)
+                    if vel_mean is not None
+                    else torch.zeros_like(ratio)
+                )
+                self.register_buffer("so_ratio", ratio)
+                self.register_buffer("so_offset", offset)
+                self.scaled_space = True
+            else:
+                self.scaled_space = False
+        else:
+            self.register_buffer("acc_idx", torch.arange(self.n_features, dtype=torch.long))
+
         if self.residual_type == "dissipative":
-            self.residual = DissipativeResidual(
-                n_features, vel_idx=vel_idx, hidden=hidden, n_layers=n_layers,
-            )
-        else:
-            self.residual = ResidualMLP(n_features, hidden=hidden, n_layers=n_layers)
-        self.n_features = n_features
-        self.second_order = second_order
-        self.scaled_space = bool(scaled_space)
+            if vel_idx is None:
+                raise ValueError("residual_type='dissipative' requires vel_idx")
+            self._build_dissipative_head(vel_idx, func.latent_dim)
 
-        self.register_buffer("pos_idx", torch.as_tensor(list(pos_idx), dtype=torch.long))
-        self.register_buffer("vel_idx", torch.as_tensor(list(vel_idx), dtype=torch.long))
-        if acc_idx is None:
-            acc_idx = sorted(set(range(n_features)) - set(int(i) for i in pos_idx))
-        self.register_buffer("acc_idx", torch.as_tensor(list(acc_idx), dtype=torch.long))
-
-        # Second-order override: d(pos_scaled)/dt = vel_scaled * so_ratio + so_offset.
-        if scaled_space and pos_scale is not None and vel_scale is not None:
-            so_ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
-                pos_scale, dtype=torch.float32
-            )
-            so_offset = (
-                torch.as_tensor(vel_mean, dtype=torch.float32)
-                / torch.as_tensor(pos_scale, dtype=torch.float32)
-                if vel_mean is not None
-                else torch.zeros_like(so_ratio)
-            )
-            self.register_buffer("so_ratio", so_ratio)
-            self.register_buffer("so_offset", so_offset)
-        else:
-            self.so_ratio = None
-            self.so_offset = None
-
-        self.node_norm_mode = "sqnorm"  # see APHYNITYGRUODEPredictorModel
+        # "norm"   -> ||F_a||   (APHYNITY Eq. 4 / Algorithm 1 -- what the paper uses)
+        # "sqnorm" -> ||F_a||^2  (legacy; the paper reports this only as a diagnostic)
+        # Squaring shrinks a ~4e-3 residual to ~1.6e-5, making the least-action
+        # penalty ~200x smaller than the trajectory term and effectively inert -- so
+        # f_node is never pressured to defer to f_phys.
+        self.node_norm_mode = "norm"
         self._node_sq_sum = None
         self._node_evals = 0
-        self.nfe = 0
 
-    # ---- APHYNITY least-action bookkeeping (same contract as the GRU-ODE model) ----
+    _NODE_EVAL_CAP = 200000
+
+    def _build_dissipative_head(self, vel_idx, latent_dim):
+        """Map the latent to the free entries of a lower-triangular damping factor."""
+        import numpy as _np
+        self._diss_vel_idx = [int(i) for i in vel_idx]
+        n_vel = len(self._diss_vel_idx)
+        self._diss_n_vel = n_vel
+        rows, cols = _np.tril_indices(n_vel)
+        self._diss_rows = rows.tolist()
+        self._diss_cols = cols.tolist()
+        self._diss_n_tril = n_vel * (n_vel + 1) // 2
+        self._diss_other_idx = [
+            i for i in range(self.n_features) if i not in self._diss_vel_idx
+        ]
+        out_dim = self._diss_n_tril + len(self._diss_other_idx)
+        self.diss_head = nn.Linear(latent_dim, out_dim)
+        with torch.no_grad():
+            self.diss_head.weight.mul_(0.01)
+            self.diss_head.bias.zero_()
+
+    def _dissipative_residual(self, h: torch.Tensor, y_read: torch.Tensor) -> torch.Tensor:
+        """f_node = -L(h) L(h)^T v  on the velocity channels (power <= 0 by design)."""
+        raw = self.diss_head(h)
+        n_t = self._diss_n_tril
+        L = y_read.new_zeros(y_read.shape[:-1] + (self._diss_n_vel, self._diss_n_vel))
+        L[..., self._diss_rows, self._diss_cols] = raw[..., :n_t]
+        D = L @ L.transpose(-1, -2)                       # PSD by construction
+        v = y_read[..., self._diss_vel_idx].unsqueeze(-1)
+        f_vel = -(D @ v).squeeze(-1)                      # v . f_vel = -||L^T v||^2 <= 0
+
+        out = y_read.new_zeros(y_read.shape)
+        for j, idx in enumerate(self._diss_vel_idx):
+            out[..., idx] = f_vel[..., j]
+        if self._diss_other_idx:
+            other = raw[..., n_t:]
+            for j, idx in enumerate(self._diss_other_idx):
+                out[..., idx] = other[..., j]
+        return out  # guard against unbounded growth if pop() is never called
 
     @property
     def last_node_norm(self) -> torch.Tensor:
+        """Aggregate neural-residual magnitude over the current rollout."""
         if self._node_sq_sum is None or self._node_evals == 0:
             return torch.zeros(())
         mean_sq = self._node_sq_sum / float(self._node_evals)
-        if getattr(self, "node_norm_mode", "sqnorm") == "sqnorm":
+        if getattr(self, "node_norm_mode", "norm") == "sqnorm":
             return mean_sq
         return torch.sqrt(mean_sq + 1e-12)
 
     def pop_node_norm(self) -> torch.Tensor:
+        """Read the aggregate and reset for the next batch."""
         value = self.last_node_norm
         self._node_sq_sum = None
         self._node_evals = 0
         return value
 
-    def forward(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        self.nfe += 1
+    def forward(self, t: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+        self.func.nfe += 1
 
-        f_phys = self.physics_model(y)
-        f_node = self.residual(y)
+        y_read = state[..., : self.n_features]
+        h_raw = state[..., self.n_features : self.n_features + self.hidden_size]
 
+        # LATENT BOUNDING -- see `latent_bounding`.
+        #
+        # The original code did `h = torch.tanh(h)` here on every function
+        # evaluation. That makes the variable the solver INTEGRATES (raw h) differ
+        # from the variable the network READS (tanh h), which is not a consistent
+        # ODE. Because dh/dt generically has a non-zero mean, raw |h| grows without
+        # bound; tanh(h) then saturates (empirically within ~30 steps), its Jacobian
+        # collapses to ~0, and decode(tanh(h)) becomes CONSTANT. The neural residual
+        # degenerates into a fixed derivative bias, which integrates into a roughly
+        # duration-independent position offset -- matching the tight ~17-22 km
+        # clustering of final_pos_error in long rollouts. Short (<=60 step) rollouts
+        # stay in the near-linear region of tanh, which is why this never showed up
+        # in windowed training metrics.
+        #
+        #   "soft" (default) - integrate h directly; keep it bounded with a leaky
+        #       containment term added to dh/dt. Read and integrated state are
+        #       IDENTICAL, so the latent stays informative for the whole rollout.
+        #   "tanh" - original behaviour, retained for A/B comparison.
+        mode = getattr(self, "latent_bounding", "soft")
+        if mode == "tanh":
+            h = torch.tanh(h_raw)
+        else:
+            h = h_raw
+
+        if getattr(self.func, "cell_input_size", 0) > 0:
+            dh = self.func.cell(t, h, y_read)
+        else:
+            dh = self.func.cell(t, h)
+
+        if mode != "tanh":
+            # Leaky containment: pull h back toward 0 only once |h| exceeds
+            # latent_clamp, so it cannot run away, while leaving the latent fully
+            # responsive inside the operating band (no saturation, live Jacobian).
+            limit = float(getattr(self, "latent_clamp", 3.0))
+            decay = float(getattr(self, "latent_decay", 0.1))
+            excess = torch.clamp(h.abs() - limit, min=0.0)
+            dh = dh - decay * torch.sign(h) * excess
+
+        f_phys = self.physics_model(y_read)
+        if self.residual_type == "dissipative":
+            f_node = self._dissipative_residual(h, y_read)
+        else:
+            f_node = self.func.decode(h)
+
+        # Penalize neural residual ONLY on acceleration/rate channels.
+        # NOTE: this norm is a *metric/penalty* only -- the f_node used in xdot
+        # below is left untouched so the integrated dynamics are unchanged. During
+        # full-trajectory training the residual can grow very large as a trajectory
+        # transits the geodesic-frame singularity (s -> 0); squaring such a value
+        # overflows float32 (>~1e19) to inf, which made node_norm nan and forced
+        # the training step to be skipped -- disabling the APHYNITY least-action
+        # penalty on exactly the batches with the largest residual, where it is
+        # most needed. Clamp to a large finite magnitude before squaring so those
+        # batches instead contribute a large-but-finite penalty gradient.
         f_node_acc = f_node.index_select(-1, self.acc_idx)
         f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
         f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+
+        # ACCUMULATE over every solver evaluation in the current rollout.
+        # APHYNITY defines ||F||^2 ~= sum_{i,k} ||F(X_k^(i))||^2 -- over all
+        # trajectories AND all timesteps. Previously this line OVERWROTE the value
+        # on every call, so the loss saw only the final RK4 sub-step of the final
+        # timestep: roughly 1 of ~4800 evaluations per batch, a high-variance sample
+        # biased toward the end state. The aggregate is read (and reset) once per
+        # batch by the loss wrapper via pop_node_norm().
         sq = torch.mean(f_node_acc ** 2)
         if self._node_sq_sum is None or self._node_evals >= self._NODE_EVAL_CAP:
             self._node_sq_sum = sq
@@ -251,9 +219,10 @@ class APHYNITYNODEPredictorModel(nn.Module):
         xdot = f_phys + f_node
 
         if self.second_order:
-            vel_now = y.index_select(-1, self.vel_idx)
-            if self.so_ratio is not None:
+            vel_now = y_read.index_select(-1, self.vel_idx)
+            if getattr(self, "scaled_space", False):
                 vel_now = vel_now * self.so_ratio + self.so_offset
-            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
+            pos_deriv = vel_now
+            xdot = xdot.index_copy(-1, self.pos_idx, pos_deriv)
 
-        return xdot
+        return torch.cat((xdot, dh), dim=-1)

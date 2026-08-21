@@ -621,6 +621,9 @@ def train_NEXT(
                     pos_scale=so_pos_scale,
                     vel_scale=so_vel_scale,
                     vel_mean=so_vel_mean,
+                    residual_type=("dissipative"
+                                   if aphynity_residual_type == "dissipative"
+                                   else "decode"),
                 ).to(node.device)
                 aphynity_is_node = False
 
@@ -1331,11 +1334,13 @@ def main():
         "--aphynity-residual-type",
         default="mlp",
         choices=["mlp", "dissipative"],
-        help="Neural residual for aphynity-node. 'mlp' is the unconstrained residual. "
-        "'dissipative' structures the residual as -L(y)L(y)^T v so it can only REMOVE "
-        "energy from the velocity channels (power <= 0 by construction), making "
-        "positive-feedback rollout divergence mathematically impossible while keeping "
-        "full expressivity. ONNX-safe (matrix ops only).",
+        help="Neural residual structure. 'mlp' keeps the unconstrained residual "
+        "(decode(h) for gruode, an MLP for node). 'dissipative' structures the "
+        "residual as -L L^T v so it can only REMOVE kinetic energy (power <= 0 by "
+        "construction), making positive-feedback rollout divergence impossible while "
+        "keeping full expressivity. For gruode the latent still supplies trajectory "
+        "context -- it parameterises the damping matrix instead of the force. "
+        "ONNX-safe (matrix ops only).",
     )
     parser.add_argument(
         "--aphynity-node-norm-mode",

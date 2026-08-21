@@ -1,123 +1,259 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 50 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library physics-stable --sindy-only --sindy-scale-heights 5000 --sindy-scan-l1 .05,.1,.15,.2
-There are 22 training trajs and 6 validation trajs.
+"""APHYNITY-NODE: f_phys(y) + f_NODE(y).
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
+This is the architecture described by the APHYNITY paper (Table E2: F_a is an MLP
+on the STATE, e.g. MLP(in=2, units=200, layers=3, out=2)) and, per the team's
+account, the one Ben used: a physics backbone plus a neural network that learns
+residuals as a DIRECT function of the current state.
 
-[SINDy scan] l1_threshold sweep
-  Ranked by ROLLOUT STABILITY, not R2. R2 measures one-step fit and
-  does not predict whether the equation stays bounded when integrated:
-  positive-feedback terms (h*h, h*v_s) can give a high R2 and still
-  explode over hundreds of steps. Fewest divergences wins, then lowest
-  median rollout error. R2 is shown for context only.
-        l1   active   %dense    meanR2   diverged   medianErr_m    worstErr_m
-     0.050       49     58%    0.5955        0/6       39988.8      232770.5
-     0.100       37     44%    0.5895        0/6       42798.9      239527.7
-     0.150       33     39%    0.5788        0/6       22368.3      195610.8
-     0.200       29     34%    0.5695        0/6       19377.6       57405.7
-  -> most STABLE backbone: l1 = 0.200 (29 terms, R2 0.5695, 0/6 diverged, median 19377.6 m)
-Discovered Physics Matrix Xi:
- [[-1.02761993e-02 -4.57250030e-03  4.80430310e-03  1.37652294e-03
-  -1.05089693e-02]
- [ 0.00000000e+00  0.00000000e+00  2.35982561e-03 -2.93532093e-04
-   1.13243215e-02]
- [ 0.00000000e+00  0.00000000e+00 -4.58516859e-03  0.00000000e+00
-  -2.69231459e-02]
- [ 1.56237954e-03  0.00000000e+00  3.15405961e-03  1.28175757e-03
-  -2.20181563e-02]
- [ 0.00000000e+00  0.00000000e+00  1.37869139e-03  1.04960997e-02
-  -4.90392070e-03]
- [ 0.00000000e+00  2.10312971e-02 -8.72240760e-03 -9.62819748e-04
-  -1.53652063e-03]
- [ 0.00000000e+00  0.00000000e+00 -2.62664428e-03 -8.55613079e-04
-   3.88287345e-03]
- [ 0.00000000e+00  0.00000000e+00 -7.37729488e-04 -1.43015755e-03
-   1.20186982e-03]
- [ 0.00000000e+00  0.00000000e+00 -7.78287255e-03 -1.45757910e-03
-  -2.54416043e-03]
- [ 0.00000000e+00  0.00000000e+00 -1.99146828e-03 -1.41739837e-03
-   5.72647567e-03]
- [ 0.00000000e+00  0.00000000e+00 -1.74445679e-03 -1.24024572e-02
-   1.88839398e-03]
- [ 0.00000000e+00  0.00000000e+00  2.56847948e-03  2.01566495e-04
-  -4.42865590e-03]
- [ 0.00000000e+00  0.00000000e+00 -5.21487192e-04 -7.17037388e-03
-  -1.53933035e-02]
- [ 0.00000000e+00  0.00000000e+00  4.02546224e-03  1.22227865e-03
-   1.25465537e-02]
- [ 0.00000000e+00  0.00000000e+00  9.96943236e-03 -7.28196526e-03
-  -8.71886672e-03]
- [ 0.00000000e+00  0.00000000e+00 -2.48793614e-03 -1.33927831e-02
-   1.44770996e-03]
- [ 0.00000000e+00  0.00000000e+00  4.05131172e-03  3.75615802e-04
-  -6.98130943e-05]]
-[SINDy] active terms: 54/85 | max|coef| per target: [0.01028 0.02103 0.00997 0.01339 0.02692]
-[SINDy] R2 per target: [1.     1.     0.6669 0.6294 0.4913]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.5958 | max relative term contribution 0.6855
-[SINDy] library: physics-stable | scale heights: [5000.0]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     1                  contrib=0.9886 coef=-1.028e-02 ip=1.00
-          ds/dt     v_s                contrib=0.1493 coef=+1.562e-03 ip=1.00
-          dh/dt     v_h                contrib=0.9789 coef=+2.103e-02 ip=1.00
-          dh/dt     1                  contrib=0.2130 coef=-4.573e-03 ip=1.00
-          dv_s/dt   drag_V2@H=5000     contrib=0.5915 coef=+9.969e-03 ip=1.00
-          dv_s/dt   v_h                contrib=0.5170 coef=-8.722e-03 ip=1.00
-          dv_s/dt   v_s*v_h            contrib=0.3844 coef=-7.783e-03 ip=1.00
-          dv_s/dt   1                  contrib=0.2850 coef=+4.804e-03 ip=1.00
-          dv_al/dt  aero_va@H=5000     contrib=0.6346 coef=-1.339e-02 ip=1.00
-          dv_al/dt  v_al*v_h           contrib=0.5455 coef=-1.240e-02 ip=1.00
-          dv_al/dt  v_al               contrib=0.4956 coef=+1.050e-02 ip=1.00
-          dv_al/dt  drag_V2@H=5000     contrib=0.3454 coef=-7.282e-03 ip=1.00
-          dv_h/dt   h                  contrib=0.6855 coef=-2.692e-02 ip=1.00
-          dv_h/dt   v_s                contrib=0.5684 coef=-2.202e-02 ip=1.00
-          dv_h/dt   drag_vs@H=5000     contrib=0.4000 coef=-1.539e-02 ip=1.00
-          dv_h/dt   v_al*v_al          contrib=0.3315 coef=+5.726e-03 ip=1.00
+Contrast with APHYNITYGRUODEPredictorModel, where the residual is decode(h) -- a
+function of an integrated LATENT rather than the state. A GRU-ODE latent is the
+right inductive bias for irregularly-sampled / partially-observed series, where a
+belief state must be maintained. For fully-observed, regularly-sampled trajectory
+data the state IS observed, so the latent adds a lagged bottleneck (the latent is
+a contraction and forgets its initial condition over long rollouts), integrates
+100 extra dimensions, and adds ~40k parameters of overfitting capacity against a
+tiny dataset -- all cost, no benefit.
 
-=== DISCOVERED SINDy EQUATIONS ===
-ds/dt = - 0.0102762*1 [ip=1.00] + 0.00156238*v_s [ip=1.00]
-dh/dt = 0.0210313*v_h [ip=1.00] - 0.0045725*1 [ip=1.00]
-dv_s/dt = 0.00996943*drag_V2@H=5000 [ip=1.00] - 0.00872241*v_h [ip=1.00] - 0.00778287*v_s*v_h [ip=1.00] + 0.0048043*1 [ip=1.00] - 0.00458517*h [ip=1.00] + 0.00405131*curv_vs2 [ip=1.00] + 0.00402546*drag_vh@H=5000 [ip=1.00] + 0.00315406*v_s [ip=1.00] - 0.00262664*v_s*v_s [ip=1.00] + 0.00256848*v_h*v_h [ip=1.00] - 0.00248794*aero_va@H=5000 [ip=1.00] + 0.00235983*s [ip=1.00] - 0.00199147*v_al*v_al [ip=1.00] - 0.00174446*v_al*v_h [ip=1.00] + 0.00137869*v_al [ip=1.00] - 0.000737729*v_s*v_al [ip=1.00] - 0.000521487*drag_vs@H=5000 [ip=0.86]
-dv_al/dt = - 0.0133928*aero_va@H=5000 [ip=1.00] - 0.0124025*v_al*v_h [ip=1.00] + 0.0104961*v_al [ip=1.00] - 0.00728197*drag_V2@H=5000 [ip=1.00] - 0.00717037*drag_vs@H=5000 [ip=1.00] - 0.00145758*v_s*v_h [ip=1.00] - 0.00143016*v_s*v_al [ip=1.00] - 0.0014174*v_al*v_al [ip=1.00] + 0.00137652*1 [ip=1.00] + 0.00128176*v_s [ip=1.00] + 0.00122228*drag_vh@H=5000 [ip=0.98] - 0.00096282*v_h [ip=0.98] - 0.000855613*v_s*v_s [ip=1.00] + 0.000375616*curv_vs2 [ip=0.92] - 0.000293532*s [ip=0.78] + 0.000201566*v_h*v_h [ip=0.76]
-dv_h/dt = - 0.0269231*h [ip=1.00] - 0.0220182*v_s [ip=1.00] - 0.0153933*drag_vs@H=5000 [ip=1.00] + 0.0125466*drag_vh@H=5000 [ip=1.00] + 0.0113243*s [ip=1.00] - 0.010509*1 [ip=1.00] - 0.00871887*drag_V2@H=5000 [ip=1.00] + 0.00572648*v_al*v_al [ip=1.00] - 0.00490392*v_al [ip=1.00] - 0.00442866*v_h*v_h [ip=1.00] + 0.00388287*v_s*v_s [ip=1.00] - 0.00254416*v_s*v_h [ip=1.00] + 0.00188839*v_al*v_h [ip=0.96] - 0.00153652*v_h [ip=1.00] + 0.00144771*aero_va@H=5000 [ip=0.94] + 0.00120187*v_s*v_al [ip=0.96] - 6.98131e-05*curv_vs2 [ip=0.70]
+State vector here is just the physical state (e.g. 5 for the integrated geodesic
+frame). No encoder, no latent, no h0.
+"""
 
-[SINDy] equations written to: model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_50win_5stride_equations.txt
+from __future__ import annotations
 
-[pure-SINDy rollout — train]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251     71999.6    206566.5    206566.5
-  train_1                         324    324    130994.0    427540.0    427540.0
-  train_2                         465    465    241904.9    823277.9    823277.9
-  train_3                         181    181     66743.7    169393.8    169393.8
-  train_4                         383    383    166947.7    519320.4    519320.4
-  train_5                          95     95     47323.1    226228.8    226228.8
-  train_6                         166    166     47399.1    141295.8    141295.8
-  train_7                          97     97     14147.9     63719.0     63719.0
-  train_8                         181    181     43068.3    129122.2    129122.2
-  train_9                         210    210     18892.0     56743.3     57196.2
-  train_10                        121    121     38890.6    127365.3    127365.3
-  train_11                        102    102     25601.4     88517.9     88517.9
-  train_12                        451    451    246995.9    788318.4    788318.4
-  train_13                        212    212     37298.4    164204.3    164204.3
-  train_14                        208    208     33580.9     89956.2     89956.2
-  train_15                        217    217     83838.2    383452.6    383452.6
-  train_16                        117    117     20679.4     84774.7     84774.7
-  train_17                        333    333    139653.5    469911.4    469911.4
-  train_18                        272    272     40009.9    104513.5    104513.5
-  train_19                        221    221     74130.3    219406.8    219406.8
-  train_20                        444    444    208728.5    664111.1    664111.1
-  train_21                        262    262     86595.7    246289.0    246289.0
-  SUMMARY: mean=85701.1 m | median=57071.4 m | worst=246995.9 m | diverged 0/22
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+import numpy as np
+import torch
+import torch.nn as nn
 
-[pure-SINDy rollout — validation]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     17063.1     58401.1     58401.1
-  validation_1                    123    123     24440.3     48055.0     48055.0
-  validation_2                    179    179     51664.7     88481.6     93411.9
-  validation_3                    150    150     69926.1    181985.4    181985.4
-  validation_4                    144    144     18352.8     29345.2     29345.2
-  validation_5                    287    287    234784.8    483108.6    483108.6
-  SUMMARY: mean=69372.0 m | median=38052.5 m | worst=234784.8 m | diverged 0/6
-  (in-plane geodesic error: range + altitude; excludes cross-range)
 
-[--sindy-only] Discovery complete; skipping model training.
+class ResidualMLP(nn.Module):
+    """f_NODE(y): plain MLP on the physical state (paper's F_a)."""
+
+    def __init__(self, n_features: int, hidden: int = 200, n_layers: int = 3):
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(n_features, hidden), nn.Tanh()]
+        for _ in range(max(0, n_layers - 2)):
+            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
+        layers += [nn.Linear(hidden, n_features)]
+        self.net = nn.Sequential(*layers)
+        # Small init so the residual starts near zero and the physics backbone
+        # dominates early -- APHYNITY's least-action prior ("explain as much as
+        # possible with physics") expressed as an initialization.
+        with torch.no_grad():
+            last = self.net[-1]
+            last.weight.mul_(0.01)
+            last.bias.zero_()
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        return self.net(y)
+
+
+class DissipativeResidual(nn.Module):
+    """A neural residual constrained to be strictly ENERGY-DISSIPATIVE.
+
+    Motivation
+    ----------
+    An unconstrained residual MLP can inject energy into the rollout: it is free to
+    produce a force aligned with velocity, which accelerates the vehicle and, over a
+    long integration, compounds into divergence. This is the measured failure mode --
+    high one-step R^2, catastrophic rollout. Hand-restricting the SINDy library to
+    non-feedback terms removed the divergence but cost accuracy, because it also threw
+    away expressivity the residual legitimately needs.
+
+    This module keeps the expressivity but forbids energy injection *by construction*.
+    The residual force on the velocity channels is
+
+        f_diss(y) = -(L(y) L(y)^T) @ v
+
+    where L(y) is a lower-triangular matrix produced by a small network, so
+    D(y) = L L^T is symmetric positive semi-definite. The power the residual delivers
+    to the vehicle is then
+
+        v . f_diss = -v^T D v  <=  0     (always non-positive)
+
+    i.e. the residual can only remove kinetic energy, never add it -- a damping /
+    drag-like force. Positive-feedback runaway becomes mathematically impossible while
+    the network is still free to shape the *amount* and *direction* of damping from the
+    full state. Only matrix products are used, so this traces to ONNX cleanly (unlike a
+    port-Hamiltonian gradient, which needs autograd inside the vector field).
+
+    A small unconstrained additive term on the non-velocity channels is allowed so the
+    residual can still correct, e.g., the turn-rate channel; that channel is not part
+    of the kinetic-energy argument and is separately bounded by the APHYNITY penalty.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        vel_idx,
+        hidden: int = 200,
+        n_layers: int = 3,
+        allow_offdiag_channels: bool = True,
+    ):
+        super().__init__()
+        self.n_features = n_features
+        self.vel_idx = list(int(i) for i in vel_idx)
+        self.n_vel = len(self.vel_idx)
+        # Non-velocity channels the residual may still nudge (e.g. turn-rate v_alpha).
+        self.other_idx = [i for i in range(n_features) if i not in self.vel_idx]
+        self.allow_offdiag_channels = bool(allow_offdiag_channels)
+
+        # Number of free entries in an n_vel x n_vel lower-triangular matrix.
+        self.n_tril = self.n_vel * (self.n_vel + 1) // 2
+        self.tril_rows, self.tril_cols = np.tril_indices(self.n_vel)
+
+        out_dim = self.n_tril + (len(self.other_idx) if allow_offdiag_channels else 0)
+
+        layers: list[nn.Module] = [nn.Linear(n_features, hidden), nn.Tanh()]
+        for _ in range(max(0, n_layers - 2)):
+            layers += [nn.Linear(hidden, hidden), nn.Tanh()]
+        layers += [nn.Linear(hidden, out_dim)]
+        self.net = nn.Sequential(*layers)
+
+        # Start near zero: little damping, backbone dominates early.
+        with torch.no_grad():
+            last = self.net[-1]
+            last.weight.mul_(0.01)
+            last.bias.zero_()
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        raw = self.net(y)                      # (..., out_dim)
+        batch_shape = y.shape[:-1]
+
+        tril_vals = raw[..., : self.n_tril]
+
+        # Assemble L (lower-triangular), then D = L L^T (symmetric PSD).
+        L = y.new_zeros(batch_shape + (self.n_vel, self.n_vel))
+        L[..., self.tril_rows, self.tril_cols] = tril_vals
+        D = L @ L.transpose(-1, -2)            # (..., n_vel, n_vel), PSD by construction
+
+        v = y[..., self.vel_idx].unsqueeze(-1)  # (..., n_vel, 1)
+        f_vel = -(D @ v).squeeze(-1)            # (..., n_vel): -D v, power <= 0
+
+        out = y.new_zeros(y.shape)
+        for j, idx in enumerate(self.vel_idx):
+            out[..., idx] = f_vel[..., j]
+
+        if self.allow_offdiag_channels and self.other_idx:
+            other = raw[..., self.n_tril :]
+            for j, idx in enumerate(self.other_idx):
+                out[..., idx] = other[..., j]
+        return out
+
+
+class APHYNITYNODEPredictorModel(nn.Module):
+    """dy/dt = f_phys(y) + f_NODE(y), with the second-order kinematic override.
+
+    Interface matches APHYNITYGRUODEPredictorModel where it matters (last_node_norm
+    / pop_node_norm for the APHYNITY loss wrapper, the pos/vel override, node_norm
+    accumulation), so the training loop and loss are unchanged. The state vector is
+    the physical state only -- there is no latent partition to carry.
+    """
+
+    _NODE_EVAL_CAP = 200000
+
+    def __init__(
+        self,
+        physics_model: nn.Module,
+        n_features: int,
+        pos_idx,
+        vel_idx,
+        acc_idx=None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        hidden: int = 200,
+        n_layers: int = 3,
+        second_order: bool = True,
+        scaled_space: bool = True,
+        residual_type: str = "mlp",
+    ):
+        super().__init__()
+        self.physics_model = physics_model
+        # residual_type:
+        #   "mlp"         -- unconstrained residual (original).
+        #   "dissipative" -- structurally energy-removing residual: cannot inject
+        #                    energy into the velocity channels, so positive-feedback
+        #                    rollout divergence is impossible by construction while
+        #                    keeping full expressivity. ONNX-safe (matrix ops only).
+        self.residual_type = str(residual_type)
+        if self.residual_type == "dissipative":
+            self.residual = DissipativeResidual(
+                n_features, vel_idx=vel_idx, hidden=hidden, n_layers=n_layers,
+            )
+        else:
+            self.residual = ResidualMLP(n_features, hidden=hidden, n_layers=n_layers)
+        self.n_features = n_features
+        self.second_order = second_order
+        self.scaled_space = bool(scaled_space)
+
+        self.register_buffer("pos_idx", torch.as_tensor(list(pos_idx), dtype=torch.long))
+        self.register_buffer("vel_idx", torch.as_tensor(list(vel_idx), dtype=torch.long))
+        if acc_idx is None:
+            acc_idx = sorted(set(range(n_features)) - set(int(i) for i in pos_idx))
+        self.register_buffer("acc_idx", torch.as_tensor(list(acc_idx), dtype=torch.long))
+
+        # Second-order override: d(pos_scaled)/dt = vel_scaled * so_ratio + so_offset.
+        if scaled_space and pos_scale is not None and vel_scale is not None:
+            so_ratio = torch.as_tensor(vel_scale, dtype=torch.float32) / torch.as_tensor(
+                pos_scale, dtype=torch.float32
+            )
+            so_offset = (
+                torch.as_tensor(vel_mean, dtype=torch.float32)
+                / torch.as_tensor(pos_scale, dtype=torch.float32)
+                if vel_mean is not None
+                else torch.zeros_like(so_ratio)
+            )
+            self.register_buffer("so_ratio", so_ratio)
+            self.register_buffer("so_offset", so_offset)
+        else:
+            self.so_ratio = None
+            self.so_offset = None
+
+        self.node_norm_mode = "sqnorm"  # see APHYNITYGRUODEPredictorModel
+        self._node_sq_sum = None
+        self._node_evals = 0
+        self.nfe = 0
+
+    # ---- APHYNITY least-action bookkeeping (same contract as the GRU-ODE model) ----
+
+    @property
+    def last_node_norm(self) -> torch.Tensor:
+        if self._node_sq_sum is None or self._node_evals == 0:
+            return torch.zeros(())
+        mean_sq = self._node_sq_sum / float(self._node_evals)
+        if getattr(self, "node_norm_mode", "sqnorm") == "sqnorm":
+            return mean_sq
+        return torch.sqrt(mean_sq + 1e-12)
+
+    def pop_node_norm(self) -> torch.Tensor:
+        value = self.last_node_norm
+        self._node_sq_sum = None
+        self._node_evals = 0
+        return value
+
+    def forward(self, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        self.nfe += 1
+
+        f_phys = self.physics_model(y)
+        f_node = self.residual(y)
+
+        f_node_acc = f_node.index_select(-1, self.acc_idx)
+        f_node_acc = torch.nan_to_num(f_node_acc, nan=0.0, posinf=1e9, neginf=-1e9)
+        f_node_acc = torch.clamp(f_node_acc, min=-1e9, max=1e9)
+        sq = torch.mean(f_node_acc ** 2)
+        if self._node_sq_sum is None or self._node_evals >= self._NODE_EVAL_CAP:
+            self._node_sq_sum = sq
+            self._node_evals = 1
+        else:
+            self._node_sq_sum = self._node_sq_sum + sq
+            self._node_evals += 1
+
+        xdot = f_phys + f_node
+
+        if self.second_order:
+            vel_now = y.index_select(-1, self.vel_idx)
+            if self.so_ratio is not None:
+                vel_now = vel_now * self.so_ratio + self.so_offset
+            xdot = xdot.index_copy(-1, self.pos_idx, vel_now)
+
+        return xdot

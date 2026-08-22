@@ -1,96 +1,223 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame grdth --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_physics_dissipative/GRDTH/glide --sindy-library physics --sindy-scale-heights 5000 --sindy-l1-threshold .
-01
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_1augseg_8solvstep_sindy-only/GEODESIC/glide --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold .1 
 There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 110 training trajs
 
 --- Running Ensemble-SINDy Governing Equation Discovery ---
 Discovered Physics Matrix Xi:
- [[-0.01021207  0.00380906  0.00566808  0.00387102  0.00125603]
- [ 0.          0.         -0.00895078  0.01824327 -0.00227537]
- [ 0.          0.          0.01307773 -0.05150486 -0.00103643]
- [ 0.00155263  0.         -0.00139069  0.02838932 -0.00064512]
- [ 0.          0.01751982  0.00444012  0.00898588  0.00177085]
- [ 0.          0.         -0.00141876 -0.00268305  0.00042236]
- [ 0.          0.         -0.00091411  0.0193372   0.00125279]
- [ 0.          0.         -0.01356174  0.02207038  0.00211366]
- [ 0.          0.          0.00084316 -0.00601211  0.00175198]
- [ 0.          0.         -0.00057138  0.01629997  0.0062914 ]
- [ 0.          0.          0.00042806 -0.01158209  0.02185567]
- [ 0.          0.          0.00539178 -0.01338924 -0.00314943]
- [ 0.          0.         -0.01478555  0.02055241 -0.00398704]
- [ 0.          0.         -0.00827693  0.0049302  -0.00634488]
- [ 0.          0.         -0.00299027  0.00753017 -0.02400214]
- [ 0.          0.         -0.00046752 -0.01504957  0.00031891]
- [ 0.          0.          0.00639961  0.01185247  0.00553473]
- [ 0.          0.         -0.00063539 -0.00924947  0.00316889]
- [ 0.          0.          0.00031057  0.01980945  0.00132338]
- [ 0.          0.          0.00166527  0.00572961  0.00733143]
- [ 0.          0.         -0.00078186 -0.01138893 -0.00158637]
- [ 0.          0.         -0.00087891  0.02289325  0.01044152]
- [ 0.          0.         -0.00097223  0.00521967 -0.00768762]
- [ 0.          0.          0.00438933  0.02174262  0.01351209]
- [ 0.          0.         -0.0020507  -0.00306378 -0.00353274]
- [ 0.          0.          0.00604381 -0.00498757  0.00142712]]
-[SINDy] active terms: 82/130 | max|coef| per target: [0.01021 0.01752 0.01479 0.0515  0.024  ]
-[SINDy] R2 per target: [1.     1.     0.609  0.6403 0.5539]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.6011 | max relative term contribution 1.0658
-[SINDy] library: physics | scale heights: [5000.0]
-[FRAME-FIT] frame=grdth library=physics meanR2(acc)=0.6011 perTarget=[1.0, 1.0, 0.609, 0.64, 0.554]
+ [[-0.00248942  0.          0.          0.00394169 -0.04535456]
+ [ 0.00239314  0.         -0.0084516  -0.0043616  -0.00771011]
+ [-0.00561191  0.         -0.00438389 -0.00716378  0.02286748]
+ [ 0.          0.         -0.00837627  0.00648294  0.02276176]
+ [ 0.          0.         -0.00357557  0.         -0.0146018 ]
+ [ 0.          0.          0.02016438 -0.00792125  0.        ]
+ [ 0.          0.02144403 -0.00248734  0.         -0.00440736]
+ [ 0.          0.          0.          0.00642032  0.        ]]
+[SINDy] active terms: 22/40 | max|coef| per target: [0.00561 0.02144 0.02016 0.00792 0.04535]
+[SINDy] R2 per target: [0.994  1.     0.4565 0.0936 0.2739]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2747 | max relative term contribution 1.1964
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2747 perTarget=[0.994, 1.0, 0.456, 0.094, 0.274]
 [SINDy] physics coefficients trainable: True
 [SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     1                  contrib=1.0244 coef=-1.021e-02 ip=1.00
-          ds/dt     v_s                contrib=0.1514 coef=+1.553e-03 ip=1.00
-          dh/dt     v_al               contrib=0.9719 coef=+1.752e-02 ip=1.00
-          dh/dt     1                  contrib=0.2328 coef=+3.809e-03 ip=1.00
-          dv_s/dt   s*h                contrib=0.9289 coef=-1.356e-02 ip=1.00
-          dv_s/dt   h*v_s              contrib=0.6746 coef=-1.479e-02 ip=1.00
-          dv_s/dt   h                  contrib=0.6049 coef=+1.308e-02 ip=1.00
-          dv_s/dt   h*h                contrib=0.5194 coef=+5.392e-03 ip=1.00
-          dv_al/dt  h                  contrib=1.0658 coef=-5.150e-02 ip=1.00
-          dv_al/dt  v_s                contrib=0.7505 coef=+2.839e-02 ip=1.00
-          dv_al/dt  v_al*v_al          contrib=0.7435 coef=+1.981e-02 ip=1.00
-          dv_al/dt  s*h                contrib=0.6763 coef=+2.207e-02 ip=1.00
-          dv_h/dt   s*v_h              contrib=0.8540 coef=+2.186e-02 ip=1.00
-          dv_h/dt   h*v_h              contrib=0.7866 coef=-2.400e-02 ip=1.00
-          dv_h/dt   drag_V2@H=5000     contrib=0.7081 coef=+1.351e-02 ip=1.00
-          dv_h/dt   drag_vs@H=5000     contrib=0.5472 coef=+1.044e-02 ip=1.00
+          ds/dt     curv_vs2           contrib=0.5399 coef=-5.612e-03 ip=1.00
+          ds/dt     1                  contrib=0.2395 coef=-2.489e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2302 coef=+2.393e-03 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.1964 coef=+2.016e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.5014 coef=-8.452e-03 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.4970 coef=-8.376e-03 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.2601 coef=-4.384e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.3758 coef=-7.921e-03 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3398 coef=-7.164e-03 ip=1.00
+          dv_al/dt  aero_along@H=5000  contrib=0.3075 coef=+6.483e-03 ip=0.96
+          dv_al/dt  v_al               contrib=0.3046 coef=+6.420e-03 ip=1.00
+          dv_h/dt   1                  contrib=1.1787 coef=-4.535e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5943 coef=+2.287e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.5915 coef=+2.276e-02 ip=1.00
+          dv_h/dt   aero_vert@H=5000   contrib=0.3771 coef=-1.460e-02 ip=1.00
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x16ac44f90>, 0.0001)
-[INFO] Epoch 5: loss: 0.0004472 pos_err: 36.8258972 vel_err: 14.4394684 traj_loss: 0.0004288 node_norm: 0.0000185 lambda: 1.0000244 val_loss: 0.0001504 val_pos_err: 61.7795258 val_vel_err: 24.6781731 val_traj_loss: 0.0001176 val_node_norm: 0.0000328 val_lambda: 1.0000253
-[INFO] Epoch 10: loss: 0.0003937 pos_err: 33.4063339 vel_err: 13.1596766 traj_loss: 0.0003851 node_norm: 0.0000085 lambda: 1.0000535 val_loss: 0.0001234 val_pos_err: 60.1304131 val_vel_err: 24.1243896 val_traj_loss: 0.0001085 val_node_norm: 0.0000149 val_lambda: 1.0000535
-[INFO] Epoch 15: loss: 0.0003495 pos_err: 31.7931538 vel_err: 12.5548973 traj_loss: 0.0003441 node_norm: 0.0000054 lambda: 1.0000820 val_loss: 0.0001067 val_pos_err: 57.8354149 val_vel_err: 23.2379284 val_traj_loss: 0.0000969 val_node_norm: 0.0000098 val_lambda: 1.0000802
-[INFO] Epoch 20: loss: 0.0003104 pos_err: 31.0950222 vel_err: 12.3138494 traj_loss: 0.0003065 node_norm: 0.0000038 lambda: 1.0001050 val_loss: 0.0001128 val_pos_err: 58.3502998 val_vel_err: 23.5498676 val_traj_loss: 0.0001050 val_node_norm: 0.0000078 val_lambda: 1.0001035
-[INFO] [rollout probe @ epoch 25] mean_pos_err=12912.2 worst=32792.9 finite=67%
-[INFO] Epoch 25: loss: 0.0002754 pos_err: 30.7202606 vel_err: 12.1329880 traj_loss: 0.0002722 node_norm: 0.0000032 lambda: 1.0001283 val_loss: 0.0000971 val_pos_err: 53.8250732 val_vel_err: 21.6937809 val_traj_loss: 0.0000908 val_node_norm: 0.0000062 val_lambda: 1.0001277 rollout_pos_err: 12912.1883545 rollout_pos_err_worst: 32792.9062500 rollout_frac_finite: 0.6666667
-[INFO] Epoch 30: loss: 0.0002435 pos_err: 30.6438084 vel_err: 12.1077518 traj_loss: 0.0002408 node_norm: 0.0000026 lambda: 1.0001510 val_loss: 0.0000901 val_pos_err: 52.5031776 val_vel_err: 20.9354534 val_traj_loss: 0.0000823 val_node_norm: 0.0000078 val_lambda: 1.0001498
-[INFO] Epoch 35: loss: 0.0002151 pos_err: 30.4232025 vel_err: 12.0352564 traj_loss: 0.0002123 node_norm: 0.0000028 lambda: 1.0001737 val_loss: 0.0001012 val_pos_err: 56.6811943 val_vel_err: 22.8500347 val_traj_loss: 0.0000945 val_node_norm: 0.0000067 val_lambda: 1.0001725
-[INFO] Epoch 40: loss: 0.0001895 pos_err: 30.3702183 vel_err: 12.0020943 traj_loss: 0.0001870 node_norm: 0.0000024 lambda: 1.0001926 val_loss: 0.0000998 val_pos_err: 55.7871094 val_vel_err: 22.5610390 val_traj_loss: 0.0000943 val_node_norm: 0.0000054 val_lambda: 1.0001944
-[INFO] Epoch 45: loss: 0.0001674 pos_err: 30.4810486 vel_err: 12.0072269 traj_loss: 0.0001654 node_norm: 0.0000020 lambda: 1.0002193 val_loss: 0.0000920 val_pos_err: 51.9352379 val_vel_err: 20.8706951 val_traj_loss: 0.0000869 val_node_norm: 0.0000051 val_lambda: 1.0002178
-[INFO] [rollout probe @ epoch 50] mean_pos_err=10216.6 worst=22771.4 finite=67%
-[INFO] Epoch 50: loss: 0.0001492 pos_err: 30.1387920 vel_err: 11.8830652 traj_loss: 0.0001471 node_norm: 0.0000021 lambda: 1.0002379 val_loss: 0.0000857 val_pos_err: 52.2844124 val_vel_err: 20.9737339 val_traj_loss: 0.0000822 val_node_norm: 0.0000035 val_lambda: 1.0002385 rollout_pos_err: 10216.5935059 rollout_pos_err_worst: 22771.3867188 rollout_frac_finite: 0.6666667
-[INFO] Epoch 55: loss: 0.0001345 pos_err: 29.9965019 vel_err: 11.8208494 traj_loss: 0.0001323 node_norm: 0.0000021 lambda: 1.0002595 val_loss: 0.0000837 val_pos_err: 51.1946220 val_vel_err: 20.4773560 val_traj_loss: 0.0000796 val_node_norm: 0.0000042 val_lambda: 1.0002599
-[INFO] Epoch 60: loss: 0.0001223 pos_err: 30.1676178 vel_err: 11.8809137 traj_loss: 0.0001207 node_norm: 0.0000015 lambda: 1.0002818 val_loss: 0.0000840 val_pos_err: 50.8046417 val_vel_err: 20.3107281 val_traj_loss: 0.0000801 val_node_norm: 0.0000039 val_lambda: 1.0002805
-[INFO] Early stopping triggered at 61
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x30b23cbd0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0016582 pos_err: 571.4032593 vel_err: 21.1689854 traj_loss: 0.0015853 node_norm: 0.0000726 lambda: 1.0001705 val_loss: 0.0008739 val_pos_err: 477.0956421 val_vel_err: 22.3879929 val_traj_loss: 0.0007954 val_node_norm: 0.0000784 val_lambda: 1.0001699
+[INFO] Epoch 10: loss: 0.0015897 pos_err: 569.7149658 vel_err: 20.7174969 traj_loss: 0.0015400 node_norm: 0.0000492 lambda: 1.0003599 val_loss: 0.0007948 val_pos_err: 480.9593811 val_vel_err: 18.9660034 val_traj_loss: 0.0007318 val_node_norm: 0.0000627 val_lambda: 1.0003604
+[INFO] Epoch 15: loss: 0.0015489 pos_err: 570.0661011 vel_err: 20.0886440 traj_loss: 0.0015104 node_norm: 0.0000377 lambda: 1.0005417 val_loss: 0.0007540 val_pos_err: 477.1505127 val_vel_err: 20.4149818 val_traj_loss: 0.0007085 val_node_norm: 0.0000451 val_lambda: 1.0005416
+[INFO] Epoch 20: loss: 0.0015191 pos_err: 570.7012939 vel_err: 19.9241142 traj_loss: 0.0014870 node_norm: 0.0000310 lambda: 1.0007175 val_loss: 0.0007319 val_pos_err: 477.6670837 val_vel_err: 20.3762131 val_traj_loss: 0.0006956 val_node_norm: 0.0000359 val_lambda: 1.0007180
+[INFO] [rollout probe @ epoch 25] mean_pos_err=38274.4 worst=144840.4 finite=100%
+[INFO] Epoch 25: loss: 0.0014977 pos_err: 570.2702026 vel_err: 19.7885075 traj_loss: 0.0014696 node_norm: 0.0000268 lambda: 1.0008917 val_loss: 0.0007124 val_pos_err: 479.0781555 val_vel_err: 20.0809669 val_traj_loss: 0.0006837 val_node_norm: 0.0000281 val_lambda: 1.0008916 rollout_pos_err: 38274.3672282 rollout_pos_err_worst: 144840.4375000 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0014784 pos_err: 570.0178223 vel_err: 19.5426102 traj_loss: 0.0014529 node_norm: 0.0000239 lambda: 1.0010630 val_loss: 0.0007073 val_pos_err: 479.6749268 val_vel_err: 19.8586102 val_traj_loss: 0.0006840 val_node_norm: 0.0000226 val_lambda: 1.0010625
+[INFO] Epoch 35: loss: 0.0014622 pos_err: 570.1840820 vel_err: 19.6954708 traj_loss: 0.0014385 node_norm: 0.0000220 lambda: 1.0012324 val_loss: 0.0007020 val_pos_err: 478.5589905 val_vel_err: 19.0403366 val_traj_loss: 0.0006763 val_node_norm: 0.0000248 val_lambda: 1.0012326
+[INFO] Epoch 40: loss: 0.0014467 pos_err: 570.2277222 vel_err: 19.7896214 traj_loss: 0.0014246 node_norm: 0.0000201 lambda: 1.0014026 val_loss: 0.0006937 val_pos_err: 479.7177124 val_vel_err: 19.2405758 val_traj_loss: 0.0006730 val_node_norm: 0.0000198 val_lambda: 1.0014024
+[INFO] Epoch 45: loss: 0.0014321 pos_err: 570.2393188 vel_err: 19.8862629 traj_loss: 0.0014116 node_norm: 0.0000183 lambda: 1.0015715 val_loss: 0.0006949 val_pos_err: 477.8322144 val_vel_err: 19.9776382 val_traj_loss: 0.0006760 val_node_norm: 0.0000178 val_lambda: 1.0015713
+[INFO] [rollout probe @ epoch 50] mean_pos_err=23622.5 worst=81414.0 finite=100%
+[INFO] Epoch 50: loss: 0.0014198 pos_err: 570.1545410 vel_err: 19.8748741 traj_loss: 0.0013992 node_norm: 0.0000181 lambda: 1.0017397 val_loss: 0.0006921 val_pos_err: 478.6183777 val_vel_err: 19.6827412 val_traj_loss: 0.0006736 val_node_norm: 0.0000173 val_lambda: 1.0017400 rollout_pos_err: 23622.4974772 rollout_pos_err_worst: 81414.0468750 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0014074 pos_err: 570.5341187 vel_err: 19.7313595 traj_loss: 0.0013866 node_norm: 0.0000181 lambda: 1.0019083 val_loss: 0.0006999 val_pos_err: 475.7955933 val_vel_err: 20.2809582 val_traj_loss: 0.0006765 val_node_norm: 0.0000221 val_lambda: 1.0019084
+[INFO] Epoch 60: loss: 0.0013957 pos_err: 570.4953003 vel_err: 19.7367477 traj_loss: 0.0013746 node_norm: 0.0000182 lambda: 1.0020765 val_loss: 0.0006934 val_pos_err: 481.8273621 val_vel_err: 18.4066105 val_traj_loss: 0.0006703 val_node_norm: 0.0000216 val_lambda: 1.0020771
+[INFO] Epoch 65: loss: 0.0013841 pos_err: 569.4934082 vel_err: 20.0958805 traj_loss: 0.0013637 node_norm: 0.0000173 lambda: 1.0022457 val_loss: 0.0006929 val_pos_err: 480.3183899 val_vel_err: 18.8889961 val_traj_loss: 0.0006704 val_node_norm: 0.0000210 val_lambda: 1.0022451
+[INFO] Epoch 70: loss: 0.0013719 pos_err: 569.7832031 vel_err: 19.8571167 traj_loss: 0.0013521 node_norm: 0.0000166 lambda: 1.0024135 val_loss: 0.0006948 val_pos_err: 478.4228516 val_vel_err: 19.7693138 val_traj_loss: 0.0006740 val_node_norm: 0.0000191 val_lambda: 1.0024132
+[INFO] [rollout probe @ epoch 75] mean_pos_err=20712.6 worst=64218.5 finite=100%
+[INFO] Epoch 75: loss: 0.0013626 pos_err: 570.4042969 vel_err: 19.7415180 traj_loss: 0.0013414 node_norm: 0.0000177 lambda: 1.0025812 val_loss: 0.0006918 val_pos_err: 474.5333252 val_vel_err: 21.2430801 val_traj_loss: 0.0006756 val_node_norm: 0.0000145 val_lambda: 1.0025811 rollout_pos_err: 20712.5785319 rollout_pos_err_worst: 64218.4960938 rollout_frac_finite: 1.0000000
+[INFO] Early stopping triggered at 79
 
-Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x16a9ea3d0>, 0.0001)
-[INFO] Epoch 5: loss: 0.0004220 pos_err: 246.4354858 vel_err: 31.8162613 traj_loss: 0.0004116 node_norm: 0.0000102 lambda: 1.0003053 val_loss: 0.0010425 val_pos_err: 413.5464478 val_vel_err: 55.3663177 val_traj_loss: 0.0010234 val_node_norm: 0.0000187 val_lambda: 1.0003057
-[INFO] Epoch 10: loss: 0.0004149 pos_err: 242.3504486 vel_err: 31.4577408 traj_loss: 0.0003972 node_norm: 0.0000175 lambda: 1.0005860 val_loss: 0.0011883 val_pos_err: 428.8197937 val_vel_err: 58.1191139 val_traj_loss: 0.0011576 val_node_norm: 0.0000300 val_lambda: 1.0005854
-[INFO] Epoch 15: loss: 0.0003878 pos_err: 231.9391327 vel_err: 29.8580189 traj_loss: 0.0003683 node_norm: 0.0000191 lambda: 1.0009389 val_loss: 0.0016800 val_pos_err: 476.1343384 val_vel_err: 65.5024185 val_traj_loss: 0.0016357 val_node_norm: 0.0000428 val_lambda: 1.0009402
-[INFO] Epoch 20: loss: 0.0003850 pos_err: 223.9165039 vel_err: 28.8355560 traj_loss: 0.0003634 node_norm: 0.0000211 lambda: 1.0012493 val_loss: 0.0016513 val_pos_err: 477.9772034 val_vel_err: 65.5783005 val_traj_loss: 0.0015989 val_node_norm: 0.0000504 val_lambda: 1.0012479
-[INFO] [rollout probe @ epoch 25] mean_pos_err=10532.4 worst=21830.8 finite=83%
-[INFO] Epoch 25: loss: 0.0003623 pos_err: 220.9091797 vel_err: 28.3478699 traj_loss: 0.0003363 node_norm: 0.0000255 lambda: 1.0015808 val_loss: 0.0013065 val_pos_err: 437.9559631 val_vel_err: 59.5664406 val_traj_loss: 0.0012483 val_node_norm: 0.0000562 val_lambda: 1.0015820 rollout_pos_err: 10532.3681641 rollout_pos_err_worst: 21830.8007812 rollout_frac_finite: 0.8333333
-[INFO] Epoch 30: loss: 0.0003463 pos_err: 212.4862671 vel_err: 27.1220169 traj_loss: 0.0003196 node_norm: 0.0000262 lambda: 1.0018458 val_loss: 0.0013480 val_pos_err: 442.8869934 val_vel_err: 60.1220131 val_traj_loss: 0.0012807 val_node_norm: 0.0000649 val_lambda: 1.0018449
-[INFO] Epoch 35: loss: 0.0003381 pos_err: 208.0346680 vel_err: 26.6039696 traj_loss: 0.0003087 node_norm: 0.0000288 lambda: 1.0021529 val_loss: 0.0012240 val_pos_err: 433.4406433 val_vel_err: 58.4247627 val_traj_loss: 0.0011521 val_node_norm: 0.0000694 val_lambda: 1.0021539
-[INFO] Epoch 40: loss: 0.0003369 pos_err: 205.1285858 vel_err: 26.2693634 traj_loss: 0.0003029 node_norm: 0.0000333 lambda: 1.0024242 val_loss: 0.0012085 val_pos_err: 430.6151733 val_vel_err: 57.8306351 val_traj_loss: 0.0011350 val_node_norm: 0.0000707 val_lambda: 1.0024225
-[INFO] Epoch 45: loss: 0.0003218 pos_err: 199.4505005 vel_err: 25.5144424 traj_loss: 0.0002861 node_norm: 0.0000349 lambda: 1.0027242 val_loss: 0.0011832 val_pos_err: 407.0343018 val_vel_err: 54.8001060 val_traj_loss: 0.0010993 val_node_norm: 0.0000809 val_lambda: 1.0027252
-[INFO] [rollout probe @ epoch 50] mean_pos_err=13560.7 worst=31171.2 finite=100%
-[INFO] Epoch 50: loss: 0.0003104 pos_err: 194.9368744 vel_err: 24.5996609 traj_loss: 0.0002745 node_norm: 0.0000351 lambda: 1.0029680 val_loss: 0.0010907 val_pos_err: 407.3685608 val_vel_err: 54.1991310 val_traj_loss: 0.0010100 val_node_norm: 0.0000777 val_lambda: 1.0029680 rollout_pos_err: 13560.6702881 rollout_pos_err_worst: 31171.2343750 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0002996 pos_err: 188.2411652 vel_err: 23.6631126 traj_loss: 0.0002606 node_norm: 0.0000382 lambda: 1.0031981 val_loss: 0.0010599 val_pos_err: 406.8354187 val_vel_err: 53.8402252 val_traj_loss: 0.0009773 val_node_norm: 0.0000794 val_lambda: 1.0031990
-[INFO] Epoch 60: loss: 0.0002977 pos_err: 186.7231598 vel_err: 23.3635292 traj_loss: 0.0002567 node_norm: 0.0000402 lambda: 1.0034121 val_loss: 0.0011655 val_pos_err: 421.3484497 val_vel_err: 55.0498314 val_traj_loss: 0.0010740 val_node_norm: 0.0000878 val_lambda: 1.0034133
-[INFO] Epoch 65: loss: 0.0002932 pos_err: 182.8691711 vel_err: 22.8403625 traj_loss: 0.0002487 node_norm: 0.0000436 lambda: 1.0036449 val_loss: 0.0009084 val_pos_err: 378.3229065 val_vel_err: 48.6458969 val_traj_loss: 0.0008034 val_node_norm: 0.0001021 val_lambda: 1.0036434
-[INFO] Epoch 70: loss: 0.0002745 pos_err: 175.2470245 vel_err: 21.7064533 traj_loss: 0.0002286 node_norm: 0.0000451 lambda: 1.0038304 val_loss: 0.0008930 val_pos_err: 375.5705261 val_vel_err: 47.9844017 val_traj_loss: 0.0007800 val_node_norm: 0.0001101 val_lambda: 1.0038314
-[INFO] [rollout probe @ epoch 75] mean_pos_err=13264.5 worst=28175.6 finite=100%
-[INFO] Epoch 75: loss: 0.0002707 pos_err: 170.8943329 vel_err: 21.2164612 traj_loss: 0.0002245 node_norm: 0.0000453 lambda: 1.0040056 val_loss: 0.0010143 val_pos_err: 371.8241272 val_vel_err: 47.4656410 val_traj_loss: 0.0008846 val_node_norm: 0.0001261 val_lambda: 1.0040058 rollout_pos_err: 13264.5439453 rollout_pos_err_worst: 28175.5625000 rollout_frac_finite: 1.0000000
-[INFO] Epoch 80: loss: 0.0002629 pos_err: 167.1617279 vel_err: 20.7890778 traj_loss: 0.0002166 node_norm: 0.0000454 lambda: 1.0041867 val_loss: 0.0007104 val_pos_err: 363.1980591 val_vel_err: 45.2812080 val_traj_loss: 0.0005639 val_node_norm: 0.0001441 val_lambda: 1.0041852
-[INFO] Epoch 85: loss: 0.0002795 pos_err: 171.9339905 vel_err: 21.6104298 traj_loss: 0.0002294 node_norm: 0.0000491 lambda: 1.0043426 val_loss: 0.0006119 val_pos_err: 318.0549011 val_vel_err: 39.0890961 val_traj_loss: 0.0004714 val_node_norm: 0.0001384 val_lambda: 1.0043432
-[INFO] Epoch 90: loss: 0.0002572 pos_err: 162.5668335 vel_err: 20.2555408 traj_loss: 0.0002089 node_norm: 0.0000474 lambda: 1.0044918 val_loss: 0.0005508 val_pos_err: 320.5858459 val_vel_err: 39.3061104 val_traj_loss: 0.0004056 val_node_norm: 0.0001434 val_lambda: 1.0044900
+Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x30c5be550>, 0.0001)
+[INFO] Epoch 5: loss: 0.0057247 pos_err: 1059.9853516 vel_err: 87.6597519 traj_loss: 0.0052067 node_norm: 0.0005147 lambda: 1.0006412 val_loss: 0.0034392 val_pos_err: 876.1690063 val_vel_err: 80.6943207 val_traj_loss: 0.0031148 val_node_norm: 0.0003224 val_lambda: 1.0006417
+[INFO] Epoch 10: loss: 0.0056853 pos_err: 1055.5786133 vel_err: 86.4388046 traj_loss: 0.0051443 node_norm: 0.0005337 lambda: 1.0014203 val_loss: 0.0034499 val_pos_err: 879.5274048 val_vel_err: 77.4343185 val_traj_loss: 0.0031155 val_node_norm: 0.0003300 val_lambda: 1.0014209
+[INFO] Epoch 15: loss: 0.0056746 pos_err: 1052.2288818 vel_err: 86.1772156 traj_loss: 0.0051265 node_norm: 0.0005368 lambda: 1.0021886 val_loss: 0.0033801 val_pos_err: 871.4097900 val_vel_err: 79.2746048 val_traj_loss: 0.0030262 val_node_norm: 0.0003473 val_lambda: 1.0021886
+[INFO] Epoch 20: loss: 0.0056781 pos_err: 1054.9002686 vel_err: 85.7436066 traj_loss: 0.0051294 node_norm: 0.0005336 lambda: 1.0029461 val_loss: 0.0033866 val_pos_err: 847.3051147 val_vel_err: 78.8628159 val_traj_loss: 0.0030257 val_node_norm: 0.0003519 val_lambda: 1.0029465
+[INFO] [rollout probe @ epoch 25] mean_pos_err=11775.4 worst=26065.0 finite=100%
+[INFO] Epoch 25: loss: 0.0056533 pos_err: 1047.5871582 vel_err: 85.3848267 traj_loss: 0.0050951 node_norm: 0.0005394 lambda: 1.0036952 val_loss: 0.0033567 val_pos_err: 907.8755493 val_vel_err: 71.1641769 val_traj_loss: 0.0030019 val_node_norm: 0.0003437 val_lambda: 1.0036949 rollout_pos_err: 11775.3662923 rollout_pos_err_worst: 26065.0410156 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0056484 pos_err: 1051.9942627 vel_err: 84.6721878 traj_loss: 0.0050853 node_norm: 0.0005404 lambda: 1.0044429 val_loss: 0.0033986 val_pos_err: 881.4226685 val_vel_err: 74.4492493 val_traj_loss: 0.0030237 val_node_norm: 0.0003615 val_lambda: 1.0044423
+[INFO] Epoch 35: loss: 0.0056624 pos_err: 1051.5654297 vel_err: 85.2080917 traj_loss: 0.0050935 node_norm: 0.0005424 lambda: 1.0051956 val_loss: 0.0033331 val_pos_err: 904.5239258 val_vel_err: 73.6031113 val_traj_loss: 0.0029434 val_node_norm: 0.0003743 val_lambda: 1.0051961
+[INFO] Epoch 40: loss: 0.0056612 pos_err: 1050.7928467 vel_err: 84.5221558 traj_loss: 0.0050894 node_norm: 0.0005416 lambda: 1.0059391 val_loss: 0.0033676 val_pos_err: 886.3562012 val_vel_err: 74.9907684 val_traj_loss: 0.0029830 val_node_norm: 0.0003668 val_lambda: 1.0059386
+[INFO] Epoch 45: loss: 0.0056536 pos_err: 1049.7410889 vel_err: 84.7835846 traj_loss: 0.0050707 node_norm: 0.0005491 lambda: 1.0066830 val_loss: 0.0033581 val_pos_err: 904.6412354 val_vel_err: 71.8003922 val_traj_loss: 0.0029701 val_node_norm: 0.0003681 val_lambda: 1.0066825
+[INFO] [rollout probe @ epoch 50] mean_pos_err=7926.3 worst=15949.1 finite=100%
+[INFO] Epoch 50: loss: 0.0056449 pos_err: 1048.7723389 vel_err: 84.3080292 traj_loss: 0.0050661 node_norm: 0.0005412 lambda: 1.0074233 val_loss: 0.0033410 val_pos_err: 870.8767700 val_vel_err: 73.7749557 val_traj_loss: 0.0029547 val_node_norm: 0.0003644 val_lambda: 1.0074230 rollout_pos_err: 7926.2701416 rollout_pos_err_worst: 15949.0625000 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0056447 pos_err: 1044.1291504 vel_err: 84.7105942 traj_loss: 0.0050546 node_norm: 0.0005488 lambda: 1.0081631 val_loss: 0.0033304 val_pos_err: 930.6693726 val_vel_err: 67.9158859 val_traj_loss: 0.0029192 val_node_norm: 0.0003874 val_lambda: 1.0081625
+[INFO] Epoch 60: loss: 0.0056424 pos_err: 1049.7684326 vel_err: 84.1218567 traj_loss: 0.0050516 node_norm: 0.0005458 lambda: 1.0088995 val_loss: 0.0034339 val_pos_err: 851.0056152 val_vel_err: 79.4453735 val_traj_loss: 0.0030358 val_node_norm: 0.0003711 val_lambda: 1.0088992
+[INFO] Epoch 65: loss: 0.0056448 pos_err: 1048.6335449 vel_err: 84.4961166 traj_loss: 0.0050517 node_norm: 0.0005444 lambda: 1.0096463 val_loss: 0.0034082 val_pos_err: 883.0366211 val_vel_err: 71.7946472 val_traj_loss: 0.0029824 val_node_norm: 0.0003970 val_lambda: 1.0096463
+[INFO] Epoch 70: loss: 0.0056503 pos_err: 1050.8602295 vel_err: 84.0762253 traj_loss: 0.0050525 node_norm: 0.0005454 lambda: 1.0103865 val_loss: 0.0033754 val_pos_err: 889.6459351 val_vel_err: 72.2817535 val_traj_loss: 0.0029536 val_node_norm: 0.0003911 val_lambda: 1.0103863
+[INFO] [rollout probe @ epoch 75] mean_pos_err=9766.3 worst=20099.5 finite=100%
+[INFO] Epoch 75: loss: 0.0056476 pos_err: 1050.2985840 vel_err: 84.2512054 traj_loss: 0.0050440 node_norm: 0.0005474 lambda: 1.0111275 val_loss: 0.0033342 val_pos_err: 886.1729736 val_vel_err: 74.7935257 val_traj_loss: 0.0029225 val_node_norm: 0.0003791 val_lambda: 1.0111278 rollout_pos_err: 9766.2772624 rollout_pos_err_worst: 20099.4863281 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0056454 pos_err: 1047.9929199 vel_err: 83.9471817 traj_loss: 0.0050372 node_norm: 0.0005485 lambda: 1.0118649 val_loss: 0.0033733 val_pos_err: 905.2746582 val_vel_err: 70.9582977 val_traj_loss: 0.0029526 val_node_norm: 0.0003857 val_lambda: 1.0118653
+[INFO] Epoch 85: loss: 0.0056458 pos_err: 1045.0418701 vel_err: 84.6256409 traj_loss: 0.0050305 node_norm: 0.0005518 lambda: 1.0126048 val_loss: 0.0034169 val_pos_err: 873.6978149 val_vel_err: 74.4325409 val_traj_loss: 0.0029805 val_node_norm: 0.0003988 val_lambda: 1.0126052
+[INFO] Early stopping triggered at 87
+
+Running length strategy: (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x32a5e9dd0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0069966 pos_err: 1077.8072510 vel_err: 111.3995361 traj_loss: 0.0062749 node_norm: 0.0007167 lambda: 1.0008011 val_loss: 0.0044850 val_pos_err: 871.5410156 val_vel_err: 96.3461914 val_traj_loss: 0.0039255 val_node_norm: 0.0005564 val_lambda: 1.0008012
+[INFO] Epoch 10: loss: 0.0070357 pos_err: 1076.1988525 vel_err: 110.1539612 traj_loss: 0.0063036 node_norm: 0.0007208 lambda: 1.0017926 val_loss: 0.0044578 val_pos_err: 927.1415405 val_vel_err: 97.6617126 val_traj_loss: 0.0039085 val_node_norm: 0.0005422 val_lambda: 1.0017920
+[INFO] Epoch 15: loss: 0.0069760 pos_err: 1070.5817871 vel_err: 110.4082489 traj_loss: 0.0062435 node_norm: 0.0007152 lambda: 1.0027797 val_loss: 0.0044040 val_pos_err: 960.0905151 val_vel_err: 90.6731415 val_traj_loss: 0.0038366 val_node_norm: 0.0005567 val_lambda: 1.0027791
+[INFO] Epoch 20: loss: 0.0069483 pos_err: 1067.7286377 vel_err: 109.5706253 traj_loss: 0.0062101 node_norm: 0.0007148 lambda: 1.0037767 val_loss: 0.0044181 val_pos_err: 914.6298218 val_vel_err: 95.6167831 val_traj_loss: 0.0038606 val_node_norm: 0.0005430 val_lambda: 1.0037770
+[INFO] [rollout probe @ epoch 25] mean_pos_err=9739.7 worst=25455.2 finite=100%
+[INFO] Epoch 25: loss: 0.0069638 pos_err: 1064.0307617 vel_err: 109.1251144 traj_loss: 0.0062232 node_norm: 0.0007111 lambda: 1.0047568 val_loss: 0.0046159 val_pos_err: 975.9032593 val_vel_err: 93.4079056 val_traj_loss: 0.0040434 val_node_norm: 0.0005533 val_lambda: 1.0047566 rollout_pos_err: 9739.7034098 rollout_pos_err_worst: 25455.2402344 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0069844 pos_err: 1072.5926514 vel_err: 109.9338531 traj_loss: 0.0062352 node_norm: 0.0007134 lambda: 1.0057398 val_loss: 0.0045293 val_pos_err: 894.3914185 val_vel_err: 99.0194321 val_traj_loss: 0.0039432 val_node_norm: 0.0005634 val_lambda: 1.0057393
+[INFO] Epoch 35: loss: 0.0069706 pos_err: 1072.4375000 vel_err: 110.2500610 traj_loss: 0.0062188 node_norm: 0.0007100 lambda: 1.0067394 val_loss: 0.0044264 val_pos_err: 919.1511841 val_vel_err: 97.7966232 val_traj_loss: 0.0038408 val_node_norm: 0.0005597 val_lambda: 1.0067390
+[INFO] Epoch 40: loss: 0.0069359 pos_err: 1064.1943359 vel_err: 108.5528793 traj_loss: 0.0061723 node_norm: 0.0007160 lambda: 1.0077059 val_loss: 0.0045215 val_pos_err: 886.7335205 val_vel_err: 98.8141251 val_traj_loss: 0.0039340 val_node_norm: 0.0005571 val_lambda: 1.0077062
+[INFO] Epoch 45: loss: 0.0069679 pos_err: 1068.5021973 vel_err: 109.8589706 traj_loss: 0.0061980 node_norm: 0.0007159 lambda: 1.0087050 val_loss: 0.0046371 val_pos_err: 837.0095215 val_vel_err: 106.4024963 val_traj_loss: 0.0040426 val_node_norm: 0.0005594 val_lambda: 1.0087050
+[INFO] [rollout probe @ epoch 50] mean_pos_err=8705.1 worst=21958.0 finite=100%
+[INFO] Epoch 50: loss: 0.0069614 pos_err: 1064.9206543 vel_err: 108.9208221 traj_loss: 0.0061820 node_norm: 0.0007195 lambda: 1.0096895 val_loss: 0.0048660 val_pos_err: 882.1476440 val_vel_err: 106.7933426 val_traj_loss: 0.0042612 val_node_norm: 0.0005636 val_lambda: 1.0096895 rollout_pos_err: 8705.0762533 rollout_pos_err_worst: 21957.9511719 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0069647 pos_err: 1065.6761475 vel_err: 107.9660645 traj_loss: 0.0061761 node_norm: 0.0007226 lambda: 1.0106786 val_loss: 0.0046414 val_pos_err: 891.7130127 val_vel_err: 101.5906067 val_traj_loss: 0.0040322 val_node_norm: 0.0005662 val_lambda: 1.0106789
+[INFO] Epoch 60: loss: 0.0070123 pos_err: 1063.2321777 vel_err: 109.4104233 traj_loss: 0.0062193 node_norm: 0.0007204 lambda: 1.0116680 val_loss: 0.0044139 val_pos_err: 931.5441895 val_vel_err: 97.9014282 val_traj_loss: 0.0038423 val_node_norm: 0.0005268 val_lambda: 1.0116676
+[INFO] Epoch 65: loss: 0.0069916 pos_err: 1068.6219482 vel_err: 109.0114136 traj_loss: 0.0061943 node_norm: 0.0007190 lambda: 1.0126343 val_loss: 0.0046106 val_pos_err: 913.5494995 val_vel_err: 99.9700012 val_traj_loss: 0.0040153 val_node_norm: 0.0005446 val_lambda: 1.0126343
+[INFO] Epoch 70: loss: 0.0069666 pos_err: 1059.9025879 vel_err: 108.4104004 traj_loss: 0.0061639 node_norm: 0.0007187 lambda: 1.0136259 val_loss: 0.0047204 val_pos_err: 897.8880615 val_vel_err: 100.6509705 val_traj_loss: 0.0040823 val_node_norm: 0.0005825 val_lambda: 1.0136256
+[INFO] Early stopping triggered at 71
+
+Running length strategy: (0.7, 2000, <neural_ode_mod.EarlyStopper object at 0x32a5e9d90>, 0.0001)
+[INFO] Epoch 5: loss: 0.0071999 pos_err: 1126.1871338 vel_err: 117.8233795 traj_loss: 0.0065821 node_norm: 0.0006113 lambda: 1.0009756 val_loss: 0.0053083 val_pos_err: 1111.2344971 val_vel_err: 103.6293259 val_traj_loss: 0.0047763 val_node_norm: 0.0005274 val_lambda: 1.0009755
+[INFO] Epoch 10: loss: 0.0071667 pos_err: 1093.2049561 vel_err: 116.8476181 traj_loss: 0.0065342 node_norm: 0.0006183 lambda: 1.0021782 val_loss: 0.0050689 val_pos_err: 1192.3233643 val_vel_err: 103.1566696 val_traj_loss: 0.0045371 val_node_norm: 0.0005219 val_lambda: 1.0021781
+[INFO] Epoch 15: loss: 0.0072096 pos_err: 1107.2071533 vel_err: 116.7123489 traj_loss: 0.0065644 node_norm: 0.0006233 lambda: 1.0033389 val_loss: 0.0055239 val_pos_err: 1124.0830078 val_vel_err: 114.9535522 val_traj_loss: 0.0049463 val_node_norm: 0.0005611 val_lambda: 1.0033389
+[INFO] Epoch 20: loss: 0.0072785 pos_err: 1118.2508545 vel_err: 117.9813766 traj_loss: 0.0066281 node_norm: 0.0006203 lambda: 1.0045470 val_loss: 0.0050556 val_pos_err: 1064.4284668 val_vel_err: 105.2411270 val_traj_loss: 0.0045022 val_node_norm: 0.0005329 val_lambda: 1.0045468
+[INFO] [rollout probe @ epoch 25] mean_pos_err=5828.5 worst=15001.6 finite=100%
+[INFO] Epoch 25: loss: 0.0071829 pos_err: 1100.0937500 vel_err: 117.1932297 traj_loss: 0.0065246 node_norm: 0.0006209 lambda: 1.0057232 val_loss: 0.0049746 val_pos_err: 1001.7709961 val_vel_err: 105.6563110 val_traj_loss: 0.0044147 val_node_norm: 0.0005346 val_lambda: 1.0057235 rollout_pos_err: 5828.4728800 rollout_pos_err_worst: 15001.6289062 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0071522 pos_err: 1096.0397949 vel_err: 116.3727417 traj_loss: 0.0064816 node_norm: 0.0006263 lambda: 1.0068284 val_loss: 0.0054049 val_pos_err: 1011.6055908 val_vel_err: 113.4520798 val_traj_loss: 0.0048373 val_node_norm: 0.0005346 val_lambda: 1.0068288
+[INFO] Epoch 35: loss: 0.0072350 pos_err: 1117.4611816 vel_err: 118.4050980 traj_loss: 0.0065541 node_norm: 0.0006286 lambda: 1.0079755 val_loss: 0.0052114 val_pos_err: 1086.0067139 val_vel_err: 103.1428375 val_traj_loss: 0.0046445 val_node_norm: 0.0005298 val_lambda: 1.0079751
+[INFO] Epoch 40: loss: 0.0073433 pos_err: 1126.2789307 vel_err: 118.5283813 traj_loss: 0.0066504 node_norm: 0.0006322 lambda: 1.0091133 val_loss: 0.0052664 val_pos_err: 1146.1806641 val_vel_err: 111.2060394 val_traj_loss: 0.0046980 val_node_norm: 0.0005255 val_lambda: 1.0091134
+[INFO] Epoch 45: loss: 0.0072171 pos_err: 1093.5240479 vel_err: 116.1513443 traj_loss: 0.0065202 node_norm: 0.0006297 lambda: 1.0103111 val_loss: 0.0051731 val_pos_err: 1061.1020508 val_vel_err: 108.0267487 val_traj_loss: 0.0045930 val_node_norm: 0.0005327 val_lambda: 1.0103116
+[INFO] [rollout probe @ epoch 50] mean_pos_err=6681.9 worst=14508.8 finite=100%
+[INFO] Epoch 50: loss: 0.0071610 pos_err: 1098.0328369 vel_err: 116.3287735 traj_loss: 0.0064575 node_norm: 0.0006296 lambda: 1.0114582 val_loss: 0.0052366 val_pos_err: 1036.9674072 val_vel_err: 111.7834015 val_traj_loss: 0.0046517 val_node_norm: 0.0005316 val_lambda: 1.0114576 rollout_pos_err: 6681.9162598 rollout_pos_err_worst: 14508.7685547 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0071820 pos_err: 1100.3018799 vel_err: 115.3897705 traj_loss: 0.0064684 node_norm: 0.0006321 lambda: 1.0125965 val_loss: 0.0052642 val_pos_err: 990.4448853 val_vel_err: 112.3679886 val_traj_loss: 0.0046794 val_node_norm: 0.0005259 val_lambda: 1.0125970
+[INFO] Epoch 60: loss: 0.0072679 pos_err: 1112.7612305 vel_err: 116.1899719 traj_loss: 0.0065383 node_norm: 0.0006398 lambda: 1.0137318 val_loss: 0.0050989 val_pos_err: 1085.3881836 val_vel_err: 108.4222946 val_traj_loss: 0.0045140 val_node_norm: 0.0005229 val_lambda: 1.0137315
+[INFO] Epoch 65: loss: 0.0071901 pos_err: 1099.9998779 vel_err: 115.6238251 traj_loss: 0.0064645 node_norm: 0.0006294 lambda: 1.0148770 val_loss: 0.0052526 val_pos_err: 1110.6259766 val_vel_err: 111.9474258 val_traj_loss: 0.0046556 val_node_norm: 0.0005278 val_lambda: 1.0148765
+[INFO] Epoch 70: loss: 0.0071950 pos_err: 1096.8218994 vel_err: 115.8606415 traj_loss: 0.0064573 node_norm: 0.0006341 lambda: 1.0160404 val_loss: 0.0049394 val_pos_err: 1094.1794434 val_vel_err: 109.0667191 val_traj_loss: 0.0043583 val_node_norm: 0.0005112 val_lambda: 1.0160400
+[INFO] [rollout probe @ epoch 75] mean_pos_err=8368.4 worst=25514.8 finite=100%
+[INFO] Epoch 75: loss: 0.0072118 pos_err: 1089.1463623 vel_err: 116.1376877 traj_loss: 0.0064652 node_norm: 0.0006354 lambda: 1.0171815 val_loss: 0.0050452 val_pos_err: 1051.5483398 val_vel_err: 108.6142426 val_traj_loss: 0.0044383 val_node_norm: 0.0005306 val_lambda: 1.0171819 rollout_pos_err: 8368.3710938 rollout_pos_err_worst: 25514.8457031 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0072159 pos_err: 1100.7467041 vel_err: 115.9182358 traj_loss: 0.0064591 node_norm: 0.0006384 lambda: 1.0183361 val_loss: 0.0051131 val_pos_err: 1143.4044189 val_vel_err: 108.2181625 val_traj_loss: 0.0045114 val_node_norm: 0.0005190 val_lambda: 1.0183355
+[INFO] Epoch 85: loss: 0.0072001 pos_err: 1092.2783203 vel_err: 116.0523148 traj_loss: 0.0064381 node_norm: 0.0006366 lambda: 1.0194712 val_loss: 0.0051895 val_pos_err: 1153.5314941 val_vel_err: 108.0390396 val_traj_loss: 0.0045799 val_node_norm: 0.0005204 val_lambda: 1.0194713
+[INFO] Epoch 90: loss: 0.0072515 pos_err: 1097.9952393 vel_err: 115.4377518 traj_loss: 0.0064798 node_norm: 0.0006384 lambda: 1.0205815 val_loss: 0.0053635 val_pos_err: 1070.8922119 val_vel_err: 112.5296097 val_traj_loss: 0.0047217 val_node_norm: 0.0005446 val_lambda: 1.0205821
+[INFO] Early stopping triggered at 91
+
+Running length strategy: (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x32a5e9d10>, 0.0002)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 0.0075748 pos_err: 1312.2835693 vel_err: 125.7816162 traj_loss: 0.0070273 node_norm: 0.0005377 lambda: 1.0013834 val_loss: 0.0070543 val_pos_err: 1607.8699951 val_vel_err: 119.9140625 val_traj_loss: 0.0065532 val_node_norm: 0.0004920 val_lambda: 1.0013829
+[INFO] Epoch 10: loss: 0.0081588 pos_err: 1359.1546631 vel_err: 127.3595734 traj_loss: 0.0075974 node_norm: 0.0005376 lambda: 1.0031422 val_loss: 0.0067427 val_pos_err: 1494.4774170 val_vel_err: 124.2381058 val_traj_loss: 0.0062206 val_node_norm: 0.0005025 val_lambda: 1.0031419
+[INFO] Epoch 15: loss: 0.0075573 pos_err: 1340.0434570 vel_err: 128.3397369 traj_loss: 0.0069714 node_norm: 0.0005528 lambda: 1.0047368 val_loss: 0.0064258 val_pos_err: 1799.4503174 val_vel_err: 124.7969894 val_traj_loss: 0.0058698 val_node_norm: 0.0005283 val_lambda: 1.0047364
+[INFO] Epoch 20: loss: 0.0073050 pos_err: 1254.9936523 vel_err: 123.2101746 traj_loss: 0.0067105 node_norm: 0.0005523 lambda: 1.0063018 val_loss: 0.0063161 val_pos_err: 1522.7855225 val_vel_err: 119.6597977 val_traj_loss: 0.0057699 val_node_norm: 0.0005098 val_lambda: 1.0063018
+[INFO] Saved checkpoint at 22
+[INFO] [rollout probe @ epoch 25] mean_pos_err=4894.9 worst=6935.9 finite=100%
+[INFO] Epoch 25: loss: 0.0079179 pos_err: 1321.6896973 vel_err: 124.0888062 traj_loss: 0.0072958 node_norm: 0.0005648 lambda: 1.0078571 val_loss: 0.0060764 val_pos_err: 1362.0523682 val_vel_err: 118.4379425 val_traj_loss: 0.0055215 val_node_norm: 0.0005115 val_lambda: 1.0078568 rollout_pos_err: 4894.8853760 rollout_pos_err_worst: 6935.9003906 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0077127 pos_err: 1294.1032715 vel_err: 124.8977051 traj_loss: 0.0070842 node_norm: 0.0005621 lambda: 1.0093625 val_loss: 0.0072135 val_pos_err: 1345.3674316 val_vel_err: 130.3942566 val_traj_loss: 0.0066124 val_node_norm: 0.0005391 val_lambda: 1.0093627
+[INFO] Epoch 35: loss: 0.0077871 pos_err: 1283.6096191 vel_err: 123.2803268 traj_loss: 0.0071425 node_norm: 0.0005661 lambda: 1.0109988 val_loss: 0.0065293 val_pos_err: 1605.2697754 val_vel_err: 121.8712234 val_traj_loss: 0.0059382 val_node_norm: 0.0005258 val_lambda: 1.0109992
+[INFO] Epoch 40: loss: 0.0072355 pos_err: 1240.6081543 vel_err: 120.0908127 traj_loss: 0.0065902 node_norm: 0.0005626 lambda: 1.0125538 val_loss: 0.0061564 val_pos_err: 1448.5645752 val_vel_err: 119.4195404 val_traj_loss: 0.0055555 val_node_norm: 0.0005311 val_lambda: 1.0125532
+[INFO] Epoch 45: loss: 0.0076225 pos_err: 1326.7138672 vel_err: 125.3595505 traj_loss: 0.0069573 node_norm: 0.0005681 lambda: 1.0139554 val_loss: 0.0072512 val_pos_err: 1675.8913574 val_vel_err: 122.5597229 val_traj_loss: 0.0066505 val_node_norm: 0.0005078 val_lambda: 1.0139560
+[INFO] Saved checkpoint at 48
+[INFO] [rollout probe @ epoch 50] mean_pos_err=5547.0 worst=7047.3 finite=100%
+[INFO] Epoch 50: loss: 0.0075478 pos_err: 1287.1739502 vel_err: 124.1538467 traj_loss: 0.0068751 node_norm: 0.0005660 lambda: 1.0155256 val_loss: 0.0072519 val_pos_err: 1264.7655029 val_vel_err: 124.8487167 val_traj_loss: 0.0066394 val_node_norm: 0.0005095 val_lambda: 1.0155253 rollout_pos_err: 5547.0102132 rollout_pos_err_worst: 7047.2578125 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0073032 pos_err: 1225.4998779 vel_err: 121.0079193 traj_loss: 0.0066257 node_norm: 0.0005645 lambda: 1.0170527 val_loss: 0.0068511 val_pos_err: 1436.5302734 val_vel_err: 117.2085037 val_traj_loss: 0.0061956 val_node_norm: 0.0005498 val_lambda: 1.0170528
+[INFO] Epoch 60: loss: 0.0080334 pos_err: 1327.8552246 vel_err: 124.6928024 traj_loss: 0.0073251 node_norm: 0.0005714 lambda: 1.0186870 val_loss: 0.0073408 val_pos_err: 1639.6951904 val_vel_err: 125.9067841 val_traj_loss: 0.0066579 val_node_norm: 0.0005585 val_lambda: 1.0186867
+[INFO] Epoch 65: loss: 0.0077959 pos_err: 1326.0844727 vel_err: 126.4111786 traj_loss: 0.0070796 node_norm: 0.0005733 lambda: 1.0201836 val_loss: 0.0063026 val_pos_err: 1508.8403320 val_vel_err: 121.5402679 val_traj_loss: 0.0056341 val_node_norm: 0.0005548 val_lambda: 1.0201834
+[INFO] Epoch 70: loss: 0.0075647 pos_err: 1343.9455566 vel_err: 125.4398041 traj_loss: 0.0068425 node_norm: 0.0005732 lambda: 1.0217780 val_loss: 0.0068217 val_pos_err: 1240.0593262 val_vel_err: 124.5728455 val_traj_loss: 0.0061616 val_node_norm: 0.0005259 val_lambda: 1.0217780
+[INFO] [rollout probe @ epoch 75] mean_pos_err=6340.9 worst=13732.6 finite=100%
+[INFO] Epoch 75: loss: 0.0073955 pos_err: 1265.8356934 vel_err: 123.7482300 traj_loss: 0.0066725 node_norm: 0.0005676 lambda: 1.0232875 val_loss: 0.0062387 val_pos_err: 1371.8017578 val_vel_err: 122.0735550 val_traj_loss: 0.0055632 val_node_norm: 0.0005459 val_lambda: 1.0232869 rollout_pos_err: 6340.8900553 rollout_pos_err_worst: 13732.5917969 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0074512 pos_err: 1254.0488281 vel_err: 122.9698486 traj_loss: 0.0067081 node_norm: 0.0005763 lambda: 1.0248719 val_loss: 0.0079090 val_pos_err: 1872.4254150 val_vel_err: 135.3500061 val_traj_loss: 0.0071614 val_node_norm: 0.0005695 val_lambda: 1.0248723
+[INFO] Epoch 85: loss: 0.0078926 pos_err: 1308.6740723 vel_err: 124.1259308 traj_loss: 0.0071264 node_norm: 0.0005779 lambda: 1.0264280 val_loss: 0.0065801 val_pos_err: 1542.7862549 val_vel_err: 120.0205994 val_traj_loss: 0.0058861 val_node_norm: 0.0005384 val_lambda: 1.0264277
+[INFO] Epoch 90: loss: 0.0073661 pos_err: 1192.9814453 vel_err: 121.1350784 traj_loss: 0.0066107 node_norm: 0.0005706 lambda: 1.0279542 val_loss: 0.0066945 val_pos_err: 1452.3377686 val_vel_err: 122.3366013 val_traj_loss: 0.0059742 val_node_norm: 0.0005533 val_lambda: 1.0279542
+[INFO] Epoch 95: loss: 0.0075149 pos_err: 1287.3768311 vel_err: 124.7873459 traj_loss: 0.0067425 node_norm: 0.0005732 lambda: 1.0295490 val_loss: 0.0071654 val_pos_err: 1556.6047363 val_vel_err: 125.8125229 val_traj_loss: 0.0063679 val_node_norm: 0.0006094 val_lambda: 1.0295495
+[INFO] [rollout probe @ epoch 100] mean_pos_err=10450.3 worst=20395.0 finite=100%
+[INFO] Epoch 100: loss: 0.0075979 pos_err: 1264.1622314 vel_err: 121.4054947 traj_loss: 0.0068084 node_norm: 0.0005783 lambda: 1.0310262 val_loss: 0.0065936 val_pos_err: 1901.7576904 val_vel_err: 117.7735977 val_traj_loss: 0.0058571 val_node_norm: 0.0005547 val_lambda: 1.0310265 rollout_pos_err: 10450.2947184 rollout_pos_err_worst: 20395.0000000 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0074742 pos_err: 1261.8820801 vel_err: 123.3279037 traj_loss: 0.0066772 node_norm: 0.0005796 lambda: 1.0325737 val_loss: 0.0064858 val_pos_err: 1489.8435059 val_vel_err: 117.6316681 val_traj_loss: 0.0057119 val_node_norm: 0.0005878 val_lambda: 1.0325736
+[INFO] Epoch 110: loss: 0.0074019 pos_err: 1215.5717773 vel_err: 120.9778137 traj_loss: 0.0065967 node_norm: 0.0005808 lambda: 1.0340191 val_loss: 0.0073152 val_pos_err: 1944.2679443 val_vel_err: 131.5454102 val_traj_loss: 0.0065228 val_node_norm: 0.0005704 val_lambda: 1.0340186
+[INFO] Epoch 115: loss: 0.0072544 pos_err: 1190.4416504 vel_err: 118.8780975 traj_loss: 0.0064489 node_norm: 0.0005765 lambda: 1.0355030 val_loss: 0.0062032 val_pos_err: 1244.1468506 val_vel_err: 121.3015594 val_traj_loss: 0.0054724 val_node_norm: 0.0005365 val_lambda: 1.0355026
+[INFO] Epoch 120: loss: 0.0074579 pos_err: 1238.2065430 vel_err: 122.7701721 traj_loss: 0.0066360 node_norm: 0.0005766 lambda: 1.0369594 val_loss: 0.0079317 val_pos_err: 1747.7364502 val_vel_err: 126.4171753 val_traj_loss: 0.0070843 val_node_norm: 0.0005857 val_lambda: 1.0369588
+[INFO] [rollout probe @ epoch 125] mean_pos_err=7500.3 worst=18188.6 finite=100%
+[INFO] Epoch 125: loss: 0.0078065 pos_err: 1319.9631348 vel_err: 123.8604813 traj_loss: 0.0069569 node_norm: 0.0005822 lambda: 1.0384449 val_loss: 0.0089469 val_pos_err: 1706.4426270 val_vel_err: 132.6931000 val_traj_loss: 0.0080520 val_node_norm: 0.0005853 val_lambda: 1.0384455 rollout_pos_err: 7500.2859294 rollout_pos_err_worst: 18188.6191406 rollout_frac_finite: 1.0000000
+[INFO] Early stopping triggered at 128
+
+Running length strategy: (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x32a5e9d50>, 0.0001)
+[INFO] Saved checkpoint at 2
+[INFO] Epoch 5: loss: 0.0070595 pos_err: 1195.9450684 vel_err: 119.3037567 traj_loss: 0.0064699 node_norm: 0.0005821 lambda: 1.0011684 val_loss: 0.0066116 val_pos_err: 1262.0000000 val_vel_err: 124.5800323 val_traj_loss: 0.0060248 val_node_norm: 0.0005798 val_lambda: 1.0011684
+[INFO] Epoch 10: loss: 0.0070601 pos_err: 1205.6214600 vel_err: 119.3520966 traj_loss: 0.0064653 node_norm: 0.0005776 lambda: 1.0026702 val_loss: 0.0063990 val_pos_err: 1396.7840576 val_vel_err: 118.7929382 val_traj_loss: 0.0058425 val_node_norm: 0.0005409 val_lambda: 1.0026698
+[INFO] Epoch 15: loss: 0.0070232 pos_err: 1186.6151123 vel_err: 118.8513565 traj_loss: 0.0064175 node_norm: 0.0005790 lambda: 1.0041693 val_loss: 0.0065645 val_pos_err: 1382.9699707 val_vel_err: 121.0597534 val_traj_loss: 0.0059733 val_node_norm: 0.0005663 val_lambda: 1.0041693
+[INFO] Epoch 20: loss: 0.0070162 pos_err: 1183.6408691 vel_err: 119.2250595 traj_loss: 0.0064016 node_norm: 0.0005782 lambda: 1.0057019 val_loss: 0.0065679 val_pos_err: 1398.8699951 val_vel_err: 120.0353699 val_traj_loss: 0.0059600 val_node_norm: 0.0005740 val_lambda: 1.0057015
+[INFO] [rollout probe @ epoch 25] mean_pos_err=5726.3 worst=9882.0 finite=100%
+[INFO] Epoch 25: loss: 0.0069898 pos_err: 1161.9458008 vel_err: 117.6964645 traj_loss: 0.0063660 node_norm: 0.0005778 lambda: 1.0072368 val_loss: 0.0066770 val_pos_err: 1378.1030273 val_vel_err: 121.7833328 val_traj_loss: 0.0060482 val_node_norm: 0.0005850 val_lambda: 1.0072373 rollout_pos_err: 5726.2609863 rollout_pos_err_worst: 9882.0136719 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0070454 pos_err: 1192.4836426 vel_err: 118.9635696 traj_loss: 0.0064112 node_norm: 0.0005778 lambda: 1.0087894 val_loss: 0.0068216 val_pos_err: 1424.4237061 val_vel_err: 123.4532700 val_traj_loss: 0.0061699 val_node_norm: 0.0005975 val_lambda: 1.0087900
+[INFO] Saved checkpoint at 31
+[INFO] Epoch 35: loss: 0.0071264 pos_err: 1238.8245850 vel_err: 119.6784744 traj_loss: 0.0064803 node_norm: 0.0005795 lambda: 1.0102831 val_loss: 0.0070441 val_pos_err: 1453.8503418 val_vel_err: 125.3893814 val_traj_loss: 0.0063882 val_node_norm: 0.0005903 val_lambda: 1.0102830
+[INFO] Epoch 40: loss: 0.0070027 pos_err: 1167.9766846 vel_err: 117.7195892 traj_loss: 0.0063480 node_norm: 0.0005797 lambda: 1.0118116 val_loss: 0.0063683 val_pos_err: 1488.1171875 val_vel_err: 117.3382950 val_traj_loss: 0.0057355 val_node_norm: 0.0005651 val_lambda: 1.0118121
+[INFO] Saved checkpoint at 43
+[INFO] Epoch 45: loss: 0.0070316 pos_err: 1181.0964355 vel_err: 118.0502243 traj_loss: 0.0063715 node_norm: 0.0005756 lambda: 1.0132780 val_loss: 0.0073052 val_pos_err: 1502.1745605 val_vel_err: 123.4225845 val_traj_loss: 0.0066373 val_node_norm: 0.0005797 val_lambda: 1.0132779
+[INFO] [rollout probe @ epoch 50] mean_pos_err=4844.7 worst=6614.0 finite=100%
+[INFO] Epoch 50: loss: 0.0070970 pos_err: 1197.8294678 vel_err: 119.2997055 traj_loss: 0.0064157 node_norm: 0.0005861 lambda: 1.0148419 val_loss: 0.0076512 val_pos_err: 1410.2287598 val_vel_err: 125.7265930 val_traj_loss: 0.0069464 val_node_norm: 0.0006017 val_lambda: 1.0148416 rollout_pos_err: 4844.7246501 rollout_pos_err_worst: 6614.0102539 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0070648 pos_err: 1176.0607910 vel_err: 117.7590027 traj_loss: 0.0063722 node_norm: 0.0005880 lambda: 1.0164045 val_loss: 0.0075251 val_pos_err: 1520.7147217 val_vel_err: 128.8780365 val_traj_loss: 0.0068315 val_node_norm: 0.0005814 val_lambda: 1.0164046
+[INFO] Epoch 60: loss: 0.0070419 pos_err: 1167.5410156 vel_err: 117.7051010 traj_loss: 0.0063467 node_norm: 0.0005813 lambda: 1.0179478 val_loss: 0.0068735 val_pos_err: 1261.5833740 val_vel_err: 124.8050232 val_traj_loss: 0.0061493 val_node_norm: 0.0006139 val_lambda: 1.0179473
+[INFO] Epoch 65: loss: 0.0070605 pos_err: 1165.8983154 vel_err: 117.1722488 traj_loss: 0.0063545 node_norm: 0.0005822 lambda: 1.0194775 val_loss: 0.0060693 val_pos_err: 1650.7475586 val_vel_err: 116.3038559 val_traj_loss: 0.0053938 val_node_norm: 0.0005704 val_lambda: 1.0194770
+[INFO] Saved checkpoint at 65
+[INFO] Epoch 70: loss: 0.0070820 pos_err: 1191.7265625 vel_err: 118.3201218 traj_loss: 0.0063633 node_norm: 0.0005850 lambda: 1.0210050 val_loss: 0.0067569 val_pos_err: 1262.3349609 val_vel_err: 122.3591309 val_traj_loss: 0.0060431 val_node_norm: 0.0005869 val_lambda: 1.0210056
+[INFO] [rollout probe @ epoch 75] mean_pos_err=6757.0 worst=12825.4 finite=100%
+[INFO] Epoch 75: loss: 0.0071251 pos_err: 1199.8887939 vel_err: 119.0456238 traj_loss: 0.0063957 node_norm: 0.0005852 lambda: 1.0225521 val_loss: 0.0075223 val_pos_err: 1551.6275635 val_vel_err: 125.3561249 val_traj_loss: 0.0067458 val_node_norm: 0.0006245 val_lambda: 1.0225517 rollout_pos_err: 6757.0428874 rollout_pos_err_worst: 12825.3935547 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0071140 pos_err: 1193.8613281 vel_err: 118.7204666 traj_loss: 0.0063719 node_norm: 0.0005882 lambda: 1.0241657 val_loss: 0.0069066 val_pos_err: 1435.8817139 val_vel_err: 122.6595764 val_traj_loss: 0.0061569 val_node_norm: 0.0006010 val_lambda: 1.0241653
+[INFO] Epoch 85: loss: 0.0071052 pos_err: 1179.8710938 vel_err: 117.4664612 traj_loss: 0.0063586 node_norm: 0.0005833 lambda: 1.0256809 val_loss: 0.0063840 val_pos_err: 1401.9307861 val_vel_err: 119.5632858 val_traj_loss: 0.0056306 val_node_norm: 0.0006088 val_lambda: 1.0256815
+[INFO] Epoch 90: loss: 0.0071279 pos_err: 1157.5408936 vel_err: 117.6908875 traj_loss: 0.0063672 node_norm: 0.0005873 lambda: 1.0272214 val_loss: 0.0071035 val_pos_err: 1638.7406006 val_vel_err: 124.4554291 val_traj_loss: 0.0063648 val_node_norm: 0.0005654 val_lambda: 1.0272212
+[INFO] Epoch 95: loss: 0.0071328 pos_err: 1171.0532227 vel_err: 117.6579208 traj_loss: 0.0063605 node_norm: 0.0005893 lambda: 1.0287703 val_loss: 0.0067255 val_pos_err: 1502.4241943 val_vel_err: 120.3893585 val_traj_loss: 0.0059657 val_node_norm: 0.0005882 val_lambda: 1.0287703
+[INFO] [rollout probe @ epoch 100] mean_pos_err=6656.2 worst=9399.2 finite=100%
+[INFO] Epoch 100: loss: 0.0071056 pos_err: 1167.7211914 vel_err: 117.4358292 traj_loss: 0.0063312 node_norm: 0.0005825 lambda: 1.0303112 val_loss: 0.0072274 val_pos_err: 1553.9611816 val_vel_err: 122.6483536 val_traj_loss: 0.0064533 val_node_norm: 0.0005785 val_lambda: 1.0303106 rollout_pos_err: 6656.1778158 rollout_pos_err_worst: 9399.2441406 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0071349 pos_err: 1152.3489990 vel_err: 117.3957520 traj_loss: 0.0063431 node_norm: 0.0005896 lambda: 1.0318768 val_loss: 0.0068439 val_pos_err: 1663.4205322 val_vel_err: 122.2772141 val_traj_loss: 0.0060503 val_node_norm: 0.0006007 val_lambda: 1.0318772
+[INFO] Epoch 110: loss: 0.0072101 pos_err: 1190.2373047 vel_err: 118.7329559 traj_loss: 0.0064071 node_norm: 0.0005883 lambda: 1.0335079 val_loss: 0.0069997 val_pos_err: 1343.5935059 val_vel_err: 121.5388336 val_traj_loss: 0.0062097 val_node_norm: 0.0005819 val_lambda: 1.0335073
+[INFO] Epoch 115: loss: 0.0071035 pos_err: 1145.7996826 vel_err: 116.4605484 traj_loss: 0.0062941 node_norm: 0.0005889 lambda: 1.0350237 val_loss: 0.0067103 val_pos_err: 1623.2556152 val_vel_err: 120.7738419 val_traj_loss: 0.0058966 val_node_norm: 0.0006072 val_lambda: 1.0350242
+[INFO] Epoch 120: loss: 0.0071414 pos_err: 1170.3168945 vel_err: 117.8505783 traj_loss: 0.0063234 node_norm: 0.0005870 lambda: 1.0365460 val_loss: 0.0075675 val_pos_err: 1544.0389404 val_vel_err: 124.2797012 val_traj_loss: 0.0067093 val_node_norm: 0.0006130 val_lambda: 1.0365463
+[INFO] [rollout probe @ epoch 125] mean_pos_err=6405.4 worst=14228.8 finite=100%
+[INFO] Epoch 125: loss: 0.0071148 pos_err: 1179.3389893 vel_err: 117.7041168 traj_loss: 0.0062838 node_norm: 0.0005914 lambda: 1.0381277 val_loss: 0.0068745 val_pos_err: 1458.1682129 val_vel_err: 120.8245926 val_traj_loss: 0.0060263 val_node_norm: 0.0006184 val_lambda: 1.0381274 rollout_pos_err: 6405.4419759 rollout_pos_err_worst: 14228.7910156 rollout_frac_finite: 1.0000000
+[INFO] Epoch 130: loss: 0.0071668 pos_err: 1168.2700195 vel_err: 117.7886353 traj_loss: 0.0063275 node_norm: 0.0005883 lambda: 1.0396681 val_loss: 0.0069757 val_pos_err: 1702.8322754 val_vel_err: 119.4941406 val_traj_loss: 0.0061240 val_node_norm: 0.0006088 val_lambda: 1.0396680
+[INFO] Epoch 135: loss: 0.0071630 pos_err: 1178.0729980 vel_err: 117.8692398 traj_loss: 0.0063130 node_norm: 0.0005898 lambda: 1.0412296 val_loss: 0.0068662 val_pos_err: 1495.1656494 val_vel_err: 120.9250565 val_traj_loss: 0.0059879 val_node_norm: 0.0006314 val_lambda: 1.0412302
+[INFO] Epoch 140: loss: 0.0071435 pos_err: 1148.3183594 vel_err: 117.0710678 traj_loss: 0.0062813 node_norm: 0.0005935 lambda: 1.0427692 val_loss: 0.0070075 val_pos_err: 1679.3549805 val_vel_err: 123.9604950 val_traj_loss: 0.0061373 val_node_norm: 0.0006078 val_lambda: 1.0427686
+[INFO] Epoch 145: loss: 0.0071182 pos_err: 1148.4134521 vel_err: 115.6426010 traj_loss: 0.0062496 node_norm: 0.0005918 lambda: 1.0442991 val_loss: 0.0081018 val_pos_err: 1482.6397705 val_vel_err: 129.3233337 val_traj_loss: 0.0071512 val_node_norm: 0.0006339 val_lambda: 1.0442990
+[INFO] Early stopping triggered at 145
+
+Running length strategy: (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x32a5e9c50>, 1e-05)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 0.0067924 pos_err: 1128.7707520 vel_err: 114.9118118 traj_loss: 0.0061954 node_norm: 0.0005895 lambda: 1.0012172 val_loss: 0.0064024 val_pos_err: 1431.0603027 val_vel_err: 119.8687668 val_traj_loss: 0.0057902 val_node_norm: 0.0006051 val_lambda: 1.0012178
+[INFO] Saved checkpoint at 5
+[INFO] Epoch 10: loss: 0.0068017 pos_err: 1137.4919434 vel_err: 114.5717010 traj_loss: 0.0061945 node_norm: 0.0005903 lambda: 1.0027239 val_loss: 0.0066221 val_pos_err: 1461.1359863 val_vel_err: 120.9210510 val_traj_loss: 0.0059926 val_node_norm: 0.0006132 val_lambda: 1.0027242
+[INFO] Epoch 15: loss: 0.0068053 pos_err: 1141.8742676 vel_err: 114.6263046 traj_loss: 0.0061900 node_norm: 0.0005891 lambda: 1.0042340 val_loss: 0.0070106 val_pos_err: 1463.4543457 val_vel_err: 123.6905594 val_traj_loss: 0.0063584 val_node_norm: 0.0006253 val_lambda: 1.0042335
+[INFO] Epoch 20: loss: 0.0068132 pos_err: 1139.1788330 vel_err: 114.2306290 traj_loss: 0.0061878 node_norm: 0.0005897 lambda: 1.0057755 val_loss: 0.0068404 val_pos_err: 1449.8889160 val_vel_err: 122.9552307 val_traj_loss: 0.0061855 val_node_norm: 0.0006192 val_lambda: 1.0057755
+[INFO] [rollout probe @ epoch 25] mean_pos_err=5899.5 worst=12161.3 finite=100%
+[INFO] Epoch 25: loss: 0.0068263 pos_err: 1137.7932129 vel_err: 114.5071411 traj_loss: 0.0061917 node_norm: 0.0005895 lambda: 1.0072950 val_loss: 0.0068443 val_pos_err: 1437.1319580 val_vel_err: 122.3456192 val_traj_loss: 0.0061713 val_node_norm: 0.0006279 val_lambda: 1.0072953 rollout_pos_err: 5899.5024821 rollout_pos_err_worst: 12161.2509766 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0068318 pos_err: 1137.9567871 vel_err: 114.4002914 traj_loss: 0.0061881 node_norm: 0.0005891 lambda: 1.0088243 val_loss: 0.0065775 val_pos_err: 1436.8472900 val_vel_err: 120.6359863 val_traj_loss: 0.0059077 val_node_norm: 0.0006176 val_lambda: 1.0088245
+[INFO] Epoch 35: loss: 0.0068380 pos_err: 1135.8392334 vel_err: 114.3489151 traj_loss: 0.0061847 node_norm: 0.0005895 lambda: 1.0103174 val_loss: 0.0067692 val_pos_err: 1446.6798096 val_vel_err: 121.6560822 val_traj_loss: 0.0060868 val_node_norm: 0.0006196 val_lambda: 1.0103173
+[INFO] Epoch 40: loss: 0.0068593 pos_err: 1136.1951904 vel_err: 114.5660248 traj_loss: 0.0061966 node_norm: 0.0005893 lambda: 1.0118448 val_loss: 0.0069466 val_pos_err: 1428.3673096 val_vel_err: 122.9798203 val_traj_loss: 0.0062470 val_node_norm: 0.0006256 val_lambda: 1.0118451
+[INFO] Epoch 45: loss: 0.0068605 pos_err: 1128.2882080 vel_err: 114.4807281 traj_loss: 0.0061875 node_norm: 0.0005902 lambda: 1.0133845 val_loss: 0.0068536 val_pos_err: 1475.2293701 val_vel_err: 121.8935547 val_traj_loss: 0.0061416 val_node_norm: 0.0006299 val_lambda: 1.0133840
+[INFO] [rollout probe @ epoch 50] mean_pos_err=6458.5 worst=14407.7 finite=100%
+[INFO] Epoch 50: loss: 0.0068728 pos_err: 1141.6839600 vel_err: 114.4574203 traj_loss: 0.0061901 node_norm: 0.0005904 lambda: 1.0149113 val_loss: 0.0067355 val_pos_err: 1489.3308105 val_vel_err: 121.1224213 val_traj_loss: 0.0060314 val_node_norm: 0.0006142 val_lambda: 1.0149108 rollout_pos_err: 6458.4515788 rollout_pos_err_worst: 14407.7001953 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0068758 pos_err: 1132.5098877 vel_err: 114.3839417 traj_loss: 0.0061840 node_norm: 0.0005902 lambda: 1.0164386 val_loss: 0.0067005 val_pos_err: 1464.0203857 val_vel_err: 120.8510132 val_traj_loss: 0.0059865 val_node_norm: 0.0006156 val_lambda: 1.0164390
+[INFO] Epoch 60: loss: 0.0068856 pos_err: 1136.0172119 vel_err: 114.3491135 traj_loss: 0.0061840 node_norm: 0.0005905 lambda: 1.0179493 val_loss: 0.0067587 val_pos_err: 1466.6337891 val_vel_err: 121.0535965 val_traj_loss: 0.0060319 val_node_norm: 0.0006186 val_lambda: 1.0179499
+[INFO] Epoch 65: loss: 0.0068904 pos_err: 1130.5388184 vel_err: 114.2874832 traj_loss: 0.0061788 node_norm: 0.0005912 lambda: 1.0194778 val_loss: 0.0068383 val_pos_err: 1494.9741211 val_vel_err: 121.6694870 val_traj_loss: 0.0060961 val_node_norm: 0.0006234 val_lambda: 1.0194778

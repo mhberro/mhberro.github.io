@@ -1,27 +1,7 @@
-"""Minimal numpy-backed stand-in for the torch API subset used by the
-library torch-mirrors, so numpy/torch column parity can be checked offline."""
-import numpy as np
-
-
-def as_tensor(x, dtype=None, device=None):
-    return np.asarray(x, dtype=float)
-
-
-def ones_like(x):
-    return np.ones_like(x)
-
-
-def sqrt(x):
-    return np.sqrt(x)
-
-
-def exp(x):
-    return np.exp(x)
-
-
-def clamp(x, min=None, max=None):
-    return np.clip(x, min, max)
-
-
-def cat(cols, dim=-1):
-    return np.concatenate(cols, axis=dim)
+python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --sr 100000000 --frame grdth --model-type aphynity-gruode --sbi-phase glide \
+  --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 \
+  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
+  --sindy-library physics-stable --sindy-scale-heights 5000 \
+  --sindy-l1-threshold 0.2 --aphynity-residual-type dissipative \
+  -o model_outputs/SBI/grdth_win75_stable_l1p2_dissipative/GRDTH/glide

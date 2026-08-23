@@ -1,130 +1,27 @@
-"""Verify the frame-index/sign fix on synthetic grdth-, dcu- and geodesic-shaped data."""
-import sys, types
+"""Minimal numpy-backed stand-in for the torch API subset used by the
+library torch-mirrors, so numpy/torch column parity can be checked offline."""
 import numpy as np
 
-# Install the shim as "torch" so the *_torch mirrors run unmodified.
-sys.modules['torch'] = types.ModuleType('torch')
-import _torch_shim as shim
-for k in dir(shim):
-    if not k.startswith('_'):
-        setattr(sys.modules['torch'], k, getattr(shim, k))
 
-from physics_library import PhysicsInformedLibrary, evaluate_library_torch
-from eom_library import EOMLibrary, evaluate_eom_library_torch
-from _frame_map_extracted import frame_index_map  # extracted verbatim from NEXT_training.py
+def as_tensor(x, dtype=None, device=None):
+    return np.asarray(x, dtype=float)
 
-N = 400
-rng = np.random.default_rng(0)
-alt = np.linspace(108_000, 22_000, N)          # 108 km -> 22 km glide
-v_along = np.linspace(5200, 3100, N)
-v_vert = np.gradient(alt, 1.0)
-turn = 1e-4 * np.sin(np.linspace(0, 6, N))
-rangem = np.cumsum(v_along) * 1.0
 
-FRAMES = {
-    # frame, model_states, state matrix in that frame's column order
-    "geodesic5": ("geodesic", 5, np.column_stack([rangem, alt, v_along, turn, v_vert])),
-    "grdth":     ("grdth",    5, np.column_stack([rangem, -alt, v_along, -v_vert, turn])),
-    "dcu":       ("dcu",      6, np.column_stack([rangem, 0.1*rangem, alt,
-                                                  v_along, 0.1*v_along, v_vert])),
-}
+def ones_like(x):
+    return np.ones_like(x)
 
-print("=" * 78)
-print("TEST 1  atmosphere column must vary with altitude (not pin at the clip)")
-print("=" * 78)
-for name, (frame, ns, Y) in FRAMES.items():
-    fidx = frame_index_map(frame, ns)
-    lib = PhysicsInformedLibrary(state_vector_len=ns, degree=2,
-                                 scale_heights=(5000.0,), **fidx)
-    Th = lib.fit_transform(Y)
-    names = lib.term_names()
-    j = names.index("drag_V2@H=5000")
-    col = Th[:, j]
-    clip = lib.clip
-    frac_clipped = float(np.mean(np.abs(np.abs(col) - clip) < 1e-9))
-    print(f"  {name:<10} h_idx={fidx['h_idx']} h_sign={fidx['h_sign']:+.0f}  "
-          f"drag_V2 range=[{col.min():+.3f},{col.max():+.3f}]  "
-          f"unique={len(np.unique(np.round(col,6))):>4}  clipped={frac_clipped:.0%}")
-    assert frac_clipped < 0.5, f"{name}: atmosphere column still saturated!"
-    assert len(np.unique(np.round(col, 6))) > 50, f"{name}: column carries no info"
-print("  PASS - all frames produce a varying, unsaturated atmosphere column\n")
 
-print("=" * 78)
-print("TEST 2  regression: OLD hardcoded map on grdth (what was actually run)")
-print("=" * 78)
-frame, ns, Y = FRAMES["grdth"]
-old = PhysicsInformedLibrary(state_vector_len=ns, degree=2, scale_heights=(5000.0,),
-                             h_idx=1, vs_idx=2, va_idx=3, vh_idx=4, h_sign=1.0)
-Th_old = old.fit_transform(Y)
-j = old.term_names().index("drag_V2@H=5000")
-col_old = Th_old[:, j]
-print(f"  OLD grdth drag_V2: unique values={len(np.unique(np.round(col_old,6)))}  "
-      f"range=[{col_old.min():+.4f},{col_old.max():+.4f}]")
-print(f"  -> confirms the pre-fix column was degenerate/constant\n")
+def sqrt(x):
+    return np.sqrt(x)
 
-print("=" * 78)
-print("TEST 3  numpy vs torch-mirror parity (physics library, every frame)")
-print("=" * 78)
-for name, (frame, ns, Y) in FRAMES.items():
-    fidx = frame_index_map(frame, ns)
-    lib = PhysicsInformedLibrary(state_vector_len=ns, degree=2,
-                                 scale_heights=(5000.0,), **fidx)
-    Th_np = lib.fit_transform(Y)
-    Th_t = evaluate_library_torch(Y, lib.library_spec())
-    err = np.max(np.abs(Th_np - Th_t))
-    print(f"  {name:<10} shape={Th_np.shape}  max|numpy-torch|={err:.3e}")
-    assert err < 1e-9, f"{name}: numpy/torch mismatch"
-print("  PASS - physics library paths agree\n")
 
-print("=" * 78)
-print("TEST 4  numpy vs torch-mirror parity (EOM library, geodesic + grdth)")
-print("=" * 78)
-for name in ("geodesic5", "grdth"):
-    frame, ns, Y = FRAMES[name]
-    fidx = frame_index_map(frame, ns)
-    lib = EOMLibrary(state_vector_len=ns, scale_heights=(5000.0,), **fidx)
-    Th_np = lib.fit_transform(Y)
-    Th_t = evaluate_eom_library_torch(Y, lib.library_spec())
-    err = np.max(np.abs(Th_np - Th_t))
-    grav = Th_np[:, lib.term_names().index("gravity")]
-    print(f"  {name:<10} cols={Th_np.shape[1]}  max|numpy-torch|={err:.3e}  "
-          f"gravity range=[{grav.min():+.3f},{grav.max():+.3f}]")
-    assert err < 1e-9, f"{name}: EOM numpy/torch mismatch"
-print("  PASS - EOM library paths agree\n")
+def exp(x):
+    return np.exp(x)
 
-print("=" * 78)
-print("TEST 5  h_sign default preserves legacy specs (no 'h_sign' key)")
-print("=" * 78)
-frame, ns, Y = FRAMES["geodesic5"]
-lib = PhysicsInformedLibrary(state_vector_len=ns, degree=2, scale_heights=(5000.0,),
-                             **frame_index_map(frame, ns))
-Th_np = lib.fit_transform(Y)
-spec = lib.library_spec()
-spec.pop("h_sign")                      # simulate an old checkpoint's spec
-Th_legacy = evaluate_library_torch(Y, spec)
-print(f"  spec without h_sign -> max diff {np.max(np.abs(Th_np - Th_legacy)):.3e}")
-assert np.max(np.abs(Th_np - Th_legacy)) < 1e-9
-print("  PASS - backward compatible\n")
 
-print("=" * 78)
-print("TEST 6  index map is self-consistent with each frame's velocity channels")
-print("=" * 78)
-expect = {
-    ("geodesic", 5): dict(h_idx=1, vs_idx=2, va_idx=3, vh_idx=4, h_sign=1.0),
-    ("geodesic", 6): dict(h_idx=2, vs_idx=3, va_idx=4, vh_idx=5, h_sign=1.0),
-    ("grdth",    5): dict(h_idx=1, vs_idx=2, va_idx=4, vh_idx=3, h_sign=-1.0),
-    ("dcu",      6): dict(h_idx=2, vs_idx=3, va_idx=4, vh_idx=5, h_sign=1.0),
-}
-for (fr, ns), want in expect.items():
-    got = frame_index_map(fr, ns)
-    status = "ok" if got == want else "MISMATCH"
-    print(f"  {fr:<9}({ns}) -> {got}  [{status}]")
-    assert got == want
-# every index must be inside the state vector, and distinct
-for (fr, ns), want in expect.items():
-    idxs = [want[k] for k in ("h_idx", "vs_idx", "va_idx", "vh_idx")]
-    assert all(0 <= i < ns for i in idxs), f"{fr}: index out of range"
-    assert len(set(idxs)) == 4, f"{fr}: duplicate index"
-print("  PASS - all indices in range and distinct\n")
+def clamp(x, min=None, max=None):
+    return np.clip(x, min, max)
 
-print("ALL TESTS PASSED")
+
+def cat(cols, dim=-1):
+    return np.concatenate(cols, axis=dim)

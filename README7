@@ -1,44 +1,117 @@
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 \
-  --sindy-l1-threshold 0.005 \
-  -o model_outputs/SBI/eom_win75_screen_l1p005/GEODESIC/glide --sindy-only
+Hey Mo, so for my candidate library, the PySINDy PolynomialLibrary algorithmically generates all polynomial combinations up to the specified degree. I was using degree 2. We should probably be able to get better results creating the library of candidate terms by hand or at least supplementing it since we have domain knowledge and know many of the terms that would be important
+ 
+for example:
+ 
+ 
+Example: Custom library with specific physics terms
+from pysindy.feature_library import CustomLibrary
+def custom_features(x):
+    """
+    x has shape (n_samples, 9) where:
+    x[:, 0:6] = state [d, c, u, vd, vc, vu]
+    x[:, 6:9] = control [u0, u1, u2]
+    """
+    d, c, u, vd, vc, vu = x[:, 0], x[:, 1], x[:, 2], x[:, 3], x[:, 4], x[:, 5]
+    u0, u1, u2 = x[:, 6], x[:, 7], x[:, 8]
+    # Only include physically meaningful terms
+    features = [
+        np.ones_like(d),           # Bias
+        vd, vc, vu,                # Velocities (for position derivatives)
+        u0, u1, u2,                # Controls (for acceleration)
+        d**2 + c**2 + u**2,        # Radial distance squared
+        vd**2 + vc**2 + vu**2,     # Speed squared
+        d*vd + c*vc + u*vu,        # Radial velocity
+    ]
+    return np.column_stack(features)
+library = CustomLibrary(
+    library_functions=[custom_features],
+    function_names=[
+        lambda x: ['1', 'vd', 'vc', 'vu', 'u0', 'u1', 'u2', 
+                   'r²', 'v²', 'r·v']
+    ]
+)
+ 
+Here is an example of the file I generate with the optimized equations:
+equations.txt
+ 
+Another thing I'm realizing is that APHYNITY is co-learning the physics parameters with the neural net learning the residuals
+ 
+So we can use SINDY to find the most salient candidate terms, then make their coefficients tuneable when we throw it over the fence to APHYNITY
 
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 \
-  --sindy-l1-threshold 0.01 \
-  -o model_outputs/SBI/eom_win75_screen_l1p01/GEODESIC/glide --sindy-only
+===========================
 
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 \
-  --sindy-l1-threshold 0.05 \
-  -o model_outputs/SBI/eom_win75_screen_l1p05/GEODESIC/glide --sindy-only
+================================================================================GLIDE PHASE SINDY EQUATIONS================================================================================
+d(x)/dt = -5.377669e-02 * 1 + 9.999739e-01 * vx
+d(y)/dt = 9.999577e-01 * vy
+d(z)/dt = 9.999805e-01 * vz
+d(vx)/dt = 9.207813e-01 * u0
+d(vy)/dt = 7.643243e+00 * 1 + 1.012395e+00 * u1
+d(vz)/dt = -5.570859e+00 * 1 + 1.021355e+00 * u2
 
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 \
-  --sindy-l1-threshold 0.1 \
-  -o model_outputs/SBI/eom_win75_screen_l1p1/GEODESIC/glide --sindy-only
+Summary:
+  Total non-zero terms: 9
+  Total possible terms: 330
+  Sparsity: 2.7%
+  Coefficient matrix shape: (6, 55)
 
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 \
-  --sindy-l1-threshold 0.2 \
-  -o model_outputs/SBI/eom_win75_screen_l1p2/GEODESIC/glide --sindy-only
+Coefficient Matrix:
+[[-0.05377669  0.          0.          0.          0.99997395  0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]
+ [ 0.          0.          0.          0.          0.          0.99995769
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]
+ [ 0.          0.          0.          0.          0.          0.
+   0.99998045  0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]
+ [ 0.          0.          0.          0.          0.          0.
+   0.          0.92078131  0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]
+ [ 7.64324277  0.          0.          0.          0.          0.
+   0.          0.          1.01239503  0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]
+ [-5.57085894  0.          0.          0.          0.          0.
+   0.          0.          0.          1.02135458  0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.          0.          0.          0.          0.          0.
+   0.        ]]

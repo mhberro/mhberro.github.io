@@ -93,3 +93,382 @@ dv_h/dt = - 0.0453624*1 [ip=1.00] + 0.022954*curv_vs2 [ip=1.00] + 0.0224582*aero
 [--sindy-only] Discovery complete; skipping model training.
 
 ==========================
+
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --sr 100000000 --frame geodesic --geodesic-mode integrated \
+  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
+  --window-size 75 --window-stride 5 --augment-segments 1 \
+  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
+  --sindy-library eom --sindy-scale-heights 5000 \
+  --sindy-l1-threshold 0.01 \
+  -o model_outputs/SBI/eom_win75_screen_l1p01/GEODESIC/glide --sindy-only
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-0.00248942  0.         -0.0012939   0.00361331 -0.04535456]
+ [ 0.00239314  0.         -0.00903785 -0.00408096 -0.00768549]
+ [-0.00561191  0.         -0.00437837 -0.00635607  0.02295404]
+ [ 0.          0.         -0.00838291  0.00623119  0.0224582 ]
+ [ 0.          0.         -0.0035802  -0.00108164 -0.01459275]
+ [ 0.          0.          0.02014075 -0.00788538  0.00057893]
+ [ 0.          0.02144403 -0.0024854   0.00066438 -0.00438758]
+ [ 0.          0.          0.          0.00640564 -0.00132343]]
+[SINDy] active terms: 27/40 | max|coef| per target: [0.00561 0.02144 0.02014 0.00789 0.04535]
+[SINDy] R2 per target: [0.994  1.     0.4609 0.0984 0.2755]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2783 | max relative term contribution 1.1950
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2783 perTarget=[0.994, 1.0, 0.461, 0.098, 0.276]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5399 coef=-5.612e-03 ip=1.00
+          ds/dt     1                  contrib=0.2395 coef=-2.489e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2302 coef=+2.393e-03 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.1950 coef=+2.014e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.5362 coef=-9.038e-03 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.4974 coef=-8.383e-03 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.2598 coef=-4.378e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.3741 coef=-7.885e-03 ip=1.00
+          dv_al/dt  v_al               contrib=0.3039 coef=+6.406e-03 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3015 coef=-6.356e-03 ip=1.00
+          dv_al/dt  aero_along@H=5000  contrib=0.2956 coef=+6.231e-03 ip=1.00
+          dv_h/dt   1                  contrib=1.1787 coef=-4.535e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5965 coef=+2.295e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.5837 coef=+2.246e-02 ip=1.00
+          dv_h/dt   aero_vert@H=5000   contrib=0.3769 coef=-1.459e-02 ip=1.00
+
+=== DISCOVERED SINDy EQUATIONS ===
+ds/dt = - 0.00561191*curv_vs2 [ip=1.00] - 0.00248942*1 [ip=1.00] + 0.00239314*gravity [ip=1.00]
+dh/dt = 0.021444*v_h [ip=1.00]
+dv_s/dt = 0.0201407*aero_q@H=5000 [ip=1.00] - 0.00903785*gravity [ip=1.00] - 0.00838291*aero_along@H=5000 [ip=1.00] - 0.00437837*curv_vs2 [ip=1.00] - 0.0035802*aero_vert@H=5000 [ip=1.00] - 0.0024854*v_h [ip=1.00] - 0.0012939*1 [ip=1.00]
+dv_al/dt = - 0.00788538*aero_q@H=5000 [ip=1.00] + 0.00640564*v_al [ip=1.00] - 0.00635607*curv_vs2 [ip=1.00] + 0.00623119*aero_along@H=5000 [ip=1.00] - 0.00408096*gravity [ip=1.00] + 0.00361331*1 [ip=1.00] - 0.00108164*aero_vert@H=5000 [ip=0.96] + 0.000664377*v_h [ip=0.96]
+dv_h/dt = - 0.0453546*1 [ip=1.00] + 0.022954*curv_vs2 [ip=1.00] + 0.0224582*aero_along@H=5000 [ip=1.00] - 0.0145927*aero_vert@H=5000 [ip=1.00] - 0.00768549*gravity [ip=1.00] - 0.00438758*v_h [ip=1.00] - 0.00132343*v_al [ip=0.96] + 0.000578933*aero_q@H=5000 [ip=0.92]
+
+[SINDy] equations written to: model_outputs/SBI/eom_win75_screen_l1p01/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
+
+[pure-SINDy rollout — train]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  train_0                         251    251     34154.5     29551.9     64724.7
+  train_1                         324    324     47493.5    140913.0    140913.0
+  train_2                         465    465    110223.9    446842.7    446842.7
+  train_3                         181    181     18947.2     12141.8     33909.1
+  train_4                         383    383     56807.5    176320.6    176320.6
+  train_5                          95     95     14055.1     18288.8     23252.0
+  train_6                         166    166     34580.7     66883.3     66883.3
+  train_7                          97     97     17837.8     34471.0     34795.8
+  train_8                         181    181     19424.2      8977.3     32259.6
+  train_9                         210    210     49230.3     99553.6     99553.6
+  train_10                        121    121     16623.2     25900.7     26732.1
+  train_11                        102    102     18243.8     29618.9     33161.8
+  train_12                        451    451     90217.3    322064.7    322064.7
+  train_13                        212    212     52179.3     95232.7     95232.7
+  train_14                        208    208     44392.9     84477.3     84477.3
+  train_15                        217    217     55676.1    123637.1    123637.1
+  train_16                        117    117     14100.9     18264.8     23320.1
+  train_17                        333    333     52569.7     40276.6     82992.3
+  train_18                        272    272     31221.3     35187.0     58545.0
+  train_19                        221    221     26262.7     59542.2     59542.2
+  train_20                        444    444     80493.6    250831.6    250831.6
+  train_21                        262    262     32202.5     98199.9     98199.9
+  SUMMARY: mean=41679.0 m | median=34367.6 m | worst=110223.9 m | diverged 0/22
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[pure-SINDy rollout — validation]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  validation_0                    130    130     28028.7     54730.8     54730.8
+  validation_1                    123    123     20823.0     44453.3     44453.3
+  validation_2                    179    179     20409.8     49982.2     49982.2
+  validation_3                    150    150     28683.6     49280.0     50055.7
+  validation_4                    144    144     30662.3     73315.5     73315.5
+  validation_5                    287    287     63051.0    218124.9    218124.9
+  SUMMARY: mean=31943.1 m | median=28356.1 m | worst=63051.0 m | diverged 0/6
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[--sindy-only] Discovery complete; skipping model training.
+
+=============================
+
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --sr 100000000 --frame geodesic --geodesic-mode integrated \
+  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
+  --window-size 75 --window-stride 5 --augment-segments 1 \
+  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
+  --sindy-library eom --sindy-scale-heights 5000 \
+  --sindy-l1-threshold 0.05 \
+  -o model_outputs/SBI/eom_win75_screen_l1p05/GEODESIC/glide --sindy-only
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-0.00248942  0.         -0.0012939   0.00371281 -0.04535456]
+ [ 0.00239314  0.         -0.00900466 -0.00417572 -0.00768549]
+ [-0.00561191  0.         -0.00435013 -0.0067048   0.02295404]
+ [ 0.          0.         -0.00837627  0.00613578  0.02251908]
+ [ 0.          0.         -0.00357231 -0.00120045 -0.0146018 ]
+ [ 0.          0.          0.02014503 -0.00770598  0.        ]
+ [ 0.          0.02144403 -0.00248734  0.         -0.00439548]
+ [ 0.          0.          0.          0.00641379 -0.00132346]]
+[SINDy] active terms: 25/40 | max|coef| per target: [0.00561 0.02144 0.02015 0.00771 0.04535]
+[SINDy] R2 per target: [0.994  1.     0.4609 0.0978 0.2749]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2779 | max relative term contribution 1.1952
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2779 perTarget=[0.994, 1.0, 0.461, 0.098, 0.275]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5399 coef=-5.612e-03 ip=1.00
+          ds/dt     1                  contrib=0.2395 coef=-2.489e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2302 coef=+2.393e-03 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.1952 coef=+2.015e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.5343 coef=-9.005e-03 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.4970 coef=-8.376e-03 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.2581 coef=-4.350e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.3655 coef=-7.706e-03 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3181 coef=-6.705e-03 ip=1.00
+          dv_al/dt  v_al               contrib=0.3043 coef=+6.414e-03 ip=1.00
+          dv_al/dt  aero_along@H=5000  contrib=0.2911 coef=+6.136e-03 ip=0.98
+          dv_h/dt   1                  contrib=1.1787 coef=-4.535e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5965 coef=+2.295e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.5852 coef=+2.252e-02 ip=1.00
+          dv_h/dt   aero_vert@H=5000   contrib=0.3771 coef=-1.460e-02 ip=1.00
+
+=== DISCOVERED SINDy EQUATIONS ===
+ds/dt = - 0.00561191*curv_vs2 [ip=1.00] - 0.00248942*1 [ip=1.00] + 0.00239314*gravity [ip=1.00]
+dh/dt = 0.021444*v_h [ip=1.00]
+dv_s/dt = 0.020145*aero_q@H=5000 [ip=1.00] - 0.00900466*gravity [ip=1.00] - 0.00837627*aero_along@H=5000 [ip=1.00] - 0.00435013*curv_vs2 [ip=1.00] - 0.00357231*aero_vert@H=5000 [ip=1.00] - 0.00248734*v_h [ip=1.00] - 0.0012939*1 [ip=0.90]
+dv_al/dt = - 0.00770598*aero_q@H=5000 [ip=1.00] - 0.0067048*curv_vs2 [ip=1.00] + 0.00641379*v_al [ip=1.00] + 0.00613578*aero_along@H=5000 [ip=0.98] - 0.00417572*gravity [ip=1.00] + 0.00371281*1 [ip=1.00] - 0.00120045*aero_vert@H=5000 [ip=0.70]
+dv_h/dt = - 0.0453546*1 [ip=1.00] + 0.022954*curv_vs2 [ip=1.00] + 0.0225191*aero_along@H=5000 [ip=1.00] - 0.0146018*aero_vert@H=5000 [ip=1.00] - 0.00768549*gravity [ip=1.00] - 0.00439548*v_h [ip=1.00] - 0.00132346*v_al [ip=0.84]
+
+[SINDy] equations written to: model_outputs/SBI/eom_win75_screen_l1p05/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
+
+[pure-SINDy rollout — train]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  train_0                         251    251     34184.7     29606.3     64757.0
+  train_1                         324    324     50006.9    159461.3    159461.3
+  train_2                         465    465    122894.5    496825.8    496825.8
+  train_3                         181    181     19090.8     14704.7     33898.7
+  train_4                         383    383     59972.9    199733.4    199733.4
+  train_5                          95     95     14046.1     18243.7     23234.4
+  train_6                         166    166     34576.2     66907.1     66907.1
+  train_7                          97     97     17832.9     34445.3     34776.0
+  train_8                         181    181     19807.6     13555.9     32244.9
+  train_9                         210    210     49438.0    100268.0    100268.0
+  train_10                        121    121     16623.1     26033.1     26714.4
+  train_11                        102    102     18237.2     29585.0     33145.0
+  train_12                        451    451    100439.2    366640.3    366640.3
+  train_13                        212    212     52452.0     96331.7     96331.7
+  train_14                        208    208     44528.7     84904.3     84904.3
+  train_15                        217    217     56021.6    125041.4    125041.4
+  train_16                        117    117     14089.2     18282.0     23304.0
+  train_17                        333    333     52935.3     35914.0     83572.5
+  train_18                        272    272     31479.5     30324.4     58554.4
+  train_19                        221    221     26684.8     56406.2     56406.2
+  train_20                        444    444     88140.7    288486.9    288486.9
+  train_21                        262    262     32808.8    102752.0    102752.0
+  SUMMARY: mean=43467.8 m | median=34380.5 m | worst=122894.5 m | diverged 0/22
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[pure-SINDy rollout — validation]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  validation_0                    130    130     28037.3     54758.1     54758.1
+  validation_1                    123    123     20838.0     44505.4     44505.4
+  validation_2                    179    179     21021.7     46898.7     46898.7
+  validation_3                    150    150     28684.4     49379.4     50113.9
+  validation_4                    144    144     30724.2     73568.2     73568.2
+  validation_5                    287    287     67607.6    240830.3    240830.3
+  SUMMARY: mean=32818.9 m | median=28360.8 m | worst=67607.6 m | diverged 0/6
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[--sindy-only] Discovery complete; skipping model training.
+
+============================
+
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --sr 100000000 --frame geodesic --geodesic-mode integrated \
+  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
+  --window-size 75 --window-stride 5 --augment-segments 1 \
+  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
+  --sindy-library eom --sindy-scale-heights 5000 \
+  --sindy-l1-threshold 0.1 \
+  -o model_outputs/SBI/eom_win75_screen_l1p1/GEODESIC/glide --sindy-only
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-0.00248942  0.          0.          0.00394169 -0.04535456]
+ [ 0.00239314  0.         -0.0084516  -0.0043616  -0.00771011]
+ [-0.00561191  0.         -0.00438389 -0.00716378  0.02286748]
+ [ 0.          0.         -0.00837627  0.00648294  0.02276176]
+ [ 0.          0.         -0.00357557  0.         -0.0146018 ]
+ [ 0.          0.          0.02016438 -0.00792125  0.        ]
+ [ 0.          0.02144403 -0.00248734  0.         -0.00440736]
+ [ 0.          0.          0.          0.00642032  0.        ]]
+[SINDy] active terms: 22/40 | max|coef| per target: [0.00561 0.02144 0.02016 0.00792 0.04535]
+[SINDy] R2 per target: [0.994  1.     0.4565 0.0936 0.2739]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2747 | max relative term contribution 1.1964
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2747 perTarget=[0.994, 1.0, 0.456, 0.094, 0.274]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5399 coef=-5.612e-03 ip=1.00
+          ds/dt     1                  contrib=0.2395 coef=-2.489e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2302 coef=+2.393e-03 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.1964 coef=+2.016e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.5014 coef=-8.452e-03 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.4970 coef=-8.376e-03 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.2601 coef=-4.384e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.3758 coef=-7.921e-03 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3398 coef=-7.164e-03 ip=1.00
+          dv_al/dt  aero_along@H=5000  contrib=0.3075 coef=+6.483e-03 ip=0.96
+          dv_al/dt  v_al               contrib=0.3046 coef=+6.420e-03 ip=1.00
+          dv_h/dt   1                  contrib=1.1787 coef=-4.535e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5943 coef=+2.287e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.5915 coef=+2.276e-02 ip=1.00
+          dv_h/dt   aero_vert@H=5000   contrib=0.3771 coef=-1.460e-02 ip=1.00
+
+=== DISCOVERED SINDy EQUATIONS ===
+ds/dt = - 0.00561191*curv_vs2 [ip=1.00] - 0.00248942*1 [ip=1.00] + 0.00239314*gravity [ip=1.00]
+dh/dt = 0.021444*v_h [ip=1.00]
+dv_s/dt = 0.0201644*aero_q@H=5000 [ip=1.00] - 0.0084516*gravity [ip=1.00] - 0.00837627*aero_along@H=5000 [ip=1.00] - 0.00438389*curv_vs2 [ip=1.00] - 0.00357557*aero_vert@H=5000 [ip=1.00] - 0.00248734*v_h [ip=1.00]
+dv_al/dt = - 0.00792125*aero_q@H=5000 [ip=1.00] - 0.00716378*curv_vs2 [ip=1.00] + 0.00648294*aero_along@H=5000 [ip=0.96] + 0.00642032*v_al [ip=1.00] - 0.0043616*gravity [ip=1.00] + 0.00394169*1 [ip=1.00]
+dv_h/dt = - 0.0453546*1 [ip=1.00] + 0.0228675*curv_vs2 [ip=1.00] + 0.0227618*aero_along@H=5000 [ip=1.00] - 0.0146018*aero_vert@H=5000 [ip=1.00] - 0.00771011*gravity [ip=1.00] - 0.00440736*v_h [ip=1.00]
+
+[SINDy] equations written to: model_outputs/SBI/eom_win75_screen_l1p1/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
+
+[pure-SINDy rollout — train]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  train_0                         251    251     30666.8     16422.4     63916.8
+  train_1                         324    324     58788.8    207620.7    207620.7
+  train_2                         465    465    154077.4    677282.5    677282.5
+  train_3                         181    181     18418.0     16433.1     33870.8
+  train_4                         383    383     69591.7    255832.7    255832.7
+  train_5                          95     95     13944.6     18045.6     23048.3
+  train_6                         166    166     34130.1     65229.5     65229.5
+  train_7                          97     97     17555.0     33632.5     34074.0
+  train_8                         181    181     19517.1     24550.8     31149.8
+  train_9                         210    210     48782.0     95406.4     95406.4
+  train_10                        121    121     15545.5     23668.4     25233.3
+  train_11                        102    102     18304.2     29770.2     33307.9
+  train_12                        451    451    124038.9    512867.5    512867.5
+  train_13                        212    212     51741.8     92573.1     92702.9
+  train_14                        208    208     40245.0     70993.1     70993.1
+  train_15                        217    217     54521.2    119557.8    119557.8
+  train_16                        117    117     13103.3     16129.2     22224.1
+  train_17                        333    333     42343.4     41273.6     71284.1
+  train_18                        272    272     30392.9     49194.5     58384.7
+  train_19                        221    221     27614.5     79547.2     79547.2
+  train_20                        444    444    103842.3    360669.2    360669.2
+  train_21                        262    262     33582.7    114540.0    114540.0
+  SUMMARY: mean=46397.6 m | median=33856.4 m | worst=154077.4 m | diverged 0/22
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[pure-SINDy rollout — validation]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  validation_0                    130    130     27980.5     54473.2     54473.2
+  validation_1                    123    123     21030.0     44165.6     44165.6
+  validation_2                    179    179     20597.3     50420.8     50420.8
+  validation_3                    150    150     26637.9     42345.3     45093.6
+  validation_4                    144    144     30162.6     71547.7     71547.7
+  validation_5                    287    287     72101.9    260056.3    260056.3
+  SUMMARY: mean=33085.0 m | median=27309.2 m | worst=72101.9 m | diverged 0/6
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[--sindy-only] Discovery complete; skipping model training.
+
+======================
+
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --sr 100000000 --frame geodesic --geodesic-mode integrated \
+  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
+  --window-size 75 --window-stride 5 --augment-segments 1 \
+  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
+  --sindy-library eom --sindy-scale-heights 5000 \
+  --sindy-l1-threshold 0.2 \
+  -o model_outputs/SBI/eom_win75_screen_l1p2/GEODESIC/glide --sindy-only
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[ 0.          0.          0.          0.00378214 -0.04519423]
+ [ 0.          0.         -0.0040913  -0.00463388 -0.00806425]
+ [-0.01029425  0.          0.         -0.00713145  0.02224448]
+ [ 0.          0.         -0.00625004  0.00669671  0.0233333 ]
+ [ 0.          0.          0.          0.         -0.01463159]
+ [ 0.          0.          0.01670717 -0.0089967   0.        ]
+ [ 0.          0.02144403  0.          0.         -0.0045416 ]
+ [ 0.          0.          0.          0.00640687  0.        ]]
+[SINDy] active terms: 17/40 | max|coef| per target: [0.01029 0.02144 0.01671 0.009   0.04519]
+[SINDy] R2 per target: [0.2427 1.     0.4144 0.0954 0.2743]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2614 | max relative term contribution 1.1745
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2614 perTarget=[0.243, 1.0, 0.414, 0.095, 0.274]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.9903 coef=-1.029e-02 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=0.9912 coef=+1.671e-02 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.3708 coef=-6.250e-03 ip=0.98
+          dv_s/dt   gravity            contrib=0.2427 coef=-4.091e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.4268 coef=-8.997e-03 ip=0.98
+          dv_al/dt  curv_vs2           contrib=0.3383 coef=-7.131e-03 ip=1.00
+          dv_al/dt  aero_along@H=5000  contrib=0.3177 coef=+6.697e-03 ip=0.90
+          dv_al/dt  v_al               contrib=0.3039 coef=+6.407e-03 ip=1.00
+          dv_h/dt   1                  contrib=1.1745 coef=-4.519e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.6064 coef=+2.333e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5781 coef=+2.224e-02 ip=1.00
+          dv_h/dt   aero_vert@H=5000   contrib=0.3779 coef=-1.463e-02 ip=1.00
+
+=== DISCOVERED SINDy EQUATIONS ===
+ds/dt = - 0.0102942*curv_vs2 [ip=1.00]
+dh/dt = 0.021444*v_h [ip=1.00]
+dv_s/dt = 0.0167072*aero_q@H=5000 [ip=1.00] - 0.00625004*aero_along@H=5000 [ip=0.98] - 0.0040913*gravity [ip=1.00]
+dv_al/dt = - 0.0089967*aero_q@H=5000 [ip=0.98] - 0.00713145*curv_vs2 [ip=1.00] + 0.00669671*aero_along@H=5000 [ip=0.90] + 0.00640687*v_al [ip=1.00] - 0.00463388*gravity [ip=0.96] + 0.00378214*1 [ip=0.76]
+dv_h/dt = - 0.0451942*1 [ip=1.00] + 0.0233333*aero_along@H=5000 [ip=1.00] + 0.0222445*curv_vs2 [ip=1.00] - 0.0146316*aero_vert@H=5000 [ip=1.00] - 0.00806425*gravity [ip=1.00] - 0.0045416*v_h [ip=1.00]
+
+[SINDy] equations written to: model_outputs/SBI/eom_win75_screen_l1p2/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
+
+[pure-SINDy rollout — train]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  train_0                         251    251     29419.3     14279.0     62736.5
+  train_1                         324    324     49574.2    147522.4    147522.4
+  train_2                         465    465    110674.0    446618.5    446618.5
+  train_3                         181    181     19698.0      9749.1     34046.9
+  train_4                         383    383     62043.4    203163.2    203163.2
+  train_5                          95     95     14103.2     18480.1     23321.2
+  train_6                         166    166     37332.8     77039.8     77039.8
+  train_7                          97     97     17589.0     33766.0     34155.7
+  train_8                         181    181     20348.6     11237.1     31832.7
+  train_9                         210    210     41849.0     67855.7     73259.1
+  train_10                        121    121     18239.1     30615.2     30676.4
+  train_11                        102    102     18384.9     30206.0     33475.9
+  train_12                        451    451     90987.3    320196.5    320196.5
+  train_13                        212    212     47885.4     77340.2     83812.5
+  train_14                        208    208     34331.2     53755.5     53925.8
+  train_15                        217    217     51489.9    109516.9    109516.9
+  train_16                        117    117     15278.0     23611.6     23611.6
+  train_17                        333    333     39689.8     64916.1     69441.0
+  train_18                        272    272     30237.6     51873.3     57730.9
+  train_19                        221    221     27610.5     63886.5     63886.5
+  train_20                        444    444     84249.1    257953.5    257953.5
+  train_21                        262    262     31816.3     93004.9     93004.9
+  SUMMARY: mean=40583.2 m | median=33073.8 m | worst=110674.0 m | diverged 0/22
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[pure-SINDy rollout — validation]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  validation_0                    130    130     27508.5     53205.2     53332.2
+  validation_1                    123    123     19631.8     39408.1     39408.1
+  validation_2                    179    179     20321.2     43531.2     43531.2
+  validation_3                    150    150     30582.6     52297.2     54963.9
+  validation_4                    144    144     28968.3     67364.6     67364.6
+  validation_5                    287    287     59097.4    197450.4    197450.4
+  SUMMARY: mean=31018.3 m | median=28238.4 m | worst=59097.4 m | diverged 0/6
+  (in-plane geodesic error: range + altitude; excludes cross-range)
+
+[--sindy-only] Discovery complete; skipping model training.

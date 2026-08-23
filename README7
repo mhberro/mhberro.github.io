@@ -1,117 +1,365 @@
-Hey Mo, so for my candidate library, the PySINDy PolynomialLibrary algorithmically generates all polynomial combinations up to the specified degree. I was using degree 2. We should probably be able to get better results creating the library of candidate terms by hand or at least supplementing it since we have domain knowledge and know many of the terms that would be important
- 
-for example:
- 
- 
-Example: Custom library with specific physics terms
-from pysindy.feature_library import CustomLibrary
-def custom_features(x):
-    """
-    x has shape (n_samples, 9) where:
-    x[:, 0:6] = state [d, c, u, vd, vc, vu]
-    x[:, 6:9] = control [u0, u1, u2]
-    """
-    d, c, u, vd, vc, vu = x[:, 0], x[:, 1], x[:, 2], x[:, 3], x[:, 4], x[:, 5]
-    u0, u1, u2 = x[:, 6], x[:, 7], x[:, 8]
-    # Only include physically meaningful terms
-    features = [
-        np.ones_like(d),           # Bias
-        vd, vc, vu,                # Velocities (for position derivatives)
-        u0, u1, u2,                # Controls (for acceleration)
-        d**2 + c**2 + u**2,        # Radial distance squared
-        vd**2 + vc**2 + vu**2,     # Speed squared
-        d*vd + c*vc + u*vu,        # Radial velocity
-    ]
-    return np.column_stack(features)
-library = CustomLibrary(
-    library_functions=[custom_features],
-    function_names=[
-        lambda x: ['1', 'vd', 'vc', 'vu', 'u0', 'u1', 'u2', 
-                   'r²', 'v²', 'r·v']
-    ]
-)
- 
-Here is an example of the file I generate with the optimized equations:
-equations.txt
- 
-Another thing I'm realizing is that APHYNITY is co-learning the physics parameters with the neural net learning the residuals
- 
-So we can use SINDY to find the most salient candidate terms, then make their coefficients tuneable when we throw it over the fence to APHYNITY
+#!/usr/bin/env python3
+# diagnose_grdth_singularity.py
+"""Quantify the 1/GR polar-coordinate singularity in the grdth frame, on REAL data.
 
-===========================
+Why this exists
+---------------
+grdth produces the best teacher-forced/windowed metrics in the project
+(val_pos_err ~50 m) and simultaneously the worst free-rollout behaviour
+(divergence on 25-35% of trajectories, outliers at 1e5-1e7 m). Code inspection
+says this is NOT a model-wiring bug: the second-order kinematic override
+(pos_idx=[0,1], vel_idx=[2,3]) is exact, since d(GR)/dt == GRdot and
+d(Down)/dt == Downdot hold identically in this frame.
 
-================================================================================GLIDE PHASE SINDY EQUATIONS================================================================================
-d(x)/dt = -5.377669e-02 * 1 + 9.999739e-01 * vx
-d(y)/dt = 9.999577e-01 * vy
-d(z)/dt = 9.999805e-01 * vz
-d(vx)/dt = 9.207813e-01 * u0
-d(vy)/dt = 7.643243e+00 * 1 + 1.012395e+00 * u1
-d(vz)/dt = -5.570859e+00 * 1 + 1.021355e+00 * u2
+The proposed explanation is geometric. grdth is a POLAR frame whose origin is the
+impact point, so ground range GR -> 0 at the end of every flight. In polar
+coordinates the true vector field contains
 
-Summary:
-  Total non-zero terms: 9
-  Total possible terms: 330
-  Sparsity: 2.7%
-  Coefficient matrix shape: (6, 55)
+    dv_r/dt   = V_th^2 / GR        + a_radial        <- centripetal
+    dV_th/dt  = -v_r * V_th / GR   + a_tangential    <- Coriolis
 
-Coefficient Matrix:
-[[-0.05377669  0.          0.          0.          0.99997395  0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]
- [ 0.          0.          0.          0.          0.          0.99995769
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]
- [ 0.          0.          0.          0.          0.          0.
-   0.99998045  0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]
- [ 0.          0.          0.          0.          0.          0.
-   0.          0.92078131  0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]
- [ 7.64324277  0.          0.          0.          0.          0.
-   0.          0.          1.01239503  0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]
- [-5.57085894  0.          0.          0.          0.          0.
-   0.          0.          0.          1.02135458  0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.          0.          0.          0.          0.          0.
-   0.        ]]
+Both are RATIONAL in the state (they contain 1/GR). No column in the polynomial,
+`physics`, or `eom` libraries can represent 1/GR. Over a 75-step window GR is
+nearly constant, so a polynomial absorbs the term and one-step R^2 looks superb;
+over a 500-step free rollout GR sweeps over decades and the same fitted terms
+extrapolate catastrophically.
+
+What this script measures
+-------------------------
+For each trajectory, in the grdth frame:
+
+  1. GR range and min(GR)          -> how close does the flight get to the pole?
+  2. dynamic range of 1/GR         -> how far outside any local fit does it travel?
+  3. FICTITIOUS FRACTION:
+         |V_th^2/GR|      / |dv_r/dt|
+         |v_r*V_th/GR|    / |dV_th/dt|
+     i.e. what share of the acceleration the model must predict is a pure
+     coordinate artifact rather than aerodynamics.
+  4. steps spent inside a "near-pole" radius.
+
+It then does the same for the geodesic-integrated frame where available, so the
+two can be compared directly, and prints a verdict.
+
+VERDICT CRITERIA (printed automatically)
+  CONFIRMED  if median fictitious fraction is order 1 (>0.5) OR min(GR) is small
+             (< 50 km) on a meaningful number of trajectories.
+  This would mean grdth's acceleration channels are dominated by an
+  unrepresentable 1/GR term, which fully explains the fit-vs-rollout inversion.
+
+Usage
+-----
+    python diagnose_grdth_singularity.py \
+        --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+        --dt 1 --sr 100000000
+
+    # match whatever --ref-ecef the training run used (default: impact)
+    python diagnose_grdth_singularity.py ... --ref-ecef glide
+
+Run it from the same directory as NEXT_training.py so the project imports resolve.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+import numpy as np
+
+try:
+    from scipy.interpolate import make_interp_spline
+except Exception as exc:  # pragma: no cover
+    sys.exit(f"scipy is required: {exc}")
+
+# --- project imports (run from the NEXT_training.py directory) ---------------
+try:
+    from load_truth import load_single_truth
+    from trajectory_helpers import (
+        TIME_INDEX, POS_SLICE, VEL_SLICE,
+        GR_INDEX, DOWN_INDEX, GR_DOT_INDEX, DOWN_DOT_INDEX, THETA_DOT_INDEX,
+    )
+    from NEXT_frame import ecef_to_next_grdth
+except Exception as exc:  # pragma: no cover
+    sys.exit(f"Could not import project modules (run from the NEXT_training.py dir): {exc}")
+
+# geodesic is optional -- only needed for the side-by-side comparison
+_HAVE_GEO = True
+try:
+    from NEXT_geodesic_frame import ecef_to_local_geodesic_vec
+except Exception:
+    try:
+        from NEXT_frame import ecef_to_local_geodesic_vec  # type: ignore
+    except Exception:
+        _HAVE_GEO = False
+
+
+# --------------------------------------------------------------------- helpers
+
+def _resample(ecef, dt):
+    """Mirror prep_trajectory's spline resampling onto a uniform dt grid."""
+    new_times = np.arange(ecef[0, 0], ecef[-1, 0] + dt, dt)
+    vals = make_interp_spline(ecef[:, 0], ecef[:, 1:], bc_type="not-a-knot")(
+        new_times, extrapolate=True
+    )
+    return np.hstack([np.atleast_2d(new_times).T, vals])
+
+
+def _slant_filter(ecef, max_sr):
+    keep = [r for r in ecef if np.linalg.norm(r[POS_SLICE] - ecef[-1, POS_SLICE]) < max_sr]
+    return np.asarray(keep, dtype=np.float64) if keep else ecef
+
+
+def _safe_ratio(num, den, floor=1e-12):
+    den = np.abs(den)
+    ok = den > floor
+    out = np.full_like(num, np.nan, dtype=float)
+    out[ok] = np.abs(num[ok]) / den[ok]
+    return out
+
+
+def _pct(x, q):
+    x = x[np.isfinite(x)]
+    return float(np.percentile(x, q)) if x.size else float("nan")
+
+
+def load_phase(target_path: Path, phase: str):
+    phase_path = target_path / phase
+    files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
+    min_ts = 1 if phase == "impact" else 3
+    out = []
+    for f in files:
+        out.append(
+            load_single_truth(f, debug=False, min_state_vector_size=7, min_timesteps=min_ts)
+        )
+    return out, [f.name for f in files]
+
+
+# ------------------------------------------------------------------- analysis
+
+def analyse_grdth(ecef, ref_ecef, dt, near_pole_m):
+    """Return the grdth singularity diagnostics for one trajectory."""
+    g, _heading = ecef_to_next_grdth(ecef, ref_ecef)
+    g = np.atleast_2d(g)
+
+    t = g[:, TIME_INDEX]
+    GR = g[:, GR_INDEX]
+    v_r = g[:, GR_DOT_INDEX]      # d(GR)/dt
+    V_th = g[:, THETA_DOT_INDEX]  # NOTE: tangential VELOCITY (m/s), not an angular rate
+    Down = g[:, DOWN_INDEX]
+    v_d = g[:, DOWN_DOT_INDEX]
+
+    # measured accelerations the model must reproduce
+    dvr = np.gradient(v_r, t)
+    dvth = np.gradient(V_th, t)
+
+    # the two purely-geometric (fictitious) contributions
+    GRs = np.where(np.abs(GR) < 1e-9, np.nan, GR)
+    centripetal = V_th ** 2 / GRs
+    coriolis = -v_r * V_th / GRs
+
+    frac_r = _safe_ratio(centripetal, dvr)
+    frac_th = _safe_ratio(coriolis, dvth)
+
+    # sanity: the second-order override should be exact in this frame
+    ov_gr = float(np.max(np.abs(np.gradient(GR, t) - v_r)))
+    ov_dn = float(np.max(np.abs(np.gradient(Down, t) - v_d)))
+
+    inv = 1.0 / np.clip(np.abs(GRs), 1e-9, None)
+    return dict(
+        n=len(t),
+        gr_min=float(np.nanmin(GR)),
+        gr_max=float(np.nanmax(GR)),
+        gr_final=float(GR[-1]),
+        inv_dyn_range=float(np.nanmax(inv) / max(np.nanmin(inv), 1e-30)),
+        frac_r_med=_pct(frac_r, 50),
+        frac_r_p90=_pct(frac_r, 90),
+        frac_th_med=_pct(frac_th, 50),
+        centripetal_max=float(np.nanmax(np.abs(centripetal))),
+        dvr_max=float(np.nanmax(np.abs(dvr))),
+        near_pole_steps=int(np.sum(np.abs(GR) < near_pole_m)),
+        ov_gr=ov_gr,
+        ov_dn=ov_dn,
+    )
+
+
+def analyse_geodesic(ecef, ref_ecef, dt):
+    """Same idea for the geodesic-integrated frame, for comparison."""
+    state, _az = ecef_to_local_geodesic_vec(
+        ecef[:, POS_SLICE], ecef[:, VEL_SLICE], ref_ecef
+    )
+    state = np.atleast_2d(state)
+    t = ecef[:, TIME_INDEX]
+    s = state[:, 0]
+    v_s = state[:, 2]
+    v_al = state[:, 3]  # ANGULAR RATE (rad/s), not a tangential velocity
+
+    dvs = np.gradient(v_s, t)
+    # with an angular rate the centripetal term is s*omega^2 -- a MONOMIAL,
+    # inside the polynomial function class (unlike grdth's V_th^2/GR).
+    centripetal = s * v_al ** 2
+    frac = _safe_ratio(centripetal, dvs)
+    return dict(
+        n=len(t),
+        s_min=float(np.nanmin(np.abs(s))),
+        s_max=float(np.nanmax(np.abs(s))),
+        frac_med=_pct(frac, 50),
+        centripetal_max=float(np.nanmax(np.abs(centripetal))),
+    )
+
+
+# ----------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tgt-data-paths", required=True,
+                    help="Target dir containing boost/ glide/ impact/ subdirs")
+    ap.add_argument("--dt", type=float, default=1.0)
+    ap.add_argument("--sr", type=float, default=1e8, help="Slant-range cutoff (m)")
+    ap.add_argument("--ref-ecef", choices=["impact", "boost", "glide"], default="impact",
+                    help="Which phase's final position defines the frame origin "
+                         "(must match the training run; NEXT_training defaults to impact)")
+    ap.add_argument("--near-pole-m", type=float, default=50_000.0,
+                    help="Radius below which GR counts as 'near the pole'")
+    ap.add_argument("--skip-geodesic", action="store_true")
+    args = ap.parse_args()
+
+    target = Path(args.tgt_data_paths)
+    boost, _ = load_phase(target, "boost")
+    glide, names = load_phase(target, "glide")
+    impact, _ = load_phase(target, "impact")
+
+    print("=" * 100)
+    print("grdth 1/GR SINGULARITY DIAGNOSTIC")
+    print(f"  target      : {target}")
+    print(f"  frame origin: last position of the '{args.ref_ecef}' phase")
+    print(f"  trajectories: {len(glide)} glide files")
+    print("=" * 100)
+
+    rows, geo_rows = [], []
+    for i, gl in enumerate(glide):
+        name = names[i] if i < len(names) else f"traj_{i}"
+        try:
+            src = {"impact": impact, "boost": boost, "glide": glide}[args.ref_ecef][i]
+            ref_ecef = deepcopy(np.atleast_2d(src)[-1, POS_SLICE])
+
+            ecef = np.atleast_2d(gl)[:, 0:7]
+            while ecef.shape[0] and np.any(np.isclose(ecef[0, VEL_SLICE], 0)):
+                ecef = ecef[1:]
+            ecef = _slant_filter(ecef, args.sr)
+            if ecef.shape[0] < 5:
+                print(f"  [skip] {name}: too few samples")
+                continue
+            ecef = _resample(ecef, args.dt)
+
+            r = analyse_grdth(ecef, ref_ecef, args.dt, args.near_pole_m)
+            r["name"] = name
+            rows.append(r)
+
+            if _HAVE_GEO and not args.skip_geodesic:
+                try:
+                    gr_ = analyse_geodesic(ecef, ref_ecef, args.dt)
+                    gr_["name"] = name
+                    geo_rows.append(gr_)
+                except Exception as e:
+                    print(f"  [geodesic skipped for {name}: {e}]")
+        except Exception as e:
+            print(f"  [error] {name}: {e}")
+
+    if not rows:
+        sys.exit("No trajectories analysed.")
+
+    # ---------------- per-trajectory table ----------------
+    print("\n--- PER-TRAJECTORY (grdth) ---")
+    hdr = (f"  {'trajectory':<26}{'steps':>6}{'minGR_km':>10}{'finalGR_km':>11}"
+           f"{'1/GR range':>11}{'fic_r_med':>10}{'fic_r_p90':>10}{'fic_th_med':>11}"
+           f"{'nearPole':>9}")
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in sorted(rows, key=lambda x: x["gr_min"]):
+        print(f"  {r['name'][:26]:<26}{r['n']:>6}{r['gr_min']/1000:>10.1f}"
+              f"{r['gr_final']/1000:>11.1f}{r['inv_dyn_range']:>11.1f}"
+              f"{r['frac_r_med']:>10.2f}{r['frac_r_p90']:>10.2f}"
+              f"{r['frac_th_med']:>11.2f}{r['near_pole_steps']:>9}")
+
+    # ---------------- override sanity ----------------
+    max_ov = max(max(r["ov_gr"], r["ov_dn"]) for r in rows)
+    print(f"\n--- SECOND-ORDER OVERRIDE SANITY (should be ~finite-difference noise) ---")
+    print(f"  max over all trajectories of |d(pos)/dt - vel| = {max_ov:.3e} m/s")
+    print("  -> if this is small, pos_idx/vel_idx wiring is CORRECT and the problem is geometric,")
+    print("     not a model-wiring bug.")
+
+    # ---------------- aggregate ----------------
+    gr_min_all = np.array([r["gr_min"] for r in rows])
+    fic_r = np.array([r["frac_r_med"] for r in rows])
+    fic_th = np.array([r["frac_th_med"] for r in rows])
+    cmax = np.array([r["centripetal_max"] for r in rows])
+    npole = np.array([r["near_pole_steps"] for r in rows])
+    steps = np.array([r["n"] for r in rows])
+
+    print("\n--- AGGREGATE (grdth) ---")
+    print(f"  min(GR) across flights      : min {gr_min_all.min()/1000:,.1f} km | "
+          f"median {np.median(gr_min_all)/1000:,.1f} km | max {gr_min_all.max()/1000:,.1f} km")
+    print(f"  median fictitious fraction  : radial {np.nanmedian(fic_r):.2f} | "
+          f"tangential {np.nanmedian(fic_th):.2f}")
+    print(f"  peak |centripetal| term     : {np.nanmax(cmax):,.1f} m/s^2 "
+          f"({np.nanmax(cmax)/9.80665:,.1f} g)")
+    print(f"  flights entering <{args.near_pole_m/1000:,.0f} km : "
+          f"{int(np.sum(npole > 0))}/{len(rows)}")
+
+    if steps.size > 2 and np.std(npole.astype(float)) > 0:
+        c = float(np.corrcoef(steps, npole)[0, 1])
+        print(f"  corr(trajectory length, steps near pole) = {c:+.2f}"
+              "   <- positive means the LONGEST flights sit closest to the singularity,")
+        print("      which is exactly the set that diverged in the rollout screens.")
+
+    # ---------------- geodesic comparison ----------------
+    if geo_rows:
+        gfic = np.array([g["frac_med"] for g in geo_rows])
+        gsmin = np.array([g["s_min"] for g in geo_rows])
+        gcmax = np.array([g["centripetal_max"] for g in geo_rows])
+        print("\n--- COMPARISON: geodesic-integrated ---")
+        print(f"  min(s) across flights       : median {np.median(gsmin)/1000:,.1f} km")
+        print(f"  median centripetal fraction : {np.nanmedian(gfic):.2f}")
+        print(f"  peak |s*omega^2| term       : {np.nanmax(gcmax):,.3f} m/s^2")
+        print("  NOTE: geodesic stores an angular RATE (v_alpha), so its centripetal term is")
+        print("        s*omega^2 -- a MONOMIAL that a polynomial library CAN represent.")
+        print("        grdth stores a tangential VELOCITY, giving V_th^2/GR -- RATIONAL,")
+        print("        which no library column can represent. Same physics, different")
+        print("        function class. That is the core asymmetry.")
+
+    # ---------------- verdict ----------------
+    print("\n" + "=" * 100)
+    med_fic = float(np.nanmedian(np.concatenate([fic_r, fic_th])))
+    close = int(np.sum(gr_min_all < args.near_pole_m))
+    confirmed = (med_fic > 0.5) or (close >= max(1, len(rows) // 4))
+    if confirmed:
+        print("VERDICT: HYPOTHESIS CONFIRMED")
+        print(f"  Median fictitious fraction {med_fic:.2f}; {close}/{len(rows)} flights come")
+        print(f"  within {args.near_pole_m/1000:,.0f} km of the frame origin.")
+        print("  grdth's acceleration channels are substantially a 1/GR coordinate artifact")
+        print("  that the candidate libraries cannot express. This explains the inversion:")
+        print("  bounded, smooth STATE channels -> excellent windowed/teacher-forced error;")
+        print("  an unrepresentable pole in the DERIVATIVES -> free-rollout divergence.")
+        print("\n  SUGGESTED FIX (cheap to screen with --sindy-only):")
+        print("    1. Add explicit fictitious-force columns to a grdth library:")
+        print("         V_th^2/GR   and   -v_r*V_th/GR")
+        print("       with a GR floor (100-1000 m), mirroring what eom_library does for")
+        print("       gravity/drag. Linear in coefficients, so all existing machinery works.")
+        print("    2. Add a real singularity guard to ecef_to_next_grdth. It currently uses")
+        print("       np.finfo(gr.dtype).eps (~2e-16 m); geodesic uses S_EPS_M = 100.0 m.")
+        print("    3. Alternative: store omega = V_th/GR instead of V_th (the commented-out")
+        print("       'gr**2' path in ecef_to_next_grdth), making the term polynomial.")
+    else:
+        print("VERDICT: NOT CONFIRMED on this data")
+        print(f"  Median fictitious fraction {med_fic:.2f}; only {close}/{len(rows)} flights")
+        print(f"  come within {args.near_pole_m/1000:,.0f} km of the origin.")
+        print("  The 1/GR pole is NOT the dominant effect here -- look elsewhere")
+        print("  (scaler conditioning, per-channel loss weighting, or the residual).")
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    main()

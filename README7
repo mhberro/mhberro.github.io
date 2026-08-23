@@ -1,65 +1,59 @@
-# physics_library.py
-"""Physics-informed candidate library for Ensemble-SINDy on HGV glide dynamics.
+# eom_library.py
+"""Parametric Equations-of-Motion (EOM) basis for the physics backbone.
 
-Motivation
-----------
-A degree-2 polynomial library in [s, h, v_s, v_alpha, v_h] cannot express
-aerodynamic drag/lift, which scale as rho(h) * V^2 with rho(h) approximately
-exponential in altitude. Over a glide from ~108 km to ~22 km that factor spans
-about five orders of magnitude, so the least-squares projection of drag onto a
-polynomial basis is ~0 -- which is exactly what the polynomial-only discovery
-returned (all acceleration-channel coefficients at the 0.01-0.03 noise floor,
-smeared over ~20 terms, versus clean 2-term recovery on the position rows where
-the truth IS expressible).
+The idea
+--------
+SINDy exists to discover *unknown structure*. But the structure of atmospheric
+glide flight is not unknown -- it is textbook 3-DoF point-mass physics: gravity,
+aerodynamic drag along the velocity vector, aerodynamic lift perpendicular to it,
+and geometric curvature terms. What is genuinely unknown for a given threat is a
+handful of AERODYNAMIC COEFFICIENTS (C_D*A/m, C_L*A/m and their lateral analogue).
 
-E-SINDy (Fasel et al.) is explicit that the library choice "is crucial" and that
-the strategy is to start simple and increase complexity until sparse and accurate
-models emerge. This module supplies the next rung: atmosphere/drag candidates.
+Asking a sparse-regression search to rediscover Newton from ~22 noisy flights is
+badly under-determined: it invents non-physical positive-feedback terms (h*h, s*s)
+that fit one step and destroy the rollout. This module instead writes the known
+force laws down and leaves only the unknown coefficients free.
 
-Units
------
-Physics terms are evaluated in PHYSICAL units. When the SINDy data is in
-StandardScaler space, pass `feature_mean` / `feature_scale` and the library
-unscales internally. Polynomial terms are left on the input (scaled) state so
-the polynomial block reproduces prior behaviour exactly. Mixing is harmless:
-the regression coefficients absorb the unit conversion, and `stridge` already
-column-normalises before thresholding.
+The crucial property that makes this a drop-in: the EOM are **linear in the unknown
+coefficients**, so the same `stridge` / ensemble machinery and the same standalone
+rollout evaluation work unchanged -- only the candidate columns differ. Instead of
+~85 polynomial columns we offer ~6 physically-derived ones.
 
-Scale-height uncertainty
-------------------------
-If the generating atmosphere model is unknown, do NOT dump many scale heights
-into one library: exp(-h/H) for nearby H are highly collinear, bootstrap
-selection flips between them, every inclusion probability lands below the
-threshold, and all of them get zeroed. Prefer ONE scale height per fit and
-scan H across separate fits (see `--sindy-scan-scale-heights`), reading off
-which H yields the strongest, sparsest acceleration-channel coefficients.
+Basis columns (all evaluated in PHYSICAL units, then normalised)
+---------------------------------------------------------------
+With V = sqrt(v_s^2 + v_h^2), dynamic-pressure-like factor q = 0.5*rho(h)*V^2 and
+rho(h) = exp(-h/H):
+
+  drag_s   = -q * v_s / V        (drag, along-track component)   -> coeff k_D
+  drag_h   = -q * v_h / V        (drag, vertical component)      -> coeff k_D
+  lift_s   = +q * v_h / V        (in-plane lift, along-track)    -> coeff k_L
+  lift_h   = -q * v_s / V        (in-plane lift, vertical)       -> coeff k_L
+  lat_aero =  q                  (lateral/bank force -> turn rate) -> coeff k_lat
+  gravity  = -g0*(Re/(Re+h))^2   (gravity, vertical)             -> coeff ~1 (fixed form)
+  curv     = +v_s^2/(Re+h)       (centrifugal/curvature, vertical) -> coeff ~1
+  bias     =  1                  (small constant offset / trim)
+
+Every column is a genuine force term. There is no term whose magnitude grows with
+POSITION in a way that feeds back on itself, so a fitted model is structurally
+incapable of the runaway that the polynomial library produced.
 """
 
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
 
 EARTH_RADIUS_M = 6371000.0
-_V_EPS = 1e-12
-# Cap the exponent so a below-reference altitude cannot overflow exp().
+G0 = 9.80665
+_V_EPS = 1e-9
 _EXP_ARG_MAX = 10.0
 
 
-class PhysicsInformedLibrary:
-    """Polynomial terms plus atmosphere/drag/curvature candidates.
-
-    Column order is: [polynomial block] + [physics block]. The same ordering is
-    reproduced by `SINDyPhysicsModel` in torch; `library_spec()` is the single
-    source of truth shared by both paths.
-    """
+class EOMLibrary:
+    """Physically-derived candidate columns for glide-phase equations of motion."""
 
     def __init__(
         self,
         state_vector_len: int = 5,
-        degree: int = 2,
-        include_bias: bool = True,
         h_idx: int = 1,
         vs_idx: int = 2,
         va_idx: int = 3,
@@ -69,141 +63,89 @@ class PhysicsInformedLibrary:
         earth_radius: float = EARTH_RADIUS_M,
         feature_mean=None,
         feature_scale=None,
-        include_curvature: bool = True,
+        include_bias: bool = True,
+        include_linear_velocity: bool = True,
         clip: float = 8.0,
-        pos_idx: tuple[int, ...] = (0, 1),
-        vel_idx: tuple[int, ...] = (2, 4),
-        poly_mode: str = "full",
+        # kept for interface compatibility with the other libraries
+        degree: int = 2,
+        pos_idx=(0, 1),
+        vel_idx=(2, 4),
+        poly_mode: str = "eom",
     ):
         self.state_vector_len = state_vector_len
-        self.degree = degree
-        self.include_bias = include_bias
-        self.h_idx = h_idx
-        self.vs_idx = vs_idx
-        self.va_idx = va_idx
-        self.vh_idx = vh_idx
-        # h_sign converts the frame's altitude-like channel into TRUE ALTITUDE
-        # (positive up). It is +1 for frames that store height directly (geodesic
-        # h, DCU Up) and -1 for frames that store NED Down (grdth), where the
-        # stored channel is the NEGATIVE of altitude.
-        #
-        # This is not cosmetic. rho(h) = exp(-h/H) is evaluated on this channel.
-        # With the wrong sign, a vehicle at +100 km altitude presents as
-        # h = -100000, so -h/H = +20 and the exponent saturates against
-        # _EXP_ARG_MAX on EVERY sample: the atmosphere columns collapse to a
-        # constant and carry no altitude information at all. The same sign feeds
-        # the curvature denominator (Re + h).
+        self.h_idx, self.vs_idx, self.va_idx, self.vh_idx = h_idx, vs_idx, va_idx, vh_idx
+        # See PhysicsInformedLibrary.h_sign. Converts the frame's altitude-like
+        # channel to TRUE ALTITUDE (positive up): +1 for geodesic h and DCU Up,
+        # -1 for grdth's NED Down. Feeds rho(h)=exp(-h/H), the gravity term
+        # g0*(Re/(Re+h))^2 and the curvature denominator, all of which are wrong
+        # (and the first of which saturates) if the sign is inverted.
         self.h_sign = float(h_sign)
         self.scale_heights = tuple(float(H) for H in scale_heights)
         self.earth_radius = float(earth_radius)
-        self.include_curvature = bool(include_curvature)
-        # Physics columns are RMS-normalised using training-set statistics and then
-        # clipped to +/- `clip`. This is essential, not cosmetic: rho(h)=exp(-h/H) is
-        # an UNBOUNDED extrapolator. During early training the integrator wanders
-        # below the training altitude envelope, and an unnormalised drag column can
-        # exceed anything seen in data by ~1e6, sending the rollout to inf. Clipping
-        # in normalised space bounds f_phys to a fixed multiple of its in-data scale.
+        self.include_bias = bool(include_bias)
+        # A small linear-in-velocity block lets the fit absorb mild unmodelled damping
+        # without introducing any position dependence (hence no feedback risk).
+        self.include_linear_velocity = bool(include_linear_velocity)
         self.clip = float(clip)
-        self.physics_scale_ = None  # set on the first fit_transform, then frozen
-
-        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, dtype=float)
-        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, dtype=float)
-
+        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, float)
+        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, float)
+        self.col_scale_ = None  # frozen normalisation, set on first fit_transform
         self.pos_idx = tuple(int(i) for i in pos_idx)
         self.vel_idx = tuple(int(i) for i in vel_idx)
-        # poly_mode controls which polynomial candidates are OFFERED to SINDy:
-        #   "full"   -- every combination up to `degree` (the original behaviour).
-        #   "stable" -- exclude polynomial terms that create positive feedback in a
-        #               long rollout. Concretely: no product that contains a POSITION
-        #               variable (s, h). A term like h*h or h*v_s or s*v_s means "an
-        #               acceleration that grows with position", which has no physical
-        #               basis here and compounds without bound when integrated -- these
-        #               are exactly the ip=1.00 terms that fit one-step (high R^2) yet
-        #               blow the rollout up past ~200 steps. Gravity's dependence on
-        #               altitude enters through the dedicated physics terms instead
-        #               (first-order `h` is still allowed; it is linear and bounded by
-        #               the drag that opposes it). Velocity-only products (v*v) are
-        #               kept: they feed drag-like damping, not positional feedback.
-        self.poly_mode = str(poly_mode)
 
-        self.poly_combos = []
-        for d in range(0 if include_bias else 1, degree + 1):
-            for combo in itertools.combinations_with_replacement(range(state_vector_len), d):
-                if self.poly_mode == "stable" and not self._combo_is_stable(combo):
-                    continue
-                self.poly_combos.append(combo)
-
-        # (kind, scale_height_or_None) -- consumed identically by numpy and torch.
-        self.physics_terms: list[tuple[str, float | None]] = []
+        # (name, kind, scale_height_or_None)
+        self.terms: list[tuple[str, str, float | None]] = []
+        if self.include_bias:
+            self.terms.append(("1", "bias", None))
+        self.terms.append(("gravity", "gravity", None))
+        self.terms.append(("curv_vs2", "curv", None))
         for H in self.scale_heights:
-            self.physics_terms.append(("drag_vs", H))   # rho(h) * V * v_s
-            self.physics_terms.append(("drag_vh", H))   # rho(h) * V * v_h
-            self.physics_terms.append(("drag_V2", H))   # rho(h) * V^2
-            self.physics_terms.append(("aero_va", H))   # rho(h) * V * v_alpha
-        if self.include_curvature:
-            self.physics_terms.append(("curv_vs2", None))  # v_s^2 / (Re + h)
+            # IMPORTANT -- avoid degenerate columns. In the in-plane 3-DoF form,
+            # drag_s = -q*v_s/V and lift_h = -q*v_s/V are the SAME column, and
+            # drag_h = -q*v_h/V is the negative of lift_s. Offering all four makes the
+            # regression rank-deficient: coefficients split arbitrarily between exact
+            # duplicates (observed as identical coefficients on paired terms). Offer
+            # only the two independent in-plane aero directions, plus the lateral term.
+            self.terms.append((f"aero_along@H={int(H)}", "drag_s", H))   # ~ -q*v_s/V
+            self.terms.append((f"aero_vert@H={int(H)}", "drag_h", H))    # ~ -q*v_h/V
+            self.terms.append((f"aero_q@H={int(H)}", "lat_aero", H))     # ~  q (bank/lateral)
+        if self.include_linear_velocity:
+            # v_s is nearly collinear with the aero columns on glide data (both track
+            # speed), so it is excluded; v_h and v_al add independent information.
+            self.terms.append(("v_h", "lin_vh", None))
+            self.terms.append(("v_al", "lin_va", None))
 
-    def _combo_is_stable(self, combo: tuple) -> bool:
-        """Reject polynomial terms that create positional positive feedback.
+    # ------------------------------------------------------------- interface
 
-        A term is disallowed in "stable" mode when it is a PRODUCT (degree >= 2)
-        that involves any position variable. First-order position (`h`, `s`) is
-        allowed -- it is linear and physically corresponds to gravity gradients,
-        and is held in check by the opposing drag terms. Pure velocity products
-        (e.g. v_s*v_s, v_s*v_h) are allowed -- they act like damping, not
-        positional runaway.
-        """
-        if len(combo) < 2:
-            return True
-        return not any(i in self.pos_idx for i in combo)
+    def term_names(self) -> list[str]:
+        return [t[0] for t in self.terms]
 
-    # ------------------------------------------------------------------ spec
+    def term_combos(self, n_features: int | None = None) -> list:
+        """Bias reported as the empty tuple so callers can locate it; rest opaque."""
+        return [() if t[1] == "bias" else None for t in self.terms]
+
+    @property
+    def n_terms(self) -> int:
+        return len(self.terms)
 
     def library_spec(self) -> dict:
-        """Everything the torch evaluator needs to rebuild identical columns."""
         return {
+            "kind": "eom",
             "state_vector_len": self.state_vector_len,
-            "degree": self.degree,
-            "include_bias": self.include_bias,
-            "poly_combos": [tuple(c) for c in self.poly_combos],
-            "physics_terms": list(self.physics_terms),
-            "h_idx": self.h_idx,
-            "vs_idx": self.vs_idx,
-            "va_idx": self.va_idx,
-            "vh_idx": self.vh_idx,
+            "terms": [(n, k, H) for (n, k, H) in self.terms],
+            "h_idx": self.h_idx, "vs_idx": self.vs_idx,
+            "va_idx": self.va_idx, "vh_idx": self.vh_idx,
             "h_sign": self.h_sign,
             "earth_radius": self.earth_radius,
             "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
             "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
             "clip": self.clip,
-            "physics_scale": None if self.physics_scale_ is None else list(self.physics_scale_),
+            "col_scale": None if self.col_scale_ is None else list(self.col_scale_),
+            "poly_combos": [],
+            "physics_terms": [],
         }
 
-    def term_combos(self, n_features: int | None = None) -> list:
-        """Column layout: polynomial tuples first, then None for each physics term."""
-        return [tuple(c) for c in self.poly_combos] + [None] * len(self.physics_terms)
-
-    def term_names(self) -> list[str]:
-        # Default physical names for the 5-state geodesic frame; fall back to generic
-        # x0..xN for any other state size (e.g. the 6-state DCU / geodesic-original
-        # frames) so indexing never runs off the end.
-        default5 = ["s", "h", "v_s", "v_al", "v_h"]
-        if self.state_vector_len == len(default5):
-            names = default5
-        else:
-            names = [f"x{i}" for i in range(self.state_vector_len)]
-        out = []
-        for combo in self.poly_combos:
-            out.append("1" if len(combo) == 0 else "*".join(names[i] for i in combo))
-        for kind, H in self.physics_terms:
-            out.append(f"{kind}" if H is None else f"{kind}@H={int(H)}")
-        return out
-
-    @property
-    def n_terms(self) -> int:
-        return len(self.poly_combos) + len(self.physics_terms)
-
-    # ------------------------------------------------------------- numpy path
+    # ------------------------------------------------------------ evaluation
 
     def _to_physical(self, Y: np.ndarray) -> np.ndarray:
         if self.feature_mean is None or self.feature_scale is None:
@@ -211,116 +153,115 @@ class PhysicsInformedLibrary:
         return Y * self.feature_scale + self.feature_mean
 
     def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n_samples = Y.shape[0]
-        cols = np.empty((n_samples, self.n_terms), dtype=float)
-        n_poly = len(self.poly_combos)
-
-        # --- polynomial block, on the input (scaled) state ---
-        for i, combo in enumerate(self.poly_combos):
-            cols[:, i] = 1.0 if len(combo) == 0 else np.prod(Y[:, combo], axis=1)
-
-        # --- physics block, on the PHYSICAL state ---
+        n = Y.shape[0]
         P = self._to_physical(Y)
         h = self.h_sign * P[:, self.h_idx]  # true altitude, positive up
         vs = P[:, self.vs_idx]
         va = P[:, self.va_idx]
         vh = P[:, self.vh_idx]
+
         V = np.sqrt(vs * vs + vh * vh + _V_EPS)
+        Re = self.earth_radius
+        g = G0 * (Re / (Re + h)) ** 2
 
-        off = len(self.poly_combos)
-        for j, (kind, H) in enumerate(self.physics_terms):
-            if kind == "curv_vs2":
-                cols[:, off + j] = vs * vs / (self.earth_radius + h)
-                continue
-            rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
-            if kind == "drag_vs":
-                cols[:, off + j] = rho * V * vs
-            elif kind == "drag_vh":
-                cols[:, off + j] = rho * V * vh
-            elif kind == "drag_V2":
-                cols[:, off + j] = rho * V * V
-            elif kind == "aero_va":
-                cols[:, off + j] = rho * V * va
+        cols = np.empty((n, self.n_terms), dtype=float)
+        for j, (_, kind, H) in enumerate(self.terms):
+            if kind == "bias":
+                cols[:, j] = 1.0
+            elif kind == "gravity":
+                cols[:, j] = -g
+            elif kind == "curv":
+                cols[:, j] = vs * vs / (Re + h)
+            elif kind == "lin_vs":
+                cols[:, j] = vs
+            elif kind == "lin_vh":
+                cols[:, j] = vh
+            elif kind == "lin_va":
+                cols[:, j] = va
             else:
-                raise ValueError(f"unknown physics term kind: {kind}")
+                rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
+                q = 0.5 * rho * V * V
+                if kind == "drag_s":
+                    cols[:, j] = -q * vs / V
+                elif kind == "drag_h":
+                    cols[:, j] = -q * vh / V
+                elif kind == "lift_s":
+                    cols[:, j] = q * vh / V
+                elif kind == "lift_h":
+                    cols[:, j] = -q * vs / V
+                elif kind == "lat_aero":
+                    cols[:, j] = q
+                else:
+                    raise ValueError(f"unknown EOM term kind: {kind}")
 
-        # Freeze RMS statistics on the first (training) call, then always normalise
-        # and clip so the torch evaluator can reproduce identical values.
-        if self.physics_terms:
-            block = cols[:, off:]
-            if self.physics_scale_ is None:
-                rms = np.sqrt(np.mean(block ** 2, axis=0))
-                rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
-                self.physics_scale_ = rms
-            cols[:, off:] = np.clip(
-                block / self.physics_scale_, -self.clip, self.clip
-            )
-        return cols
+        # Freeze per-column RMS on the first (training) call, then always normalise
+        # and clip. Same reasoning as the physics library: exp(-h/H) is unbounded
+        # outside the training envelope and would otherwise destabilise a rollout
+        # that wanders below it.
+        if self.col_scale_ is None:
+            rms = np.sqrt(np.mean(cols ** 2, axis=0))
+            rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
+            self.col_scale_ = rms
+        return np.clip(cols / self.col_scale_, -self.clip, self.clip)
 
 
-def evaluate_library_torch(y, spec: dict):
-    """Torch mirror of `PhysicsInformedLibrary.fit_transform`.
-
-    Kept in this module, next to the numpy implementation, so the two cannot
-    drift apart. Column order is identical by construction.
-    """
+def evaluate_eom_library_torch(y, spec: dict):
+    """Torch mirror of `EOMLibrary.fit_transform` (identical column order)."""
     import torch
 
+    mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
+    if mean is not None and scale is not None:
+        mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
+        scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
+        P = y * scale_t + mean_t
+    else:
+        P = y
+
+    hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
+    # Default +1.0 preserves the behaviour of specs written before h_sign existed.
+    h_sign = float(spec.get("h_sign", 1.0))
+    h = h_sign * P[..., hi : hi + 1]
+    vs = P[..., vsi : vsi + 1]
+    va = P[..., vai : vai + 1]
+    vh = P[..., vhi : vhi + 1]
+    V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
+    Re = spec["earth_radius"]
+    g = G0 * (Re / (Re + h)) ** 2
+
     cols = []
-    for combo in spec["poly_combos"]:
-        if len(combo) == 0:
-            cols.append(torch.ones_like(y[..., :1]))
+    for (_, kind, H) in spec["terms"]:
+        if kind == "bias":
+            cols.append(torch.ones_like(h))
+        elif kind == "gravity":
+            cols.append(-g)
+        elif kind == "curv":
+            cols.append(vs * vs / (Re + h))
+        elif kind == "lin_vs":
+            cols.append(vs)
+        elif kind == "lin_vh":
+            cols.append(vh)
+        elif kind == "lin_va":
+            cols.append(va)
         else:
-            term = y[..., combo[0] : combo[0] + 1]
-            for k in combo[1:]:
-                term = term * y[..., k : k + 1]
-            cols.append(term)
-
-    physics_terms = spec["physics_terms"]
-    if physics_terms:
-        mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
-        if mean is not None and scale is not None:
-            mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
-            scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
-            P = y * scale_t + mean_t
-        else:
-            P = y
-
-        hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
-        # Default +1.0 keeps pre-existing checkpoints/specs (which have no
-        # "h_sign" key) behaving exactly as before.
-        h_sign = float(spec.get("h_sign", 1.0))
-        h = h_sign * P[..., hi : hi + 1]
-        vs = P[..., vsi : vsi + 1]
-        va = P[..., vai : vai + 1]
-        vh = P[..., vhi : vhi + 1]
-        V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
-        Re = spec["earth_radius"]
-
-        for kind, H in physics_terms:
-            if kind == "curv_vs2":
-                cols.append(vs * vs / (Re + h))
-                continue
             rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
-            if kind == "drag_vs":
-                cols.append(rho * V * vs)
-            elif kind == "drag_vh":
-                cols.append(rho * V * vh)
-            elif kind == "drag_V2":
-                cols.append(rho * V * V)
-            elif kind == "aero_va":
-                cols.append(rho * V * va)
+            q = 0.5 * rho * V * V
+            if kind == "drag_s":
+                cols.append(-q * vs / V)
+            elif kind == "drag_h":
+                cols.append(-q * vh / V)
+            elif kind == "lift_s":
+                cols.append(q * vh / V)
+            elif kind == "lift_h":
+                cols.append(-q * vs / V)
+            elif kind == "lat_aero":
+                cols.append(q)
             else:
-                raise ValueError(f"unknown physics term kind: {kind}")
+                raise ValueError(f"unknown EOM term kind: {kind}")
 
-        # Same RMS normalisation + clipping as the numpy path. Without this the
-        # physics block is unbounded outside the training envelope.
-        ps = spec.get("physics_scale")
-        clip = float(spec.get("clip", 8.0))
-        n_poly = len(spec["poly_combos"])
-        if ps is not None:
-            for j in range(len(physics_terms)):
-                sc = float(ps[j]) if float(ps[j]) != 0.0 else 1.0
-                cols[n_poly + j] = torch.clamp(cols[n_poly + j] / sc, -clip, clip)
-
-    return torch.cat(cols, dim=-1)
+    out = torch.cat(cols, dim=-1)
+    cs = spec.get("col_scale")
+    clip = float(spec.get("clip", 8.0))
+    if cs is not None:
+        cs_t = torch.as_tensor(cs, dtype=out.dtype, device=out.device)
+        out = torch.clamp(out / cs_t, -clip, clip)
+    return out

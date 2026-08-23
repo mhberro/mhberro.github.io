@@ -1,458 +1,90 @@
-# ensemble_sindy.py
-"""Ensemble-SINDy discovery module for sparse physical vector fields."""
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.2 --aphynity-tau2 10 -o model_outputs/SBI/eom_win75_l1p2_tau10_trajboot_FULL/GEODESIC/glide                                                                                                                                     
+There are 22 training trajs and 6 validation trajs.
 
-from __future__ import annotations
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[ 0.          0.          0.          0.00419264 -0.04436743]
+ [ 0.          0.         -0.0051839   0.         -0.00644396]
+ [-0.01029743  0.          0.         -0.00653097  0.02386028]
+ [ 0.          0.         -0.00642848  0.00245761  0.02327473]
+ [ 0.          0.          0.          0.         -0.0152652 ]
+ [ 0.          0.          0.0175033  -0.00569499  0.        ]
+ [ 0.          0.02144403  0.          0.         -0.004653  ]
+ [ 0.          0.          0.          0.00646468  0.        ]]
+[SINDy] active terms: 16/40 | max|coef| per target: [0.0103  0.02144 0.0175  0.00653 0.04437]
+[SINDy] R2 per target: [0.2427 1.     0.4026 0.0591 0.2743]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2453 | max relative term contribution 1.1530
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2453 perTarget=[0.243, 1.0, 0.403, 0.059, 0.274]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.9907 coef=-1.030e-02 ip=1.00
+          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.0385 coef=+1.750e-02 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.3814 coef=-6.428e-03 ip=0.78
+          dv_s/dt   gravity            contrib=0.3076 coef=-5.184e-03 ip=0.86
+          dv_al/dt  curv_vs2           contrib=0.3098 coef=-6.531e-03 ip=0.86
+          dv_al/dt  v_al               contrib=0.3067 coef=+6.465e-03 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.2702 coef=-5.695e-03 ip=0.78
+          dv_al/dt  1                  contrib=0.1989 coef=+4.193e-03 ip=0.60
+          dv_h/dt   1                  contrib=1.1530 coef=-4.437e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.6201 coef=+2.386e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.6049 coef=+2.327e-02 ip=0.96
+          dv_h/dt   aero_vert@H=5000   contrib=0.3943 coef=-1.527e-02 ip=1.00
 
-import itertools
-import numpy as np
-import torch
-from torch import nn
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x335468810>, 0.0001)
+[INFO] Epoch 5: loss: 0.0017160 pos_err: 570.9844971 vel_err: 21.6901855 traj_loss: 0.0015902 node_norm: 0.0000710 lambda: 1.0344929 val_loss: 0.0008913 val_pos_err: 480.0313110 val_vel_err: 21.6410522 val_traj_loss: 0.0007819 val_node_norm: 0.0000825 val_lambda: 1.0344934
+[INFO] Epoch 10: loss: 0.0017002 pos_err: 570.0806274 vel_err: 21.0400372 traj_loss: 0.0015357 node_norm: 0.0000528 lambda: 1.0727504 val_loss: 0.0008475 val_pos_err: 478.3633728 val_vel_err: 20.2171707 val_traj_loss: 0.0007367 val_node_norm: 0.0000572 val_lambda: 1.0727509
+[INFO] Epoch 15: loss: 0.0017095 pos_err: 570.8735962 vel_err: 20.1311436 traj_loss: 0.0015042 node_norm: 0.0000414 lambda: 1.1089746 val_loss: 0.0008306 val_pos_err: 478.6370850 val_vel_err: 19.7405663 val_traj_loss: 0.0007113 val_node_norm: 0.0000418 val_lambda: 1.1089746
+[INFO] Epoch 20: loss: 0.0017306 pos_err: 570.5631714 vel_err: 20.1144772 traj_loss: 0.0014800 node_norm: 0.0000372 lambda: 1.1442106 val_loss: 0.0008323 val_pos_err: 479.5371094 val_vel_err: 19.3999672 val_traj_loss: 0.0006935 val_node_norm: 0.0000388 val_lambda: 1.1442100
+[INFO] [rollout probe @ epoch 25] mean_pos_err=35230.6 worst=131422.2 finite=100%
+[INFO] Epoch 25: loss: 0.0017513 pos_err: 570.5011597 vel_err: 19.9990959 traj_loss: 0.0014592 node_norm: 0.0000313 lambda: 1.1787570 val_loss: 0.0008407 val_pos_err: 475.0231934 val_vel_err: 21.0826550 val_traj_loss: 0.0006857 val_node_norm: 0.0000324 val_lambda: 1.1787572 rollout_pos_err: 35230.5932617 rollout_pos_err_worst: 131422.2187500 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0017774 pos_err: 570.1081543 vel_err: 19.8068047 traj_loss: 0.0014412 node_norm: 0.0000293 lambda: 1.2129635 val_loss: 0.0008491 val_pos_err: 479.3975830 val_vel_err: 19.5358257 val_traj_loss: 0.0006769 val_node_norm: 0.0000280 val_lambda: 1.2129641
+[INFO] Epoch 35: loss: 0.0018038 pos_err: 570.4779663 vel_err: 19.7830715 traj_loss: 0.0014244 node_norm: 0.0000277 lambda: 1.2468793 val_loss: 0.0008736 val_pos_err: 477.4374390 val_vel_err: 20.9059525 val_traj_loss: 0.0006819 val_node_norm: 0.0000234 val_lambda: 1.2468786
+[INFO] Epoch 40: loss: 0.0018324 pos_err: 570.1021729 vel_err: 19.8445587 traj_loss: 0.0014085 node_norm: 0.0000285 lambda: 1.2807081 val_loss: 0.0008938 val_pos_err: 476.8913269 val_vel_err: 20.6573830 val_traj_loss: 0.0006771 val_node_norm: 0.0000267 val_lambda: 1.2807075
+[INFO] Epoch 45: loss: 0.0018577 pos_err: 570.8069458 vel_err: 19.5592880 traj_loss: 0.0013925 node_norm: 0.0000273 lambda: 1.3144418 val_loss: 0.0009116 val_pos_err: 480.2832642 val_vel_err: 19.5163288 val_traj_loss: 0.0006724 val_node_norm: 0.0000278 val_lambda: 1.3144422
+[INFO] [rollout probe @ epoch 50] mean_pos_err=16178.5 worst=43428.7 finite=100%
+[INFO] Epoch 50: loss: 0.0018852 pos_err: 570.2188721 vel_err: 19.7324238 traj_loss: 0.0013787 node_norm: 0.0000267 lambda: 1.3480446 val_loss: 0.0009246 val_pos_err: 480.1231079 val_vel_err: 18.9360943 val_traj_loss: 0.0006679 val_node_norm: 0.0000243 val_lambda: 1.3480443 rollout_pos_err: 16178.4873047 rollout_pos_err_worst: 43428.7187500 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0019133 pos_err: 570.1939087 vel_err: 19.7132378 traj_loss: 0.0013645 node_norm: 0.0000281 lambda: 1.3815386 val_loss: 0.0009561 val_pos_err: 478.2278748 val_vel_err: 19.9668980 val_traj_loss: 0.0006723 val_node_norm: 0.0000273 val_lambda: 1.3815391
+[INFO] Epoch 60: loss: 0.0019389 pos_err: 570.1674194 vel_err: 19.7176361 traj_loss: 0.0013514 node_norm: 0.0000265 lambda: 1.4150584 val_loss: 0.0009709 val_pos_err: 478.0592041 val_vel_err: 20.0656376 val_traj_loss: 0.0006719 val_node_norm: 0.0000201 val_lambda: 1.4150583
+[INFO] Epoch 65: loss: 0.0019643 pos_err: 570.4151001 vel_err: 19.5125103 traj_loss: 0.0013372 node_norm: 0.0000273 lambda: 1.4485313 val_loss: 0.0009900 val_pos_err: 477.0393982 val_vel_err: 19.8109188 val_traj_loss: 0.0006666 val_node_norm: 0.0000244 val_lambda: 1.4485310
+[INFO] Epoch 70: loss: 0.0019926 pos_err: 570.2883911 vel_err: 19.6957436 traj_loss: 0.0013252 node_norm: 0.0000288 lambda: 1.4818804 val_loss: 0.0010190 val_pos_err: 479.3045959 val_vel_err: 18.5103817 val_traj_loss: 0.0006631 val_node_norm: 0.0000364 val_lambda: 1.4818810
+[INFO] [rollout probe @ epoch 75] mean_pos_err=14159.1 worst=32007.5 finite=100%
+[INFO] Epoch 75: loss: 0.0020171 pos_err: 569.2742920 vel_err: 19.7941971 traj_loss: 0.0013130 node_norm: 0.0000277 lambda: 1.5151900 val_loss: 0.0010329 val_pos_err: 477.4989929 val_vel_err: 20.1313267 val_traj_loss: 0.0006659 val_node_norm: 0.0000239 val_lambda: 1.5151894 rollout_pos_err: 14159.1330566 rollout_pos_err_worst: 32007.4765625 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0020425 pos_err: 569.8671265 vel_err: 19.5711327 traj_loss: 0.0013001 node_norm: 0.0000294 lambda: 1.5484358 val_loss: 0.0010579 val_pos_err: 477.5343018 val_vel_err: 19.6012459 val_traj_loss: 0.0006653 val_node_norm: 0.0000278 val_lambda: 1.5484359
+[INFO] Epoch 85: loss: 0.0020688 pos_err: 569.3181152 vel_err: 19.6490593 traj_loss: 0.0012889 node_norm: 0.0000301 lambda: 1.5817343 val_loss: 0.0010742 val_pos_err: 478.2347412 val_vel_err: 19.6126575 val_traj_loss: 0.0006642 val_node_norm: 0.0000236 val_lambda: 1.5817349
+[INFO] Epoch 90: loss: 0.0020971 pos_err: 569.2777710 vel_err: 19.7709427 traj_loss: 0.0012791 node_norm: 0.0000314 lambda: 1.6149377 val_loss: 0.0011034 val_pos_err: 478.9527283 val_vel_err: 19.0022221 val_traj_loss: 0.0006647 val_node_norm: 0.0000299 val_lambda: 1.6149385
+[INFO] Early stopping triggered at 90
 
-
-class PolynomialLibrary:
-    def __init__(self, degree: int = 2, include_bias: bool = True):
-        self.degree = degree
-        self.include_bias = include_bias
-
-    def term_combos(self, n_features: int) -> list:
-        """Column layout: one tuple per term (empty tuple = bias)."""
-        combos = []
-        for d in range(0 if self.include_bias else 1, self.degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
-        return combos
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n_samples, n_features = Y.shape
-        combos = []
-        for d in range(0 if self.include_bias else 1, self.degree + 1):
-            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
-
-        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
-        for i, combo in enumerate(combos):
-            if len(combo) == 0:
-                library[:, i] = 1.0
-            else:
-                library[:, i] = np.prod(Y[:, combo], axis=1)
-        return library
-
-
-def stridge(
-    Theta: np.ndarray,
-    Ydot: np.ndarray,
-    l1_threshold: float = 0.01,
-    ridge_kw: float = 1e-3,
-    max_iter: int = 25,
-) -> np.ndarray:
-    n_features = Theta.shape[1]
-    n_targets = Ydot.shape[1]
-
-    col_norms = np.linalg.norm(Theta, axis=0)
-    col_norms[col_norms < 1e-8] = 1.0
-    Theta_norm = Theta / col_norms
-
-    Xi_norm = np.linalg.lstsq(
-        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
-        Theta_norm.T @ Ydot,
-        rcond=None,
-    )[0]
-
-    for _ in range(max_iter):
-        small_inds = np.abs(Xi_norm) < l1_threshold
-        Xi_norm[small_inds] = 0.0
-        for i in range(n_targets):
-            big_inds = ~small_inds[:, i]
-            if np.any(big_inds):
-                Theta_sub = Theta_norm[:, big_inds]
-                Xi_norm[big_inds, i] = np.linalg.lstsq(
-                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(np.sum(big_inds)),
-                    Theta_sub.T @ Ydot[:, i],
-                    rcond=None,
-                )[0]
-
-    Xi = Xi_norm / col_norms[:, None]
-    return Xi
-
-
-class EnsembleSINDyDiscoverer:
-    def __init__(
-        self,
-        degree: int = 2,
-        n_bootstraps: int = 50,
-        # Paper (Sec. 3): "m new rows are sampled with replacement from the original
-        # m rows", giving the standard 1 - e^-1 ~= 0.632 coverage. A ratio of 0.7 with
-        # replacement yields only ~0.50 coverage, discarding information in an already
-        # data-starved regime. Default restored to 1.0.
-        subsample_ratio: float = 1.0,
-        l1_threshold: float = 0.01,
-        # Paper uses tol = 0.6 for b(r)agging; 0.4 is reserved for LIBRARY bagging,
-        # which is followed by a second bagging pass and so deliberately permissive.
-        # This class performs data-bootstrap b(r)agging, so 0.6 is the right default.
-        inclusion_prob_threshold: float = 0.60,
-        aggregation: str = "bragging",
-        pos_idx: list[int] | None = None,
-        vel_idx: list[int] | None = None,
-        pos_scale=None,
-        vel_scale=None,
-        vel_mean=None,
-        library=None,
-        # --- E-SINDy Algorithm 3: library bagging ---
-        # Samples l = library_fraction * D library TERMS without replacement per
-        # bootstrap, discards terms with low inclusion probability, then runs the
-        # normal data-bootstrap b(r)agging on the pruned library. The paper
-        # recommends this for large libraries and the low-data limit (it is the
-        # method behind their 21-point lynx-hare result), and it is the direct
-        # remedy for a dense, collinear solution.
-        library_bagging: bool = False,
-        library_fraction: float = 0.6,
-        # Paper uses tol = 0.4 for the library-pruning pass (deliberately permissive
-        # because a second bagging pass follows). Note a term is only *available* in
-        # ~library_fraction of bootstraps, so its inclusion probability is diluted by
-        # that factor -- 0.4 against an availability ceiling of 0.6 means "selected in
-        # ~2/3 of the bootstraps where it appeared".
-        library_inclusion_threshold: float = 0.4,
-        n_library_bootstraps: int | None = None,
-        # Position-derivative rows are known exactly and are overwritten downstream by
-        # the model's second-order index_copy. Setting them analytically removes two
-        # degenerate targets (which otherwise attract collinear surrogates such as
-        # curv_vs2 standing in for v_s) and keeps them out of the library-pruning vote.
-        analytic_position_rows: bool = True,
-        # Bootstrap resampling UNIT for data-bagging (paper Algorithm 2).
-        #   "trajectory" -- resample whole trajectories with replacement, then use
-        #       all rows of the chosen trajectories. This is the statistically
-        #       correct unit here: the paper's 1 - e^-1 coverage argument assumes
-        #       the m resampled rows are independent draws, but rows within one
-        #       glide are heavily autocorrelated. Resampling ~4400 correlated rows
-        #       as if independent collapses the bootstrap distribution -- every
-        #       candidate's inclusion probability saturates at ~1.0 and the
-        #       ip>threshold filter (the whole point of E-SINDy) prunes nothing.
-        #       Resampling the ~22 trajectories restores real between-flight
-        #       variability, so inclusion probabilities again separate robust terms
-        #       from flight-specific ones.
-        #   "row" -- original behaviour (resample individual rows). Kept for A/B.
-        # Requires trajectory boundaries to be passed to discover(); if they are
-        # not available it falls back to "row" with a one-time warning.
-        bootstrap_unit: str = "trajectory",
-        random_state: int | None = 0,
-    ):
-        self.degree = degree
-        self.n_bootstraps = n_bootstraps
-        self.subsample_ratio = subsample_ratio
-        self.l1_threshold = l1_threshold
-        self.inclusion_prob_threshold = inclusion_prob_threshold
-        self.aggregation = aggregation
-        self.pos_idx = pos_idx
-        self.vel_idx = vel_idx
-        # StandardScaler statistics for the position/velocity index pairs, needed to
-        # express the velocity identity correctly in scaled space (see fit()).
-        self.pos_scale = pos_scale
-        self.vel_scale = vel_scale
-        self.vel_mean = vel_mean
-        # `library` lets a physics-informed basis be supplied; defaults to the
-        # plain polynomial library for backwards compatibility.
-        self.library_builder = library if library is not None else PolynomialLibrary(
-            degree=degree, include_bias=True
-        )
-        self.library_bagging = bool(library_bagging)
-        self.library_fraction = float(library_fraction)
-        self.library_inclusion_threshold = float(library_inclusion_threshold)
-        self.n_library_bootstraps = n_library_bootstraps
-        self.analytic_position_rows = bool(analytic_position_rows)
-        self.bootstrap_unit = str(bootstrap_unit)
-        self.random_state = random_state
-
-    # ------------------------------------------------------------- ensembling
-
-    def _data_bag(self, Theta, Ydot, rng, groups=None):
-        """Data-bootstrap ensemble (paper Algorithm 2).
-
-        `groups`, when provided, is a list of index arrays -- one per trajectory --
-        partitioning the rows of Theta/Ydot. With bootstrap_unit="trajectory" the
-        ensemble resamples these GROUPS with replacement (a block bootstrap): each
-        bootstrap draws n_traj trajectories with replacement and concatenates their
-        rows. This is the correct unit when rows within a trajectory are
-        autocorrelated -- see the constructor note. With unit="row" (or no groups
-        available) it falls back to the original per-row resampling.
-        """
-        n_samples, n_terms = Theta.shape
-        n_targets = Ydot.shape[1]
-        coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
-
-        use_traj = self.bootstrap_unit == "trajectory" and groups is not None and len(groups) >= 2
-        if self.bootstrap_unit == "trajectory" and not use_traj and not getattr(self, "_warned_row_fallback", False):
-            print(
-                "[E-SINDy] bootstrap_unit='trajectory' requested but trajectory "
-                "boundaries were unavailable; falling back to row resampling."
-            )
-            self._warned_row_fallback = True
-
-        if use_traj:
-            n_groups = len(groups)
-            for b in range(self.n_bootstraps):
-                pick = rng.choice(n_groups, size=n_groups, replace=True)
-                idx = np.concatenate([groups[g] for g in pick])
-                coeffs[b] = stridge(Theta[idx], Ydot[idx], l1_threshold=self.l1_threshold)
-        else:
-            sub_size = max(2, int(n_samples * self.subsample_ratio))
-            for b in range(self.n_bootstraps):
-                idx = rng.choice(n_samples, size=sub_size, replace=True)
-                coeffs[b] = stridge(Theta[idx], Ydot[idx], l1_threshold=self.l1_threshold)
-        return coeffs
-
-    def _library_bag_keep_mask(self, Theta, Ydot, vote_targets, rng):
-        """Library-term bootstrap (paper Algorithm 3): prune the candidate set."""
-        n_terms = Theta.shape[1]
-        n_targets = Ydot.shape[1]
-        q = int(self.n_library_bootstraps or self.n_bootstraps)
-        n_draw = max(2, int(round(self.library_fraction * n_terms)))
-        coeffs = np.zeros((q, n_terms, n_targets))
-        for b in range(q):
-            # Library terms are sampled WITHOUT replacement (paper Sec. 3).
-            cols = rng.choice(n_terms, size=n_draw, replace=False)
-            coeffs[b][cols] = stridge(
-                Theta[:, cols], Ydot, l1_threshold=self.l1_threshold
-            )
-        ip = np.mean(np.abs(coeffs) > 1e-8, axis=0)
-        vote = ip[:, vote_targets] if len(vote_targets) else ip
-        keep = vote.max(axis=1) >= self.library_inclusion_threshold
-        if keep.sum() < 2:  # never prune everything away
-            keep = np.ones(n_terms, dtype=bool)
-        return keep, ip
-
-    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
-        Y_all, Ydot_all = [], []
-
-        # Scaled-space conversion for the velocity identity (see below).
-        ratio = offset = None
-        if self.pos_scale is not None and self.vel_scale is not None:
-            ratio = np.asarray(self.vel_scale, dtype=float) / np.asarray(self.pos_scale, dtype=float)
-            offset = (
-                np.asarray(self.vel_mean, dtype=float) / np.asarray(self.pos_scale, dtype=float)
-                if self.vel_mean is not None
-                else np.zeros_like(ratio)
-            )
-
-        for Y in Y_list:
-            if len(Y) < 5:
-                continue
-            Ydot = np.gradient(Y, dt, axis=0)
-
-            # Enforce the exact velocity identity for position-derivative targets.
-            #
-            # IMPORTANT: when Y is in StandardScaler space (use_scalar=True), the
-            # identity is NOT Ydot[pos] = Y[vel]. It is
-            #     d(pos_scaled)/dt = vel_scaled*(sigma_vel/sigma_pos) + mu_vel/sigma_pos
-            # i.e. exactly the so_ratio / so_offset the predictor model applies.
-            # The previous unscaled form overstated the target by sigma_pos/sigma_vel
-            # (~1e2-1e3 for this geodesic frame), so SINDy was regressed against a
-            # target that was orders of magnitude wrong. It duly returned ~1.0 on the
-            # matching velocity term -- which is an artifact of the wrong target, not
-            # a discovery. Those rows are also discarded downstream by the model's
-            # second-order index_copy, so the mis-set targets only consumed fit budget.
-            #
-            # With no scaler supplied, ratio=1 / offset=0 recovers the original
-            # (correct, unscaled) behaviour.
-            if self.pos_idx is not None and self.vel_idx is not None:
-                for k, (p_i, v_i) in enumerate(zip(self.pos_idx, self.vel_idx)):
-                    if ratio is None:
-                        Ydot[:, p_i] = Y[:, v_i]
-                    else:
-                        Ydot[:, p_i] = Y[:, v_i] * ratio[k] + offset[k]
-
-            Y_all.append(Y[2:-2])
-            Ydot_all.append(Ydot[2:-2])
-
-        if len(Y_all) == 0:
-            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
-
-        # Row-index groups, one per trajectory, so the data bootstrap can resample
-        # whole trajectories rather than individual (autocorrelated) rows.
-        traj_groups = []
-        _row_cursor = 0
-        for _ya in Y_all:
-            _n = _ya.shape[0]
-            traj_groups.append(np.arange(_row_cursor, _row_cursor + _n))
-            _row_cursor += _n
-
-        Y_stacked = np.vstack(Y_all)
-        Ydot_stacked = np.vstack(Ydot_all)
-
-        Theta = self.library_builder.fit_transform(Y_stacked)
-        n_samples, n_terms = Theta.shape
-        n_targets = Ydot_stacked.shape[1]
-        n_features = Y_stacked.shape[1]
-        rng = np.random.default_rng(self.random_state)
-
-        # Stored for scale-aware diagnostics. Raw |coefficient| is NOT comparable
-        # across a library whose columns span many orders of magnitude (a physical
-        # drag column can be ~1e6 while a scaled polynomial column is ~1). The
-        # meaningful quantity is the term's CONTRIBUTION, |coef| * ||column||,
-        # optionally normalised by the target norm to be dimensionless.
-        self.column_norms_ = np.linalg.norm(Theta, axis=0)
-        self.target_norms_ = np.linalg.norm(Ydot_stacked, axis=0)
-
-        # Which targets are actually fit (position rows may be set analytically).
-        use_analytic = (
-            self.analytic_position_rows
-            and self.pos_idx is not None
-            and self.vel_idx is not None
-            and ratio is not None
-        )
-        pos_targets = list(self.pos_idx) if use_analytic else []
-        fit_targets = [t for t in range(n_targets) if t not in pos_targets]
-
-        # Stage 1 (optional): prune the candidate library.
-        if self.library_bagging:
-            keep, self.library_inclusion_probs_ = self._library_bag_keep_mask(
-                Theta, Ydot_stacked, fit_targets, rng
-            )
-        else:
-            keep = np.ones(n_terms, dtype=bool)
-            self.library_inclusion_probs_ = None
-        self.kept_terms_ = keep
-
-        # Stage 2: data-bootstrap b(r)agging on the (pruned) library.
-        bootstrap_coeffs = self._data_bag(Theta[:, keep], Ydot_stacked, rng, groups=traj_groups)
-        active_masks = np.abs(bootstrap_coeffs) > 1e-8
-        ip_kept = np.mean(active_masks, axis=0)
-
-        if self.aggregation == "bragging":
-            Xi_kept = np.median(bootstrap_coeffs, axis=0)
-        else:
-            Xi_kept = np.mean(bootstrap_coeffs, axis=0)
-        Xi_kept[ip_kept < self.inclusion_prob_threshold] = 0.0
-
-        # Expand back to the full library layout.
-        Xi_agg = np.zeros((n_terms, n_targets))
-        inclusion_probs = np.zeros((n_terms, n_targets))
-        Xi_agg[keep] = Xi_kept
-        inclusion_probs[keep] = ip_kept
-
-        # Position rows set analytically: d(pos_scaled)/dt = vel_scaled*ratio + offset,
-        # i.e. `offset` on the bias term and `ratio` on the matching velocity term.
-        if use_analytic:
-            combos = self.library_builder.term_combos(n_features)
-            try:
-                bias_col = combos.index(())
-            except ValueError:
-                bias_col = None
-            for k, p_i in enumerate(self.pos_idx):
-                v_i = self.vel_idx[k]
-                try:
-                    vel_col = combos.index((v_i,))
-                except ValueError:
-                    continue
-                Xi_agg[:, p_i] = 0.0
-                inclusion_probs[:, p_i] = 0.0
-                Xi_agg[vel_col, p_i] = float(ratio[k])
-                inclusion_probs[vel_col, p_i] = 1.0
-                if bias_col is not None:
-                    Xi_agg[bias_col, p_i] = float(offset[k])
-                    inclusion_probs[bias_col, p_i] = 1.0
-
-        # Per-target coefficient of determination of the discovered model. This is
-        # the correct criterion for comparing LIBRARIES or hyper-parameters (e.g.
-        # scale height): term "contribution" is not, because collinear candidates
-        # trade coefficient mass among themselves and leave it roughly flat.
-        resid = Ydot_stacked - Theta @ Xi_agg
-        ss_res = np.sum(resid ** 2, axis=0)
-        ss_tot = np.sum((Ydot_stacked - Ydot_stacked.mean(axis=0)) ** 2, axis=0)
-        self.r2_ = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, 1.0)
-        return Xi_agg, inclusion_probs
-
-
-class SINDyPhysicsModel(nn.Module):
-    def __init__(
-        self,
-        Xi: np.ndarray,
-        state_vector_len: int = 5,
-        degree: int = 2,
-        trainable: bool = True,
-        library_spec: dict | None = None,
-    ):
-        """Sparse physics term F_p for the APHYNITY decomposition.
-
-        `trainable` (default True) makes the discovered coefficients LEARNABLE.
-
-        This matters: APHYNITY solves  min ||F_a||  s.t.  dX/dt = (F_p + F_a)(X)
-        jointly over the physical parameters theta_p AND the network theta_a. Its
-        existence/uniqueness results (Props. 1-2) are a metric projection of the
-        true F onto the set F_p, and the paper's headline parameter-identification
-        gains (e.g. 67.6% -> 2.3% error) come precisely from theta_p being corrected
-        by that joint optimization.
-
-        Previously Xi was a register_buffer, i.e. NOT in .parameters(), so theta_p
-        was frozen at whatever E-SINDy found on numerically-differentiated data.
-        With F_p fixed, F_a must supply all of (F - F_p), so ||F_a|| is bounded
-        below by a large constant and minimizing it merely fights the data term
-        instead of shifting work onto the physics. That is not the APHYNITY
-        algorithm; it is a fixed-residual model with a penalty.
-
-        The E-SINDy SPARSITY PATTERN is preserved via a non-trainable mask, so
-        thresholded-out library terms stay exactly zero and cannot creep back in.
-        A masked linear-in-parameters family is a finite-dimensional subspace,
-        which the APHYNITY paper notes is a Chebyshev set - so the uniqueness
-        guarantee still applies.
-        """
-        super().__init__()
-        self.degree = degree
-        self.state_vector_len = state_vector_len
-
-        Xi_t = torch.as_tensor(Xi, dtype=torch.float32)
-        # Sparsity pattern discovered by E-SINDy (inclusion-probability thresholded).
-        self.register_buffer("Xi_mask", (Xi_t != 0).to(torch.float32))
-        self.trainable = bool(trainable)
-        if self.trainable:
-            self.Xi_raw = nn.Parameter(Xi_t.clone())
-        else:
-            self.register_buffer("Xi_raw", Xi_t.clone())
-
-        # `library_spec` (from PhysicsInformedLibrary.library_spec()) selects the
-        # candidate basis. When omitted we fall back to the plain polynomial basis
-        # so existing checkpoints and callers behave exactly as before.
-        self.library_spec = library_spec
-        if library_spec is None:
-            combos = []
-            for d in range(degree + 1):
-                combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
-            self.combos = combos
-        else:
-            self.combos = [tuple(c) for c in library_spec["poly_combos"]]
-
-    @property
-    def Xi(self) -> torch.Tensor:
-        """Effective coefficients: learnable values restricted to the sparse pattern."""
-        return self.Xi_raw * self.Xi_mask
-
-    def forward(self, y: torch.Tensor) -> torch.Tensor:
-        if self.library_spec is not None:
-            if self.library_spec.get("kind") == "eom":
-                from eom_library import evaluate_eom_library_torch
-
-                Theta = evaluate_eom_library_torch(y, self.library_spec)
-            else:
-                from physics_library import evaluate_library_torch
-
-                Theta = evaluate_library_torch(y, self.library_spec)
-            return torch.matmul(Theta, self.Xi)
-        return self._forward_polynomial(y)
-
-    def _forward_polynomial(self, y: torch.Tensor) -> torch.Tensor:
-        cols = []
-        for combo in self.combos:
-            if len(combo) == 0:
-                cols.append(torch.ones_like(y[..., :1]))
-            elif len(combo) == 1:
-                cols.append(y[..., combo[0] : combo[0] + 1])
-            elif len(combo) == 2:
-                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
-            elif len(combo) == 3:
-                cols.append(
-                    y[..., combo[0] : combo[0] + 1]
-                    * y[..., combo[1] : combo[1] + 1]
-                    * y[..., combo[2] : combo[2] + 1]
-                )
-            else:
-                raise NotImplementedError("Polynomial degree > 3 not supported.")
-
-        Theta = torch.cat(cols, dim=-1)
-        return torch.matmul(Theta, self.Xi)
+Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x311b276d0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0063396 pos_err: 1051.2431641 vel_err: 87.3092346 traj_loss: 0.0051174 node_norm: 0.0005697 lambda: 1.1275215 val_loss: 0.0039070 val_pos_err: 891.8746338 val_vel_err: 82.2982864 val_traj_loss: 0.0031283 val_node_norm: 0.0003797 val_lambda: 1.1275216
+[INFO] Epoch 10: loss: 0.0070626 pos_err: 1036.0581055 vel_err: 86.5994568 traj_loss: 0.0050213 node_norm: 0.0006349 lambda: 1.2800837 val_loss: 0.0042486 val_pos_err: 868.3709106 val_vel_err: 74.1516342 val_traj_loss: 0.0029926 val_node_norm: 0.0004177 val_lambda: 1.2800841
+[INFO] Epoch 15: loss: 0.0078261 pos_err: 1034.2288818 vel_err: 85.4295273 traj_loss: 0.0049848 node_norm: 0.0006967 lambda: 1.4302369 val_loss: 0.0048145 val_pos_err: 855.6737671 val_vel_err: 84.9088058 val_traj_loss: 0.0030571 val_node_norm: 0.0004422 val_lambda: 1.4302368
+[INFO] Epoch 20: loss: 0.0085224 pos_err: 1028.4416504 vel_err: 83.7833023 traj_loss: 0.0049313 node_norm: 0.0007378 lambda: 1.5785937 val_loss: 0.0051848 val_pos_err: 836.1196899 val_vel_err: 74.5028534 val_traj_loss: 0.0029717 val_node_norm: 0.0004938 val_lambda: 1.5785941
+[INFO] [rollout probe @ epoch 25] mean_pos_err=13267.8 worst=27180.5 finite=100%
+[INFO] Epoch 25: loss: 0.0092122 pos_err: 1019.7400513 vel_err: 84.3396530 traj_loss: 0.0048942 node_norm: 0.0007743 lambda: 1.7240756 val_loss: 0.0054220 val_pos_err: 862.8790283 val_vel_err: 70.3166504 val_traj_loss: 0.0028456 val_node_norm: 0.0005160 val_lambda: 1.7240762 rollout_pos_err: 13267.8092448 rollout_pos_err_worst: 27180.5000000 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0099055 pos_err: 1015.9149170 vel_err: 82.9940262 traj_loss: 0.0048677 node_norm: 0.0008153 lambda: 1.8674546 val_loss: 0.0059263 val_pos_err: 842.0252686 val_vel_err: 72.0464172 val_traj_loss: 0.0028811 val_node_norm: 0.0005459 val_lambda: 1.8674548
+[INFO] Epoch 35: loss: 0.0105531 pos_err: 1012.6125488 vel_err: 82.7910156 traj_loss: 0.0048277 node_norm: 0.0008491 lambda: 2.0100636 val_loss: 0.0062614 val_pos_err: 858.5173340 val_vel_err: 71.2526932 val_traj_loss: 0.0028356 val_node_norm: 0.0005617 val_lambda: 2.0100641
+[INFO] Epoch 40: loss: 0.0112636 pos_err: 1010.5124512 vel_err: 81.9930801 traj_loss: 0.0048187 node_norm: 0.0008880 lambda: 2.1531830 val_loss: 0.0068277 val_pos_err: 797.4757080 val_vel_err: 80.2745895 val_traj_loss: 0.0029104 val_node_norm: 0.0005611 val_lambda: 2.1531827
+[INFO] Epoch 45: loss: 0.0118787 pos_err: 1006.6326904 vel_err: 82.2365952 traj_loss: 0.0047836 node_norm: 0.0009030 lambda: 2.2944391 val_loss: 0.0071371 val_pos_err: 842.6591187 val_vel_err: 71.1031265 val_traj_loss: 0.0028428 val_node_norm: 0.0006145 val_lambda: 2.2944386
+[INFO] [rollout probe @ epoch 50] mean_pos_err=15931.6 worst=33472.0 finite=100%
+[INFO] Epoch 50: loss: 0.0125587 pos_err: 1001.0921021 vel_err: 81.2626495 traj_loss: 0.0047743 node_norm: 0.0009325 lambda: 2.4351735 val_loss: 0.0074769 val_pos_err: 846.3218384 val_vel_err: 70.6609192 val_traj_loss: 0.0028036 val_node_norm: 0.0006496 val_lambda: 2.4351747 rollout_pos_err: 15931.5913900 rollout_pos_err_worst: 33472.0156250 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0132326 pos_err: 995.8301392 vel_err: 82.1350021 traj_loss: 0.0047636 node_norm: 0.0009678 lambda: 2.5747204 val_loss: 0.0078142 val_pos_err: 855.5709839 val_vel_err: 69.8062363 val_traj_loss: 0.0027850 val_node_norm: 0.0006436 val_lambda: 2.5747194
+[INFO] Epoch 60: loss: 0.0139227 pos_err: 996.5460205 vel_err: 82.8358383 traj_loss: 0.0047644 node_norm: 0.0009895 lambda: 2.7145672 val_loss: 0.0084011 val_pos_err: 787.1328125 val_vel_err: 79.0747681 val_traj_loss: 0.0028506 val_node_norm: 0.0006629 val_lambda: 2.7145655
+[INFO] Epoch 65: loss: 0.0145496 pos_err: 995.8623657 vel_err: 81.9009705 traj_loss: 0.0047434 node_norm: 0.0010075 lambda: 2.8549559 val_loss: 0.0085742 val_pos_err: 836.7689819 val_vel_err: 75.3697968 val_traj_loss: 0.0027678 val_node_norm: 0.0006722 val_lambda: 2.8549554
+[INFO] Epoch 70: loss: 0.0151555 pos_err: 989.8894653 vel_err: 80.8537216 traj_loss: 0.0047166 node_norm: 0.0010347 lambda: 2.9938359 val_loss: 0.0089200 val_pos_err: 840.0300293 val_vel_err: 67.8329086 val_traj_loss: 0.0027438 val_node_norm: 0.0007056 val_lambda: 2.9938371
+[INFO] [rollout probe @ epoch 75] mean_pos_err=15747.6 worst=34756.4 finite=100%
+[INFO] Epoch 75: loss: 0.0158299 pos_err: 992.5774536 vel_err: 81.1022797 traj_loss: 0.0047164 node_norm: 0.0010611 lambda: 3.1313307 val_loss: 0.0093493 val_pos_err: 828.0392456 val_vel_err: 73.1686020 val_traj_loss: 0.0027595 val_node_norm: 0.0007085 val_lambda: 3.1313291 rollout_pos_err: 15747.6132812 rollout_pos_err_worst: 34756.3632812 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0164246 pos_err: 986.0847778 vel_err: 80.8224716 traj_loss: 0.0046952 node_norm: 0.0010730 lambda: 3.2696443 val_loss: 0.0097817 val_pos_err: 828.9986572 val_vel_err: 68.7417221 val_traj_loss: 0.0027676 val_node_norm: 0.0007325 val_lambda: 3.2696455
+[INFO] Epoch 85: loss: 0.0170657 pos_err: 985.4075317 vel_err: 80.0265961 traj_loss: 0.0046851 node_norm: 0.0010988 lambda: 3.4080048 val_loss: 0.0102228 val_pos_err: 794.4930420 val_vel_err: 74.8070755 val_traj_loss: 0.0027823 val_node_norm: 0.0007407 val_lambda: 3.4080048
+[INFO] Epoch 90: loss: 0.0177025 pos_err: 983.6301880 vel_err: 80.6354065 traj_loss: 0.0046788 node_norm: 0.0011101 lambda: 3.5462949 val_loss: 0.0104150 val_pos_err: 807.6889038 val_vel_err: 71.2942123 val_traj_loss: 0.0027224 val_node_norm: 0.0007605 val_lambda: 3.5462949
+[INFO] Epoch 95: loss: 0.0183848 pos_err: 985.1854858 vel_err: 80.3142700 traj_loss: 0.0046808 node_norm: 0.0011304 lambda: 3.6862168 val_loss: 0.0108414 val_pos_err: 807.9898682 val_vel_err: 70.9176559 val_traj_loss: 0.0027314 val_node_norm: 0.0007730 val_lambda: 3.6862152
+[INFO] [rollout probe @ epoch 100] mean_pos_err=12573.1 worst=33797.2 finite=100%
+[INFO] Epoch 100: loss: 0.0190176 pos_err: 980.6367188 vel_err: 80.0646057 traj_loss: 0.0046758 node_norm: 0.0011432 lambda: 3.8227382 val_loss: 0.0116144 val_pos_err: 761.1507568 val_vel_err: 79.1419144 val_traj_loss: 0.0028288 val_node_norm: 0.0008007 val_lambda: 3.8227384 rollout_pos_err: 12573.1035970 rollout_pos_err_worst: 33797.1718750 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0196668 pos_err: 978.6891479 vel_err: 80.4469223 traj_loss: 0.0046703 node_norm: 0.0011670 lambda: 3.9611676 val_loss: 0.0115169 val_pos_err: 835.2128296 val_vel_err: 68.6100769 val_traj_loss: 0.0027090 val_node_norm: 0.0007860 val_lambda: 3.9611695
+[INFO] Epoch 110: loss: 0.0202998 pos_err: 977.4808350 vel_err: 80.4182281 traj_loss: 0.0046647 node_norm: 0.0011825 lambda: 4.0983272 val_loss: 0.0118622 val_pos_err: 823.8355103 val_vel_err: 68.8005066 val_traj_loss: 0.0026977 val_node_norm: 0.0008064 val_lambda: 4.0983257
+[INFO] Epoch 115: loss: 0.0208531 pos_err: 977.5309448 vel_err: 79.7815857 traj_loss: 0.0046428 node_norm: 0.0011914 lambda: 4.2348824 val_loss: 0.0126523 val_pos_err: 821.6784058 val_vel_err: 75.5994492 val_traj_loss: 0.0027907 val_node_norm: 0.0008342 val_lambda: 4.2348828
+[INFO] Epoch 120: loss: 0.0214966 pos_err: 974.7208862 vel_err: 79.3624649 traj_loss: 0.0046384 node_norm: 0.0012094 lambda: 4.3737478 val_loss: 0.0127763 val_pos_err: 797.6018066 val_vel_err: 71.3697815 val_traj_loss: 0.0027342 val_node_norm: 0.0008178 val_lambda: 4.3737469
+[INFO] [rollout probe @ epoch 125] mean_pos_err=15659.7 worst=38914.9 finite=100%
+[INFO] Epoch 125: loss: 0.0220948 pos_err: 973.6168213 vel_err: 79.2947159 traj_loss: 0.0046268 node_norm: 0.0012279 lambda: 4.5100398 val_loss: 0.0132010 val_pos_err: 810.1644897 val_vel_err: 71.1451492 val_traj_loss: 0.0027419 val_node_norm: 0.0008348 val_lambda: 4.5100398 rollout_pos_err: 15659.7207031 rollout_pos_err_worst: 38914.9062500 rollout_frac_finite: 1.0000000

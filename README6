@@ -1,428 +1,58 @@
-#!/usr/bin/env python3
-# compute_error_floor.py
-"""Measure the UNPREDICTABLE maneuver amplitude sigma_m and compute the intrinsic
-position-error floor as a function of forecast horizon.
-
-Companion to MANEUVER_ERROR_FLOOR.md. Read that first for the derivation.
-
-What this answers
------------------
-The maneuver diagnostic showed the forcing u = a - g is not a function of state
-(leave-one-trajectory-out R^2 negative on both datasets). That implies a nonzero
-lower bound on ANY forecaster's position error. The bound depends on exactly two
-numbers:
-
-    sigma_m : std-dev per axis of the UNPREDICTABLE part of u -- i.e. what is left
-              after the best possible physics model has removed drag/lift/gravity.
-    tau     : autocorrelation time of that residual.
-
-This script measures both and evaluates the floor.
-
-Why the earlier LOTO number can't be reused
--------------------------------------------
-diagnose_maneuver_structure.py regressed u on RAW ECEF position/velocity. Those vary
-enormously between flights with different launch/impact geography, so a tree model
-cannot extrapolate into a held-out flight's spatial region -- which is why LOTO-R^2
-came out NEGATIVE rather than merely low. That overstates unpredictability: some of u
-genuinely IS state-predictable in the right coordinates (that is exactly what the EOM
-library recovers). Using that sigma would make the floor far too pessimistic.
-
-This script therefore builds FRAME-RELATIVE, geography-invariant features:
-
-    altitude, speed, vertical speed, flight-path angle, air-density proxy exp(-h/H),
-    dynamic-pressure proxy rho*V^2, and rho*V^2 resolved along/normal to velocity
-
-and fits u in a VELOCITY-ALIGNED basis (along-track / cross-track / vertical), which
-is where drag and lift are simple. The residual after leave-one-trajectory-out
-prediction is the honest sigma_m.
-
-Usage
------
-    python compute_error_floor.py \\
-        --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --phase glide
-
-    # compare against your own measured results:
-    python compute_error_floor.py ... --observed-error 12301 --observed-horizon 300 --observed-dims 3
-
-Run from the directory containing load_truth.py / trajectory_helpers.py.
-"""
-
-from __future__ import annotations
-
-import argparse
-import os
-import sys
-from pathlib import Path
-
-import numpy as np
-
-try:
-    from load_truth import load_single_truth
-    from trajectory_helpers import TIME_INDEX, POS_SLICE, VEL_SLICE, ACC_SLICE
-except Exception as exc:  # pragma: no cover
-    sys.exit(f"Run from the directory with load_truth.py / trajectory_helpers.py: {exc}")
-
-try:
-    from sklearn.ensemble import HistGradientBoostingRegressor
-    _HAVE_SK = True
-except Exception:
-    _HAVE_SK = False
-
-GM_EARTH = 3.986004418e14
-R_EARTH = 6371000.0
-SCALE_HEIGHT = 7200.0
-
-
-# ------------------------------------------------------------------ physics
-
-def gravity_ecef(pos):
-    r = np.linalg.norm(pos, axis=1, keepdims=True)
-    r = np.where(r < 1.0, 1.0, r)
-    return -GM_EARTH * pos / r**3
-
-
-def frame_relative_features(pos, vel):
-    """Geography-invariant features in which drag/lift are simple functions.
-
-    Deliberately excludes absolute ECEF position: including it lets a flexible
-    regressor memorise each flight's specific corridor and destroys cross-flight
-    generalisation (the failure mode that produced the negative raw-ECEF LOTO R^2).
-    """
-    r = np.linalg.norm(pos, axis=1)
-    alt = r - R_EARTH
-    V = np.linalg.norm(vel, axis=1)
-    V_safe = np.where(V < 1e-6, 1e-6, V)
-
-    # vertical (radial) unit vector and vertical speed
-    up = pos / np.where(r[:, None] < 1.0, 1.0, r[:, None])
-    v_vert = np.einsum("ij,ij->i", vel, up)
-    v_horiz = np.sqrt(np.maximum(V**2 - v_vert**2, 0.0))
-    gamma = np.arctan2(v_vert, np.where(v_horiz < 1e-6, 1e-6, v_horiz))  # flight-path angle
-
-    rho = np.exp(-np.clip(alt, -1e4, 1e6) / SCALE_HEIGHT)
-    q = 0.5 * rho * V**2                      # dynamic pressure proxy
-
-    return np.column_stack([alt, V, v_vert, gamma, rho, q, q * V, q / V_safe])
-
-
-def velocity_frame(vel):
-    """Orthonormal (along-track, cross-track, vertical-ish) basis per sample.
-
-    Drag lies along -t_hat and lift normal to it, so resolving u in this basis makes
-    the state-predictable part low-order and lets the regressor actually find it.
-    """
-    V = np.linalg.norm(vel, axis=1, keepdims=True)
-    t_hat = vel / np.where(V < 1e-6, 1e-6, V)
-    ref = np.tile(np.array([0.0, 0.0, 1.0]), (len(vel), 1))
-    c = np.cross(t_hat, ref)
-    cn = np.linalg.norm(c, axis=1, keepdims=True)
-    c_hat = np.where(cn < 1e-9, np.tile(np.array([1.0, 0.0, 0.0]), (len(vel), 1)), c / np.where(cn < 1e-9, 1.0, cn))
-    n_hat = np.cross(c_hat, t_hat)
-    return t_hat, c_hat, n_hat
-
-
-# --------------------------------------------------------------------- data
-
-def load_phase(target: Path, phase: str):
-    phase_path = target / phase if (target / phase).is_dir() else target
-    if not phase_path.is_dir():
-        sys.exit(f"Not a directory: {phase_path}")
-    files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path)) if not x.startswith(".")]
-    out = []
-    n_fail = 0
-    for f in files:
-        if f.is_dir():
-            continue
-        try:
-            arr = np.atleast_2d(load_single_truth(str(f), debug=False,
-                                                  min_state_vector_size=7, min_timesteps=30))
-        except Exception:
-            n_fail += 1
-            continue
-        if arr.shape[1] >= 7 and arr.shape[0] >= 30:
-            out.append(arr)
-    print(f"[load] {len(out)}/{len(files)} trajectories loaded ({n_fail} parse failures)", flush=True)
-    return out
-
-
-def build_uv(traj):
-    pos = traj[:, POS_SLICE]
-    vel = traj[:, VEL_SLICE]
-    time = traj[:, TIME_INDEX]
-    has_acc = traj.shape[1] >= 10
-    acc = traj[:, ACC_SLICE] if has_acc else np.gradient(vel, time, axis=0)
-    u_ecef = acc - gravity_ecef(pos)
-
-    t_hat, c_hat, n_hat = velocity_frame(vel)
-    u_vf = np.column_stack([
-        np.einsum("ij,ij->i", u_ecef, t_hat),   # along-track (drag lives here)
-        np.einsum("ij,ij->i", u_ecef, c_hat),   # cross-track (bank/turn maneuver)
-        np.einsum("ij,ij->i", u_ecef, n_hat),   # normal (lift)
-    ])
-    X = frame_relative_features(pos, vel)
-    dt = float(np.median(np.diff(time))) if len(time) > 1 else 1.0
-    return u_vf, X, dt, has_acc
-
-
-# ---------------------------------------------------------------- estimation
-
-def loto_residuals(U, X, max_flights=None, trim=5):
-    """Leave-one-trajectory-out residual of u after the best state-based fit.
-
-    Returns residual arrays per flight (same order). trim drops the first/last few
-    samples per flight, where differentiated acceleration has edge artifacts.
-    """
-    n = len(U)
-    idxs = list(range(n))
-    if max_flights:
-        idxs = idxs[:max_flights]
-    resid = {i: np.zeros_like(U[i]) for i in idxs}
-    r2 = [[], [], []]
-    for k, held in enumerate(idxs):
-        tr = [i for i in idxs if i != held]
-        Xtr = np.vstack([X[i][trim:-trim] for i in tr])
-        Xte = X[held][trim:-trim]
-        for c in range(3):
-            ytr = np.concatenate([U[i][trim:-trim, c] for i in tr])
-            yte = U[held][trim:-trim, c]
-            mdl = HistGradientBoostingRegressor(max_depth=4, max_iter=200, learning_rate=0.07)
-            mdl.fit(Xtr, ytr)
-            pred = mdl.predict(Xte)
-            resid[held][trim:-trim, c] = yte - pred
-            ss_res = np.sum((yte - pred) ** 2)
-            ss_tot = np.sum((yte - yte.mean()) ** 2)
-            r2[c].append(1 - ss_res / ss_tot if ss_tot > 0 else np.nan)
-        print(f"  [loto] flight {k+1}/{len(idxs)} done", end="\r", flush=True)
-    print(" " * 40, end="\r")
-    return resid, [float(np.nanmedian(x)) for x in r2], idxs
-
-
-def autocorr_time(x, dt, max_lag=200):
-    x = x - x.mean()
-    d = np.dot(x, x)
-    if d <= 0:
-        return np.nan
-    for lag in range(1, min(max_lag, len(x) - 1)):
-        if np.dot(x[:-lag], x[lag:]) / d < np.exp(-1):
-            return lag * dt
-    return max_lag * dt
-
-
-def ar_innovation_sigma(u_list_1d, tau_steps, max_p=8):
-    """One-step-ahead AR residual std -- the INNOVATION of the forcing process.
-
-    This is the correct sigma_m for a HISTORY-DRIVEN maneuver. The diagnostic showed
-    u is NOT a function of instantaneous state (LOTO negative) BUT is almost perfectly
-    predictable from its own recent history (AR R^2 ~ 0.999). A forcing-carrying
-    forecaster (the GRU-ODE latent) exploits exactly that history, so the error it
-    cannot avoid is the AR INNOVATION -- what remains after the best linear prediction
-    from recent u -- NOT the residual-after-instantaneous-state, which still contains
-    the entire history-predictable lift oscillation and massively overstates sigma_m.
-    (That conflation is what produced the impossible 14 m/s^2 / 360 km first result.)
-
-    Fits u_t ~ [u_{t-1..t-p}] per flight; returns (innovation_std, p).
-    """
-    p = int(np.clip(round(tau_steps / 3.0), 2, max_p))
-    innov = []
-    for u in u_list_1d:
-        n = len(u)
-        if n < p + 20:
-            continue
-        Xd = np.column_stack([u[p - 1 - k: n - 1 - k] for k in range(p)])
-        y = u[p:]
-        m = min(len(Xd), len(y)); Xd, y = Xd[:m], y[:m]
-        A = np.column_stack([np.ones(len(Xd)), Xd])
-        coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-        innov.append(y - A @ coef)
-    if not innov:
-        return np.nan, p
-    return float(np.std(np.concatenate(innov))), p
-
-
-def K_kernel(T, tau, n=800):
-    """K_B(T): position-error kernel when the maneuver state is NOT carried.
-
-    K_B = int int (T-s)(T-s') exp(-|s-s'|/tau) ds ds'.  Multiplies sigma_STAT^2.
-    This is the pessimistic bound for a forecaster that ignores the maneuver.
-    """
-    s = np.linspace(0.0, T, n)
-    w = T - s
-    rho = np.exp(-np.abs(s[:, None] - s[None, :]) / tau)
-    inner = np.trapezoid(w[None, :] * rho, s, axis=1)
-    return float(np.trapezoid(w * inner, s))
-
-
-def K_kernel_carried(T, tau, n=800):
-    """K_A(T): position-error kernel for a forecaster that CARRIES the maneuver state.
-
-    The forecaster knows everything predictable from history, so its error is driven
-    only by future innovations. For an OU process the error covariance is
-        C_e(s,s') = sigma_stat^2 ( e^{-|s-s'|/tau} - e^{-(s+s')/tau} ),
-    and K_A = int int (T-s)(T-s') [that] ds ds'.  Multiplies sigma_STAT^2.
-
-    This is the RELEVANT floor for our system: the GRU-ODE residual carries the
-    forcing state, so the innovation -- not the full maneuver -- is what it cannot
-    predict. K_A < K_B; the two converge for T >> tau.
-    """
-    s = np.linspace(0.0, T, n)
-    w = T - s
-    C = (np.exp(-np.abs(s[:, None] - s[None, :]) / tau)
-         - np.exp(-(s[:, None] + s[None, :]) / tau))
-    inner = np.trapezoid(w[None, :] * C, s, axis=1)
-    return float(np.trapezoid(w * inner, s))
-
-
-# --------------------------------------------------------------------- main
-
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tgt-data-paths", required=True)
-    ap.add_argument("--phase", default="glide")
-    ap.add_argument("--max-flights", type=int, default=None,
-                    help="Cap flights used in the leave-one-out fit (speed).")
-    ap.add_argument("--observed-error", type=float, default=None,
-                    help="Your measured position error (m) to compare against the floor.")
-    ap.add_argument("--observed-horizon", type=float, default=300.0)
-    ap.add_argument("--observed-dims", type=int, default=3, choices=[2, 3])
-    args = ap.parse_args()
-
-    if not _HAVE_SK:
-        sys.exit("scikit-learn required:  pip install scikit-learn")
-
-    trajs = load_phase(Path(args.tgt_data_paths), args.phase)
-    if len(trajs) < 4:
-        sys.exit(f"Need >=4 trajectories, got {len(trajs)}")
-
-    U, X, dts, accflags = [], [], [], []
-    for tr in trajs:
-        u, x, dt, has_acc = build_uv(tr)
-        U.append(u); X.append(x); dts.append(dt); accflags.append(has_acc)
-    dt = float(np.median(dts))
-
-    print("=" * 96)
-    print("INTRINSIC ERROR FLOOR  --  measuring the unpredictable maneuver amplitude")
-    print(f"  dataset: {args.tgt_data_paths}/{args.phase}   flights: {len(trajs)}   dt: {dt:.2f}s")
-    print(f"  acceleration: {'MEASURED' if all(accflags) else 'DIFFERENTIATED from velocity'}")
-    print("=" * 96)
-
-    tot_std = np.array([np.std(np.concatenate([u[:, c] for u in U])) for c in range(3)])
-    print("\n--- total |u| in the velocity frame (predictable physics NOT yet removed) ---")
-    for c, nm in enumerate(["along-track", "cross-track", "normal/lift"]):
-        print(f"    {nm:12}: std {tot_std[c]:8.3f} m/s^2")
-
-    # State-only fit is reported for context ONLY -- its residual is NOT sigma_m.
-    # The maneuver is history-driven (AR R^2 ~ 0.999) not instantaneous-state-driven
-    # (LOTO negative), so the state-fit residual still contains the whole
-    # history-predictable lift oscillation and grossly overstates the truly
-    # unpredictable part. We therefore measure sigma from the AR INNOVATION instead.
-    print("\n--- context: instantaneous-state predictability (LOTO) ---")
-    _, r2, used = loto_residuals(U, X, max_flights=args.max_flights)
-    for c, nm in enumerate(["along-track", "cross-track", "normal/lift"]):
-        print(f"    {nm:12}: state-only LOTO-R^2 {r2[c]:6.3f}  "
-              f"(low/negative => not an INSTANTANEOUS-state function; expected here)")
-
-    trim = 5
-    taus = np.array([
-        np.nanmedian([autocorr_time(u[trim:-trim, c], dt) for u in U]) for c in range(3)
-    ])
-    tau = float(np.nanmean(taus))
-    tau_steps = tau / dt
-
-    # sigma_INNOVATION per axis: what a history-carrying forecaster cannot predict.
-    sig_innov = np.zeros(3)
-    ar_p = 0
-    for c in range(3):
-        comp = [u[trim:-trim, c] for u in U]
-        sig_innov[c], ar_p = ar_innovation_sigma(comp, tau_steps)
-
-    # Convert the discrete innovation std to the OU STATIONARY std that the kernels
-    # multiply:  sigma_stat = sigma_innov / sqrt(1 - e^{-2 dt/tau}).
-    a = np.exp(-dt / tau)
-    innov_to_stat = 1.0 / np.sqrt(max(1.0 - a * a, 1e-9))
-    sig_stat = sig_innov * innov_to_stat
-
-    print(f"\n--- sigma : the TRULY-UNPREDICTABLE forcing (AR({ar_p}) innovation) ---")
-    print("    this is what a forcing-carrying forecaster (GRU-ODE latent) cannot avoid.")
-    for c, nm in enumerate(["along-track", "cross-track", "normal/lift"]):
-        frac = 100.0 * sig_innov[c] / tot_std[c] if tot_std[c] > 0 else np.nan
-        print(f"    {nm:12}: sigma_innov {sig_innov[c]:6.3f}  -> sigma_stat {sig_stat[c]:6.3f} m/s^2"
-              f"  ({sig_stat[c]/9.80665*1000:6.1f} milli-g)   tau {taus[c]:5.1f}s   "
-              f"[innov = {frac:.0f}% of total |u|]")
-
-    sigma_stat = float(np.mean(sig_stat))
-    print(f"\n    AGGREGATE: sigma_stat = {sigma_stat:.3f} m/s^2   tau = {tau:.1f} s   "
-          f"(innovation was {np.mean(sig_innov):.3f} m/s^2)")
-
-    # -------- sanity gates: refuse to emit a physically impossible floor --------
-    problems = []
-    if np.mean(sig_innov) > np.mean(tot_std):
-        problems.append("innovation exceeds total |u| (fit is anti-correlated) -- sigma invalid")
-    if not np.isfinite(sigma_stat) or sigma_stat <= 0:
-        problems.append("sigma_stat non-finite or non-positive")
-
-    # ---------------- the floor ----------------
-    print("\n" + "=" * 96)
-    print("INTRINSIC POSITION-ERROR FLOOR")
-    print("  Regime A = forecaster CARRIES the maneuver state (our GRU-ODE case) -- the relevant one")
-    print("  Regime B = forecaster IGNORES it (pessimistic reference)")
-    print("=" * 96)
-    print(f"  {'horizon':>9}{'A: 3D RMS':>14}{'B: 3D RMS':>14}   regime")
-    for T in [10, 17, 30, 60, 100, 200, 300, 500, 800]:
-        rA = sigma_stat * np.sqrt(K_kernel_carried(float(T), tau)) * np.sqrt(3)
-        rB = sigma_stat * np.sqrt(K_kernel(float(T), tau)) * np.sqrt(3)
-        reg = "coherent" if T < tau else ("transition" if T < 5 * tau else "diffusive")
-        print(f"  {T:>7}s {rA:>13,.0f}m{rB:>13,.0f}m   {reg}")
-
-    if problems:
-        print("\n" + "!" * 96)
-        print("SANITY CHECK FAILED -- floor is NOT trustworthy:")
-        for p in problems:
-            print(f"  - {p}")
-        print("  The sigma measurement is unreliable on this data; do not use these numbers.")
-        print("!" * 96)
-        return
-
-    if args.observed_error:
-        T = args.observed_horizon
-        floorA = sigma_stat * np.sqrt(K_kernel_carried(T, tau)) * np.sqrt(args.observed_dims)
-        floorB = sigma_stat * np.sqrt(K_kernel(T, tau)) * np.sqrt(args.observed_dims)
-        ratio = args.observed_error / floorA if floorA > 0 else np.inf
-        print("\n" + "=" * 96)
-        print("COMPARISON AGAINST YOUR MEASURED RESULT")
-        print("=" * 96)
-        print(f"  measured error   : {args.observed_error:,.0f} m  @ T={T:.0f}s ({args.observed_dims}D)")
-        print(f"  floor Regime A   : {floorA:,.0f} m   (history-carrying -- the one to compare to)")
-        print(f"  floor Regime B   : {floorB:,.0f} m   (maneuver-ignoring reference)")
-        print(f"  ratio to A       : {ratio:.2f}x")
-        print()
-        if args.observed_error < floorA * 0.7:
-            print("  => BELOW the computed floor. This is physically impossible, so the sigma")
-            print("     measurement is still off (or the measured error is not a true free")
-            print("     rollout at this horizon). DO NOT use -- investigate before trusting.")
-        elif ratio < 1.4:
-            print("  => AT THE FLOOR. Remaining error is the unpredictable maneuver innovation,")
-            print("     not model deficiency. Frame/library/sparsity tuning cannot materially")
-            print("     help single-trajectory accuracy; shift to a distributional deliverable.")
-        elif ratio < 3:
-            print("  => NEAR THE FLOOR (~2x). Modest headroom; prioritise the forcing-carrying")
-            print("     residual over further physics-backbone work.")
-        else:
-            print("  => ABOVE THE FLOOR. Real modelling headroom remains. Keep optimising, and")
-            print("     check non-maneuver error sources (integration, frame, scaler, checkpoint).")
-
-    print("\nNOTE: differentiated accelerations bias tau DOWN and sigma UP, so this floor")
-    print("is conservative (pessimistic). Regime A is the honest bound for a model that")
-    print("carries the forcing state; Regime B brackets the no-carry worst case.")
-
-
-if __name__ == "__main__":
-    import traceback
-    try:
-        main()
-    except SystemExit:
-        raise
-    except Exception:
-        print("\n[FATAL] traceback:\n", flush=True)
-        traceback.print_exc()
-        sys.exit(1)
+(.venv) e471302@usmk2tqq3hkk2 next % python compute_error_floor.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --phase glide --observed-error 12301 --observed-horizon 300 --observed-dims 3
+[load] 28/28 trajectories loaded (0 parse failures)
+================================================================================================
+INTRINSIC ERROR FLOOR  --  measuring the unpredictable maneuver amplitude
+  dataset: trajectory_library/phases/LowE_555063a9_HGV/glide   flights: 28   dt: 1.00s
+  acceleration: DIFFERENTIATED from velocity
+================================================================================================
+
+--- total |u| in the velocity frame (predictable physics NOT yet removed) ---
+    along-track : std    7.988 m/s^2
+    cross-track : std   19.047 m/s^2
+    normal/lift : std   18.973 m/s^2
+
+--- context: instantaneous-state predictability (LOTO) ---
+    along-track : state-only LOTO-R^2  0.869  (low/negative => not an INSTANTANEOUS-state function; expected here)
+    cross-track : state-only LOTO-R^2  0.134  (low/negative => not an INSTANTANEOUS-state function; expected here)
+    normal/lift : state-only LOTO-R^2  0.094  (low/negative => not an INSTANTANEOUS-state function; expected here)
+
+--- sigma : the TRULY-UNPREDICTABLE forcing (AR(6) innovation) ---
+    this is what a forcing-carrying forecaster (GRU-ODE latent) cannot avoid.
+    along-track : sigma_innov  0.233  -> sigma_stat  0.699 m/s^2  (  71.3 milli-g)   tau  18.0s   [innov = 3% of total |u|]
+    cross-track : sigma_innov  0.727  -> sigma_stat  2.184 m/s^2  ( 222.7 milli-g)   tau  16.5s   [innov = 4% of total |u|]
+    normal/lift : sigma_innov  0.903  -> sigma_stat  2.711 m/s^2  ( 276.4 milli-g)   tau  16.5s   [innov = 5% of total |u|]
+
+    AGGREGATE: sigma_stat = 1.865 m/s^2   tau = 17.0 s   (innovation was 0.621 m/s^2)
+
+================================================================================================
+INTRINSIC POSITION-ERROR FLOOR
+  Regime A = forecaster CARRIES the maneuver state (our GRU-ODE case) -- the relevant one
+  Regime B = forecaster IGNORES it (pessimistic reference)
+================================================================================================
+    horizon     A: 3D RMS     B: 3D RMS   regime
+       10s            67m          150m   coherent
+       17s           228m          412m   transition
+       30s           796m        1,182m   transition
+       60s         3,239m        4,024m   transition
+      100s         8,306m        9,475m   diffusive
+      200s        26,942m       28,755m   diffusive
+      300s        51,775m       54,056m   diffusive
+      500s       115,421m      118,428m   diffusive
+      800s       238,245m      242,095m   diffusive
+
+================================================================================================
+COMPARISON AGAINST YOUR MEASURED RESULT
+================================================================================================
+  measured error   : 12,301 m  @ T=300s (3D)
+  floor Regime A   : 51,775 m   (history-carrying -- the one to compare to)
+  floor Regime B   : 54,056 m   (maneuver-ignoring reference)
+  ratio to A       : 0.24x
+
+  => BELOW the computed floor. This is physically impossible, so the sigma
+     measurement is still off (or the measured error is not a true free
+     rollout at this horizon). DO NOT use -- investigate before trusting.
+
+NOTE: differentiated accelerations bias tau DOWN and sigma UP, so this floor
+is conservative (pessimistic). Regime A is the honest bound for a model that
+carries the forcing state; Regime B brackets the no-carry worst case.

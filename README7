@@ -1,52 +1,52 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python diagnose_maneuver_structure.py --tgt-data-paths trajectory_library/phases/LowE_3f39bfb6_HGV --phase glide
+.venv) e471302@usmk2tqq3hkk2 next % python diagnose_maneuver_structure.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --phase glide
 [diagnose_maneuver_structure] starting...
-[diagnose_maneuver_structure] target resolved to: /Users/e471302/lm_cm_repos/next/trajectory_library/phases/LowE_3f39bfb6_HGV
-[load_phase] looking in: trajectory_library/phases/LowE_3f39bfb6_HGV/glide
-[load_phase] found 80 entries (showing up to 5): ['Albuqurque_lp10_ECEF.csv', 'Albuqurque_lp5_ECEF.csv', 'Albuqurque_lp6_ECEF.csv', 'Albuqurque_lp8_ECEF.csv', 'Boise_lp1_ECEF.csv']
-[load_phase] loaded 80/80 trajectories (skipped: 0 dirs, 0 parse failures, 0 too-small)
+[diagnose_maneuver_structure] target resolved to: /Users/e471302/lm_cm_repos/next/trajectory_library/phases/LowE_555063a9_HGV
+[load_phase] looking in: trajectory_library/phases/LowE_555063a9_HGV/glide
+[load_phase] found 28 entries (showing up to 5): ['Atlanta_lp10_ECEF.csv', 'Atlanta_lp2_ECEF.csv', 'Atlanta_lp4_ECEF.csv', 'Atlanta_lp9_ECEF.csv', 'Boston_lp10_ECEF.csv']
+[load_phase] loaded 28/28 trajectories (skipped: 0 dirs, 0 parse failures, 0 too-small)
 ====================================================================================================
 MANEUVER-FORCING STRUCTURE DIAGNOSTIC   u = a - g   (ECEF)
-  dataset : trajectory_library/phases/LowE_3f39bfb6_HGV/glide
-  flights : 80   (steps: min 95, max 810)
+  dataset : trajectory_library/phases/LowE_555063a9_HGV/glide
+  flights : 28   (steps: min 95, max 465)
   acceleration source: DIFFERENTIATED from velocity for all flights (no measured accel column in this dataset) -- see compute_u() docstring for the noise caveat this introduces to Tests 1 and 5
 ====================================================================================================
 
 --- TEST 1: autocorrelation time of u (steps to fall below 1/e) ---
     ~1 step => white/random increments | large => smooth, predictable from history
-    u_x: median  18.5   [p10 16.0, p90 21.1]
-    u_y: median  18.0   [p10 15.0, p90 24.1]
-    u_z: median  19.0   [p10 13.9, p90 23.1]
+    u_x: median  16.5   [p10 8.7, p90 22.3]
+    u_y: median  17.0   [p10 10.9, p90 25.0]
+    u_z: median  16.0   [p10 8.4, p90 22.3]
 
 --- TEST 3: one-step AR(5) R^2 of u from its OWN recent history ---
     high => temporally structured (forecastable by carrying a forcing state)
-    u_x: median  0.999   [p10 0.992, p90 1.000]
+    u_x: median  0.998   [p10 0.978, p90 1.000]
     u_y: median  0.999   [p10 0.992, p90 1.000]
-    u_z: median  0.999   [p10 0.993, p90 1.000]
+    u_z: median  0.999   [p10 0.989, p90 1.000]
 
 --- TEST 5: dominant oscillation period of u (steps) ---
-    u_x: median  170.8
-    u_y: median  186.0
-    u_z: median  184.2
+    u_x: median  126.5
+    u_y: median  166.2
+    u_z: median  172.5
 
 --- TEST 2: leave-one-trajectory-out R^2 for u ~ g(state) ---
     honest test of 'is u a function of state'. high => a state-based
     physics library can capture the maneuver; low => it cannot.
-    u_x: LOTO-R^2 -2.370
-    u_y: LOTO-R^2 -0.293
-    u_z: LOTO-R^2 -0.293
+    u_x: LOTO-R^2 -2.881
+    u_y: LOTO-R^2 -1.699
+    u_z: LOTO-R^2 -1.555
 
 --- TEST 4: cross-flight distributional stability of |u| ---
-    per-flight mean |u|: 16.180 m/s^2  (flight-to-flight CV 0.33)
-    per-flight std  |u|: 22.705 m/s^2
+    per-flight mean |u|: 17.661 m/s^2  (flight-to-flight CV 0.43)
+    per-flight std  |u|: 23.526 m/s^2
     low CV => the maneuver DISTRIBUTION is stable across flights even
     if the sequence isn't -> a probabilistic/ensemble model is well posed.
 
 ====================================================================================================
 VERDICT
 ====================================================================================================
-  autocorr time (median)      : 18.5 steps
+  autocorr time (median)      : 16.5 steps
   AR self-predictability (med): 0.999
-  state predictability (LOTO) : -0.293
+  state predictability (LOTO) : -1.699
 
   => STRUCTURED (history-driven, weakly state-dependent). The forcing is
      smooth/autocorrelated and forecastable by CARRYING A FORCING STATE

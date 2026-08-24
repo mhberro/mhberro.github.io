@@ -1,24 +1,2 @@
-From my understanding those are the estimated aerodynamic forces acting on the hypersonic glide vehicle in the DCU frame 
- 
- 
-def estimate_control_inputs(trajectories, sigma=2.0, output_frame='ECEF'):
-    """
-    Estimate aerodynamic control by subtracting gravity from measured acceleration.
-    
-    For glide phase: u = a_measured - g
-    where u represents aerodynamic forces (lift + drag)
-    """
-    # 1. Compute acceleration from velocity (numerical derivative)
-    accel_ecef = gradient(vel_ecef)
-    
-    # 2. Compute gravitational acceleration
-    g_ecef = -GM_EARTH * pos_ecef / r³
-    
-    # 3. Control = measured acceleration - gravity
-    u_ecef = accel_ecef - g_ecef
- 
-In other words, those control inputs represent the combined aerodynamic forces:
-Atmospheric drag: Opposes velocity, proportional to ρv²
-Aerodynamic lift: Perpendicular to velocity, controlled by angle of attack
-Bank-to-turn maneuvers: Lateral forces from banking
- 
+python compute_error_floor.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+  --phase glide --observed-error 12301 --observed-horizon 300 --observed-dims 3

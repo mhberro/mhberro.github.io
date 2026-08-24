@@ -1,90 +1,343 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.2 --aphynity-tau2 10 -o model_outputs/SBI/eom_win75_l1p2_tau10_trajboot_FULL/GEODESIC/glide                                                                                                                                     
-There are 22 training trajs and 6 validation trajs.
+#!/usr/bin/env python3
+# diagnose_maneuver_structure.py
+"""Is the maneuver forcing STRUCTURED (learnable/forecastable) or RANDOM (only
+characterizable as a distribution)?
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
-Discovered Physics Matrix Xi:
- [[ 0.          0.          0.          0.00419264 -0.04436743]
- [ 0.          0.         -0.0051839   0.         -0.00644396]
- [-0.01029743  0.          0.         -0.00653097  0.02386028]
- [ 0.          0.         -0.00642848  0.00245761  0.02327473]
- [ 0.          0.          0.          0.         -0.0152652 ]
- [ 0.          0.          0.0175033  -0.00569499  0.        ]
- [ 0.          0.02144403  0.          0.         -0.004653  ]
- [ 0.          0.          0.          0.00646468  0.        ]]
-[SINDy] active terms: 16/40 | max|coef| per target: [0.0103  0.02144 0.0175  0.00653 0.04437]
-[SINDy] R2 per target: [0.2427 1.     0.4026 0.0591 0.2743]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.2453 | max relative term contribution 1.1530
-[SINDy] library: eom | scale heights: [5000.0]
-[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.2453 perTarget=[0.243, 1.0, 0.403, 0.059, 0.274]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     curv_vs2           contrib=0.9907 coef=-1.030e-02 ip=1.00
-          dh/dt     v_h                contrib=0.9990 coef=+2.144e-02 ip=1.00
-          dv_s/dt   aero_q@H=5000      contrib=1.0385 coef=+1.750e-02 ip=1.00
-          dv_s/dt   aero_along@H=5000  contrib=0.3814 coef=-6.428e-03 ip=0.78
-          dv_s/dt   gravity            contrib=0.3076 coef=-5.184e-03 ip=0.86
-          dv_al/dt  curv_vs2           contrib=0.3098 coef=-6.531e-03 ip=0.86
-          dv_al/dt  v_al               contrib=0.3067 coef=+6.465e-03 ip=1.00
-          dv_al/dt  aero_q@H=5000      contrib=0.2702 coef=-5.695e-03 ip=0.78
-          dv_al/dt  1                  contrib=0.1989 coef=+4.193e-03 ip=0.60
-          dv_h/dt   1                  contrib=1.1530 coef=-4.437e-02 ip=1.00
-          dv_h/dt   curv_vs2           contrib=0.6201 coef=+2.386e-02 ip=1.00
-          dv_h/dt   aero_along@H=5000  contrib=0.6049 coef=+2.327e-02 ip=0.96
-          dv_h/dt   aero_vert@H=5000   contrib=0.3943 coef=-1.527e-02 ip=1.00
+Why this gates the whole modeling decision
+------------------------------------------
+Every research report converged on the same diagnosis: the object's maneuvering
+acceleration is an exogenous forcing that is not a clean function of state, so a
+state-only physics model has an irreducible error floor on the maneuvering
+channels. The forcing is
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x335468810>, 0.0001)
-[INFO] Epoch 5: loss: 0.0017160 pos_err: 570.9844971 vel_err: 21.6901855 traj_loss: 0.0015902 node_norm: 0.0000710 lambda: 1.0344929 val_loss: 0.0008913 val_pos_err: 480.0313110 val_vel_err: 21.6410522 val_traj_loss: 0.0007819 val_node_norm: 0.0000825 val_lambda: 1.0344934
-[INFO] Epoch 10: loss: 0.0017002 pos_err: 570.0806274 vel_err: 21.0400372 traj_loss: 0.0015357 node_norm: 0.0000528 lambda: 1.0727504 val_loss: 0.0008475 val_pos_err: 478.3633728 val_vel_err: 20.2171707 val_traj_loss: 0.0007367 val_node_norm: 0.0000572 val_lambda: 1.0727509
-[INFO] Epoch 15: loss: 0.0017095 pos_err: 570.8735962 vel_err: 20.1311436 traj_loss: 0.0015042 node_norm: 0.0000414 lambda: 1.1089746 val_loss: 0.0008306 val_pos_err: 478.6370850 val_vel_err: 19.7405663 val_traj_loss: 0.0007113 val_node_norm: 0.0000418 val_lambda: 1.1089746
-[INFO] Epoch 20: loss: 0.0017306 pos_err: 570.5631714 vel_err: 20.1144772 traj_loss: 0.0014800 node_norm: 0.0000372 lambda: 1.1442106 val_loss: 0.0008323 val_pos_err: 479.5371094 val_vel_err: 19.3999672 val_traj_loss: 0.0006935 val_node_norm: 0.0000388 val_lambda: 1.1442100
-[INFO] [rollout probe @ epoch 25] mean_pos_err=35230.6 worst=131422.2 finite=100%
-[INFO] Epoch 25: loss: 0.0017513 pos_err: 570.5011597 vel_err: 19.9990959 traj_loss: 0.0014592 node_norm: 0.0000313 lambda: 1.1787570 val_loss: 0.0008407 val_pos_err: 475.0231934 val_vel_err: 21.0826550 val_traj_loss: 0.0006857 val_node_norm: 0.0000324 val_lambda: 1.1787572 rollout_pos_err: 35230.5932617 rollout_pos_err_worst: 131422.2187500 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0017774 pos_err: 570.1081543 vel_err: 19.8068047 traj_loss: 0.0014412 node_norm: 0.0000293 lambda: 1.2129635 val_loss: 0.0008491 val_pos_err: 479.3975830 val_vel_err: 19.5358257 val_traj_loss: 0.0006769 val_node_norm: 0.0000280 val_lambda: 1.2129641
-[INFO] Epoch 35: loss: 0.0018038 pos_err: 570.4779663 vel_err: 19.7830715 traj_loss: 0.0014244 node_norm: 0.0000277 lambda: 1.2468793 val_loss: 0.0008736 val_pos_err: 477.4374390 val_vel_err: 20.9059525 val_traj_loss: 0.0006819 val_node_norm: 0.0000234 val_lambda: 1.2468786
-[INFO] Epoch 40: loss: 0.0018324 pos_err: 570.1021729 vel_err: 19.8445587 traj_loss: 0.0014085 node_norm: 0.0000285 lambda: 1.2807081 val_loss: 0.0008938 val_pos_err: 476.8913269 val_vel_err: 20.6573830 val_traj_loss: 0.0006771 val_node_norm: 0.0000267 val_lambda: 1.2807075
-[INFO] Epoch 45: loss: 0.0018577 pos_err: 570.8069458 vel_err: 19.5592880 traj_loss: 0.0013925 node_norm: 0.0000273 lambda: 1.3144418 val_loss: 0.0009116 val_pos_err: 480.2832642 val_vel_err: 19.5163288 val_traj_loss: 0.0006724 val_node_norm: 0.0000278 val_lambda: 1.3144422
-[INFO] [rollout probe @ epoch 50] mean_pos_err=16178.5 worst=43428.7 finite=100%
-[INFO] Epoch 50: loss: 0.0018852 pos_err: 570.2188721 vel_err: 19.7324238 traj_loss: 0.0013787 node_norm: 0.0000267 lambda: 1.3480446 val_loss: 0.0009246 val_pos_err: 480.1231079 val_vel_err: 18.9360943 val_traj_loss: 0.0006679 val_node_norm: 0.0000243 val_lambda: 1.3480443 rollout_pos_err: 16178.4873047 rollout_pos_err_worst: 43428.7187500 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0019133 pos_err: 570.1939087 vel_err: 19.7132378 traj_loss: 0.0013645 node_norm: 0.0000281 lambda: 1.3815386 val_loss: 0.0009561 val_pos_err: 478.2278748 val_vel_err: 19.9668980 val_traj_loss: 0.0006723 val_node_norm: 0.0000273 val_lambda: 1.3815391
-[INFO] Epoch 60: loss: 0.0019389 pos_err: 570.1674194 vel_err: 19.7176361 traj_loss: 0.0013514 node_norm: 0.0000265 lambda: 1.4150584 val_loss: 0.0009709 val_pos_err: 478.0592041 val_vel_err: 20.0656376 val_traj_loss: 0.0006719 val_node_norm: 0.0000201 val_lambda: 1.4150583
-[INFO] Epoch 65: loss: 0.0019643 pos_err: 570.4151001 vel_err: 19.5125103 traj_loss: 0.0013372 node_norm: 0.0000273 lambda: 1.4485313 val_loss: 0.0009900 val_pos_err: 477.0393982 val_vel_err: 19.8109188 val_traj_loss: 0.0006666 val_node_norm: 0.0000244 val_lambda: 1.4485310
-[INFO] Epoch 70: loss: 0.0019926 pos_err: 570.2883911 vel_err: 19.6957436 traj_loss: 0.0013252 node_norm: 0.0000288 lambda: 1.4818804 val_loss: 0.0010190 val_pos_err: 479.3045959 val_vel_err: 18.5103817 val_traj_loss: 0.0006631 val_node_norm: 0.0000364 val_lambda: 1.4818810
-[INFO] [rollout probe @ epoch 75] mean_pos_err=14159.1 worst=32007.5 finite=100%
-[INFO] Epoch 75: loss: 0.0020171 pos_err: 569.2742920 vel_err: 19.7941971 traj_loss: 0.0013130 node_norm: 0.0000277 lambda: 1.5151900 val_loss: 0.0010329 val_pos_err: 477.4989929 val_vel_err: 20.1313267 val_traj_loss: 0.0006659 val_node_norm: 0.0000239 val_lambda: 1.5151894 rollout_pos_err: 14159.1330566 rollout_pos_err_worst: 32007.4765625 rollout_frac_finite: 1.0000000
-[INFO] Epoch 80: loss: 0.0020425 pos_err: 569.8671265 vel_err: 19.5711327 traj_loss: 0.0013001 node_norm: 0.0000294 lambda: 1.5484358 val_loss: 0.0010579 val_pos_err: 477.5343018 val_vel_err: 19.6012459 val_traj_loss: 0.0006653 val_node_norm: 0.0000278 val_lambda: 1.5484359
-[INFO] Epoch 85: loss: 0.0020688 pos_err: 569.3181152 vel_err: 19.6490593 traj_loss: 0.0012889 node_norm: 0.0000301 lambda: 1.5817343 val_loss: 0.0010742 val_pos_err: 478.2347412 val_vel_err: 19.6126575 val_traj_loss: 0.0006642 val_node_norm: 0.0000236 val_lambda: 1.5817349
-[INFO] Epoch 90: loss: 0.0020971 pos_err: 569.2777710 vel_err: 19.7709427 traj_loss: 0.0012791 node_norm: 0.0000314 lambda: 1.6149377 val_loss: 0.0011034 val_pos_err: 478.9527283 val_vel_err: 19.0022221 val_traj_loss: 0.0006647 val_node_norm: 0.0000299 val_lambda: 1.6149385
-[INFO] Early stopping triggered at 90
+    u = a_measured - g            (Jerry's u = a - g; gravity removed)
 
-Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x311b276d0>, 0.0001)
-[INFO] Epoch 5: loss: 0.0063396 pos_err: 1051.2431641 vel_err: 87.3092346 traj_loss: 0.0051174 node_norm: 0.0005697 lambda: 1.1275215 val_loss: 0.0039070 val_pos_err: 891.8746338 val_vel_err: 82.2982864 val_traj_loss: 0.0031283 val_node_norm: 0.0003797 val_lambda: 1.1275216
-[INFO] Epoch 10: loss: 0.0070626 pos_err: 1036.0581055 vel_err: 86.5994568 traj_loss: 0.0050213 node_norm: 0.0006349 lambda: 1.2800837 val_loss: 0.0042486 val_pos_err: 868.3709106 val_vel_err: 74.1516342 val_traj_loss: 0.0029926 val_node_norm: 0.0004177 val_lambda: 1.2800841
-[INFO] Epoch 15: loss: 0.0078261 pos_err: 1034.2288818 vel_err: 85.4295273 traj_loss: 0.0049848 node_norm: 0.0006967 lambda: 1.4302369 val_loss: 0.0048145 val_pos_err: 855.6737671 val_vel_err: 84.9088058 val_traj_loss: 0.0030571 val_node_norm: 0.0004422 val_lambda: 1.4302368
-[INFO] Epoch 20: loss: 0.0085224 pos_err: 1028.4416504 vel_err: 83.7833023 traj_loss: 0.0049313 node_norm: 0.0007378 lambda: 1.5785937 val_loss: 0.0051848 val_pos_err: 836.1196899 val_vel_err: 74.5028534 val_traj_loss: 0.0029717 val_node_norm: 0.0004938 val_lambda: 1.5785941
-[INFO] [rollout probe @ epoch 25] mean_pos_err=13267.8 worst=27180.5 finite=100%
-[INFO] Epoch 25: loss: 0.0092122 pos_err: 1019.7400513 vel_err: 84.3396530 traj_loss: 0.0048942 node_norm: 0.0007743 lambda: 1.7240756 val_loss: 0.0054220 val_pos_err: 862.8790283 val_vel_err: 70.3166504 val_traj_loss: 0.0028456 val_node_norm: 0.0005160 val_lambda: 1.7240762 rollout_pos_err: 13267.8092448 rollout_pos_err_worst: 27180.5000000 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0099055 pos_err: 1015.9149170 vel_err: 82.9940262 traj_loss: 0.0048677 node_norm: 0.0008153 lambda: 1.8674546 val_loss: 0.0059263 val_pos_err: 842.0252686 val_vel_err: 72.0464172 val_traj_loss: 0.0028811 val_node_norm: 0.0005459 val_lambda: 1.8674548
-[INFO] Epoch 35: loss: 0.0105531 pos_err: 1012.6125488 vel_err: 82.7910156 traj_loss: 0.0048277 node_norm: 0.0008491 lambda: 2.0100636 val_loss: 0.0062614 val_pos_err: 858.5173340 val_vel_err: 71.2526932 val_traj_loss: 0.0028356 val_node_norm: 0.0005617 val_lambda: 2.0100641
-[INFO] Epoch 40: loss: 0.0112636 pos_err: 1010.5124512 vel_err: 81.9930801 traj_loss: 0.0048187 node_norm: 0.0008880 lambda: 2.1531830 val_loss: 0.0068277 val_pos_err: 797.4757080 val_vel_err: 80.2745895 val_traj_loss: 0.0029104 val_node_norm: 0.0005611 val_lambda: 2.1531827
-[INFO] Epoch 45: loss: 0.0118787 pos_err: 1006.6326904 vel_err: 82.2365952 traj_loss: 0.0047836 node_norm: 0.0009030 lambda: 2.2944391 val_loss: 0.0071371 val_pos_err: 842.6591187 val_vel_err: 71.1031265 val_traj_loss: 0.0028428 val_node_norm: 0.0006145 val_lambda: 2.2944386
-[INFO] [rollout probe @ epoch 50] mean_pos_err=15931.6 worst=33472.0 finite=100%
-[INFO] Epoch 50: loss: 0.0125587 pos_err: 1001.0921021 vel_err: 81.2626495 traj_loss: 0.0047743 node_norm: 0.0009325 lambda: 2.4351735 val_loss: 0.0074769 val_pos_err: 846.3218384 val_vel_err: 70.6609192 val_traj_loss: 0.0028036 val_node_norm: 0.0006496 val_lambda: 2.4351747 rollout_pos_err: 15931.5913900 rollout_pos_err_worst: 33472.0156250 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0132326 pos_err: 995.8301392 vel_err: 82.1350021 traj_loss: 0.0047636 node_norm: 0.0009678 lambda: 2.5747204 val_loss: 0.0078142 val_pos_err: 855.5709839 val_vel_err: 69.8062363 val_traj_loss: 0.0027850 val_node_norm: 0.0006436 val_lambda: 2.5747194
-[INFO] Epoch 60: loss: 0.0139227 pos_err: 996.5460205 vel_err: 82.8358383 traj_loss: 0.0047644 node_norm: 0.0009895 lambda: 2.7145672 val_loss: 0.0084011 val_pos_err: 787.1328125 val_vel_err: 79.0747681 val_traj_loss: 0.0028506 val_node_norm: 0.0006629 val_lambda: 2.7145655
-[INFO] Epoch 65: loss: 0.0145496 pos_err: 995.8623657 vel_err: 81.9009705 traj_loss: 0.0047434 node_norm: 0.0010075 lambda: 2.8549559 val_loss: 0.0085742 val_pos_err: 836.7689819 val_vel_err: 75.3697968 val_traj_loss: 0.0027678 val_node_norm: 0.0006722 val_lambda: 2.8549554
-[INFO] Epoch 70: loss: 0.0151555 pos_err: 989.8894653 vel_err: 80.8537216 traj_loss: 0.0047166 node_norm: 0.0010347 lambda: 2.9938359 val_loss: 0.0089200 val_pos_err: 840.0300293 val_vel_err: 67.8329086 val_traj_loss: 0.0027438 val_node_norm: 0.0007056 val_lambda: 2.9938371
-[INFO] [rollout probe @ epoch 75] mean_pos_err=15747.6 worst=34756.4 finite=100%
-[INFO] Epoch 75: loss: 0.0158299 pos_err: 992.5774536 vel_err: 81.1022797 traj_loss: 0.0047164 node_norm: 0.0010611 lambda: 3.1313307 val_loss: 0.0093493 val_pos_err: 828.0392456 val_vel_err: 73.1686020 val_traj_loss: 0.0027595 val_node_norm: 0.0007085 val_lambda: 3.1313291 rollout_pos_err: 15747.6132812 rollout_pos_err_worst: 34756.3632812 rollout_frac_finite: 1.0000000
-[INFO] Epoch 80: loss: 0.0164246 pos_err: 986.0847778 vel_err: 80.8224716 traj_loss: 0.0046952 node_norm: 0.0010730 lambda: 3.2696443 val_loss: 0.0097817 val_pos_err: 828.9986572 val_vel_err: 68.7417221 val_traj_loss: 0.0027676 val_node_norm: 0.0007325 val_lambda: 3.2696455
-[INFO] Epoch 85: loss: 0.0170657 pos_err: 985.4075317 vel_err: 80.0265961 traj_loss: 0.0046851 node_norm: 0.0010988 lambda: 3.4080048 val_loss: 0.0102228 val_pos_err: 794.4930420 val_vel_err: 74.8070755 val_traj_loss: 0.0027823 val_node_norm: 0.0007407 val_lambda: 3.4080048
-[INFO] Epoch 90: loss: 0.0177025 pos_err: 983.6301880 vel_err: 80.6354065 traj_loss: 0.0046788 node_norm: 0.0011101 lambda: 3.5462949 val_loss: 0.0104150 val_pos_err: 807.6889038 val_vel_err: 71.2942123 val_traj_loss: 0.0027224 val_node_norm: 0.0007605 val_lambda: 3.5462949
-[INFO] Epoch 95: loss: 0.0183848 pos_err: 985.1854858 vel_err: 80.3142700 traj_loss: 0.0046808 node_norm: 0.0011304 lambda: 3.6862168 val_loss: 0.0108414 val_pos_err: 807.9898682 val_vel_err: 70.9176559 val_traj_loss: 0.0027314 val_node_norm: 0.0007730 val_lambda: 3.6862152
-[INFO] [rollout probe @ epoch 100] mean_pos_err=12573.1 worst=33797.2 finite=100%
-[INFO] Epoch 100: loss: 0.0190176 pos_err: 980.6367188 vel_err: 80.0646057 traj_loss: 0.0046758 node_norm: 0.0011432 lambda: 3.8227382 val_loss: 0.0116144 val_pos_err: 761.1507568 val_vel_err: 79.1419144 val_traj_loss: 0.0028288 val_node_norm: 0.0008007 val_lambda: 3.8227384 rollout_pos_err: 12573.1035970 rollout_pos_err_worst: 33797.1718750 rollout_frac_finite: 1.0000000
-[INFO] Epoch 105: loss: 0.0196668 pos_err: 978.6891479 vel_err: 80.4469223 traj_loss: 0.0046703 node_norm: 0.0011670 lambda: 3.9611676 val_loss: 0.0115169 val_pos_err: 835.2128296 val_vel_err: 68.6100769 val_traj_loss: 0.0027090 val_node_norm: 0.0007860 val_lambda: 3.9611695
-[INFO] Epoch 110: loss: 0.0202998 pos_err: 977.4808350 vel_err: 80.4182281 traj_loss: 0.0046647 node_norm: 0.0011825 lambda: 4.0983272 val_loss: 0.0118622 val_pos_err: 823.8355103 val_vel_err: 68.8005066 val_traj_loss: 0.0026977 val_node_norm: 0.0008064 val_lambda: 4.0983257
-[INFO] Epoch 115: loss: 0.0208531 pos_err: 977.5309448 vel_err: 79.7815857 traj_loss: 0.0046428 node_norm: 0.0011914 lambda: 4.2348824 val_loss: 0.0126523 val_pos_err: 821.6784058 val_vel_err: 75.5994492 val_traj_loss: 0.0027907 val_node_norm: 0.0008342 val_lambda: 4.2348828
-[INFO] Epoch 120: loss: 0.0214966 pos_err: 974.7208862 vel_err: 79.3624649 traj_loss: 0.0046384 node_norm: 0.0012094 lambda: 4.3737478 val_loss: 0.0127763 val_pos_err: 797.6018066 val_vel_err: 71.3697815 val_traj_loss: 0.0027342 val_node_norm: 0.0008178 val_lambda: 4.3737469
-[INFO] [rollout probe @ epoch 125] mean_pos_err=15659.7 worst=38914.9 finite=100%
-[INFO] Epoch 125: loss: 0.0220948 pos_err: 973.6168213 vel_err: 79.2947159 traj_loss: 0.0046268 node_norm: 0.0012279 lambda: 4.5100398 val_loss: 0.0132010 val_pos_err: 810.1644897 val_vel_err: 71.1451492 val_traj_loss: 0.0027419 val_node_norm: 0.0008348 val_lambda: 4.5100398 rollout_pos_err: 15659.7207031 rollout_pos_err_worst: 38914.9062500 rollout_frac_finite: 1.0000000
+and u is the combined aerodynamic force (drag + lift + bank-to-turn maneuver).
+The strategic question is what KIND of signal u is:
+
+  * STRUCTURED  -> u is predictable from state and/or its own recent history.
+        A learned forcing predictor u_hat = f(state, history) is viable, and a
+        single-trajectory forecast is a meaningful deliverable.
+
+  * RANDOM      -> u is (largely) unpredictable from state; its future is not a
+        function of anything you have at inference time. Then NO model can
+        forecast a single trajectory accurately, and the honest deliverable is a
+        DISTRIBUTION / reachable set of trajectories, not one line. This also
+        means any method reporting low single-trajectory error is either
+        overfitting each flight's specific maneuver sequence or using future
+        information (the reconstruction-vs-forecasting trap).
+
+This script measures where u falls on that spectrum, per component, using the
+tests that actually separate the two cases:
+
+  TEST 1  Temporal autocorrelation of u within a flight.
+          Long correlation time  -> smooth, low-frequency, likely predictable
+          from recent history (an AR/again-latent-state model can forecast it).
+          Near-white (corr time ~ 1 step) -> random increments, not forecastable.
+
+  TEST 2  Predictability of u from STATE (pos/vel) alone.
+          R^2 of a flexible regressor u ~ g(state), evaluated by LEAVE-ONE-
+          TRAJECTORY-OUT CV (the only honest split -- within-flight splits leak
+          because of autocorrelation). High LOTO-R^2 -> state-driven, a physics
+          library can capture it. Low -> not a function of state.
+
+  TEST 3  Predictability of u from its OWN RECENT HISTORY (autoregression).
+          One-step-ahead R^2 of u_t ~ [u_{t-1..t-p}]. High -> temporally
+          structured (forecastable by carrying a forcing state). Low -> random.
+
+  TEST 4  Cross-flight repeatability / distributional stability.
+          Are the marginal statistics of u (magnitude, direction) consistent
+          across flights? If the DISTRIBUTION is stable even when the SEQUENCE is
+          not, that is the positive result for a probabilistic/ensemble
+          deliverable: you can model the maneuver distribution even if you can't
+          predict the specific sequence.
+
+  TEST 5  Frequency content (median dominant period of u).
+          Concentrated low-frequency power -> structured maneuvers. Broadband ->
+          random.
+
+Everything is done in the ECEF frame directly from the measured acceleration
+columns (no numerical differentiation needed -- the truth files carry a,
+ACC_SLICE), so results are not contaminated by finite-difference noise.
+
+VERDICT is printed automatically with the modeling implication.
+
+Usage
+-----
+    python diagnose_maneuver_structure.py \
+        --tgt-data-paths path/to/maneuvering_dataset \
+        --phase glide          # or whichever phase dir holds the trajectories
+
+Run from the directory containing load_truth.py / trajectory_helpers.py.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+# --- project imports -------------------------------------------------------
+try:
+    from load_truth import load_single_truth
+    from trajectory_helpers import TIME_INDEX, POS_SLICE, VEL_SLICE, ACC_SLICE
+except Exception as exc:  # pragma: no cover
+    sys.exit(f"Run from the directory with load_truth.py / trajectory_helpers.py: {exc}")
+
+try:
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    _HAVE_SK = True
+except Exception:
+    _HAVE_SK = False
+
+GM_EARTH = 3.986004418e14  # m^3/s^2
+
+
+# ------------------------------------------------------------------ helpers
+
+def gravity_ecef(pos):
+    r = np.linalg.norm(pos, axis=1, keepdims=True)
+    r = np.where(r < 1.0, 1.0, r)
+    return -GM_EARTH * pos / r**3
+
+
+def load_phase(target: Path, phase: str):
+    phase_path = target / phase if (target / phase).is_dir() else target
+    files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))
+             if not x.startswith(".")]
+    out, names = [], []
+    for f in files:
+        try:
+            arr = load_single_truth(str(f), debug=False, min_state_vector_size=10, min_timesteps=5)
+            arr = np.atleast_2d(arr)
+            if arr.shape[1] >= 10 and arr.shape[0] >= 5:
+                out.append(arr)
+                names.append(f.name)
+        except Exception:
+            pass
+    return out, names
+
+
+def compute_u(traj):
+    """u = a_measured - g in ECEF, plus the state used to predict it."""
+    pos = traj[:, POS_SLICE]
+    vel = traj[:, VEL_SLICE]
+    acc = traj[:, ACC_SLICE]
+    u = acc - gravity_ecef(pos)              # (n, 3) aerodynamic+maneuver force
+    state = np.hstack([pos, vel])            # (n, 6)
+    return u, state
+
+
+def autocorr_time(x, max_lag=60):
+    """Lag (steps) at which autocorrelation drops below 1/e. ~1 => white."""
+    x = x - x.mean()
+    if np.allclose(x, 0):
+        return 0.0
+    denom = np.dot(x, x)
+    for lag in range(1, min(max_lag, len(x) - 1)):
+        r = np.dot(x[:-lag], x[lag:]) / denom
+        if r < np.exp(-1):
+            return float(lag)
+    return float(max_lag)
+
+
+def dominant_period(x):
+    x = x - x.mean()
+    if np.allclose(x, 0) or len(x) < 8:
+        return float("nan")
+    sp = np.abs(np.fft.rfft(x)) ** 2
+    freqs = np.fft.rfftfreq(len(x), d=1.0)
+    sp[0] = 0.0
+    k = int(np.argmax(sp))
+    return float(1.0 / freqs[k]) if freqs[k] > 0 else float("nan")
+
+
+def ar_r2(u_comp, p=5):
+    """One-step-ahead R^2 of u_t ~ [u_{t-1..t-p}] within one flight."""
+    n = len(u_comp)
+    if n < p + 20:
+        return float("nan")
+    if np.std(u_comp) < 1e-12:
+        # Constant component: perfectly "predictable" but carries no maneuver
+        # information. Report 1.0 so it doesn't drag the median toward "random".
+        return 1.0
+    X = np.column_stack([u_comp[p - 1 - k: n - 1 - k] for k in range(p)])
+    y = u_comp[p:]
+    m = min(len(X), len(y))
+    X, y = X[:m], y[:m]
+    Xa = np.column_stack([np.ones(len(X)), X])
+    coef, *_ = np.linalg.lstsq(Xa, y, rcond=None)
+    pred = Xa @ coef
+    ss_res = np.sum((y - pred) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    return float(1 - ss_res / ss_tot) if ss_tot > 0 else float("nan")
+
+
+def loto_state_r2(U_list, S_list, max_flights=None):
+    """Leave-one-trajectory-out R^2 for u ~ g(state), per component.
+
+    This is the honest test of 'is u a function of state': train on all but one
+    flight, predict the held-out flight, average. Within-flight CV would leak
+    through autocorrelation and overstate predictability.
+    """
+    if not _HAVE_SK:
+        return None
+    n_flights = len(U_list)
+    idxs = list(range(n_flights))
+    if max_flights:
+        idxs = idxs[:max_flights]
+    r2_per_comp = [[], [], []]
+    for held in idxs:
+        tr = [i for i in idxs if i != held]
+        Xtr = np.vstack([S_list[i] for i in tr])
+        Xte = S_list[held]
+        for c in range(3):
+            ytr = np.concatenate([U_list[i][:, c] for i in tr])
+            yte = U_list[held][:, c]
+            model = HistGradientBoostingRegressor(max_depth=4, max_iter=150,
+                                                  learning_rate=0.08)
+            model.fit(Xtr, ytr)
+            pred = model.predict(Xte)
+            ss_res = np.sum((yte - pred) ** 2)
+            ss_tot = np.sum((yte - yte.mean()) ** 2)
+            r2_per_comp[c].append(1 - ss_res / ss_tot if ss_tot > 0 else np.nan)
+    return [float(np.nanmean(r)) for r in r2_per_comp]
+
+
+# --------------------------------------------------------------------- main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tgt-data-paths", required=True)
+    ap.add_argument("--phase", default="glide")
+    ap.add_argument("--ar-order", type=int, default=5)
+    ap.add_argument("--max-loto-flights", type=int, default=None,
+                    help="Cap flights used in leave-one-out state regression (speed).")
+    args = ap.parse_args()
+
+    target = Path(args.tgt_data_paths)
+    trajs, names = load_phase(target, args.phase)
+    if len(trajs) < 3:
+        sys.exit(f"Need >=3 trajectories; found {len(trajs)} in {target}/{args.phase}")
+
+    U_list, S_list = [], []
+    for tr in trajs:
+        u, s = compute_u(tr)
+        U_list.append(u)
+        S_list.append(s)
+
+    comp = ["x", "y", "z"]
+    print("=" * 100)
+    print("MANEUVER-FORCING STRUCTURE DIAGNOSTIC   u = a_measured - g   (ECEF)")
+    print(f"  dataset : {target}/{args.phase}")
+    print(f"  flights : {len(trajs)}   (steps: "
+          f"min {min(len(u) for u in U_list)}, max {max(len(u) for u in U_list)})")
+    print("=" * 100)
+
+    # ---- TEST 1 & 5: autocorrelation time and dominant period ----
+    act = {c: [] for c in range(3)}
+    per = {c: [] for c in range(3)}
+    arr = {c: [] for c in range(3)}
+    for u in U_list:
+        for c in range(3):
+            act[c].append(autocorr_time(u[:, c]))
+            per[c].append(dominant_period(u[:, c]))
+            arr[c].append(ar_r2(u[:, c], p=args.ar_order))
+
+    print("\n--- TEST 1: autocorrelation time of u (steps to fall below 1/e) ---")
+    print("    ~1 step => white/random increments | large => smooth, predictable from history")
+    for c in range(3):
+        vals = np.array(act[c])
+        print(f"    u_{comp[c]}: median {np.nanmedian(vals):5.1f}   "
+              f"[p10 {np.nanpercentile(vals,10):.1f}, p90 {np.nanpercentile(vals,90):.1f}]")
+
+    print("\n--- TEST 3: one-step AR(%d) R^2 of u from its OWN recent history ---" % args.ar_order)
+    print("    high => temporally structured (forecastable by carrying a forcing state)")
+    for c in range(3):
+        vals = np.array(arr[c])
+        print(f"    u_{comp[c]}: median {np.nanmedian(vals):6.3f}   "
+              f"[p10 {np.nanpercentile(vals,10):.3f}, p90 {np.nanpercentile(vals,90):.3f}]")
+
+    print("\n--- TEST 5: dominant oscillation period of u (steps) ---")
+    for c in range(3):
+        vals = np.array(per[c])
+        print(f"    u_{comp[c]}: median {np.nanmedian(vals):6.1f}")
+
+    # ---- TEST 2: predictability from STATE, leave-one-trajectory-out ----
+    print("\n--- TEST 2: leave-one-trajectory-out R^2 for u ~ g(state) ---")
+    print("    honest test of 'is u a function of state'. high => a state-based")
+    print("    physics library can capture the maneuver; low => it cannot.")
+    if _HAVE_SK:
+        loto = loto_state_r2(U_list, S_list, max_flights=args.max_loto_flights)
+        for c in range(3):
+            print(f"    u_{comp[c]}: LOTO-R^2 {loto[c]:6.3f}")
+    else:
+        loto = None
+        print("    [scikit-learn not available -- skipped. pip install scikit-learn]")
+
+    # ---- TEST 4: distributional stability across flights ----
+    print("\n--- TEST 4: cross-flight distributional stability of |u| ---")
+    mags = [np.linalg.norm(u, axis=1) for u in U_list]
+    means = np.array([m.mean() for m in mags])
+    stds = np.array([m.std() for m in mags])
+    cv_of_means = float(np.std(means) / (np.mean(means) + 1e-12))
+    print(f"    per-flight mean |u|: {np.mean(means):.3f} m/s^2  "
+          f"(flight-to-flight CV {cv_of_means:.2f})")
+    print(f"    per-flight std  |u|: {np.mean(stds):.3f} m/s^2")
+    print("    low CV => the maneuver DISTRIBUTION is stable across flights even")
+    print("    if the sequence isn't -> a probabilistic/ensemble model is well posed.")
+
+    # ---------------------------- verdict ----------------------------
+    med_act = np.nanmedian([np.nanmedian(act[c]) for c in range(3)])
+    med_ar = np.nanmedian([np.nanmedian(arr[c]) for c in range(3)])
+    med_loto = np.nanmedian(loto) if loto is not None else float("nan")
+
+    print("\n" + "=" * 100)
+    print("VERDICT")
+    print("=" * 100)
+    print(f"  autocorr time (median)      : {med_act:.1f} steps")
+    print(f"  AR self-predictability (med): {med_ar:.3f}")
+    if loto is not None:
+        print(f"  state predictability (LOTO) : {med_loto:.3f}")
+    print()
+
+    state_driven = (not np.isnan(med_loto)) and med_loto > 0.5
+    history_driven = med_ar > 0.5 or med_act > 5
+    if state_driven:
+        print("  => STRUCTURED (state-driven). The maneuver forcing is substantially a")
+        print("     function of state. A physics/UDE model with the right basis can")
+        print("     capture it; single-trajectory forecasting is a valid deliverable.")
+        print("     ACTION: focus on the state-based forcing terms; SINDy-with-control")
+        print("     or a UDE residual keyed on state is the right tool.")
+    elif history_driven:
+        print("  => STRUCTURED (history-driven, weakly state-dependent). The forcing is")
+        print("     smooth/autocorrelated and forecastable by CARRYING A FORCING STATE")
+        print("     (latent-variable / recurrent residual), even though it is not a clean")
+        print("     function of instantaneous state. Single-trajectory forecasting is")
+        print("     viable over horizons up to ~the autocorrelation time; beyond that it")
+        print("     degrades toward the distributional case.")
+        print("     ACTION: a UDE with a recurrent/latent forcing state (your GRU-ODE")
+        print("     residual is well suited) -- train it to carry and propagate u.")
+    else:
+        print("  => RANDOM. The forcing is neither a function of state nor forecastable")
+        print("     from its own history. NO model can accurately forecast a single")
+        print("     trajectory -- any method that claims to is overfitting each flight's")
+        print("     maneuver sequence or using future information (the reconstruction")
+        print("     trap). The correct deliverable is a DISTRIBUTION / reachable set.")
+        if cv_of_means < 0.5:
+            print("     GOOD NEWS: the maneuver DISTRIBUTION is stable across flights")
+            print("     (low CV), so a probabilistic/ensemble forecast is well posed even")
+            print("     though a point forecast is not.")
+        print("     ACTION: reframe the deliverable as probabilistic; model the maneuver")
+        print("     as a bounded/stochastic disturbance and report an ensemble or")
+        print("     reachable set, not a single line. Re-scope any accuracy metric to a")
+        print("     distributional one (e.g. coverage, CRPS) before comparing to Jerry's.")
+    print("=" * 100)
+
+
+if __name__ == "__main__":
+    main()

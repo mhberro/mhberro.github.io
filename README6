@@ -1,4 +1,4 @@
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
+.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
   --sr 100000000 --frame geodesic --geodesic-mode integrated \
   --model-type aphynity-gruode --sbi-phase glide --use-scalar \
   --window-size 75 --window-stride 5 --augment-segments 1 \
@@ -6,445 +6,138 @@ python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9
   --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 \
   --eom-mach-powers 1,2 \
   -o model_outputs/SBI/eom_mach12/GEODESIC/glide --sindy-only
+There are 22 training trajs and 6 validation trajs.
 
-# eom_library.py
-"""Parametric Equations-of-Motion (EOM) basis for the physics backbone.
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-2.59073006e-03  6.39955970e-05  1.88136902e-03  5.01092702e-03
+  -1.04891508e-02]
+ [ 2.48604065e-03 -4.94138981e-05 -8.42186270e-03 -5.53214774e-03
+  -3.14569666e-02]
+ [-5.43914326e-03 -9.13369668e-05 -9.94172075e-03 -8.34400485e-03
+  -1.88193492e-02]
+ [-3.54595266e-05  0.00000000e+00 -4.48282802e-03  4.65146859e-03
+   1.88115407e-02]
+ [ 0.00000000e+00  0.00000000e+00 -2.39304181e-03 -9.18121563e-04
+   3.19395972e-04]
+ [ 0.00000000e+00  2.45865615e-05  8.21097898e-03 -6.96076609e-03
+   1.07373352e-02]
+ [-4.40583174e-05  0.00000000e+00  5.73211694e-03  3.02291508e-03
+   4.68585897e-03]
+ [ 1.15005244e-05  0.00000000e+00 -7.64524612e-03 -3.73577304e-03
+  -4.81897688e-03]
+ [-1.22076741e-05  0.00000000e+00  4.45353634e-03  7.63793397e-04
+   1.13258531e-02]
+ [ 8.27729856e-05  0.00000000e+00  3.68986339e-04  3.20793211e-03
+   7.37644286e-03]
+ [-4.46905711e-05  0.00000000e+00 -4.95444556e-03  7.67774932e-04
+  -6.36165940e-03]
+ [ 5.52380837e-05  0.00000000e+00  5.10137074e-03 -2.88546558e-03
+   7.38551434e-03]
+ [-2.08983698e-05  2.14172011e-02 -1.65397720e-03 -1.39177452e-04
+  -1.02041389e-02]
+ [-5.47548622e-05  0.00000000e+00  6.83539114e-04 -1.46363200e-02
+  -3.91466568e-03]
+ [ 0.00000000e+00 -2.26256872e-05  2.16432368e-03  1.76379414e-03
+   6.68563846e-03]
+ [-2.48981936e-05  0.00000000e+00  7.76284393e-04 -1.08396687e-02
+  -2.30160490e-03]
+ [ 3.01735013e-05  0.00000000e+00 -5.72827289e-04  1.40896203e-02
+   2.17591395e-03]
+ [ 0.00000000e+00  5.03830129e-05 -6.12692978e-03 -1.34767380e-03
+   4.33219194e-02]]
+[SINDy] active terms: 75/90 | max|coef| per target: [0.00544 0.02142 0.00994 0.01464 0.04332]
+[SINDy] R2 per target: [0.9979 1.     0.6805 0.1575 0.6323]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.4901 | max relative term contribution 1.1259
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.4901 perTarget=[0.998, 1.0, 0.68, 0.158, 0.632]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5233 coef=-5.439e-03 ip=1.00
+          ds/dt     1                  contrib=0.2492 coef=-2.591e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2392 coef=+2.486e-03 ip=1.00
+          ds/dt     aero_along*M2@H=5000 contrib=0.0079 coef=+8.277e-05 ip=1.00
+          dh/dt     v_h                contrib=0.9978 coef=+2.142e-02 ip=1.00
+          dh/dt     curv_vs2           contrib=0.0043 coef=-9.134e-05 ip=1.00
+          dh/dt     1                  contrib=0.0030 coef=+6.400e-05 ip=1.00
+          dh/dt     cor_turn           contrib=0.0023 coef=+5.038e-05 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.5898 coef=-9.942e-03 ip=1.00
+          dv_s/dt   gravity            contrib=0.4997 coef=-8.422e-03 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=0.4872 coef=+8.211e-03 ip=1.00
+          dv_s/dt   aero_vert*M1@H=5000 contrib=0.4445 coef=-7.645e-03 ip=1.00
+          dv_al/dt  v_al               contrib=0.6943 coef=-1.464e-02 ip=1.00
+          dv_al/dt  cor_along          contrib=0.6684 coef=+1.409e-02 ip=0.98
+          dv_al/dt  transport_va       contrib=0.5133 coef=-1.084e-02 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3958 coef=-8.344e-03 ip=1.00
+          dv_h/dt   cor_turn           contrib=1.1259 coef=+4.332e-02 ip=1.00
+          dv_h/dt   gravity            contrib=0.8175 coef=-3.146e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.4891 coef=-1.882e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.4889 coef=+1.881e-02 ip=1.00
 
-The idea
---------
-SINDy exists to discover *unknown structure*. But the structure of atmospheric
-glide flight is not unknown -- it is textbook 3-DoF point-mass physics: gravity,
-aerodynamic drag along the velocity vector, aerodynamic lift perpendicular to it,
-and geometric curvature terms. What is genuinely unknown for a given threat is a
-handful of AERODYNAMIC COEFFICIENTS (C_D*A/m, C_L*A/m and their lateral analogue).
+=== DISCOVERED SINDy EQUATIONS ===
+ds/dt = - 0.00543914*curv_vs2 [ip=1.00] - 0.00259073*1 [ip=1.00] + 0.00248604*gravity [ip=1.00] + 8.2773e-05*aero_along*M2@H=5000 [ip=1.00] + 5.52381e-05*aero_q*M2@H=5000 [ip=1.00] - 5.47549e-05*v_al [ip=0.94] - 4.46906e-05*aero_vert*M2@H=5000 [ip=1.00] - 4.40583e-05*aero_along*M1@H=5000 [ip=0.96] - 3.54595e-05*aero_along@H=5000 [ip=1.00] + 3.01735e-05*cor_along [ip=0.92] - 2.48982e-05*transport_va [ip=0.90] - 2.08984e-05*v_h [ip=0.88] - 1.22077e-05*aero_q*M1@H=5000 [ip=0.74] + 1.15005e-05*aero_vert*M1@H=5000 [ip=0.70]
+dh/dt = 0.0214172*v_h [ip=1.00] - 9.1337e-05*curv_vs2 [ip=1.00] + 6.39956e-05*1 [ip=1.00] + 5.0383e-05*cor_turn [ip=1.00] - 4.94139e-05*gravity [ip=1.00] + 2.45866e-05*aero_q@H=5000 [ip=1.00] - 2.26257e-05*centripetal_s [ip=0.98]
+dv_s/dt = - 0.00994172*curv_vs2 [ip=1.00] - 0.00842186*gravity [ip=1.00] + 0.00821098*aero_q@H=5000 [ip=1.00] - 0.00764525*aero_vert*M1@H=5000 [ip=1.00] - 0.00612693*cor_turn [ip=1.00] + 0.00573212*aero_along*M1@H=5000 [ip=1.00] + 0.00510137*aero_q*M2@H=5000 [ip=1.00] - 0.00495445*aero_vert*M2@H=5000 [ip=1.00] - 0.00448283*aero_along@H=5000 [ip=1.00] + 0.00445354*aero_q*M1@H=5000 [ip=1.00] - 0.00239304*aero_vert@H=5000 [ip=1.00] + 0.00216432*centripetal_s [ip=1.00] + 0.00188137*1 [ip=1.00] - 0.00165398*v_h [ip=1.00] + 0.000776284*transport_va [ip=1.00] + 0.000683539*v_al [ip=1.00] - 0.000572827*cor_along [ip=1.00] + 0.000368986*aero_along*M2@H=5000 [ip=1.00]
+dv_al/dt = - 0.0146363*v_al [ip=1.00] + 0.0140896*cor_along [ip=0.98] - 0.0108397*transport_va [ip=1.00] - 0.008344*curv_vs2 [ip=1.00] - 0.00696077*aero_q@H=5000 [ip=1.00] - 0.00553215*gravity [ip=1.00] + 0.00501093*1 [ip=1.00] + 0.00465147*aero_along@H=5000 [ip=1.00] - 0.00373577*aero_vert*M1@H=5000 [ip=1.00] + 0.00320793*aero_along*M2@H=5000 [ip=1.00] + 0.00302292*aero_along*M1@H=5000 [ip=1.00] - 0.00288547*aero_q*M2@H=5000 [ip=1.00] + 0.00176379*centripetal_s [ip=1.00] - 0.00134767*cor_turn [ip=1.00] - 0.000918122*aero_vert@H=5000 [ip=1.00] + 0.000767775*aero_vert*M2@H=5000 [ip=0.98] + 0.000763793*aero_q*M1@H=5000 [ip=1.00] - 0.000139177*v_h [ip=1.00]
+dv_h/dt = 0.0433219*cor_turn [ip=1.00] - 0.031457*gravity [ip=1.00] - 0.0188193*curv_vs2 [ip=1.00] + 0.0188115*aero_along@H=5000 [ip=1.00] + 0.0113259*aero_q*M1@H=5000 [ip=1.00] + 0.0107373*aero_q@H=5000 [ip=1.00] - 0.0104892*1 [ip=1.00] - 0.0102041*v_h [ip=1.00] + 0.00738551*aero_q*M2@H=5000 [ip=1.00] + 0.00737644*aero_along*M2@H=5000 [ip=1.00] + 0.00668564*centripetal_s [ip=1.00] - 0.00636166*aero_vert*M2@H=5000 [ip=1.00] - 0.00481898*aero_vert*M1@H=5000 [ip=1.00] + 0.00468586*aero_along*M1@H=5000 [ip=1.00] - 0.00391467*v_al [ip=1.00] - 0.0023016*transport_va [ip=1.00] + 0.00217591*cor_along [ip=1.00] + 0.000319396*aero_vert@H=5000 [ip=1.00]
 
-Asking a sparse-regression search to rediscover Newton from ~22 noisy flights is
-badly under-determined: it invents non-physical positive-feedback terms (h*h, s*s)
-that fit one step and destroy the rollout. This module instead writes the known
-force laws down and leaves only the unknown coefficients free.
+[PHYSICS-RECOVERY] discovered vs theoretical coefficients
+  ds/dt      transport_va   found=-2.6979e-01   (no theoretical value in this channel)
+  dv_s/dt    transport_va   found=+8.4115e+00   (no theoretical value in this channel)
+  dv_al/dt   transport_va   found=-1.1745e+02  theory=-2.0000e+00  err= 5772.7%   (-2 exact polar kinematics)
+  dv_h/dt    transport_va   found=-2.4939e+01   (no theoretical value in this channel)
+  dh/dt      centripetal_s  found=-4.3871e-06   (no theoretical value in this channel)
+  dv_s/dt    centripetal_s  found=+4.1966e-04  theory=+1.0000e+00  err=  100.0%   (+1 exact polar kinematics)
+  dv_al/dt   centripetal_s  found=+3.4200e-04   (no theoretical value in this channel)
+  dv_h/dt    centripetal_s  found=+1.2963e-03   (no theoretical value in this channel)
+  dh/dt      cor_turn       found=+2.9222e-03   (no theoretical value in this channel)
+  dv_s/dt    cor_turn       found=-3.5537e-01   (no theoretical value in this channel)
+  dv_al/dt   cor_turn       found=-7.8166e-02  theory=+f = 2*Omega*sin(lat0)
+  dv_h/dt    cor_turn       found=+2.5127e+00   (no theoretical value in this channel)
+  ds/dt      cor_along      found=+3.7147e-08   (no theoretical value in this channel)
+  dv_s/dt    cor_along      found=-7.0522e-07  theory=-f = -2*Omega*sin(lat0)   -> implies |lat0| = 0.3 deg
+  dv_al/dt   cor_along      found=+1.7346e-05   (no theoretical value in this channel)
+  dv_h/dt    cor_along      found=+2.6788e-06   (no theoretical value in this channel)
 
-The crucial property that makes this a drop-in: the EOM are **linear in the unknown
-coefficients**, so the same `stridge` / ensemble machinery and the same standalone
-rollout evaluation work unchanged -- only the candidate columns differ. Instead of
-~85 polynomial columns we offer ~6 physically-derived ones.
+[SINDy] equations written to: model_outputs/SBI/eom_mach12/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
 
-Basis columns (all evaluated in PHYSICAL units, then normalised)
----------------------------------------------------------------
-With V = sqrt(v_s^2 + v_h^2), dynamic-pressure-like factor q = 0.5*rho(h)*V^2 and
-rho(h) = exp(-h/H):
+[pure-SINDy rollout — train]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  train_0                         251    251     30060.0     24803.9     50353.1
+  train_1                         324    324    147720.9    451372.4    451372.4
+  train_2                         465    465    351393.5   1001796.4   1001796.4
+  train_3                         181    181     18301.4     17281.7     29217.7
+  train_4                         383    383    162608.0    443142.4    443142.4
+  train_5                          95     95      5583.9      4340.4      9622.7
+  train_6                         166    166     33427.4     48581.3     57713.9
+  train_7                          97     97      6030.4      4515.8      9485.8
+  train_8                         181    181     18453.4     18635.0     30011.4
+  train_9                         210    210     55893.0    132967.6    132967.6
+  train_10                        121    121     13786.7     20681.4     20753.3
+  train_11                        102    102      6879.0      3540.8     11776.1
+  train_12                        451    451    226627.6    749203.6    749203.6
+  train_13                        212    212     42966.0    108971.0    108971.0
+  train_14                        208    208     27914.7     21190.0     50695.3
+  train_15                        217    217     13519.1      8464.6     17817.9
+  train_16                        117    117     10175.7     13260.9     15474.6
+  train_17                        333    333    207676.7    561900.9    561900.9
+  train_18                        272    272     93791.5    236752.4    236752.4
+  train_19                        221    221     28961.6     13468.7     46086.4
+  train_20                        444    444    264010.2    693924.5    693924.5
+  train_21                        262    262     82516.5    210708.5    210708.5
+  SUMMARY: mean=84013.5 m | median=31743.7 m | worst=351393.5 m | diverged 0/22
+  (in-plane geodesic error: range + altitude; excludes cross-range)
 
-  drag_s   = -q * v_s / V        (drag, along-track component)   -> coeff k_D
-  drag_h   = -q * v_h / V        (drag, vertical component)      -> coeff k_D
-  lift_s   = +q * v_h / V        (in-plane lift, along-track)    -> coeff k_L
-  lift_h   = -q * v_s / V        (in-plane lift, vertical)       -> coeff k_L
-  lat_aero =  q                  (lateral/bank force -> turn rate) -> coeff k_lat
-  gravity  = -g0*(Re/(Re+h))^2   (gravity, vertical)             -> coeff ~1 (fixed form)
-  curv     = +v_s^2/(Re+h)       (centrifugal/curvature, vertical) -> coeff ~1
-  bias     =  1                  (small constant offset / trim)
+[pure-SINDy rollout — validation]
+  trajectory                    steps  valid      mean_m     final_m       max_m
+  validation_0                    130    130     10149.8      2963.2     16478.4
+  validation_1                    123    123      9894.5     20794.4     20794.4
+  validation_2                    179    179     19407.9     23021.4     29259.8
+  validation_3                    150    150     26043.4     43279.9     43440.7
+  validation_4                    144    144      5449.4      5827.0      9764.9
+  validation_5                    287    287     49845.1    112810.7    112810.7
+  SUMMARY: mean=20131.7 m | median=14778.8 m | worst=49845.1 m | diverged 0/6
+  (in-plane geodesic error: range + altitude; excludes cross-range)
 
-Every column is a genuine force term. There is no term whose magnitude grows with
-POSITION in a way that feeds back on itself, so a fitted model is structurally
-incapable of the runaway that the polynomial library produced.
-"""
-
-from __future__ import annotations
-
-import numpy as np
-
-EARTH_RADIUS_M = 6371000.0
-G0 = 9.80665
-# Speed-of-sound model for the Mach proxy. A simple two-layer ISA-like temperature
-# profile is enough: what matters for the library is that M varies correctly with
-# altitude and speed, not absolute atmospheric fidelity (the fitted coefficients
-# absorb any constant offset).
-GAMMA_AIR = 1.4
-R_SPECIFIC = 287.05
-T_SEA = 288.15
-T_LAPSE = 0.0065
-T_TROPO = 216.65
-T_MIN, T_MAX = 180.0, 320.0
-_V_EPS = 1e-9
-_EXP_ARG_MAX = 10.0
-
-
-class EOMLibrary:
-    """Physically-derived candidate columns for glide-phase equations of motion."""
-
-    def __init__(
-        self,
-        state_vector_len: int = 5,
-        h_idx: int = 1,
-        vs_idx: int = 2,
-        va_idx: int = 3,
-        vh_idx: int = 4,
-        h_sign: float = 1.0,
-        s_idx: int = 0,
-        include_frame_transport: bool = True,
-        s_floor: float = 5000.0,
-        mach_powers: tuple[int, ...] = (),
-        scale_heights: tuple[float, ...] = (7200.0,),
-        earth_radius: float = EARTH_RADIUS_M,
-        feature_mean=None,
-        feature_scale=None,
-        include_bias: bool = True,
-        include_linear_velocity: bool = True,
-        clip: float = 8.0,
-        # kept for interface compatibility with the other libraries
-        degree: int = 2,
-        pos_idx=(0, 1),
-        vel_idx=(2, 4),
-        poly_mode: str = "eom",
-    ):
-        self.state_vector_len = state_vector_len
-        self.h_idx, self.vs_idx, self.va_idx, self.vh_idx = h_idx, vs_idx, va_idx, vh_idx
-        # See PhysicsInformedLibrary.h_sign. Converts the frame's altitude-like
-        # channel to TRUE ALTITUDE (positive up): +1 for geodesic h and DCU Up,
-        # -1 for grdth's NED Down. Feeds rho(h)=exp(-h/H), the gravity term
-        # g0*(Re/(Re+h))^2 and the curvature denominator, all of which are wrong
-        # (and the first of which saturates) if the sign is inverted.
-        self.h_sign = float(h_sign)
-        # --- polar-frame transport / rotating-frame terms -------------------
-        # The geodesic-integrated frame is a POLAR system centred on the impact
-        # point: s = radius, azimuth = polar angle, v_s = radial rate, v_alpha ~
-        # angular rate (see NEXT_geodesic_frame.ecef_to_local_geodesic_vec). A polar
-        # frame has MANDATORY transport (fictitious) terms -- they are not optional
-        # physics, they are what the coordinate system itself requires:
-        #     dv_r/dt   = a_radial + r*omega^2          (centripetal)
-        #     domega/dt = a_tang/r - 2*v_r*omega/r      (Coriolis/transport)
-        # Neither was present in the original basis. Measured on representative
-        # glide numbers (s=1000 km, v_s=-5 km/s, v_alpha=1e-4) the transport term
-        # alone changes v_alpha by ~3x its own typical magnitude over 300 s.
-        #
-        # Separately, ECEF is a ROTATING frame, so true Coriolis appears. Projecting
-        # a_cor = -2*Omega x v onto this frame's (radial, tangential) axes, the
-        # azimuth dependence CANCELS for the sin(lat0) part:
-        #     a_cor . t_hat = -f * v_l ,   a_cor . l_hat = +f * v_s ,   f = 2*Om*sin(lat0)
-        # so the dominant (f-plane) Coriolis IS expressible in this state. The
-        # residual cos(lat0)*v_h terms require the azimuth, which is not a state
-        # variable, and are therefore left to the neural residual.
-        # f*|v_s| ~ 0.42 m/s^2 at 35 deg latitude -> ~19 km of cross-range over 300 s,
-        # which exceeds the entire current error budget. Omitting it forces the fit
-        # to absorb a large, systematic, coherent force.
-        self.s_idx = int(s_idx)
-        self.include_frame_transport = bool(include_frame_transport)
-        # Division by s is guarded: s -> 0 at the impact point (the frame origin),
-        # mirroring NEXT_geodesic_frame's own S_EPS_M guard but with a larger floor,
-        # because these columns divide by s rather than merely evaluating at it.
-        self.s_floor = float(s_floor)
-        # --- Mach-dependent aerodynamic coefficients ------------------------
-        # The base aero columns (aero_along/aero_vert/aero_q) each carry ONE fitted
-        # constant, i.e. they assume C_L and C_D are constant. Measured on the real
-        # 28-trajectory set that is false: the effective C_L has a within-flight
-        # coefficient of variation of 0.45 (smoothed, so not differentiation noise)
-        # and a 2.7x spread of per-flight means, and ~53% of that variation is
-        # predictable from (Mach, altitude, V). A single constant therefore cannot
-        # represent the lift, and no amount of ADDITIONAL constant-coefficient terms
-        # helps -- it is a functional-form limitation, not a term-selection one.
-        #
-        # Real hypersonic aero uses C_L(Mach, alpha) tables; hand-derived models
-        # encode that dependence explicitly. `mach_powers` reproduces it in a
-        # SINDy-compatible way: for each power k, an extra column (base_aero * M^k)
-        # is offered, so sparse regression can assemble
-        #     C(M) = c0 + c1*M + c2*M^2 + ...
-        # Each column remains LINEAR in its coefficient, so E-SINDy, the trainable-Xi
-        # co-learning and ONNX export are all unchanged.
-        #
-        # Empty tuple () = original constant-coefficient behaviour.
-        self.mach_powers = tuple(int(k) for k in mach_powers if int(k) != 0)
-        self.scale_heights = tuple(float(H) for H in scale_heights)
-        self.earth_radius = float(earth_radius)
-        self.include_bias = bool(include_bias)
-        # A small linear-in-velocity block lets the fit absorb mild unmodelled damping
-        # without introducing any position dependence (hence no feedback risk).
-        self.include_linear_velocity = bool(include_linear_velocity)
-        self.clip = float(clip)
-        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, float)
-        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, float)
-        self.col_scale_ = None  # frozen normalisation, set on first fit_transform
-        # Frozen Mach centring/scaling reference, set on the first fit_transform and
-        # shared with the torch path via library_spec. Mach spans only ~8.5-10.3 over a
-        # glide (a 19% relative range), so an UNCENTRED factor M makes (base*M) a
-        # rescaled copy of base -- measured correlation 0.9999, i.e. rank-deficient and
-        # useless to sparse regression. Centring on the training-set mean makes the
-        # column encode the Mach VARIATION (the actual C_L(Mach) dependence), dropping
-        # the correlation to ~0.995. The reference must be FROZEN, not recomputed per
-        # call, or the numpy (discovery) and torch (model) columns would disagree.
-        self.mach_ref_ = None   # (mean, std)
-        self.pos_idx = tuple(int(i) for i in pos_idx)
-        self.vel_idx = tuple(int(i) for i in vel_idx)
-
-        # (name, kind, scale_height_or_None)
-        self.terms: list[tuple[str, str, float | None]] = []
-        if self.include_bias:
-            self.terms.append(("1", "bias", None))
-        self.terms.append(("gravity", "gravity", None))
-        self.terms.append(("curv_vs2", "curv", None))
-        for H in self.scale_heights:
-            # IMPORTANT -- avoid degenerate columns. In the in-plane 3-DoF form,
-            # drag_s = -q*v_s/V and lift_h = -q*v_s/V are the SAME column, and
-            # drag_h = -q*v_h/V is the negative of lift_s. Offering all four makes the
-            # regression rank-deficient: coefficients split arbitrarily between exact
-            # duplicates (observed as identical coefficients on paired terms). Offer
-            # only the two independent in-plane aero directions, plus the lateral term.
-            self.terms.append((f"aero_along@H={int(H)}", "drag_s", H))   # ~ -q*v_s/V
-            self.terms.append((f"aero_vert@H={int(H)}", "drag_h", H))    # ~ -q*v_h/V
-            self.terms.append((f"aero_q@H={int(H)}", "lat_aero", H))     # ~  q (bank/lateral)
-            # Mach-scaled replicas: (base aero) * M^k. Together with the k=0 base
-            # column above, sparse regression can build a Mach polynomial for each
-            # aerodynamic coefficient instead of being forced to a single constant.
-            for k in self.mach_powers:
-                self.terms.append((f"aero_along*M{k}@H={int(H)}", f"drag_s_m{k}", H))
-                self.terms.append((f"aero_vert*M{k}@H={int(H)}", f"drag_h_m{k}", H))
-                self.terms.append((f"aero_q*M{k}@H={int(H)}", f"lat_aero_m{k}", H))
-        if self.include_linear_velocity:
-            # v_s is nearly collinear with the aero columns on glide data (both track
-            # speed), so it is excluded; v_h and v_al add independent information.
-            self.terms.append(("v_h", "lin_vh", None))
-            self.terms.append(("v_al", "lin_va", None))
-
-        if self.include_frame_transport:
-            # Polar-frame transport terms (mandatory kinematics of this frame).
-            #   centripetal : s * v_alpha^2      -> feeds dv_s/dt
-            #   transport   : v_s * v_alpha / s  -> feeds dv_alpha/dt (the -2 v_r w / r term)
-            # Rotating-Earth (f-plane) Coriolis, azimuth-independent components:
-            #   cor_along   : v_l = s * v_alpha  -> feeds dv_s/dt   (coefficient ~ -f)
-            #   cor_turn    : v_s / s            -> feeds dv_alpha/dt (coefficient ~ +f)
-            # NOTE: a "total horizontal speed" curvature column
-            # (v_s^2 + v_l^2)/(Re+h) was evaluated and REJECTED: on glide data it is
-            # 0.998-collinear with the existing curv_vs2 (v_l ~ 137 m/s vs v_s ~ 5200
-            # m/s, a 0.07% correction), so it only adds rank deficiency. The library
-            # docstring's own warning about degenerate columns applies.
-            self.terms.append(("centripetal_s", "centripetal", None))
-            self.terms.append(("transport_va", "transport", None))
-            self.terms.append(("cor_along", "cor_along", None))
-            self.terms.append(("cor_turn", "cor_turn", None))
-
-    # ------------------------------------------------------------- interface
-
-    def term_names(self) -> list[str]:
-        return [t[0] for t in self.terms]
-
-    def term_combos(self, n_features: int | None = None) -> list:
-        """Bias reported as the empty tuple so callers can locate it; rest opaque."""
-        return [() if t[1] == "bias" else None for t in self.terms]
-
-    @property
-    def n_terms(self) -> int:
-        return len(self.terms)
-
-    def library_spec(self) -> dict:
-        return {
-            "kind": "eom",
-            "state_vector_len": self.state_vector_len,
-            "terms": [(n, k, H) for (n, k, H) in self.terms],
-            "h_idx": self.h_idx, "vs_idx": self.vs_idx,
-            "va_idx": self.va_idx, "vh_idx": self.vh_idx,
-            "h_sign": self.h_sign,
-            "s_idx": self.s_idx,
-            "s_floor": self.s_floor,
-            "mach_ref": None if self.mach_ref_ is None else list(self.mach_ref_),
-            "earth_radius": self.earth_radius,
-            "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
-            "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
-            "clip": self.clip,
-            "col_scale": None if self.col_scale_ is None else list(self.col_scale_),
-            "poly_combos": [],
-            "physics_terms": [],
-        }
-
-    # ------------------------------------------------------------ evaluation
-
-    def _to_physical(self, Y: np.ndarray) -> np.ndarray:
-        if self.feature_mean is None or self.feature_scale is None:
-            return Y
-        return Y * self.feature_scale + self.feature_mean
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n = Y.shape[0]
-        P = self._to_physical(Y)
-        h = self.h_sign * P[:, self.h_idx]  # true altitude, positive up
-        vs = P[:, self.vs_idx]
-        va = P[:, self.va_idx]
-        vh = P[:, self.vh_idx]
-
-        V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-        Re = self.earth_radius
-        g = G0 * (Re / (Re + h)) ** 2
-
-        # Mach proxy for the Mach-dependent aero columns.
-        T = np.where(h < 11000.0, T_SEA - T_LAPSE * h,
-                     np.where(h < 20000.0, T_TROPO, T_TROPO + 0.001 * (h - 20000.0)))
-        T = np.clip(T, T_MIN, T_MAX)
-        mach = V / np.sqrt(GAMMA_AIR * R_SPECIFIC * T)
-        if self.mach_powers:
-            if self.mach_ref_ is None:
-                _mu = float(np.mean(mach))
-                _sd = float(np.std(mach))
-                self.mach_ref_ = (_mu, _sd if _sd > 1e-9 else 1.0)
-            mach = (mach - self.mach_ref_[0]) / self.mach_ref_[1]
-
-        cols = np.empty((n, self.n_terms), dtype=float)
-        # Guarded radius and tangential velocity, shared by the transport columns.
-        s_raw = P[:, self.s_idx] if self.s_idx < P.shape[1] else np.zeros(n)
-        s_g = np.where(np.abs(s_raw) < self.s_floor,
-                       np.sign(s_raw) * self.s_floor + (s_raw == 0) * self.s_floor,
-                       s_raw)
-        v_l = s_g * va  # tangential velocity implied by the scaled angular rate
-
-        for j, (_, kind, H) in enumerate(self.terms):
-            if kind == "bias":
-                cols[:, j] = 1.0
-            elif kind == "gravity":
-                cols[:, j] = -g
-            elif kind == "curv":
-                cols[:, j] = vs * vs / (Re + h)
-            elif kind == "centripetal":
-                cols[:, j] = s_g * va * va
-            elif kind == "transport":
-                cols[:, j] = vs * va / s_g
-            elif kind == "cor_along":
-                cols[:, j] = v_l
-            elif kind == "cor_turn":
-                cols[:, j] = vs / s_g
-            elif kind == "curv_horiz":
-                cols[:, j] = (vs * vs + v_l * v_l) / (Re + h)
-            elif kind == "lin_vs":
-                cols[:, j] = vs
-            elif kind == "lin_vh":
-                cols[:, j] = vh
-            elif kind == "lin_va":
-                cols[:, j] = va
-            else:
-                rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
-                q = 0.5 * rho * V * V
-                if kind == "drag_s":
-                    cols[:, j] = -q * vs / V
-                elif kind == "drag_h":
-                    cols[:, j] = -q * vh / V
-                elif kind == "lift_s":
-                    cols[:, j] = q * vh / V
-                elif kind == "lift_h":
-                    cols[:, j] = -q * vs / V
-                elif kind == "lat_aero":
-                    cols[:, j] = q
-                elif kind.startswith(("drag_s_m", "drag_h_m", "lat_aero_m")):
-                    base, _, kpow = kind.rpartition("_m")
-                    mk = mach ** int(kpow)
-                    if base == "drag_s":
-                        cols[:, j] = -q * vs / V * mk
-                    elif base == "drag_h":
-                        cols[:, j] = -q * vh / V * mk
-                    else:  # lat_aero
-                        cols[:, j] = q * mk
-                else:
-                    raise ValueError(f"unknown EOM term kind: {kind}")
-
-        # Freeze per-column RMS on the first (training) call, then always normalise
-        # and clip. Same reasoning as the physics library: exp(-h/H) is unbounded
-        # outside the training envelope and would otherwise destabilise a rollout
-        # that wanders below it.
-        if self.col_scale_ is None:
-            rms = np.sqrt(np.mean(cols ** 2, axis=0))
-            rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
-            self.col_scale_ = rms
-        return np.clip(cols / self.col_scale_, -self.clip, self.clip)
-
-
-def evaluate_eom_library_torch(y, spec: dict):
-    """Torch mirror of `EOMLibrary.fit_transform` (identical column order)."""
-    import torch
-
-    mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
-    if mean is not None and scale is not None:
-        mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
-        scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
-        P = y * scale_t + mean_t
-    else:
-        P = y
-
-    hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
-    # Default +1.0 preserves the behaviour of specs written before h_sign existed.
-    h_sign = float(spec.get("h_sign", 1.0))
-    h = h_sign * P[..., hi : hi + 1]
-    vs = P[..., vsi : vsi + 1]
-    va = P[..., vai : vai + 1]
-    vh = P[..., vhi : vhi + 1]
-    V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
-    Re = spec["earth_radius"]
-    g = G0 * (Re / (Re + h)) ** 2
-
-    # Mach proxy -- must mirror the numpy path exactly.
-    T = torch.where(h < 11000.0, T_SEA - T_LAPSE * h,
-                    torch.where(h < 20000.0,
-                                torch.full_like(h, T_TROPO),
-                                T_TROPO + 0.001 * (h - 20000.0)))
-    T = torch.clamp(T, min=T_MIN, max=T_MAX)
-    mach = V / torch.sqrt(GAMMA_AIR * R_SPECIFIC * T)
-    _mref = spec.get("mach_ref")
-    if _mref is not None:
-        mach = (mach - float(_mref[0])) / float(_mref[1])
-
-    # Guarded radius / tangential velocity for the polar-transport columns.
-    s_idx = spec.get("s_idx", 0)
-    s_floor = float(spec.get("s_floor", 5000.0))
-    s_raw = P[..., s_idx : s_idx + 1]
-    s_sign = torch.where(s_raw < 0, -torch.ones_like(s_raw), torch.ones_like(s_raw))
-    s_g = torch.where(torch.abs(s_raw) < s_floor, s_sign * s_floor, s_raw)
-    v_l = s_g * va
-
-    cols = []
-    for (_, kind, H) in spec["terms"]:
-        if kind == "bias":
-            cols.append(torch.ones_like(h))
-        elif kind == "gravity":
-            cols.append(-g)
-        elif kind == "curv":
-            cols.append(vs * vs / (Re + h))
-        elif kind == "centripetal":
-            cols.append(s_g * va * va)
-        elif kind == "transport":
-            cols.append(vs * va / s_g)
-        elif kind == "cor_along":
-            cols.append(v_l)
-        elif kind == "cor_turn":
-            cols.append(vs / s_g)
-        elif kind == "curv_horiz":
-            cols.append((vs * vs + v_l * v_l) / (Re + h))
-        elif kind == "lin_vs":
-            cols.append(vs)
-        elif kind == "lin_vh":
-            cols.append(vh)
-        elif kind == "lin_va":
-            cols.append(va)
-        else:
-            rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
-            q = 0.5 * rho * V * V
-            if kind == "drag_s":
-                cols.append(-q * vs / V)
-            elif kind == "drag_h":
-                cols.append(-q * vh / V)
-            elif kind == "lift_s":
-                cols.append(q * vh / V)
-            elif kind == "lift_h":
-                cols.append(-q * vs / V)
-            elif kind == "lat_aero":
-                cols.append(q)
-            elif kind.startswith(("drag_s_m", "drag_h_m", "lat_aero_m")):
-                base, _, kpow = kind.rpartition("_m")
-                mk = mach ** int(kpow)
-                if base == "drag_s":
-                    cols.append(-q * vs / V * mk)
-                elif base == "drag_h":
-                    cols.append(-q * vh / V * mk)
-                else:
-                    cols.append(q * mk)
-            else:
-                raise ValueError(f"unknown EOM term kind: {kind}")
-
-    out = torch.cat(cols, dim=-1)
-    cs = spec.get("col_scale")
-    clip = float(spec.get("clip", 8.0))
-    if cs is not None:
-        cs_t = torch.as_tensor(cs, dtype=out.dtype, device=out.device)
-        out = torch.clamp(out / cs_t, -clip, clip)
-    return out
+[--sindy-only] Discovery complete; skipping model training.

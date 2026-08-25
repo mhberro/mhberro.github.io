@@ -1,4 +1,4 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 -o model_outputs/SBI/eom_transport_pertarget/GEODESIC/glide --sindy-only 
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 -o model_outputs/SBI/eom_transport_pertarget/GEODESIC/glide --aphynity-tau2 2 --checkpoint-on-probe
 There are 22 training trajs and 6 validation trajs.
 
 --- Running Ensemble-SINDy Governing Equation Discovery ---
@@ -56,69 +56,14 @@ Discovered Physics Matrix Xi:
           dv_h/dt   aero_along@H=5000  contrib=0.6067 coef=+2.334e-02 ip=1.00
           dv_h/dt   aero_q@H=5000      contrib=0.5415 coef=+2.084e-02 ip=1.00
 
-=== DISCOVERED SINDy EQUATIONS ===
-ds/dt = - 0.00564748*curv_vs2 [ip=1.00] - 0.00244749*1 [ip=1.00] + 0.00239933*gravity [ip=1.00] - 9.6067e-05*v_al [ip=0.92] + 6.20095e-05*cor_along [ip=0.90] - 4.90131e-05*v_h [ip=1.00] - 4.08746e-05*transport_va [ip=0.90] - 2.88027e-05*centripetal_s [ip=0.98] + 2.01351e-05*aero_q@H=5000 [ip=0.86] + 9.74012e-06*aero_vert@H=5000 [ip=0.66] + 7.46398e-06*cor_turn [ip=0.76]
-dh/dt = 0.0214184*v_h [ip=1.00] - 8.92827e-05*curv_vs2 [ip=1.00] + 6.28289e-05*1 [ip=1.00] + 4.94222e-05*cor_turn [ip=1.00] - 4.70541e-05*gravity [ip=1.00] + 3.3759e-05*aero_q@H=5000 [ip=1.00] - 2.16172e-05*centripetal_s [ip=0.88]
-dv_s/dt = 0.0191142*aero_q@H=5000 [ip=1.00] - 0.00797056*gravity [ip=1.00] - 0.00778926*aero_along@H=5000 [ip=1.00] - 0.00401998*aero_vert@H=5000 [ip=1.00] - 0.00349157*curv_vs2 [ip=1.00] - 0.00238112*1 [ip=1.00] - 0.00217068*v_h [ip=1.00] + 0.00117815*transport_va [ip=0.98] + 0.000938217*centripetal_s [ip=1.00] - 0.00077701*cor_turn [ip=0.98] + 0.000689719*v_al [ip=1.00] - 0.000163608*cor_along [ip=1.00]
-dv_al/dt = - 0.0156262*v_al [ip=1.00] + 0.0154686*cor_along [ip=1.00] - 0.0108312*transport_va [ip=1.00] - 0.00657563*curv_vs2 [ip=1.00] - 0.00487078*gravity [ip=1.00] + 0.00389803*1 [ip=1.00] - 0.00231632*aero_q@H=5000 [ip=1.00] + 0.00158364*cor_turn [ip=1.00] + 0.00143679*centripetal_s [ip=1.00] - 0.000438504*aero_vert@H=5000 [ip=1.00] + 9.37211e-05*aero_along@H=5000 [ip=1.00] - 4.99376e-05*v_h [ip=0.98]
-dv_h/dt = 0.0564245*cor_turn [ip=1.00] - 0.0377263*gravity [ip=1.00] + 0.0233439*aero_along@H=5000 [ip=1.00] + 0.0208356*aero_q@H=5000 [ip=1.00] - 0.0160086*1 [ip=1.00] - 0.0122824*v_h [ip=1.00] - 0.00989905*curv_vs2 [ip=1.00] - 0.00369433*v_al [ip=1.00] + 0.00348964*centripetal_s [ip=1.00] + 0.00336593*cor_along [ip=1.00] + 0.00121364*aero_vert@H=5000 [ip=1.00] - 4.2455e-05*transport_va [ip=0.98]
-
-[PHYSICS-RECOVERY] discovered vs theoretical coefficients
-  ds/dt      transport_va   found=-4.4290e-01   (no theoretical value in this channel)
-  dv_s/dt    transport_va   found=+1.2766e+01   (no theoretical value in this channel)
-  dv_al/dt   transport_va   found=-1.1736e+02  theory=-2.0000e+00  err= 5768.1%   (-2 exact polar kinematics)
-  dv_h/dt    transport_va   found=-4.6002e-01   (no theoretical value in this channel)
-  ds/dt      centripetal_s  found=-5.5848e-06   (no theoretical value in this channel)
-  dh/dt      centripetal_s  found=-4.1916e-06   (no theoretical value in this channel)
-  dv_s/dt    centripetal_s  found=+1.8192e-04  theory=+1.0000e+00  err=  100.0%   (+1 exact polar kinematics)
-  dv_al/dt   centripetal_s  found=+2.7859e-04   (no theoretical value in this channel)
-  dv_h/dt    centripetal_s  found=+6.7664e-04   (no theoretical value in this channel)
-  ds/dt      cor_turn       found=+4.3292e-04   (no theoretical value in this channel)
-  dh/dt      cor_turn       found=+2.8665e-03   (no theoretical value in this channel)
-  dv_s/dt    cor_turn       found=-4.5067e-02   (no theoretical value in this channel)
-  dv_al/dt   cor_turn       found=+9.1852e-02  theory=+f = 2*Omega*sin(lat0)
-  dv_h/dt    cor_turn       found=+3.2727e+00   (no theoretical value in this channel)
-  ds/dt      cor_along      found=+7.6342e-08   (no theoretical value in this channel)
-  dv_s/dt    cor_along      found=-2.0142e-07  theory=-f = -2*Omega*sin(lat0)   -> implies |lat0| = 0.1 deg
-  dv_al/dt   cor_along      found=+1.9044e-05   (no theoretical value in this channel)
-  dv_h/dt    cor_along      found=+4.1439e-06   (no theoretical value in this channel)
-
-[SINDy] equations written to: model_outputs/SBI/eom_transport_pertarget/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
-
-[pure-SINDy rollout — train]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251     35419.2     23394.3     65392.4
-  train_1                         324    324     63967.6     82074.5    113282.5
-  train_2                         465    465    133175.4    248189.7    248189.7
-  train_3                         181    181     21800.6     16853.1     38556.6
-  train_4                         383    383    131525.9    171590.7    219561.0
-  train_5                          95     95      7404.6      6740.5     13068.7
-  train_6                         166    166     38153.6     62664.0     68206.6
-  train_7                          97     97      8168.5      3545.2     13584.5
-  train_8                         181    181     21252.3     17751.7     36297.3
-  train_9                         210    210     48614.9     56362.1     97204.4
-  train_10                        121    121     14915.4     16226.2     24056.1
-  train_11                        102    102      9291.9      4329.9     16517.2
-  train_12                        451    451    103940.6    175868.3    188158.0
-  train_13                        212    212     47834.9     80391.0     94277.8
-  train_14                        208    208     31086.3     45574.0     51611.6
-  train_15                        217    217     25555.6     27153.5     39198.1
-  train_16                        117    117     11677.6     10345.9     19242.6
-  train_17                        333    333     97578.6    129174.8    161138.1
-  train_18                        272    272     82615.0    105185.2    130634.0
-  train_19                        221    221     35400.4     44750.8     48849.2
-  train_20                        444    444    179222.4    249361.9    300384.3
-  train_21                        262    262     70549.9     78193.3    111216.7
-  SUMMARY: mean=55416.0 m | median=36786.4 m | worst=179222.4 m | diverged 0/22
-  (in-plane geodesic error: range + altitude; excludes cross-range)
-
-[pure-SINDy rollout — validation]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     14984.6      2485.0     25177.9
-  validation_1                    123    123     11379.1     21920.4     22312.5
-  validation_2                    179    179     23455.2     25372.5     36149.5
-  validation_3                    150    150     28216.4     37982.1     45137.9
-  validation_4                    144    144      7885.0      7614.6     11628.9
-  validation_5                    287    287     46875.5     62190.3     74141.5
-  SUMMARY: mean=22132.6 m | median=19219.9 m | worst=46875.5 m | diverged 0/6
-  (in-plane geodesic error: range + altitude; excludes cross-range)
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x300fcf6d0>, 0.0001)
+Traceback (most recent call last):
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1764, in <module>
+    main()
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 1720, in main
+    (node, model_name) = train_NEXT(
+                         ^^^^^^^^^^^
+  File "/Users/e471302/lm_cm_repos/next/NEXT_training.py", line 869, in train_NEXT
+    metrics = node.fit(
+              ^^^^^^^^^
+TypeError: NODEPredictor.fit() got an unexpected keyword argument 'rollout_probe_discount_gamma'

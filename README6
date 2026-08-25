@@ -1,352 +1,432 @@
-# eom_library.py
-"""Parametric Equations-of-Motion (EOM) basis for the physics backbone.
+# sindy_standalone.py
+"""Standalone evaluation of the discovered SINDy physics model, on its own.
 
-The idea
---------
-SINDy exists to discover *unknown structure*. But the structure of atmospheric
-glide flight is not unknown -- it is textbook 3-DoF point-mass physics: gravity,
-aerodynamic drag along the velocity vector, aerodynamic lift perpendicular to it,
-and geometric curvature terms. What is genuinely unknown for a given threat is a
-handful of AERODYNAMIC COEFFICIENTS (C_D*A/m, C_L*A/m and their lateral analogue).
+Why this exists
+---------------
+The agreed order of operations is to nail the physics backbone FIRST, before
+layering APHYNITY or a neural residual on top: if the physics isn't good enough,
+there is no reason to believe the residual learner will rescue it. That means we
+need to judge the discovered physics *by itself* -- integrate `f_phys` forward
+with no neural network at all and measure how far it drifts from truth.
 
-Asking a sparse-regression search to rediscover Newton from ~22 noisy flights is
-badly under-determined: it invents non-physical positive-feedback terms (h*h, s*s)
-that fit one step and destroy the rollout. This module instead writes the known
-force laws down and leaves only the unknown coefficients free.
+Two capabilities live here:
 
-The crucial property that makes this a drop-in: the EOM are **linear in the unknown
-coefficients**, so the same `stridge` / ensemble machinery and the same standalone
-rollout evaluation work unchanged -- only the candidate columns differ. Instead of
-~85 polynomial columns we offer ~6 physically-derived ones.
+1. `format_sindy_equations` -- turn the coefficient table `Xi` into readable
+   equations (e.g. "dv_h/dt = -0.0385*h + 0.0226*h*h + ..."), so discovered models
+   can be compared term-by-term against another implementation.
 
-Basis columns (all evaluated in PHYSICAL units, then normalised)
----------------------------------------------------------------
-With V = sqrt(v_s^2 + v_h^2), dynamic-pressure-like factor q = 0.5*rho(h)*V^2 and
-rho(h) = exp(-h/H):
+2. `sindy_rollout` / `evaluate_sindy` -- integrate the pure physics model forward
+   from a single initial state (RK4, matching training) and report position error
+   against truth in physical units.
 
-  drag_s   = -q * v_s / V        (drag, along-track component)   -> coeff k_D
-  drag_h   = -q * v_h / V        (drag, vertical component)      -> coeff k_D
-  lift_s   = +q * v_h / V        (in-plane lift, along-track)    -> coeff k_L
-  lift_h   = -q * v_s / V        (in-plane lift, vertical)       -> coeff k_L
-  lat_aero =  q                  (lateral/bank force -> turn rate) -> coeff k_lat
-  gravity  = -g0*(Re/(Re+h))^2   (gravity, vertical)             -> coeff ~1 (fixed form)
-  curv     = +v_s^2/(Re+h)       (centrifugal/curvature, vertical) -> coeff ~1
-  bias     =  1                  (small constant offset / trim)
-
-Every column is a genuine force term. There is no term whose magnitude grows with
-POSITION in a way that feeds back on itself, so a fitted model is structurally
-incapable of the runaway that the polynomial library produced.
+Note on the error metric: this reports IN-PLANE error in the geodesic frame --
+range (s) and altitude (h). It deliberately does NOT reconstruct cross-range,
+which would require integrating the azimuth rate and a full frame inversion (that
+is what `standalone_direct_evaluator.py` does for a trained model). In-plane error
+is a fast, honest screen for "is the physics backbone any good"; it will read
+slightly optimistic versus a full 3D ECEF error.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-EARTH_RADIUS_M = 6371000.0
-G0 = 9.80665
-_V_EPS = 1e-9
-_EXP_ARG_MAX = 10.0
+DEFAULT_STATE_NAMES = ["s", "h", "v_s", "v_al", "v_h"]
+DEFAULT_TARGET_NAMES = ["ds/dt", "dh/dt", "dv_s/dt", "dv_al/dt", "dv_h/dt"]
 
 
-class EOMLibrary:
-    """Physically-derived candidate columns for glide-phase equations of motion."""
+# --------------------------------------------------------------------- naming
 
-    def __init__(
-        self,
-        state_vector_len: int = 5,
-        h_idx: int = 1,
-        vs_idx: int = 2,
-        va_idx: int = 3,
-        vh_idx: int = 4,
-        h_sign: float = 1.0,
-        s_idx: int = 0,
-        include_frame_transport: bool = True,
-        s_floor: float = 5000.0,
-        scale_heights: tuple[float, ...] = (7200.0,),
-        earth_radius: float = EARTH_RADIUS_M,
-        feature_mean=None,
-        feature_scale=None,
-        include_bias: bool = True,
-        include_linear_velocity: bool = True,
-        clip: float = 8.0,
-        # kept for interface compatibility with the other libraries
-        degree: int = 2,
-        pos_idx=(0, 1),
-        vel_idx=(2, 4),
-        poly_mode: str = "eom",
-    ):
-        self.state_vector_len = state_vector_len
-        self.h_idx, self.vs_idx, self.va_idx, self.vh_idx = h_idx, vs_idx, va_idx, vh_idx
-        # See PhysicsInformedLibrary.h_sign. Converts the frame's altitude-like
-        # channel to TRUE ALTITUDE (positive up): +1 for geodesic h and DCU Up,
-        # -1 for grdth's NED Down. Feeds rho(h)=exp(-h/H), the gravity term
-        # g0*(Re/(Re+h))^2 and the curvature denominator, all of which are wrong
-        # (and the first of which saturates) if the sign is inverted.
-        self.h_sign = float(h_sign)
-        # --- polar-frame transport / rotating-frame terms -------------------
-        # The geodesic-integrated frame is a POLAR system centred on the impact
-        # point: s = radius, azimuth = polar angle, v_s = radial rate, v_alpha ~
-        # angular rate (see NEXT_geodesic_frame.ecef_to_local_geodesic_vec). A polar
-        # frame has MANDATORY transport (fictitious) terms -- they are not optional
-        # physics, they are what the coordinate system itself requires:
-        #     dv_r/dt   = a_radial + r*omega^2          (centripetal)
-        #     domega/dt = a_tang/r - 2*v_r*omega/r      (Coriolis/transport)
-        # Neither was present in the original basis. Measured on representative
-        # glide numbers (s=1000 km, v_s=-5 km/s, v_alpha=1e-4) the transport term
-        # alone changes v_alpha by ~3x its own typical magnitude over 300 s.
-        #
-        # Separately, ECEF is a ROTATING frame, so true Coriolis appears. Projecting
-        # a_cor = -2*Omega x v onto this frame's (radial, tangential) axes, the
-        # azimuth dependence CANCELS for the sin(lat0) part:
-        #     a_cor . t_hat = -f * v_l ,   a_cor . l_hat = +f * v_s ,   f = 2*Om*sin(lat0)
-        # so the dominant (f-plane) Coriolis IS expressible in this state. The
-        # residual cos(lat0)*v_h terms require the azimuth, which is not a state
-        # variable, and are therefore left to the neural residual.
-        # f*|v_s| ~ 0.42 m/s^2 at 35 deg latitude -> ~19 km of cross-range over 300 s,
-        # which exceeds the entire current error budget. Omitting it forces the fit
-        # to absorb a large, systematic, coherent force.
-        self.s_idx = int(s_idx)
-        self.include_frame_transport = bool(include_frame_transport)
-        # Division by s is guarded: s -> 0 at the impact point (the frame origin),
-        # mirroring NEXT_geodesic_frame's own S_EPS_M guard but with a larger floor,
-        # because these columns divide by s rather than merely evaluating at it.
-        self.s_floor = float(s_floor)
-        self.scale_heights = tuple(float(H) for H in scale_heights)
-        self.earth_radius = float(earth_radius)
-        self.include_bias = bool(include_bias)
-        # A small linear-in-velocity block lets the fit absorb mild unmodelled damping
-        # without introducing any position dependence (hence no feedback risk).
-        self.include_linear_velocity = bool(include_linear_velocity)
-        self.clip = float(clip)
-        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, float)
-        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, float)
-        self.col_scale_ = None  # frozen normalisation, set on first fit_transform
-        self.pos_idx = tuple(int(i) for i in pos_idx)
-        self.vel_idx = tuple(int(i) for i in vel_idx)
+def library_term_names(library, n_features: int, state_names=None) -> list[str]:
+    """Human-readable name for every library column.
 
-        # (name, kind, scale_height_or_None)
-        self.terms: list[tuple[str, str, float | None]] = []
-        if self.include_bias:
-            self.terms.append(("1", "bias", None))
-        self.terms.append(("gravity", "gravity", None))
-        self.terms.append(("curv_vs2", "curv", None))
-        for H in self.scale_heights:
-            # IMPORTANT -- avoid degenerate columns. In the in-plane 3-DoF form,
-            # drag_s = -q*v_s/V and lift_h = -q*v_s/V are the SAME column, and
-            # drag_h = -q*v_h/V is the negative of lift_s. Offering all four makes the
-            # regression rank-deficient: coefficients split arbitrarily between exact
-            # duplicates (observed as identical coefficients on paired terms). Offer
-            # only the two independent in-plane aero directions, plus the lateral term.
-            self.terms.append((f"aero_along@H={int(H)}", "drag_s", H))   # ~ -q*v_s/V
-            self.terms.append((f"aero_vert@H={int(H)}", "drag_h", H))    # ~ -q*v_h/V
-            self.terms.append((f"aero_q@H={int(H)}", "lat_aero", H))     # ~  q (bank/lateral)
-        if self.include_linear_velocity:
-            # v_s is nearly collinear with the aero columns on glide data (both track
-            # speed), so it is excluded; v_h and v_al add independent information.
-            self.terms.append(("v_h", "lin_vh", None))
-            self.terms.append(("v_al", "lin_va", None))
-
-        if self.include_frame_transport:
-            # Polar-frame transport terms (mandatory kinematics of this frame).
-            #   centripetal : s * v_alpha^2      -> feeds dv_s/dt
-            #   transport   : v_s * v_alpha / s  -> feeds dv_alpha/dt (the -2 v_r w / r term)
-            # Rotating-Earth (f-plane) Coriolis, azimuth-independent components:
-            #   cor_along   : v_l = s * v_alpha  -> feeds dv_s/dt   (coefficient ~ -f)
-            #   cor_turn    : v_s / s            -> feeds dv_alpha/dt (coefficient ~ +f)
-            # NOTE: a "total horizontal speed" curvature column
-            # (v_s^2 + v_l^2)/(Re+h) was evaluated and REJECTED: on glide data it is
-            # 0.998-collinear with the existing curv_vs2 (v_l ~ 137 m/s vs v_s ~ 5200
-            # m/s, a 0.07% correction), so it only adds rank deficiency. The library
-            # docstring's own warning about degenerate columns applies.
-            self.terms.append(("centripetal_s", "centripetal", None))
-            self.terms.append(("transport_va", "transport", None))
-            self.terms.append(("cor_along", "cor_along", None))
-            self.terms.append(("cor_turn", "cor_turn", None))
-
-    # ------------------------------------------------------------- interface
-
-    def term_names(self) -> list[str]:
-        return [t[0] for t in self.terms]
-
-    def term_combos(self, n_features: int | None = None) -> list:
-        """Bias reported as the empty tuple so callers can locate it; rest opaque."""
-        return [() if t[1] == "bias" else None for t in self.terms]
-
-    @property
-    def n_terms(self) -> int:
-        return len(self.terms)
-
-    def library_spec(self) -> dict:
-        return {
-            "kind": "eom",
-            "state_vector_len": self.state_vector_len,
-            "terms": [(n, k, H) for (n, k, H) in self.terms],
-            "h_idx": self.h_idx, "vs_idx": self.vs_idx,
-            "va_idx": self.va_idx, "vh_idx": self.vh_idx,
-            "h_sign": self.h_sign,
-            "s_idx": self.s_idx,
-            "s_floor": self.s_floor,
-            "earth_radius": self.earth_radius,
-            "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
-            "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
-            "clip": self.clip,
-            "col_scale": None if self.col_scale_ is None else list(self.col_scale_),
-            "poly_combos": [],
-            "physics_terms": [],
-        }
-
-    # ------------------------------------------------------------ evaluation
-
-    def _to_physical(self, Y: np.ndarray) -> np.ndarray:
-        if self.feature_mean is None or self.feature_scale is None:
-            return Y
-        return Y * self.feature_scale + self.feature_mean
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n = Y.shape[0]
-        P = self._to_physical(Y)
-        h = self.h_sign * P[:, self.h_idx]  # true altitude, positive up
-        vs = P[:, self.vs_idx]
-        va = P[:, self.va_idx]
-        vh = P[:, self.vh_idx]
-
-        V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-        Re = self.earth_radius
-        g = G0 * (Re / (Re + h)) ** 2
-
-        cols = np.empty((n, self.n_terms), dtype=float)
-        # Guarded radius and tangential velocity, shared by the transport columns.
-        s_raw = P[:, self.s_idx] if self.s_idx < P.shape[1] else np.zeros(n)
-        s_g = np.where(np.abs(s_raw) < self.s_floor,
-                       np.sign(s_raw) * self.s_floor + (s_raw == 0) * self.s_floor,
-                       s_raw)
-        v_l = s_g * va  # tangential velocity implied by the scaled angular rate
-
-        for j, (_, kind, H) in enumerate(self.terms):
-            if kind == "bias":
-                cols[:, j] = 1.0
-            elif kind == "gravity":
-                cols[:, j] = -g
-            elif kind == "curv":
-                cols[:, j] = vs * vs / (Re + h)
-            elif kind == "centripetal":
-                cols[:, j] = s_g * va * va
-            elif kind == "transport":
-                cols[:, j] = vs * va / s_g
-            elif kind == "cor_along":
-                cols[:, j] = v_l
-            elif kind == "cor_turn":
-                cols[:, j] = vs / s_g
-            elif kind == "curv_horiz":
-                cols[:, j] = (vs * vs + v_l * v_l) / (Re + h)
-            elif kind == "lin_vs":
-                cols[:, j] = vs
-            elif kind == "lin_vh":
-                cols[:, j] = vh
-            elif kind == "lin_va":
-                cols[:, j] = va
-            else:
-                rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
-                q = 0.5 * rho * V * V
-                if kind == "drag_s":
-                    cols[:, j] = -q * vs / V
-                elif kind == "drag_h":
-                    cols[:, j] = -q * vh / V
-                elif kind == "lift_s":
-                    cols[:, j] = q * vh / V
-                elif kind == "lift_h":
-                    cols[:, j] = -q * vs / V
-                elif kind == "lat_aero":
-                    cols[:, j] = q
-                else:
-                    raise ValueError(f"unknown EOM term kind: {kind}")
-
-        # Freeze per-column RMS on the first (training) call, then always normalise
-        # and clip. Same reasoning as the physics library: exp(-h/H) is unbounded
-        # outside the training envelope and would otherwise destabilise a rollout
-        # that wanders below it.
-        if self.col_scale_ is None:
-            rms = np.sqrt(np.mean(cols ** 2, axis=0))
-            rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
-            self.col_scale_ = rms
-        return np.clip(cols / self.col_scale_, -self.clip, self.clip)
-
-
-def evaluate_eom_library_torch(y, spec: dict):
-    """Torch mirror of `EOMLibrary.fit_transform` (identical column order)."""
-    import torch
-
-    mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
-    if mean is not None and scale is not None:
-        mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
-        scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
-        P = y * scale_t + mean_t
-    else:
-        P = y
-
-    hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
-    # Default +1.0 preserves the behaviour of specs written before h_sign existed.
-    h_sign = float(spec.get("h_sign", 1.0))
-    h = h_sign * P[..., hi : hi + 1]
-    vs = P[..., vsi : vsi + 1]
-    va = P[..., vai : vai + 1]
-    vh = P[..., vhi : vhi + 1]
-    V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
-    Re = spec["earth_radius"]
-    g = G0 * (Re / (Re + h)) ** 2
-
-    # Guarded radius / tangential velocity for the polar-transport columns.
-    s_idx = spec.get("s_idx", 0)
-    s_floor = float(spec.get("s_floor", 5000.0))
-    s_raw = P[..., s_idx : s_idx + 1]
-    s_sign = torch.where(s_raw < 0, -torch.ones_like(s_raw), torch.ones_like(s_raw))
-    s_g = torch.where(torch.abs(s_raw) < s_floor, s_sign * s_floor, s_raw)
-    v_l = s_g * va
-
-    cols = []
-    for (_, kind, H) in spec["terms"]:
-        if kind == "bias":
-            cols.append(torch.ones_like(h))
-        elif kind == "gravity":
-            cols.append(-g)
-        elif kind == "curv":
-            cols.append(vs * vs / (Re + h))
-        elif kind == "centripetal":
-            cols.append(s_g * va * va)
-        elif kind == "transport":
-            cols.append(vs * va / s_g)
-        elif kind == "cor_along":
-            cols.append(v_l)
-        elif kind == "cor_turn":
-            cols.append(vs / s_g)
-        elif kind == "curv_horiz":
-            cols.append((vs * vs + v_l * v_l) / (Re + h))
-        elif kind == "lin_vs":
-            cols.append(vs)
-        elif kind == "lin_vh":
-            cols.append(vh)
-        elif kind == "lin_va":
-            cols.append(va)
+    Uses the library's own `term_names()` when it has one (the physics library);
+    otherwise derives names from the polynomial combination tuples.
+    """
+    if hasattr(library, "term_names"):
+        try:
+            return list(library.term_names())
+        except TypeError:
+            pass
+    names = list(state_names or DEFAULT_STATE_NAMES)[:n_features]
+    combos = library.term_combos(n_features)
+    out = []
+    for combo in combos:
+        if combo is None:
+            out.append("<physics>")
+        elif len(combo) == 0:
+            out.append("1")
         else:
-            rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
-            q = 0.5 * rho * V * V
-            if kind == "drag_s":
-                cols.append(-q * vs / V)
-            elif kind == "drag_h":
-                cols.append(-q * vh / V)
-            elif kind == "lift_s":
-                cols.append(q * vh / V)
-            elif kind == "lift_h":
-                cols.append(-q * vs / V)
-            elif kind == "lat_aero":
-                cols.append(q)
-            else:
-                raise ValueError(f"unknown EOM term kind: {kind}")
-
-    out = torch.cat(cols, dim=-1)
-    cs = spec.get("col_scale")
-    clip = float(spec.get("clip", 8.0))
-    if cs is not None:
-        cs_t = torch.as_tensor(cs, dtype=out.dtype, device=out.device)
-        out = torch.clamp(out / cs_t, -clip, clip)
+            out.append("*".join(names[i] for i in combo))
     return out
+
+
+# --------------------------------------------------- physics recovery check
+
+EARTH_OMEGA = 7.292115e-5  # rad/s, WGS-84 Earth rotation rate
+
+
+def physics_recovery_report(
+    Xi: np.ndarray,
+    term_names: list[str],
+    library=None,
+    target_names=None,
+    origin_lat_deg: float | None = None,
+) -> str:
+    """Compare discovered coefficients against their KNOWN physical values.
+
+    The candidate columns for the polar/rotating geodesic frame have coefficients
+    that theory fixes exactly, so recovering them is a direct, falsifiable check
+    that the discovery found real physics rather than a curve fit:
+
+        transport_va  (v_s*v_alpha/s)   -> should be  -2   (exact polar kinematics:
+                                           domega/dt = a_t/r - 2 v_r omega / r)
+        centripetal_s (s*v_alpha^2)     -> should be  +1   (exact polar kinematics)
+        cor_turn      (v_s/s)           -> should be  +f = 2*Omega*sin(lat0)
+        cor_along     (s*v_alpha = v_l) -> should be  -f
+
+    IMPORTANT: `Xi` is expressed against the library's NORMALISED columns, so this
+    divides by the frozen per-column scale (`library.col_scale_`) to recover the
+    physical coefficient. Without that division the printed numbers are not
+    comparable to theory at all.
+
+    `origin_lat_deg` = latitude of the frame origin (the impact point). Pass it to
+    get a direct Coriolis check; without it, the f-dependent rows report the
+    latitude the discovered coefficient would imply, which is its own sanity read.
+    """
+    col_scale = getattr(library, "col_scale_", None) if library is not None else None
+    targets = list(target_names or DEFAULT_TARGET_NAMES)[: Xi.shape[1]]
+
+    # (description, theoretical value, TARGET CHANNEL the theory applies to).
+    # Theory fixes each coefficient ONLY in the channel the term is derived for. In
+    # any other channel the same column is just a generic regressor with no
+    # theoretical value, so comparing it to theory produces meaningless million-
+    # percent "errors" that bury the real result. Restrict the check accordingly.
+    expected = {
+        "transport_va": ("-2 exact polar kinematics", -2.0, "dv_al/dt"),
+        "centripetal_s": ("+1 exact polar kinematics", 1.0, "dv_s/dt"),
+        "cor_turn": ("+f = 2*Omega*sin(lat0)", None, "dv_al/dt"),
+        "cor_along": ("-f = -2*Omega*sin(lat0)", None, "dv_s/dt"),
+    }
+    f_true = None
+    if origin_lat_deg is not None:
+        f_true = 2.0 * EARTH_OMEGA * np.sin(np.radians(float(origin_lat_deg)))
+
+    lines = ["[PHYSICS-RECOVERY] discovered vs theoretical coefficients"]
+    if col_scale is None:
+        lines.append("  WARNING: library col_scale_ unavailable -- coefficients NOT")
+        lines.append("  de-normalised; values below are NOT comparable to theory.")
+    if f_true is not None:
+        lines.append(f"  origin latitude = {origin_lat_deg:.3f} deg  ->  f = {f_true:.4e} 1/s")
+
+    any_found = False
+    for name, (desc, theo, theory_channel) in expected.items():
+        if name not in term_names:
+            continue
+        r = term_names.index(name)
+        scale = 1.0
+        if col_scale is not None and r < len(col_scale):
+            try:
+                sv = float(col_scale[r])
+                if sv != 0.0:
+                    scale = sv
+            except (TypeError, ValueError):
+                pass
+        for c in range(Xi.shape[1]):
+            coef = float(Xi[r, c])
+            if coef == 0.0:
+                continue
+            tgt_now = targets[c] if c < len(targets) else f"d(x{c})/dt"
+            if theory_channel is not None and tgt_now != theory_channel:
+                # active but outside its derived channel -> report without a
+                # theory comparison rather than a spurious error percentage.
+                lines.append(
+                    f"  {tgt_now:<10} {name:<14} found={coef / scale:+.4e}"
+                    f"   (no theoretical value in this channel)"
+                )
+                continue
+            any_found = True
+            eff = coef / scale
+            tgt = targets[c] if c < len(targets) else f"d(x{c})/dt"
+            ref = theo
+            if ref is None and f_true is not None:
+                ref = f_true if name == "cor_turn" else -f_true
+            if ref is not None and ref != 0:
+                err = abs(eff - ref) / abs(ref) * 100.0
+                lines.append(
+                    f"  {tgt:<10} {name:<14} found={eff:+.4e}  theory={ref:+.4e}"
+                    f"  err={err:7.1f}%   ({desc})"
+                )
+            else:
+                implied = ""
+                if name in ("cor_turn", "cor_along"):
+                    sin_lat = abs(eff) / (2.0 * EARTH_OMEGA)
+                    if sin_lat <= 1.0:
+                        implied = f"   -> implies |lat0| = {np.degrees(np.arcsin(sin_lat)):.1f} deg"
+                lines.append(
+                    f"  {tgt:<10} {name:<14} found={eff:+.4e}  theory={desc}{implied}"
+                )
+    if not any_found:
+        lines.append("  (no frame-transport / Coriolis terms active in Xi)")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ equations
+
+def format_sindy_equations(
+    Xi: np.ndarray,
+    term_names: list[str],
+    target_names=None,
+    min_coef: float = 0.0,
+    inclusion_probs: np.ndarray | None = None,
+) -> str:
+    """Render `Xi` as readable equations, one per state derivative.
+
+    `min_coef` hides terms whose |coefficient| is below the cutoff (0 shows all
+    non-zero terms). If `inclusion_probs` is given, each term is annotated with the
+    fraction of bootstrap fits that selected it -- the ensemble's confidence.
+    """
+    targets = list(target_names or DEFAULT_TARGET_NAMES)[: Xi.shape[1]]
+    lines = []
+    for c in range(Xi.shape[1]):
+        target = targets[c] if c < len(targets) else f"d(x{c})/dt"
+        pieces = []
+        # Show the biggest contributors first.
+        order = np.argsort(-np.abs(Xi[:, c]))
+        for r in order:
+            coef = float(Xi[r, c])
+            if coef == 0.0 or abs(coef) < min_coef:
+                continue
+            sign = "-" if coef < 0 else "+"
+            piece = f"{sign} {abs(coef):.6g}*{term_names[r]}"
+            if inclusion_probs is not None:
+                piece += f" [ip={inclusion_probs[r, c]:.2f}]"
+            pieces.append(piece)
+        if not pieces:
+            lines.append(f"{target} = 0")
+            continue
+        body = " ".join(pieces)
+        if body.startswith("+ "):
+            body = body[2:]
+        lines.append(f"{target} = {body}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- rollout
+
+def _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset):
+    """Build the pure-physics derivative function d(scaled state)/dt.
+
+    The kinematic identity for the position channels is enforced explicitly. When
+    the discovery used analytic position rows, `Xi` already encodes exactly this,
+    so the override is a no-op; when it didn't, this keeps the rollout physically
+    consistent either way.
+    """
+    use_override = (
+        pos_idx is not None and vel_idx is not None and so_ratio is not None
+    )
+
+    def rhs(y: np.ndarray) -> np.ndarray:
+        # A diverging physics model overflows by design; that is the signal we are
+        # measuring, not an error to shout about. Suppress the numpy warnings and
+        # let the finiteness check below detect divergence cleanly.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            Theta = library.fit_transform(y.reshape(1, -1))
+            dy = np.asarray(Theta @ Xi, dtype=float).reshape(-1)
+        if use_override:
+            for k, (p_i, v_i) in enumerate(zip(pos_idx, vel_idx)):
+                dy[p_i] = y[v_i] * so_ratio[k] + so_offset[k]
+        return dy
+
+    return rhs
+
+
+def sindy_rollout(
+    library,
+    Xi: np.ndarray,
+    y0_scaled: np.ndarray,
+    n_steps: int,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=None,
+    vel_idx=None,
+    so_ratio=None,
+    so_offset=None,
+    diverge_limit: float = 1e6,
+) -> np.ndarray:
+    """Integrate the pure physics model forward with RK4.
+
+    Returns the predicted scaled states, shape (n_steps, n_features). Stops early
+    and pads with NaN if the state goes non-finite or explodes, so a diverging
+    physics model is visible rather than crashing the caller.
+    """
+    n_features = y0_scaled.shape[-1]
+    rhs = _make_rhs(library, Xi, n_features, pos_idx, vel_idx, so_ratio, so_offset)
+
+    out = np.full((n_steps, n_features), np.nan, dtype=float)
+    y = np.asarray(y0_scaled, dtype=float).copy()
+    out[0] = y
+    h = dt / float(substeps)
+
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        for step in range(1, n_steps):
+            for _ in range(substeps):
+                k1 = rhs(y)
+                k2 = rhs(y + 0.5 * h * k1)
+                k3 = rhs(y + 0.5 * h * k2)
+                k4 = rhs(y + h * k3)
+                y = y + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+            if not np.all(np.isfinite(y)) or np.max(np.abs(y)) > diverge_limit:
+                break
+            out[step] = y
+    return out
+
+
+# ------------------------------------------------------------------ evaluation
+
+def evaluate_sindy(
+    library,
+    Xi: np.ndarray,
+    trajectories: list[np.ndarray],
+    scaler,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=(0, 1),
+    vel_idx=(2, 4),
+    so_ratio=None,
+    so_offset=None,
+    names: list[str] | None = None,
+    max_steps: int | None = None,
+) -> dict:
+    """Roll out the pure physics model on each trajectory and score it.
+
+    `trajectories` are SCALED state arrays (n_steps, n_features), the same form
+    SINDy was fitted on. Returns per-trajectory rows plus an aggregate summary,
+    with errors converted back to metres.
+    """
+    rows = []
+    for i, traj in enumerate(trajectories):
+        traj = np.asarray(traj, dtype=float)
+        n_steps = traj.shape[0]
+        if max_steps is not None:
+            n_steps = min(n_steps, max_steps)
+        if n_steps < 3:
+            continue
+
+        pred = sindy_rollout(
+            library, Xi, traj[0], n_steps, dt, substeps,
+            pos_idx, vel_idx, so_ratio, so_offset,
+        )
+
+        truth_phys = scaler.inverse_transform(traj[:n_steps])
+        finite_mask = np.all(np.isfinite(pred), axis=1)
+        n_valid = int(finite_mask.sum())
+        if n_valid < 2:
+            rows.append({
+                "name": (names[i] if names else f"traj_{i}"),
+                "steps": n_steps, "valid_steps": n_valid,
+                "mean_pos_err_m": float("nan"), "final_pos_err_m": float("nan"),
+                "max_pos_err_m": float("nan"), "diverged": True,
+            })
+            continue
+
+        pred_phys = np.full_like(truth_phys, np.nan)
+        pred_phys[finite_mask] = scaler.inverse_transform(pred[finite_mask])
+
+        p = np.asarray(pos_idx, dtype=int)
+        err = np.linalg.norm(pred_phys[finite_mask][:, p] - truth_phys[finite_mask][:, p], axis=1)
+        rows.append({
+            "name": (names[i] if names else f"traj_{i}"),
+            "steps": n_steps,
+            "valid_steps": n_valid,
+            "mean_pos_err_m": float(np.mean(err)),
+            "final_pos_err_m": float(err[-1]),
+            "max_pos_err_m": float(np.max(err)),
+            "diverged": bool(n_valid < n_steps),
+        })
+
+    finite_rows = [r for r in rows if np.isfinite(r["mean_pos_err_m"])]
+    summary = {
+        "n_trajectories": len(rows),
+        "n_diverged": sum(1 for r in rows if r["diverged"]),
+        "mean_pos_err_m": float(np.mean([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "median_pos_err_m": float(np.median([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+        "worst_pos_err_m": float(np.max([r["mean_pos_err_m"] for r in finite_rows])) if finite_rows else float("nan"),
+    }
+    return {"rows": rows, "summary": summary}
+
+
+def format_evaluation(result: dict, label: str = "") -> str:
+    """Render the evaluation as a readable table."""
+    rows, s = result["rows"], result["summary"]
+    out = []
+    header = f"[pure-SINDy rollout{(' — ' + label) if label else ''}]"
+    out.append(header)
+    out.append(f"  {'trajectory':<28}{'steps':>7}{'valid':>7}{'mean_m':>12}{'final_m':>12}{'max_m':>12}")
+    for r in rows:
+        flag = "  DIVERGED" if r["diverged"] else ""
+        out.append(
+            f"  {r['name'][:28]:<28}{r['steps']:>7}{r['valid_steps']:>7}"
+            f"{r['mean_pos_err_m']:>12.1f}{r['final_pos_err_m']:>12.1f}{r['max_pos_err_m']:>12.1f}{flag}"
+        )
+    out.append(
+        f"  SUMMARY: mean={s['mean_pos_err_m']:.1f} m | median={s['median_pos_err_m']:.1f} m | "
+        f"worst={s['worst_pos_err_m']:.1f} m | diverged {s['n_diverged']}/{s['n_trajectories']}"
+    )
+    out.append("  (in-plane geodesic error: range + altitude; excludes cross-range)")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------- stability scoring
+
+def stability_score(
+    library,
+    Xi: np.ndarray,
+    trajectories: list[np.ndarray],
+    scaler,
+    dt: float,
+    substeps: int = 8,
+    pos_idx=(0, 1),
+    vel_idx=(2, 4),
+    so_ratio=None,
+    so_offset=None,
+    max_steps: int | None = None,
+) -> dict:
+    """Score a candidate physics model by how well it ROLLS OUT, not how well it fits.
+
+    This is the metric that matters for a backbone. R^2 measures one-step derivative
+    accuracy; it is measured against the data and says nothing about whether the
+    equation is stable when integrated. A model can hit R^2 = 0.71 and still explode
+    over a few hundred steps, because a free rollout compounds every small error and
+    any positive-feedback term (h*h, h*v_s, ...) grows without bound.
+
+    Ranking therefore puts DIVERGENCE FIRST and error second: a slightly less
+    accurate model that never runs away is a far better backbone than an accurate
+    one that occasionally shoots to the moon.
+    """
+    res = evaluate_sindy(
+        library, Xi, trajectories, scaler, dt, substeps,
+        pos_idx, vel_idx, so_ratio, so_offset, max_steps=max_steps,
+    )
+    s = res["summary"]
+    n = max(1, s["n_trajectories"])
+    return {
+        "frac_diverged": s["n_diverged"] / n,
+        "n_diverged": s["n_diverged"],
+        "n_trajectories": s["n_trajectories"],
+        "median_pos_err_m": s["median_pos_err_m"],
+        "mean_pos_err_m": s["mean_pos_err_m"],
+        "worst_pos_err_m": s["worst_pos_err_m"],
+    }
+
+
+def stability_rank_key(score: dict):
+    """Sort key: fewest divergences first, then lowest MEDIAN rollout error.
+
+    Median rather than mean, because a single exploded trajectory would otherwise
+    dominate the average and mask a model that is good on everything else.
+    """
+    med = score.get("median_pos_err_m", float("inf"))
+    if med is None or not np.isfinite(med):
+        med = float("inf")
+    return (score.get("frac_diverged", 1.0), med)

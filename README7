@@ -1,8 +1,252 @@
-python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 \
-  --aphynity-tau2 0.05 --no-frame-transport \
-  -o model_outputs/SBI/ablate_notransport/GEODESIC/glide
+#!/usr/bin/env python3
+# diagnose_coefficient_variation.py
+"""Are the aerodynamic coefficients CONSTANT (so a fixed-coefficient library can
+capture them) or STATE-VARYING (so no fixed column can, no matter how it's derived)?
+
+Why this gates the library design
+---------------------------------
+The eom library encodes lift as  q * (v/V)  with ONE fitted constant, and drag
+similarly. That is correct ONLY if the effective coefficients
+    C_L,eff = |a_perp| / q        C_D,eff = |a_along| / q      q = 0.5*rho(h)*V^2
+are roughly constant along a flight. If they vary a lot, the single fitted constant
+is representing an average of a moving target, and every additional fixed-coefficient
+term fits the same average -- which would explain an R^2 that will not move.
+
+A two-trajectory spot check gave C_L CV up to 3.3 (330% of its own mean). This script
+checks that across ALL trajectories, robustly, and isolates the two things that can
+falsely inflate the CV:
+
+  1. High-altitude tail: q -> 0 as density vanishes, so |a|/q explodes and is
+     meaningless. We exclude samples below a dynamic-pressure floor.
+  2. Differentiation noise: a is d(v)/dt from position-only files. We report the CV
+     of a SMOOTHED coefficient as well, so noise-driven scatter is separated from
+     genuine low-frequency variation.
+
+It also fits C_L against Mach and altitude to answer the actionable question: if the
+coefficient varies, is it a smooth function of state (fixable by adding Mach/altitude-
+dependent library columns) or not (must go to the neural residual)?
+
+VERDICT
+  CV < 0.25 (smoothed)         -> constant coeff OK; library form is adequate; the
+                                  R^2 ceiling is NOT the aero functional form.
+  CV >= 0.25 AND well-fit by
+  Mach/altitude (R^2 > ~0.6)   -> state-varying but LEARNABLE; add Mach/altitude-
+                                  dependent aero columns (linear-in-coeff, pipeline
+                                  unchanged). This is the high-value library fix.
+  CV >= 0.25 AND poorly fit    -> coefficient varies with something not in the state
+                                  (bank/alpha control); belongs in the residual.
+
+Usage
+-----
+    python diagnose_coefficient_variation.py \\
+        --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --phase glide
+
+Reads raw CSVs directly (time,x,y,z,vx,vy,vz); no project imports required, so it
+runs anywhere the trajectory files are.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import numpy as np
+
+try:
+    from sklearn.ensemble import HistGradientBoostingRegressor
+    _HAVE_SK = True
+except Exception:
+    _HAVE_SK = False
+
+R_EARTH = 6371000.0
+GM_EARTH = 3.986004418e14
+GAMMA_AIR = 1.4
+R_SPECIFIC = 287.05
+SCALE_HEIGHT = 7200.0
+
+
+def load_csv(path):
+    d = np.genfromtxt(path, delimiter=",", skip_header=1)
+    d = np.atleast_2d(d)
+    return d[d[:, 0].argsort()] if d.shape[0] > 1 else d
+
+
+def speed_of_sound(alt):
+    # crude ISA-ish temperature profile, adequate for a Mach proxy
+    T = np.where(alt < 11000, 288.15 - 0.0065 * alt,
+                 np.where(alt < 20000, 216.65,
+                          216.65 + 0.001 * (alt - 20000)))
+    T = np.clip(T, 180.0, 320.0)
+    return np.sqrt(GAMMA_AIR * R_SPECIFIC * T)
+
+
+def coeff_series(traj):
+    t = traj[:, 0]
+    pos = traj[:, 1:4]
+    vel = traj[:, 4:7]
+    acc = np.gradient(vel, t, axis=0)
+    r = np.linalg.norm(pos, axis=1, keepdims=True)
+    grav = -GM_EARTH * pos / r ** 3
+    u = acc - grav
+    V = np.linalg.norm(vel, axis=1)
+    Vs = np.where(V < 1e-6, 1e-6, V)
+    vhat = vel / Vs[:, None]
+    a_along = np.einsum("ij,ij->i", u, vhat)          # signed; negative = drag decel
+    a_perp = np.linalg.norm(u - a_along[:, None] * vhat, axis=1)
+    alt = r.ravel() - R_EARTH
+    rho = np.exp(-np.clip(alt, -1e4, 1e6) / SCALE_HEIGHT)
+    q = 0.5 * rho * V ** 2
+    mach = V / speed_of_sound(alt)
+    return dict(t=t, alt=alt, V=V, q=q, mach=mach,
+                CL=a_perp / np.where(q < 1e-12, np.nan, q),
+                CD=-a_along / np.where(q < 1e-12, np.nan, q))
+
+
+def smooth(x, w=15):
+    if len(x) < w:
+        return x
+    k = np.ones(w) / w
+    return np.convolve(x, k, mode="same")
+
+
+def cv(x):
+    x = x[np.isfinite(x)]
+    if x.size < 5 or np.abs(np.mean(x)) < 1e-30:
+        return np.nan
+    return float(np.std(x) / np.abs(np.mean(x)))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--tgt-data-paths", required=True)
+    ap.add_argument("--phase", default="glide")
+    ap.add_argument("--q-floor-frac", type=float, default=0.05,
+                    help="Exclude samples whose dynamic pressure q is below this "
+                         "fraction of the flight's max q (kills the high-altitude "
+                         "q->0 blow-up that falsely inflates the coefficient).")
+    ap.add_argument("--trim", type=int, default=5,
+                    help="Drop this many samples at each end (differentiation edges).")
+    args = ap.parse_args()
+
+    base = Path(args.tgt_data_paths)
+    phase_dir = base / args.phase if (base / args.phase).is_dir() else base
+    if not phase_dir.is_dir():
+        sys.exit(f"Not a directory: {phase_dir}")
+    files = [Path(phase_dir, x) for x in sorted(os.listdir(phase_dir))
+             if x.endswith(".csv") and not x.startswith(".")]
+    files = [f for f in files if "impact" not in f.name.lower()]
+    if len(files) < 2:
+        sys.exit(f"Need >=2 glide CSVs, found {len(files)} in {phase_dir}")
+
+    print("=" * 94)
+    print("AERO COEFFICIENT VARIATION  --  is a single fixed coefficient adequate?")
+    print(f"  {phase_dir}   ({len(files)} trajectories)")
+    print("=" * 94)
+
+    cl_raw, cl_sm, cd_raw, cd_sm = [], [], [], []
+    pooled = {k: [] for k in ("CL", "mach", "alt", "V", "q")}
+    n_used = 0
+    for f in files:
+        tr = load_csv(f)
+        if tr.shape[0] < 30 or tr.shape[1] < 7:
+            continue
+        s = coeff_series(tr)
+        tr_sl = slice(args.trim, -args.trim)
+        qf = args.q_floor_frac * np.nanmax(s["q"][tr_sl])
+        keep = (s["q"] >= qf)
+        keep[:args.trim] = False
+        keep[-args.trim:] = False
+        if keep.sum() < 20:
+            continue
+        n_used += 1
+        clv, cdv = s["CL"][keep], s["CD"][keep]
+        cl_raw.append(cv(clv)); cd_raw.append(cv(cdv))
+        cl_sm.append(cv(smooth(clv))); cd_sm.append(cv(smooth(cdv)))
+        for k in ("CL", "mach", "alt", "V", "q"):
+            pooled[k].append((s[k] if k != "CL" else s["CL"])[keep])
+
+    cl_raw = np.array(cl_raw); cl_sm = np.array(cl_sm)
+    cd_raw = np.array(cd_raw); cd_sm = np.array(cd_sm)
+
+    print(f"\n  trajectories used: {n_used}  (q-floor = {args.q_floor_frac:.0%} of per-flight max q)")
+    print("\n  within-flight coefficient of variation (median across flights):")
+    print(f"    C_L : raw {np.nanmedian(cl_raw):.2f}   smoothed {np.nanmedian(cl_sm):.2f}")
+    print(f"    C_D : raw {np.nanmedian(cd_raw):.2f}   smoothed {np.nanmedian(cd_sm):.2f}")
+    print(f"    (smoothed CV isolates genuine low-frequency variation from diff. noise)")
+
+    # cross-flight variation of the per-flight MEAN coefficient
+    cl_means = np.array([np.nanmean(c) for c in pooled["CL"] if np.isfinite(np.nanmean(c))])
+    xcv = cv(cl_means) if cl_means.size >= 3 else float("nan")
+    xcv_str = f"{xcv:.2f}" if np.isfinite(xcv) else "n/a (need >=3 flights)"
+    print(f"\n  cross-flight variation of mean C_L: CV = {xcv_str}"
+          f"   (range {np.nanmin(cl_means):.2e} .. {np.nanmax(cl_means):.2e})")
+    print("    high => different flights need different coefficients (one global set")
+    print("    cannot serve all trajectories).")
+
+    # is C_L a learnable function of Mach/altitude/V?
+    if _HAVE_SK and n_used >= 4:
+        X = np.column_stack([np.concatenate(pooled[k]) for k in ("mach", "alt", "V")])
+        y = np.concatenate(pooled["CL"])
+        m = np.isfinite(y) & np.all(np.isfinite(X), axis=1)
+        X, y = X[m], y[m]
+        # simple 5-fold to gauge learnability of the coefficient from state
+        idx = np.arange(len(y)); rng = np.random.default_rng(0); rng.shuffle(idx)
+        folds = np.array_split(idx, 5)
+        r2s = []
+        for i in range(5):
+            te = folds[i]; trn = np.concatenate([folds[j] for j in range(5) if j != i])
+            mdl = HistGradientBoostingRegressor(max_depth=4, max_iter=200, learning_rate=0.08)
+            mdl.fit(X[trn], y[trn])
+            p = mdl.predict(X[te])
+            ss = np.sum((y[te] - p) ** 2); st = np.sum((y[te] - y[te].mean()) ** 2)
+            r2s.append(1 - ss / st if st > 0 else np.nan)
+        r2_state = float(np.nanmean(r2s))
+        print(f"\n  C_L predictability from (Mach, altitude, V): R^2 = {r2_state:.3f}")
+        print("    high => the coefficient variation is a LEARNABLE function of state")
+        print("    (add Mach/altitude-dependent aero columns; pipeline unchanged).")
+    else:
+        r2_state = np.nan
+        print("\n  [sklearn unavailable -- skipping C_L(state) learnability test]")
+
+    # ---------------- verdict ----------------
+    print("\n" + "=" * 94)
+    print("VERDICT")
+    print("=" * 94)
+    cvL = np.nanmedian(cl_sm)
+    if cvL < 0.25:
+        print(f"  C_L smoothed CV = {cvL:.2f} < 0.25  =>  CONSTANT-COEFFICIENT LIBRARY IS ADEQUATE.")
+        print("  The aero functional form is NOT the R^2 ceiling. Look elsewhere")
+        print("  (residual capacity, integration, checkpoint selection).")
+    else:
+        print(f"  C_L smoothed CV = {cvL:.2f} >= 0.25  =>  COEFFICIENT IS STATE-VARYING.")
+        print("  A single fixed coefficient cannot represent the lift; this is a")
+        print("  FUNCTIONAL-FORM problem, not a term-selection one. Adding more")
+        print("  fixed-coefficient columns will not move R^2.")
+        if np.isfinite(r2_state) and r2_state > 0.6:
+            print(f"\n  AND C_L is well-predicted by state (R^2={r2_state:.2f}): the fix is to add")
+            print("  Mach/altitude-dependent aero columns to eom_library.py, e.g.")
+            print("     aero_perp * Mach,  aero_perp * Mach^2,  aero_perp * exp(-h/H2)")
+            print("  These stay linear-in-coefficients, so E-SINDy/APHYNITY are unchanged.")
+            print("  THIS is the high-value library edit.")
+        elif np.isfinite(r2_state):
+            print(f"\n  BUT C_L is only weakly predicted by state (R^2={r2_state:.2f}): the")
+            print("  variation is driven by something not in the state (bank angle / alpha")
+            print("  control). It belongs in the neural residual, not the library.")
+    print("=" * 94)
+    print("\nCAVEAT: accelerations are differentiated from position (no measured accel),")
+    print("so the RAW CV is inflated by noise; trust the SMOOTHED CV for the verdict.")
+
+
+if __name__ == "__main__":
+    import traceback
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        print("\n[FATAL] traceback:\n", flush=True)
+        traceback.print_exc()
+        sys.exit(1)

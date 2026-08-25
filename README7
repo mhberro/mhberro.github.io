@@ -1,683 +1,95 @@
-# neural_ode_mod.py
-
-"""Base training class for a Neural Ordinary Differential Equation model."""
-
-from __future__ import annotations
-
-import math
-import random
-from typing import TYPE_CHECKING
-
-import numpy as np
-import torch
-from torch import nn
-
-from cm_utilities.logger import logger
-from lm_ai_torch_training.device_type import DeviceType
-from lm_ai_torch_training.hyperparameters import TrainingParam
-from lm_ai_torch_training.model_management import (
-    TorchModelLoader,
-    TorchModelSaver,
-)
-from prediction.mlearn.neural_ode.adjoint_method import AdjointMethod
-from prediction.mlearn.neural_ode.loss_functions import (
-    ReverseLinearWeightingLoss,
-)
-
-if TYPE_CHECKING:  # pragma: no cover
-    from lm_ai_torch_training.configuration import TrainingConfiguration
-    from lm_ai_torch_training.optimizers.optimizer import OptimizerConfiguration
-    from lm_ai_torch_training.optimizers.optimizer_with_loss_function import (
-        OptimizerWithLossFunction,
-    )
-    from prediction.mlearn.ffnn.architecture import FFNNArchitecture
-    from prediction.mlearn.ffnn.model import FFNNModel
-    from prediction.mlearn.neural_ode.ode_solver import ODESolver
-
-DEFAULT_LOSS: torch.nn.modules.loss._Loss = torch.nn.MSELoss()
-
-
-# TODO: This needs to move somewhere that is more useful to PCM
-class EarlyStopper:
-    def __init__(self, patience: int = 1, min_delta: float = 0, metric_name="val_loss"):
-        # TODO: What about a percent rise stopper rather and a absolute value? Both?
-        self.patience = patience
-        self.min_delta = min_delta
-        self.counter = 0
-        self.min_validation_loss = float("inf")
-        self.previous_validation_loss = float("inf")
-        self.metric_name = metric_name
-
-    def early_stop(self, validation_loss: float):
-        # Improvement must beat best by at least min_delta
-        if validation_loss < (self.min_validation_loss - self.min_delta):
-            self.min_validation_loss = validation_loss
-            self.counter = 0
-        else:
-            # No meaningful improvement (same, tiny change, or worse)
-            self.counter += 1
-            if self.counter >= self.patience:
-                return True
-        self.previous_validation_loss = validation_loss
-        return False
-
-class ModelCheckpoint:
-    def __init__(self, min_epochs: int, directory: str, model_name: str):
-        self.min_epochs = min_epochs
-        self.directory = directory
-        self.model_name = model_name
-        self.min_metric = float("inf")
-
-    def save_on_min(self, model: NODEPredictor, epoch: int, metric: float):
-        if epoch > self.min_epochs and metric < self.min_metric:
-            self.min_metric = metric
-            model.save(
-                directory=self.directory,
-                model_name=self.model_name,
-            )
-            return True
-        return False
-
-
-class NODEPredictor(nn.Module):
-    """Neural Ordinary Differential Equation (NODE) Prediction Model.
-
-    The Neural Ordinary Differential Equation (NODE) is a neural network that
-    parameterizes the derivative of the hidden state instead of specifying a
-    discrete sequence of hidden layers. Essentially, it extends a residual
-    network model [EQ 1], adding more layers and decreasing the step size to the
-    limit to yield an ODE [EQ 2]. This is shown by the equations below:
-
-            h_t+1 = h_t + f(h_t,Θ_t)          [EQ 1]
-            dh(t)/dt = f(h(t),t,Θ)            [EQ 2]
-
-    f is a feed-forward neural network. Then, with some given initial
-    conditions, an ODE solver can be used to integrate forward the dynamics
-    captured by the network.
-
-    For more information, refer to the original paper given below
-    (https://arxiv.org/pdf/1806.07366.pdf)
-    """
-
-    def __init__(
-        self,
-        architecture: FFNNArchitecture,
-        training_configuration: TrainingConfiguration,
-        solver: ODESolver,
-        loss_func: torch.nn.modules.loss._Loss = DEFAULT_LOSS,
-        logging_interval: int = 1,  # Default to log every epoch/iteration.
-        early_stopper: EarlyStopper | None = None,
-        checkpoint: ModelCheckpoint | None = None,
-        aug_dim: int = 0,
-    ) -> None:
-        """Initializes a NODE from an input configuration.
-
-        Args:
-            architecture: A configuration defining the underlying node model.
-            training_configuration: The model training hyperparameters.
-            logging_interval: How often to log training epochs or iterations.
-                This is used if verbose is True in the training configuration.
-                Logging statements will be printed to the console every
-                logging_interval epochs or optimizer iterations.
-            solver: The ODESolver used in the NODE.
-            loss_func: The loss function optimized for training the node model.
-        """
-        super().__init__()
-        self.architecture: FFNNArchitecture = architecture
-        self.training_configuration: TrainingConfiguration = training_configuration
-        self.logging_interval: int = logging_interval
-        self.solver = solver
-        self.early_stopper = early_stopper
-        self.checkpoint = checkpoint
-        self.aug_dim = aug_dim
-
-        # Parse parameters from the training configuration.
-        self.optimizer_config: OptimizerConfiguration = self.training_configuration.optimizer
-        self.n_epochs: int = self.training_configuration.get_param(TrainingParam.N_EPOCHS)
-        self.batch_size: int = self.training_configuration.get_param(TrainingParam.BATCH_SIZE)
-        self.verbose: bool = self.training_configuration.verbose
-
-        # Set the iteration parameter for required optimizers.
-        self.training_metrics: dict[str, list[float]] = {}
-
-        # Setup the model for training and inference.
-        self._initialize_device()
-        self._initialize_losses(loss_func=loss_func)
-        self._initialize_model()
-        self._initialize_optimizer()
-
-    @torch.no_grad()
-    def rollout_probe(
-        self,
-        trajectories: list[torch.Tensor],
-        scaler=None,
-        pos_slice: slice = slice(1, 4),
-        discount_gamma: float = 0.99,
-    ) -> dict[str, float]:
-        """Free-running rollout error over FULL validation trajectories.
-
-        This is the metric that actually matters and that windowed `val_pos_err`
-        cannot see: seed once from the initial state, integrate the entire
-        trajectory autonomously, and compare in PHYSICAL units. It mirrors what
-        the standalone evaluator does, so it tracks the eventual rollout number --
-        letting architectures be compared within one training stage instead of
-        after a multi-day full run.
-
-        `scaler` (a fitted StandardScaler) unscales predictions to metres; if
-        None, error is reported in scaled units. `pos_slice` selects the position
-        columns of the physical state (default [s, h, v_s...] -> cols 1:4 assume a
-        leading time column is NOT present in the model state, i.e. the 5-wide
-        physical state's first 3 entries are positions -> use slice(0, 3) for the
-        geodesic frame; the caller passes the correct slice).
-        """
-        was_training = self.model.training
-        self.model.eval()
-        errs = []
-        disc_errs = []  # exponentially-discounted per-trajectory rollout error
-        finite = 0
-        n_attempted = 0
-        for traj in trajectories:
-            traj = traj.to(self.device)
-            n_steps = traj.size(0)
-            if n_steps < 3:
-                continue
-            n_attempted += 1
-            n_features = traj.size(-1)
-
-            # Use the SAME integration convention as batch_loss (known correct):
-            # x has shape (batch, time, features); the solver returns
-            # (time, batch, features) and batch_loss slices [:, :, :n_features].
-            # Build a batch of 1 so the two paths are identical.
-            x0_phys = traj[0:1, :]  # (1, n_features)
-            if self.aug_dim == 0:
-                x0 = x0_phys
-            elif hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                x0 = torch.cat((x0_phys, self.model.func.encode(x0_phys)), dim=-1)
-            else:
-                x0 = torch.cat(
-                    (x0_phys, torch.zeros((1, self.aug_dim), device=self.device)), dim=-1
-                )
-
-            pred_full = self.solver.integrate(
-                func=self.model, x0=x0, steps=n_steps - 1, extra_feat=None
-            )  # (time, batch=1, features_full)
-
-            # Normalise to (time, n_features) regardless of the solver's axis order.
-            pred_full = pred_full.squeeze()  # drop the singleton batch axis
-            if pred_full.dim() != 2:
-                pred_full = pred_full.reshape(n_steps, -1)
-            pred = pred_full[:, :n_features]
-
-            if pred.shape[0] != n_steps:
-                # Time axis landed elsewhere; transpose and retry once.
-                pred = pred_full.T[:, :n_features]
-
-            if not torch.isfinite(pred).all():
-                continue
-            finite += 1
-            p = pred.detach().cpu().numpy()
-            t = traj[:, :n_features].detach().cpu().numpy()
-            if scaler is not None:
-                p = scaler.inverse_transform(p)
-                t = scaler.inverse_transform(t)
-            pos_err = np.linalg.norm(p[:, pos_slice] - t[:, pos_slice], axis=1)
-            errs.append(float(np.mean(pos_err)))
-
-            # Exponentially-discounted rollout error: sum_k gamma^k * err_k,
-            # normalised by sum_k gamma^k so it stays on the same metre scale as
-            # the plain mean and is comparable across trajectories of different
-            # lengths. gamma in [0.98, 0.995] weights early-to-mid horizon fidelity
-            # while still penalising late-horizon divergence -- the quantity that
-            # actually tracks deployed 3D error, unlike one-step val_traj_loss.
-            k = np.arange(pos_err.shape[0], dtype=float)
-            w = discount_gamma ** k
-            w_sum = float(w.sum())
-            if w_sum > 0:
-                disc_errs.append(float(np.dot(w, pos_err) / w_sum))
-        if was_training:
-            self.model.train()
-        if not errs:
-            return {
-                "rollout_pos_err": float("nan"),
-                "rollout_pos_err_discounted": float("nan"),
-                "rollout_frac_finite": 0.0,
-            }
-        return {
-            "rollout_pos_err": float(np.mean(errs)),
-            "rollout_pos_err_worst": float(np.max(errs)),
-            "rollout_pos_err_discounted": float(np.mean(disc_errs)) if disc_errs else float("nan"),
-            "rollout_frac_finite": finite / max(1, n_attempted),
-        }
-
-    def fit(
-        self,
-        x: list[torch.Tensor],
-        extra_feat: torch.Tensor | None = None,
-        *,
-        shuffle: bool = True,
-        validation_data: list[torch.Tensor] | None = None,
-        enable_checkpoints: bool = False,
-        rollout_probe_data: list[torch.Tensor] | None = None,
-        rollout_probe_every: int = 25,
-        rollout_probe_scaler=None,
-        rollout_probe_pos_slice: slice = slice(1, 4),
-        rollout_probe_discount_gamma: float = 0.99,
-        checkpoint_on_probe: bool = False,
-        probe_checkpoint=None,
-    ) -> dict[str, list[float]]:
-        """Fits a model to a dataset.
-
-        Args:
-            x: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-            extra_feat: Extra features used in training.
-                This will be passed to the extra features of the Neural ODE. It
-                should be of shape (len(x), n_extra_features).
-            shuffle: Flag to shuffle the data for batching.
-                The data will not be shuffled when set to False.
-            validation_data: List of tensors that contain the time series targets.
-                Each tensor should be of shape (n_time_steps, n_features), where
-                the first point is the initial condition for the ODE solver.
-
-        Returns:
-            A dictionary of training losses and metrics.
-        """
-        if extra_feat is not None:
-            extra_feat = extra_feat.to(self.device)
-
-        for epoch in range(1, self.n_epochs + 1):
-            pool_index = list(range(len(x)))
-            if shuffle:
-                random.shuffle(pool_index)
-
-            # Size-weighted accumulators so the reported epoch metrics are a
-            # true dataset mean, not the metrics of whichever batch happened
-            # to come last. Early stopping / checkpointing depend on this.
-            train_sums: dict[str, torch.Tensor] = {}
-            train_count = 0
-
-            for _ in range(math.ceil(len(x) / self.batch_size)):
-                batch_idx = [
-                    pool_index.pop(0)
-                    for _ in range(
-                        min(
-                            len(pool_index),
-                            self.batch_size,
-                        )
-                    )
-                ]
-                x_batch_list = [x[i] for i in batch_idx]
-                max_len = max([i.size(dim=0) for i in x_batch_list])
-                x_batch = float("nan") * torch.ones((len(batch_idx), max_len, x_batch_list[0].size(dim=1)))
-                for i in range(len(x_batch_list)):
-                    x_batch[i, : x_batch_list[i].size(dim=0)] = x_batch_list[i]
-
-                if extra_feat is None:
-                    batch_metrics = self.batch_loss(x=x_batch.to(self.device))
-                else:
-                    batch_metrics = self.batch_loss(
-                        x=x_batch.to(self.device),
-                        extra_feat=extra_feat[batch_idx],
-                    )
-
-                self.optimizer.zero_grad()
-                batch_metrics["loss"].backward()
-                total_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    max_norm=1.0,  # <-- change this if you need a tighter/looser clip
-                    norm_type=2.0,
-                )
-                # NON-FINITE GUARD: norm-based clipping does NOT rescue nan/inf
-                # gradients -- the clip coefficient max_norm/nan is itself nan, so
-                # the bad grads survive and optimizer.step() would write nan into
-                # every weight, permanently killing the run (frozen metrics for all
-                # subsequent epochs). If the loss or the grad norm is non-finite,
-                # skip this step entirely so one diverged batch cannot poison the
-                # model. This can happen at full trajectory length when the state
-                # passes through the geodesic-frame singularity (s -> 0).
-                loss_is_finite = torch.isfinite(batch_metrics["loss"]).item()
-                grad_is_finite = torch.isfinite(total_norm).item()
-                if loss_is_finite and grad_is_finite:
-                    self.optimizer.step()
-                else:
-                    self.optimizer.zero_grad(set_to_none=True)
-                # # (optional) log the pre-clip norm so you can monitor it
-                # logger.debug(f"[Epoch {epoch}] Grad norm before clipping: {total_norm:.4f}")
-
-                # Accumulate detached, size-weighted metrics for the epoch mean.
-                n_in_batch = len(batch_idx)
-                train_count += n_in_batch
-                for key, value in batch_metrics.items():
-                    contribution = value.detach() * n_in_batch
-                    train_sums[key] = train_sums.get(key, 0.0) + contribution
-
-            metrics = {key: value / max(train_count, 1) for key, value in train_sums.items()}
-
-            if validation_data is not None:
-                with torch.no_grad():
-                    # repeating the above...it should be another function
-                    pool_index_val = list(range(len(validation_data)))
-                    if shuffle:
-                        random.shuffle(pool_index_val)
-
-                    # Size-weighted accumulators: val_loss must be the mean over
-                    # the FULL validation set. Previously only the last (random)
-                    # batch survived, so early stopping and checkpointing were
-                    # comparing single-batch noise against single-batch noise.
-                    val_sums: dict[str, torch.Tensor] = {}
-                    val_count = 0
-
-                    for _ in range(math.ceil(len(validation_data) / self.batch_size)):
-                        batch_idx_val = [
-                            pool_index_val.pop(0)
-                            for _ in range(
-                                min(
-                                    len(pool_index_val),
-                                    self.batch_size,
-                                )
-                            )
-                        ]
-                        x_batch_list_val = [validation_data[i] for i in batch_idx_val]
-                        max_len_val = max([i.size(dim=0) for i in x_batch_list_val])
-                        x_batch_val = float("nan") * torch.ones(
-                            (
-                                len(batch_idx_val),
-                                max_len_val,
-                                x_batch_list_val[0].size(dim=1),
-                            )
-                        )
-                        for i in range(len(x_batch_list_val)):
-                            x_batch_val[i, : x_batch_list_val[i].size(dim=0)] = x_batch_list_val[i]
-
-                        if extra_feat is None:
-                            metrics_val = self.batch_loss(x=x_batch_val.to(self.device))
-                        else:
-                            metrics_val = self.batch_loss(
-                                x=x_batch_val.to(self.device),
-                                extra_feat=extra_feat[batch_idx_val],
-                            )
-
-                        n_in_val_batch = len(batch_idx_val)
-                        val_count += n_in_val_batch
-                        for key, value in metrics_val.items():
-                            contribution = value.detach() * n_in_val_batch
-                            val_sums[key] = val_sums.get(key, 0.0) + contribution
-
-                    for key, value in val_sums.items():
-                        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-                    # update the position and velocity weights only for the loss functions that support this
-                    # and only when looking at the full trajectory
-                    # TODO: When doing this, should some kind of reset on the early stopper and checkpointer be done?
-                    if hasattr(self.criterion, "wp") and enable_checkpoints:
-                        if epoch % 50 == 0:
-                            if (
-                                metrics["pos_err_scaled"] > self.criterion.delta_pos
-                                and metrics["vel_err_scaled"] > self.criterion.delta_vel
-                            ):
-                                pass
-                            elif metrics["pos_err_scaled"] > self.criterion.delta_pos:
-                                self.criterion.wp *= 1.2  # amplify position focus
-                                logger.info(
-                                    f"Increased position weight to {self.criterion.wp} ({metrics['pos_err_scaled']} > {self.criterion.delta_pos})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                            elif metrics["vel_err_scaled"] > self.criterion.delta_vel:
-                                self.criterion.wv *= 1.2
-                                logger.info(
-                                    f"Increased velocity weight to {self.criterion.wv} ({metrics['vel_err_scaled']} > {self.criterion.delta_vel})"
-                                )
-                                # self.early_stopper.counter = self.early_stopper.counter // 2
-                    
-                    for key, value in val_sums.items():
-                        metrics[f"val_{key}"] = value / max(val_count, 1)
-
-                    # Adaptive dual update using true physical trajectory loss
-                    if hasattr(self.criterion, "update_lagrangian_multiplier"):
-                        val_traj_loss_epoch = metrics.get("val_traj_loss", metrics.get("val_loss", 0.0))
-                        if isinstance(val_traj_loss_epoch, torch.Tensor):
-                            val_traj_loss_epoch = val_traj_loss_epoch.item()
-                        self.criterion.update_lagrangian_multiplier(val_traj_loss_epoch)
-
-            # Free-rollout probe on FULL validation trajectories: the real target
-            # metric, computed cheaply during training so architectures/settings can
-            # be judged within a stage instead of after a multi-day full run.
-            if (
-                rollout_probe_data is not None
-                and rollout_probe_every > 0
-                and (epoch % rollout_probe_every == 0)
-            ):
-                probe = self.rollout_probe(
-                    rollout_probe_data,
-                    scaler=rollout_probe_scaler,
-                    pos_slice=rollout_probe_pos_slice,
-                    discount_gamma=rollout_probe_discount_gamma,
-                )
-                metrics.update(probe)
-                logger.info(
-                    f"[rollout probe @ epoch {epoch}] "
-                    f"mean_pos_err={probe['rollout_pos_err']:.1f} "
-                    f"disc={probe.get('rollout_pos_err_discounted', float('nan')):.1f} "
-                    f"worst={probe.get('rollout_pos_err_worst', float('nan')):.1f} "
-                    f"finite={probe['rollout_frac_finite']:.0%}"
-                )
-
-                # Checkpoint on the DISCOUNTED rollout probe -- the metric that
-                # actually tracks deployed 3D error. This runs ALONGSIDE the
-                # val_loss checkpoint below (different model_name), so both
-                # artifacts exist and neither selection strategy is lost. Only
-                # fires on probe epochs; a finite, fully-integrating probe is
-                # required so a diverged probe can never be selected.
-                if (
-                    checkpoint_on_probe
-                    and probe_checkpoint is not None
-                    and np.isfinite(probe.get("rollout_pos_err_discounted", float("nan")))
-                    and probe.get("rollout_frac_finite", 0.0) >= 1.0
-                    and probe_checkpoint.save_on_min(
-                        self, epoch, probe["rollout_pos_err_discounted"]
-                    )
-                ):
-                    logger.info(
-                        f"Saved PROBE checkpoint at {epoch} "
-                        f"(discounted rollout={probe['rollout_pos_err_discounted']:.1f} m)"
-                    )
-
-            self._add_metrics_to_global_metrics(metrics)
-            self._log_metrics(metrics, iteration=epoch)
-
-            if (
-                enable_checkpoints
-                and validation_data is not None
-                and self.checkpoint is not None
-                and self.checkpoint.save_on_min(
-                    self,
-                    epoch,
-                    metrics[self.early_stopper.metric_name],
-                )
-            ):
-                logger.info(f"Saved checkpoint at {epoch}")
-            if (
-                self.early_stopper is not None
-                and self.early_stopper.early_stop(metrics[self.early_stopper.metric_name])
-                # and metrics["pos_err"] < 5000
-            ):
-                logger.info(f"Early stopping triggered at {epoch}")
-                break
-
-        return self.training_metrics
-
-    def batch_loss(
-        self,
-        x: torch.Tensor,
-        extra_feat: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """Calculates the loss of the batch using stateless latent seeding."""
-        batch_size, time_steps, n_features = x.shape
-        x0_phys = x[:, 0, :]
-
-        if self.aug_dim == 0:
-            x0 = x0_phys
-        else:
-            # Check if the underlying model is a GRU-ODE network exposing an encode mechanism
-            if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                h0 = self.model.func.encode(x0_phys)
-            else:
-                # Fallback path for standard zero-augmented ANODE structures
-                h0 = torch.zeros((batch_size, self.aug_dim), device=self.device)
-
-            x0 = torch.cat((x0_phys, h0), dim=-1)
-
-        if self.solver.adjoint:
-            x_pred = AdjointMethod.apply(
-                self.solver,
-                self.model,
-                x0,
-                time_steps - 1,
-                extra_feat,
-                *tuple(self.model.parameters()),
-            )[:, :, : n_features]
-        else:
-            x_pred = self.solver.integrate(
-                func=self.model,
-                x0=x0,
-                steps=time_steps - 1,
-                extra_feat=extra_feat,
-            )[:, :, : n_features]
-
-        x_pred = torch.nan_to_num(x_pred, nan=0.0)
-        x = torch.nan_to_num(x, nan=0.0)
-
-        return self.criterion(x_pred, x)
-
-
-    def infer(
-        self,
-        x0: torch.Tensor,
-        steps: int = 1,
-        extra_feat: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Infers on a trained model with a predefined dataset.
-
-        Args:
-            x0: An input tensor with the initial conditions for the ODE Solver.
-                This is a shape (batch_size, n_features).
-            extra_feat: A tensor with the extra features of the NODE.
-                This is of shape (batch_size, n_extra_features).
-            steps: Number of steps the ODE Solver will take.
-
-        Returns:
-            A tensor containing the predicted data from the trained model.
-        """
-        with torch.no_grad():
-            if self.aug_dim != 0:
-                # Seed the latent state exactly the way training does
-                # (batch_loss): encoder-derived h0 for GRU-ODE models,
-                # zeros only for plain zero-augmented ANODE structures.
-                # The previous zero-seeding here was a train/inference
-                # mismatch: the model never learned to integrate from h0=0.
-                if hasattr(self.model, "func") and hasattr(self.model.func, "encode"):
-                    h0 = self.model.func.encode(x0)
-                else:
-                    h0 = torch.zeros(
-                        (x0.shape[0], self.aug_dim), device=x0.device, dtype=x0.dtype
-                    )
-                x0 = torch.cat((x0, h0), dim=-1)
-            return self.solver.integrate(func=self.model, x0=x0, steps=steps, extra_feat=extra_feat)
-
-    def load(
-        self,
-        directory: str,
-        model_name: str,
-        device_type: DeviceType = DeviceType.CPU,
-    ) -> None:
-        """Loads a model from file.
-
-        Args:
-            directory: The directory to load the model from.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when searching
-                for the model file.
-            device_type: The hardware device to use for model loading.
-        """
-        loader = TorchModelLoader(directory, model_name, device_type)
-        loader.load(name="model", component=self.model)
-
-    def save(self, directory: str, model_name: str) -> None:
-        """Saves a model to one torch file.
-
-        Args:
-            directory: The directory to save the model to.
-            model_name: The name of the model without extensions.
-                The torch model loading utilities will automatically apply
-                a suffix of `.pt` to the input model_name when creating
-                the model file.
-        """
-        model_saver = TorchModelSaver()
-        model_saver.add_component(name="model", component=self.model)
-        model_saver.save(directory, model_name)
-
-    def _initialize_device(self) -> None:
-        """Sets torch device based on whether GPU is available or not."""
-        self.device = torch.device(DeviceType.GPU) if torch.cuda.is_available() else torch.device(DeviceType.CPU)
-        self.to(device=self.device)
-
-    def _initialize_losses(self, loss_func: torch.nn.modules.loss._Loss) -> None:
-        """Initializes the losses for the NODE.
-
-        Args:
-            loss_func: The loss function optimized for training the node model.
-        """
-        self.criterion: torch.nn.modules.loss._Loss = loss_func.to(self.device)
-
-    def _initialize_model(self) -> None:
-        """Initialize the NODE."""
-        self.model: FFNNModel = self.architecture.get_model().to(self.device)
-
-    def _initialize_optimizer(self) -> None:
-        """Initialize the optimizer for the NODE from the model parameters."""
-        self.optimizer: torch.optim.Optimizer | OptimizerWithLossFunction = self.optimizer_config.create_from_model(
-            self.model
-        )
-
-    def _add_metrics_to_global_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-    ) -> None:
-        """Adds metrics generated from training to the global metrics.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-        """
-        # Add losses and metrics to global metrics. Most values are tensors, but
-        # some (e.g. the rollout-probe outputs) are plain Python floats.
-        for metric, value in metrics.items():
-            if metric not in self.training_metrics:
-                self.training_metrics[metric] = []
-            if hasattr(value, "detach"):
-                value = value.detach().cpu().numpy()
-            self.training_metrics[metric].append(value)
-
-    def _log_metrics(
-        self,
-        metrics: dict[str, torch.Tensor],
-        iteration: int,
-        prefix: str = "Epoch",
-    ) -> None:
-        """Logs metrics generated during a training epoch or iteration.
-
-        Args:
-            metrics: A dictionary containing the metrics generated this epoch.
-            iteration: The current epoch or optimizer iteration.
-            prefix: The prefix for the logging statement reported to console.
-        """
-        with torch.no_grad():
-            if self.verbose and iteration % self.logging_interval == 0:
-                metric_comps: list[str] = []
-                for metric, value in metrics.items():
-                    v = value.item() if hasattr(value, "item") else value
-                    metric_comps.append(f"{metric}: {v:.7f}")
-
-                metric_str: str = " ".join(metric_comps)
-                logger.info(f"{prefix} {iteration}: {metric_str}")
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 1 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 -o model_outputs/SBI/eom_transport_pertarget/GEODESIC/glide --aphynity-tau2 2 --checkpoint-on-probe
+There are 22 training trajs and 6 validation trajs.
+
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-2.44749399e-03  6.28288723e-05 -2.38111600e-03  3.89802594e-03
+  -1.60085907e-02]
+ [ 2.39932585e-03 -4.70540590e-05 -7.97056085e-03 -4.87078211e-03
+  -3.77262753e-02]
+ [-5.64747553e-03 -8.92826503e-05 -3.49157308e-03 -6.57562501e-03
+  -9.89905268e-03]
+ [ 0.00000000e+00  0.00000000e+00 -7.78926242e-03  9.37210785e-05
+   2.33438501e-02]
+ [ 9.74012386e-06  0.00000000e+00 -4.01998477e-03 -4.38504453e-04
+   1.21363543e-03]
+ [ 2.01350902e-05  3.37590431e-05  1.91141645e-02 -2.31632057e-03
+   2.08356049e-02]
+ [-4.90130942e-05  2.14184012e-02 -2.17067996e-03 -4.99376029e-05
+  -1.22824042e-02]
+ [-9.60669513e-05  0.00000000e+00  6.89719435e-04 -1.56262063e-02
+  -3.69433406e-03]
+ [-2.88027442e-05 -2.16172195e-05  9.38216836e-04  1.43679148e-03
+   3.48963583e-03]
+ [-4.08745799e-05  0.00000000e+00  1.17814560e-03 -1.08311522e-02
+  -4.24549801e-05]
+ [ 6.20094948e-05  0.00000000e+00 -1.63608025e-04  1.54686074e-02
+   3.36592767e-03]
+ [ 7.46397814e-06  4.94222402e-05 -7.77010093e-04  1.58364488e-03
+   5.64244914e-02]]
+[SINDy] active terms: 54/60 | max|coef| per target: [0.00565 0.02142 0.01911 0.01563 0.05642]
+[SINDy] R2 per target: [0.9955 1.     0.4619 0.1633 0.5643]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.3965 | max relative term contribution 1.4664
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.3965 perTarget=[0.995, 1.0, 0.462, 0.163, 0.564]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5433 coef=-5.647e-03 ip=1.00
+          ds/dt     1                  contrib=0.2355 coef=-2.447e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2308 coef=+2.399e-03 ip=1.00
+          ds/dt     v_al               contrib=0.0092 coef=-9.607e-05 ip=0.92
+          dh/dt     v_h                contrib=0.9978 coef=+2.142e-02 ip=1.00
+          dh/dt     curv_vs2           contrib=0.0042 coef=-8.928e-05 ip=1.00
+          dh/dt     1                  contrib=0.0029 coef=+6.283e-05 ip=1.00
+          dh/dt     cor_turn           contrib=0.0023 coef=+4.942e-05 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=1.1341 coef=+1.911e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.4729 coef=-7.971e-03 ip=1.00
+          dv_s/dt   aero_along@H=5000  contrib=0.4621 coef=-7.789e-03 ip=1.00
+          dv_s/dt   aero_vert@H=5000   contrib=0.2370 coef=-4.020e-03 ip=1.00
+          dv_al/dt  v_al               contrib=0.7413 coef=-1.563e-02 ip=1.00
+          dv_al/dt  cor_along          contrib=0.7338 coef=+1.547e-02 ip=1.00
+          dv_al/dt  transport_va       contrib=0.5129 coef=-1.083e-02 ip=1.00
+          dv_al/dt  curv_vs2           contrib=0.3119 coef=-6.576e-03 ip=1.00
+          dv_h/dt   cor_turn           contrib=1.4664 coef=+5.642e-02 ip=1.00
+          dv_h/dt   gravity            contrib=0.9804 coef=-3.773e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.6067 coef=+2.334e-02 ip=1.00
+          dv_h/dt   aero_q@H=5000      contrib=0.5415 coef=+2.084e-02 ip=1.00
+
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x339ec76d0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0016215 pos_err: 571.1242676 vel_err: 21.0509243 traj_loss: 0.0015507 node_norm: 0.0000608 lambda: 1.0064672 val_loss: 0.0008232 val_pos_err: 472.2460938 val_vel_err: 22.6137753 val_traj_loss: 0.0007615 val_node_norm: 0.0000567 val_lambda: 1.0064677
+[INFO] Epoch 10: loss: 0.0015750 pos_err: 570.5065918 vel_err: 20.4386444 traj_loss: 0.0015156 node_norm: 0.0000383 lambda: 1.0139124 val_loss: 0.0007787 val_pos_err: 478.9483032 val_vel_err: 20.1118736 val_traj_loss: 0.0007226 val_node_norm: 0.0000461 val_lambda: 1.0139127
+[INFO] Epoch 15: loss: 0.0015557 pos_err: 571.8572388 vel_err: 19.8459148 traj_loss: 0.0014938 node_norm: 0.0000305 lambda: 1.0210562 val_loss: 0.0007616 val_pos_err: 477.8782654 val_vel_err: 20.2377186 val_traj_loss: 0.0007062 val_node_norm: 0.0000406 val_lambda: 1.0210561
+[INFO] Epoch 20: loss: 0.0015431 pos_err: 570.7819824 vel_err: 19.7306309 traj_loss: 0.0014757 node_norm: 0.0000259 lambda: 1.0280761 val_loss: 0.0007438 val_pos_err: 476.1562195 val_vel_err: 20.8633823 val_traj_loss: 0.0006971 val_node_norm: 0.0000271 val_lambda: 1.0280761
+[INFO] [rollout probe @ epoch 25] mean_pos_err=75375.6 disc=30197.4 worst=365458.7 finite=100%
+[INFO] Epoch 25: loss: 0.0015321 pos_err: 569.9592285 vel_err: 19.7126102 traj_loss: 0.0014584 node_norm: 0.0000226 lambda: 1.0350113 val_loss: 0.0007384 val_pos_err: 477.2736206 val_vel_err: 20.0403156 val_traj_loss: 0.0006877 val_node_norm: 0.0000266 val_lambda: 1.0350113 rollout_pos_err: 75375.6149902 rollout_pos_err_worst: 365458.7187500 rollout_pos_err_discounted: 30197.3676199 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0015260 pos_err: 570.0513916 vel_err: 19.4726467 traj_loss: 0.0014440 node_norm: 0.0000215 lambda: 1.0418867 val_loss: 0.0007367 val_pos_err: 475.6875916 val_vel_err: 20.7300797 val_traj_loss: 0.0006856 val_node_norm: 0.0000224 val_lambda: 1.0418873
+[INFO] Epoch 35: loss: 0.0015188 pos_err: 570.6762085 vel_err: 19.2567883 traj_loss: 0.0014289 node_norm: 0.0000203 lambda: 1.0487317 val_loss: 0.0007377 val_pos_err: 473.0505676 val_vel_err: 20.6558723 val_traj_loss: 0.0006785 val_node_norm: 0.0000261 val_lambda: 1.0487312
+[INFO] Epoch 40: loss: 0.0015119 pos_err: 570.2277222 vel_err: 19.3455772 traj_loss: 0.0014142 node_norm: 0.0000192 lambda: 1.0555125 val_loss: 0.0007446 val_pos_err: 476.8047180 val_vel_err: 19.6382618 val_traj_loss: 0.0006795 val_node_norm: 0.0000274 val_lambda: 1.0555125
+[INFO] Epoch 45: loss: 0.0015065 pos_err: 570.6361084 vel_err: 19.0286579 traj_loss: 0.0014005 node_norm: 0.0000187 lambda: 1.0622936 val_loss: 0.0007397 val_pos_err: 476.9769897 val_vel_err: 19.5950394 val_traj_loss: 0.0006767 val_node_norm: 0.0000208 val_lambda: 1.0622932
+[INFO] [rollout probe @ epoch 50] mean_pos_err=34607.9 disc=16185.6 worst=137471.7 finite=100%
+[INFO] Epoch 50: loss: 0.0015021 pos_err: 569.9749146 vel_err: 19.3637867 traj_loss: 0.0013882 node_norm: 0.0000181 lambda: 1.0690489 val_loss: 0.0007455 val_pos_err: 476.8780518 val_vel_err: 20.4703999 val_traj_loss: 0.0006772 val_node_norm: 0.0000216 val_lambda: 1.0690488 rollout_pos_err: 34607.9405111 rollout_pos_err_worst: 137471.6562500 rollout_pos_err_discounted: 16185.6161385 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0014978 pos_err: 570.4577637 vel_err: 19.1140518 traj_loss: 0.0013758 node_norm: 0.0000177 lambda: 1.0757891 val_loss: 0.0007465 val_pos_err: 479.3907166 val_vel_err: 19.4800911 val_traj_loss: 0.0006757 val_node_norm: 0.0000196 val_lambda: 1.0757885
+[INFO] Epoch 60: loss: 0.0014926 pos_err: 569.9400635 vel_err: 19.2193031 traj_loss: 0.0013631 node_norm: 0.0000171 lambda: 1.0825223 val_loss: 0.0007445 val_pos_err: 478.1688232 val_vel_err: 18.9106083 val_traj_loss: 0.0006697 val_node_norm: 0.0000195 val_lambda: 1.0825219
+[INFO] Early stopping triggered at 64
+
+Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x339efa190>, 0.0001)
+[INFO] Epoch 5: loss: 0.0058680 pos_err: 1054.1384277 vel_err: 87.0914993 traj_loss: 0.0052087 node_norm: 0.0005265 lambda: 1.0255052 val_loss: 0.0035737 val_pos_err: 889.6052246 val_vel_err: 82.5509949 val_traj_loss: 0.0031569 val_node_norm: 0.0003363 val_lambda: 1.0255054
+[INFO] Epoch 10: loss: 0.0059885 pos_err: 1052.9868164 vel_err: 86.0519180 traj_loss: 0.0051538 node_norm: 0.0005422 lambda: 1.0567591 val_loss: 0.0036606 val_pos_err: 870.1614990 val_vel_err: 75.9120483 val_traj_loss: 0.0031181 val_node_norm: 0.0003655 val_lambda: 1.0567594
+[INFO] Epoch 15: loss: 0.0061238 pos_err: 1042.4161377 vel_err: 85.9154053 traj_loss: 0.0051223 node_norm: 0.0005549 lambda: 1.0871801 val_loss: 0.0036318 val_pos_err: 882.2550659 val_vel_err: 76.2668686 val_traj_loss: 0.0030168 val_node_norm: 0.0003520 val_lambda: 1.0871797
+[INFO] Epoch 20: loss: 0.0062611 pos_err: 1042.4863281 vel_err: 84.9863663 traj_loss: 0.0050913 node_norm: 0.0005718 lambda: 1.1174498 val_loss: 0.0036757 val_pos_err: 906.8160400 val_vel_err: 71.0665588 val_traj_loss: 0.0029611 val_node_norm: 0.0003668 val_lambda: 1.1174496
+[INFO] [rollout probe @ epoch 25] mean_pos_err=10357.6 disc=7639.9 worst=22076.4 finite=100%
+[INFO] Epoch 25: loss: 0.0064028 pos_err: 1042.3123779 vel_err: 84.9923935 traj_loss: 0.0050744 node_norm: 0.0005805 lambda: 1.1473696 val_loss: 0.0038021 val_pos_err: 881.6243896 val_vel_err: 73.9563141 val_traj_loss: 0.0029817 val_node_norm: 0.0003810 val_lambda: 1.1473702 rollout_pos_err: 10357.6244710 rollout_pos_err_worst: 22076.4199219 rollout_pos_err_discounted: 7639.8624387 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0065661 pos_err: 1041.8558350 vel_err: 85.6758194 traj_loss: 0.0050742 node_norm: 0.0005944 lambda: 1.1768875 val_loss: 0.0038903 val_pos_err: 857.1704102 val_vel_err: 74.3587494 val_traj_loss: 0.0029711 val_node_norm: 0.0003936 val_lambda: 1.1768875
+[INFO] Epoch 35: loss: 0.0066893 pos_err: 1037.3022461 vel_err: 84.8111496 traj_loss: 0.0050480 node_norm: 0.0006002 lambda: 1.2062254 val_loss: 0.0039267 val_pos_err: 901.2199707 val_vel_err: 70.6775513 val_traj_loss: 0.0029298 val_node_norm: 0.0003927 val_lambda: 1.2062250
+[INFO] Epoch 40: loss: 0.0068183 pos_err: 1039.6828613 vel_err: 84.8782959 traj_loss: 0.0050221 node_norm: 0.0006136 lambda: 1.2354535 val_loss: 0.0040280 val_pos_err: 881.8492432 val_vel_err: 73.6574936 val_traj_loss: 0.0029363 val_node_norm: 0.0004003 val_lambda: 1.2354531
+[INFO] Epoch 45: loss: 0.0069572 pos_err: 1035.4273682 vel_err: 83.9514236 traj_loss: 0.0050071 node_norm: 0.0006246 lambda: 1.2647133 val_loss: 0.0040692 val_pos_err: 899.9103394 val_vel_err: 72.1184692 val_traj_loss: 0.0028999 val_node_norm: 0.0004017 val_lambda: 1.2647133
+[INFO] [rollout probe @ epoch 50] mean_pos_err=11491.4 disc=8306.5 worst=27359.0 finite=100%
+[INFO] Epoch 50: loss: 0.0070992 pos_err: 1035.1546631 vel_err: 83.6883698 traj_loss: 0.0049972 node_norm: 0.0006343 lambda: 1.2936971 val_loss: 0.0041408 val_pos_err: 874.2755127 val_vel_err: 74.1506958 val_traj_loss: 0.0028751 val_node_norm: 0.0004214 val_lambda: 1.2936964 rollout_pos_err: 11491.4066162 rollout_pos_err_worst: 27359.0292969 rollout_pos_err_discounted: 8306.5468904 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0072443 pos_err: 1032.0952148 vel_err: 83.5144043 traj_loss: 0.0049855 node_norm: 0.0006509 lambda: 1.3225280 val_loss: 0.0042720 val_pos_err: 859.5462646 val_vel_err: 74.9384003 val_traj_loss: 0.0029096 val_node_norm: 0.0004240 val_lambda: 1.3225275
+[INFO] Epoch 60: loss: 0.0073636 pos_err: 1030.6072998 vel_err: 82.9442749 traj_loss: 0.0049665 node_norm: 0.0006522 lambda: 1.3513403 val_loss: 0.0044616 val_pos_err: 836.2838745 val_vel_err: 75.5324860 val_traj_loss: 0.0029554 val_node_norm: 0.0004679 val_lambda: 1.3513395
+[INFO] Epoch 65: loss: 0.0074943 pos_err: 1027.5421143 vel_err: 83.3373795 traj_loss: 0.0049513 node_norm: 0.0006591 lambda: 1.3804814 val_loss: 0.0043870 val_pos_err: 899.4086304 val_vel_err: 72.5979843 val_traj_loss: 0.0028496 val_node_norm: 0.0004532 val_lambda: 1.3804810
+[INFO] Epoch 70: loss: 0.0076430 pos_err: 1028.5411377 vel_err: 82.7274017 traj_loss: 0.0049439 node_norm: 0.0006768 lambda: 1.4090501 val_loss: 0.0044993 val_pos_err: 874.9768066 val_vel_err: 71.8614120 val_traj_loss: 0.0028673 val_node_norm: 0.0004591 val_lambda: 1.4090502
+[INFO] [rollout probe @ epoch 75] mean_pos_err=13771.1 disc=9624.4 worst=30113.8 finite=100%
+[INFO] Epoch 75: loss: 0.0077717 pos_err: 1027.2653809 vel_err: 82.1486435 traj_loss: 0.0049311 node_norm: 0.0006820 lambda: 1.4377482 val_loss: 0.0045252 val_pos_err: 876.3849487 val_vel_err: 69.7173843 val_traj_loss: 0.0028239 val_node_norm: 0.0004651 val_lambda: 1.4377488 rollout_pos_err: 13771.0867106 rollout_pos_err_worst: 30113.8007812 rollout_pos_err_discounted: 9624.4235878 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0079212 pos_err: 1023.6177979 vel_err: 83.2714310 traj_loss: 0.0049302 node_norm: 0.0006920 lambda: 1.4663012 val_loss: 0.0046505 val_pos_err: 873.4290771 val_vel_err: 71.8210602 val_traj_loss: 0.0028517 val_node_norm: 0.0004690 val_lambda: 1.4663018

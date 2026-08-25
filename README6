@@ -1,2 +1,37 @@
-python diagnose_coefficient_variation.py \
+(.venv) e471302@usmk2tqq3hkk2 next % python diagnose_coefficient_variation.py \                
   --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --phase glide
+==============================================================================================
+AERO COEFFICIENT VARIATION  --  is a single fixed coefficient adequate?
+  trajectory_library/phases/LowE_555063a9_HGV/glide   (28 trajectories)
+==============================================================================================
+
+  trajectories used: 28  (q-floor = 5% of per-flight max q)
+
+  within-flight coefficient of variation (median across flights):
+    C_L : raw 0.50   smoothed 0.45
+    C_D : raw 0.39   smoothed 0.37
+    (smoothed CV isolates genuine low-frequency variation from diff. noise)
+
+  cross-flight variation of mean C_L: CV = 0.20   (range 2.91e-04 .. 7.89e-04)
+    high => different flights need different coefficients (one global set
+    cannot serve all trajectories).
+
+  C_L predictability from (Mach, altitude, V): R^2 = 0.531
+    high => the coefficient variation is a LEARNABLE function of state
+    (add Mach/altitude-dependent aero columns; pipeline unchanged).
+
+==============================================================================================
+VERDICT
+==============================================================================================
+  C_L smoothed CV = 0.45 >= 0.25  =>  COEFFICIENT IS STATE-VARYING.
+  A single fixed coefficient cannot represent the lift; this is a
+  FUNCTIONAL-FORM problem, not a term-selection one. Adding more
+  fixed-coefficient columns will not move R^2.
+
+  BUT C_L is only weakly predicted by state (R^2=0.53): the
+  variation is driven by something not in the state (bank angle / alpha
+  control). It belongs in the neural residual, not the library.
+==============================================================================================
+
+CAVEAT: accelerations are differentiated from position (no measured accel),
+so the RAW CV is inflated by noise; trust the SMOOTHED CV for the verdict.

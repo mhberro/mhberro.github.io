@@ -250,6 +250,8 @@ def train_NEXT(
     eom_frame_transport: bool = True,
     eom_s_floor: float = 5000.0,
     eom_mach_powers: tuple = (),
+    eom_flight_path_angle: bool = False,
+    eom_guidance_terms: bool = False,
 ):
     training_configuration = TrainingConfiguration(
         n_epochs=1,
@@ -440,6 +442,8 @@ def train_NEXT(
                         include_frame_transport=eom_frame_transport,
                         s_floor=eom_s_floor,
                         mach_powers=tuple(eom_mach_powers),
+                        include_flight_path_angle=eom_flight_path_angle,
+                        include_guidance_terms=eom_guidance_terms,
                         scale_heights=tuple(scale_heights),
                         feature_mean=feat_mean, feature_scale=feat_scale,
                         pos_idx=tuple(pos_idx), vel_idx=tuple(vel_idx),
@@ -1548,6 +1552,27 @@ def main():
         "trained rollout.",
     )
     parser.add_argument(
+        "--eom-flight-path-angle",
+        action="store_true", default=False,
+        help="Add flight-path-angle columns (gamma, sin gamma, cos gamma). Requested "
+        "by the flight-mechanics SMEs: 'those important coefficients effectively are "
+        "going to be your angles and angular rates fed directly into the model.' An "
+        "arctangent cannot be built from the existing columns, so this is genuinely "
+        "new expressive power. NOTE: true gamma-RATE is deliberately NOT offered -- it "
+        "needs accelerations, which are the quantities being solved for, so it would "
+        "be circular and would break linear-in-coefficients.",
+    )
+    parser.add_argument(
+        "--eom-guidance-terms",
+        action="store_true", default=False,
+        help="Add a proportional-navigation column (-v_s*v_alpha). In this "
+        "impact-centred frame the LOS rate is v_alpha and closing velocity is -v_s, so "
+        "ProNav's command is -N*v_s*v_alpha. Offered WITHOUT the 1/s that transport_va "
+        "carries, so guidance and kinematic transport get separate coefficients "
+        "(measured correlation 0.80, i.e. separable). If the vehicle flies ProNav this "
+        "column's coefficient magnitude should read out as the navigation constant N.",
+    )
+    parser.add_argument(
         "--eom-mach-powers",
         default="", type=str,
         help="Comma-separated Mach powers for Mach-DEPENDENT aero coefficients, e.g. "
@@ -1820,6 +1845,8 @@ def main():
         args.eom_frame_transport,
         args.eom_s_floor,
         _parse_mach_powers(args.eom_mach_powers),
+        args.eom_flight_path_angle,
+        args.eom_guidance_terms,
     )
 
     if node is None:

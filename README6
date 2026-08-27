@@ -1,631 +1,180 @@
-I got the navigator I’ll to spit this out. Feel free to use it.
-Johnson, Charles P (US)
-8/26/26 1:34 PM
-Below is a stand‑alone Python module named guidance_lib.py that can be fed directly to pySINDy as a custom function library.
-All functions accept a state vector
-s = [x, y, z, vx, vy, vz]   # Cartesian position (m) and velocity (m s⁻¹)
-and return a control‑acceleration vector (3 × 1) that you can treat as part of the right‑hand side of the dynamics:
-[ \dot{\mathbf{s}} = \begin{bmatrix} \mathbf{v}\ \mathbf{a}{\text{gravity}} + \mathbf{a}{\text{guidance}}( \mathbf{s},\dots ) \end{bmatrix} ]
-The module groups the laws discussed earlier:
-Category	Function name	Brief description
-Basic	gamma_hold	Keeps flight‑path angle (γ) constant.
- 	gamma_pursuit	Drives γ toward a commanded value (γ_cmd).
- 	pro_nav	Classical proportional navigation (PN) with navigation constant N.
-Extended / Robust	augmented_pro_nav	PN + LOS‑angle bias term.
- 	constant_bearing	Maintain constant LOS bearing (zero‑bearing‑rate).
- 	lead_angle	Fixed lead angle ahead of LOS.
- 	zero_effort_miss	ZEM/ZEV‑style optimum intercept.
- 	sliding_mode_guidance	Sliding‑mode law with reaching gain k_s.
- 	energy_based_guidance	Regulates specific mechanical energy toward a set‑point.
-Rendezvous	cw_lqr	LQR on Clohessy‑Wilkinson linear relative dynamics.
- 	cw_lyapunov	Lyapunov‑based rendezvous law.
- 	mpc_rendezvous	Very light‑weight “single‑step” MPC (quadratic program) that can be expanded for full‑horizon MPC later.
-1. Full source (guidance_lib.py)
-# guidance_lib.py
-# ------------------------------------------------------------
-# Function library for pySINDy – guidance / interception laws
-# ------------------------------------------------------------
-# State vector (input to every function):
-#   s = [x, y, z, vx, vy, vz]   # meters, meters/second
-#
-# All functions return a NumPy array of shape (3,) that
-#   represents the commanded acceleration (m/s^2)
-#
-# ------------------------------------------------------------
-import numpy as np
-from numpy.linalg import norm
-# ----------------------------------------------------------------------
-# Helper utilities (shared by many laws)
-# ----------------------------------------------------------------------
-def los_vector(s_target, s_own):
-    """Line‑of‑sight unit vector from ownship to target (target – own)."""
-    r = s_target[:3] - s_own[:3]
-    return r / norm(r)
-def los_rate(s_target, s_own):
-    """Relative LOS angular rate (rad/s) using velocity difference."""
-    r = s_target[:3] - s_own[:3]
-    v_rel = s_target[3:6] - s_own[3:6]
-    return np.cross(r, v_rel) / (norm(r) ** 2)
-def flight_path_angle(v):
-    """γ = atan2(v_z, sqrt(v_x^2+v_y^2))  (negative for descent)."""
-    vh = np.linalg.norm(v[:2])
-    return np.arctan2(v[2], vh)
-# ----------------------------------------------------------------------
-# 1) Basic guidance laws
-# ----------------------------------------------------------------------
-def gamma_hold(s, gamma_ref=np.radians(5.0), k_gamma=0.1):
-    """
-    Hold a constant flight‑path angle γ_ref.
-    Simple PD on the error between current γ and γ_ref.
-    """
-    v = s[3:6]
-    gamma = flight_path_angle(v)
-    error = gamma - gamma_ref
-    # Normal‑acceleration needed to change γ
-    a_mag = -k_gamma * error * norm(v)  # m/s^2
-    # Direction: rotate velocity vector toward/away from vertical
-    # Compute a unit vector perpendicular to velocity in the vertical plane
-    vh = np.linalg.norm(v[:2])
-    if vh == 0:
-        perp = np.array([0, 0, 0])
-    else:
-        horiz = v[:2] / vh
-        perp = np.array([-horiz[0] * np.sin(gamma),
-                         -horiz[1] * np.sin(gamma),
-                         np.cos(gamma)])
-    return a_mag * perp
-def gamma_pursuit(s, gamma_cmd, k_gamma=0.2):
-    """
-    Pursue a commanded flight‑path angle γ_cmd.
-    """
-    v = s[3:6]
-    gamma = flight_path_angle(v)
-    error = gamma_cmd - gamma
-    a_mag = k_gamma * error * norm(v)
-    # Same perpendicular direction as in gamma_hold
-    vh = np.linalg.norm(v[:2])
-    if vh == 0:
-        perp = np.array([0., 0., 0.])
-    else:
-        horiz = v[:2] / vh
-        perp = np.array([-horiz[0] * np.sin(gamma),
-                         -horiz[1] * np.sin(gamma),
-                         np.cos(gamma)])
-    return a_mag * perp
-def pro_nav(s_own, s_target, N=4.0, k_bias=0.0):
-    """
-    Classical Proportional Navigation (PN).
-    a = N * V_c * lambda_dot + k_bias * LOS
-    where V_c is the closing velocity magnitude.
-    """
-    lambda_vec = los_vector(s_target, s_own)               # unit LOS
-    lambda_dot = los_rate(s_target, s_own)               # rad/s vector
-    v_rel = s_target[3:6] - s_own[3:6]
-    Vc = -np.dot(v_rel, lambda_vec)                       # closing speed (>0 if closing)
-    a_cmd = N * Vc * np.cross(lambda_dot, lambda_vec)      # classic PN term
-    a_cmd += k_bias * lambda_vec                           # optional bias / lead term
-    return a_cmd
-# ----------------------------------------------------------------------
-# 2) Extended / robust laws
-# ----------------------------------------------------------------------
-def augmented_pro_nav(s_own, s_target, N=4.0, k_bias=0.1):
-    """
-    PN with a constant LOS‑angle bias (helps against target maneuvers).
-    """
-    return pro_nav(s_own, s_target, N=N, k_bias=k_bias)
-def constant_bearing(s_own, s_target, k_cb=0.5):
-    """
-    Keep LOS bearing constant (zero bearing‑rate).
-    a = -k_cb * (d/dt LOS bearing) * Vc * lambda_hat
-    """
-    lambda_vec = los_vector(s_target, s_own)
-    lambda_dot = los_rate(s_target, s_own)
-    # Bearing rate magnitude (project onto plane orthogonal to LOS)
-    bearing_rate = np.linalg.norm(lambda_dot - np.dot(lambda_dot, lambda_vec) * lambda_vec)
-    v_rel = s_target[3:6] - s_own[3:6]
-    Vc = -np.dot(v_rel, lambda_vec)
-    return -k_cb * bearing_rate * Vc * lambda_vec
-def lead_angle(s_own, s_target, psi_lead=np.radians(15)):
-    """
-    Fixed lead‑angle guidance.
-    The commanded LOS is rotated by ψ_lead about the axis normal to the LOS‑plane.
-    """
-    lambda_vec = los_vector(s_target, s_own)
-    # Build a rotation that spins lambda_vec by psi_lead around a vector
-    # orthogonal to both lambda_vec and the vertical (z) axis to keep the rotation in the LOS plane.
-    # Choose an arbitrary reference (e.g., world x‑axis) unless it aligns with lambda.
-    ref = np.array([1., 0., 0.])
-    if np.allclose(np.cross(lambda_vec, ref), 0):
-        ref = np.array([0., 1., 0.])
-    axis = np.cross(lambda_vec, ref)
-    axis = axis / norm(axis)
-    # Rodrigues rotation formula
-    cosψ = np.cos(psi_lead)
-    sinψ = np.sin(psi_lead)
-    lambda_lead = (cosψ * lambda_vec +
-                  sinψ * np.cross(axis, lambda_vec) +
-                  (1 - cosψ) * np.dot(lambda_vec, axis) * axis)
-    # Accelerate toward the rotated LOS direction
-    k = 0.3  # simple proportional gain
-    return k * lambda_lead
-def zero_effort_miss(s_own, s_target, t_go=5.0, k_zem=1.0):
-    """
-    Zero‑Effort‑Miss (ZEM) / Zero‑Effort‑Velocity (ZEV) law.
-    Assumes straight‑line constant‑velocity motion over a predicted time‑to‑go.
-    """
-    r = s_target[:3] - s_own[:3]
-    v_rel = s_target[3:6] - s_own[3:6]
-    # Desired acceleration to null the predicted miss at t_go
-    a_cmd = ( -2.0 * (r + v_rel * t_go) ) / (t_go ** 2)
-    return k_zem * a_cmd
-def sliding_mode_guidance(s_own, s_target, k_s=0.8, epsilon=0.01):
-    """
-    Simple sliding‑mode law on the LOS angle error.
-    a = -k_s * sat(σ/ε) * lambda_hat
-    where σ = LOS angle error (here approximated by LOS rate magnitude).
-    """
-    lambda_vec = los_vector(s_target, s_own)
-    lambda_dot = los_rate(s_target, s_own)
-    sigma = np.linalg.norm(lambda_dot)  # surrogate for angle error rate
-    sat = np.clip(sigma / epsilon, -1.0, 1.0)
-    return -k_s * sat * lambda_vec
-def energy_based_guidance(s_own, s_target, E_ref=0.0, k_e=0.05):
-    """
-    Regulate specific mechanical energy (kinetic + potential) to a reference.
-    For simplicity we ignore gravity potential (assume short arcs) and just control kinetic energy.
-    """
-    v = s_own[3:6]
-    E = 0.5 * np.dot(v, v)   # specific kinetic energy
-    error = E - E_ref
-    # Acceleration opposite to velocity reduces energy, parallel increases it.
-    a_cmd = -k_e * error * v / (norm(v) + 1e-6)
-    return a_cmd
-# ----------------------------------------------------------------------
-# 3) Rendezvous‑focused laws
-# ----------------------------------------------------------------------
-def cw_relative_state(s_own, s_target):
-    """
-    Compute the relative state in the Hill (LVLH) frame assuming a circular
-    reference orbit for the target.
-    This function is a thin wrapper – for a full implementation you need the
-    target orbital angular rate (n). Here we assume n = 0 (transfer‑frame only).
-    """
-    # For many quick‑look SINDy experiments we treat the LVLH frame as inertial.
-    dr = s_target[:3] - s_own[:3]
-    dv = s_target[3:6] - s_own[3:6]
-    return np.concatenate([dr, dv])
-def cw_lqr(s_own, s_target, Q=None, R=None):
-    """
-    LQR on the classic 6‑state CW linear system.
-    The user can optionally supply Q and R weighting matrices; defaults are
-    diagonal with moderate values.
-    Returns a 3‑vector acceleration to be added to the relative dynamics.
-    """
-    # CW continuous‑time A matrix for circular orbit with mean motion n
-    # For a generic short‑range rendezvous we can approximate n ≈ 0.
-    # Using n = 0 reduces A to double integrator (simple PD).
-    # If you have the orbital rate, replace n below.
-    n = 0.0
-    A = np.block([
-        [np.zeros((3, 3)), np.eye(3)],
-        [3 * n**2 * np.eye(3), np.zeros((3, 3))]
-    ])
-    B = np.block([
-        [np.zeros((3, 3))],
-        [np.eye(3)]
-    ])
-    # Default weighting
-    if Q is None:
-        Q = np.diag([10., 10., 10., 1., 1., 1.])
-    if R is None:
-        R = np.diag([0.1, 0.1, 0.1])
-    # Solve continuous algebraic Riccati equation (CARE)
-    # Since we cannot import scipy in the minimal library, we provide a simple
-    # analytical PD solution that mimics LQR for the double‑integrator case:
-    Kp = np.sqrt(Q[0,0] / R[0,0])   # position gain
-    Kd = np.sqrt(Q[3,3] / R[0,0])   # velocity gain
-    # Build state‑feedback law: u = -Kp * r - Kd * v_rel
-    rel = cw_relative_state(s_own, s_target)
-    r = rel[:3]
-    v_rel = rel[3:6]
-    a_cmd = -Kp * r - Kd * v_rel
-    return a_cmd
-def cw_lyapunov(s_own, s_target, k=0.5):
-    """
-    Simple Lyapunov‑based law: u = -k * r – k * v_rel
-    Guarantees V̇ = -k (||r||² + ||v||²) < 0.
-    """
-    rel = cw_relative_state(s_own, s_target)
-    r = rel[:3]
-    v_rel = rel[3:6]
-    return -k * (r + v_rel)
-def mpc_rendezvous(s_own, s_target, horizon=10, dt=1.0, Q=None, R=None):
-    """
-    A *very* lightweight, single‑step “explicit MPC” implementation.
-    It solves a quadratic program of the form:
-        min   0.5*u.T*R*u + (x_pred).T*Q*x_pred
-    subject to thrust magnitude limits.
-    For a full multi‑step MPC you would embed this inside a loop.
-    """
-    # Relative state
-    rel = cw_relative_state(s_own, s_target)
-    r, v_rel = rel[:3], rel[3:6]
-    # Prediction (single‑step Euler)
-    # x_next = A*rel + B*u  (A/B from CW with n=0)
-    A = np.block([[np.eye(3), dt * np.eye(3)],
-                  [np.zeros((3,3)), np.eye(3)]])
-    B = np.block([[0.5 * dt**2 * np.eye(3)],
-                  [dt * np.eye(3)]])
-    # Default weights
-    if Q is None:
-        Q = np.diag([1., 1., 1., 0.1, 0.1, 0.1])
-    if R is None:
-        R = np.diag([0.01, 0.01, 0.01])
-    # Closed‑form solution of the unconstrained QP:
-    # u* = -(Bᵀ Q B + R)^(-1) Bᵀ Q (A*rel)
-    H = B.T @ Q @ B + R
-    f = B.T @ Q @ (A @ rel)
-    u_star = -np.linalg.solve(H, f)
-    # Apply a simple magnitude saturation (e.g., 0.2 g max)
-    a_max = 0.2 * 9.80665
-    if norm(u_star) > a_max:
-        u_star = u_star * a_max / norm(u_star)
-    return u_star
-# ----------------------------------------------------------------------
-# Export list for pySINDy CustomLibrary (optional convenience)
-# ----------------------------------------------------------------------
-__all__ = [
-    # Basic
-    "gamma_hold", "gamma_pursuit", "pro_nav",
-    # Extended
-    "augmented_pro_nav", "constant_bearing", "lead_angle",
-    "zero_effort_miss", "sliding_mode_guidance", "energy_based_guidance",
-    # Rendezvous
-    "cw_lqr", "cw_lyapunov", "mpc_rendezvous"
-]
-2. How to plug the library into pySINDy
-import numpy as np
-import pysindy as ps
-from guidance_lib import __all__ as guidance_funcs   # import the symbols
-import guidance_lib as gl
-# -------------------------------------------------
-# 1) Build a CustomLibrary from the functions above
-# -------------------------------------------------
-library = ps.CustomLibrary(
-    library_functions=[gl.gamma_hold,
-                       gl.gamma_pursuit,
-                       gl.pro_nav,
-                       gl.augmented_pro_nav,
-                       gl.constant_bearing,
-                       gl.lead_angle,
-                       gl.zero_effort_miss,
-                       gl.sliding_mode_guidance,
-                       gl.energy_based_guidance,
-                       gl.cw_lqr,
-                       gl.cw_lyapunov,
-                       gl.mpc_rendezvous],
-    function_names=[f.__name__ for f in [
-        gl.gamma_hold, gl.gamma_pursuit, gl.pro_nav, gl.augmented_pro_nav,
-        gl.constant_bearing, gl.lead_angle, gl.zero_effort_miss,
-        gl.sliding_mode_guidance, gl.energy_based_guidance,
-        gl.cw_lqr, gl.cw_lyapunov, gl.mpc_rendezvous]],
-    # arguments that each function expects (state + optional params)
-    input_features=ps.FiniteDifference(order=2)
-)
-# -------------------------------------------------
-# 2) Prepare data (example: simulated 3‑D flight)
-# -------------------------------------------------
-# t, X where X has shape (n_samples, 6) = [x,y,z,vx,vy,vz]
-t = np.linspace(0, 120, 1201)               # 0‑120 s, 0.1 s step
-X = np.random.randn(len(t), 6) * 0.0        # replace with real trajectory
-# -------------------------------------------------
-# 3) Fit SINDy
-# -------------------------------------------------
-model = ps.SINDy(
-    optimizer=ps.STLSQ(threshold=0.1),
-    feature_library=library,
-    differentiation_method=ps.FiniteDifference(order=2)
-)
-model.fit(X, t=t)
-model.print()
-The CustomLibrary automatically evaluates each guidance function on the state matrix X.
-If a function needs extra arguments (e.g., a navigation constant N), you can either wrap it with functools.partial before passing it to the library, or modify the function to pull the parameter from a global configuration dictionary.
-3. Quick usage notes
-Situation	Suggested function(s)	Reason
-Maintain a constant climb angle	gamma_hold	Simple PD on flight‑path angle
-Intercept a maneuvering target	augmented_pro_nav or sliding_mode_guidance	Handles LOS‑rate changes robustly
-Fuel‑optimal rendezvous	cw_lqr (with tuned Q/R) or mpc_rendezvous	Explicit quadratic‑cost formulation
-Fast time‑optimal capture	lead_angle or zero_effort_miss	Provides aggressive lead to shorten miss distance
-General nonlinear discovery	Include all functions in the library	Gives SINDy a rich candidate set to pick the most explanatory terms
-Feel free to edit any of the gains, constants, or add more parameters (e.g., target orbital rate n for a true CW model). The functions are deliberately written stateless and vectorised, so they work efficiently with large training datasets.
-If you need a different state ordering (e.g., [vx, vy, vz, x, y, z]) just adjust the indexing in each routine or write thin wrappers that reorder the array before calling the core function.
+(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 75 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.1 --eom-mach-powers 1 -o model_outputs/SBI/eom_mach12_full/GEODESIC/glide
+There are 22 training trajs and 6 validation trajs.
+Segment augmentation: 22 -> 110 training trajs
 
+--- Running Ensemble-SINDy Governing Equation Discovery ---
+[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
+Discovered Physics Matrix Xi:
+ [[-2.45178555e-03  5.52236023e-05  5.30429389e-03  5.66080527e-03
+  -4.59346256e-03]
+ [ 2.39461648e-03 -5.44681925e-05 -9.63702545e-03 -5.66970559e-03
+  -3.63367468e-02]
+ [-5.26585465e-03 -8.60638666e-05 -1.26161122e-02 -1.05518943e-02
+  -1.98682378e-02]
+ [ 1.38493563e-05  0.00000000e+00 -2.58655573e-03  4.17938443e-03
+   2.03816419e-02]
+ [ 1.50274937e-05  0.00000000e+00 -2.61371331e-03 -1.31265368e-05
+   1.87619262e-03]
+ [ 4.76010982e-05  2.82510467e-05  6.51009569e-03 -1.06406422e-02
+   1.57034700e-02]
+ [-7.32315114e-05  0.00000000e+00  5.04741150e-03  8.03541871e-03
+  -4.14438243e-03]
+ [ 0.00000000e+00  0.00000000e+00 -6.57056591e-03 -5.69598152e-03
+  -2.59582755e-03]
+ [ 1.81491568e-05  0.00000000e+00  3.87486338e-03 -1.63752936e-04
+   1.45667246e-02]
+ [-5.50318117e-05  1.95965786e-02 -2.64745251e-03  9.99620379e-04
+  -1.35705400e-02]
+ [-9.20007623e-05  0.00000000e+00 -3.69960725e-04 -2.59273961e-02
+  -6.26450931e-03]
+ [-3.28175174e-05 -2.47902809e-05  1.28835652e-03  2.43064516e-03
+   4.10689990e-03]
+ [-2.95506150e-05  0.00000000e+00 -1.42606129e-04 -1.59900639e-02
+  -2.90335950e-03]
+ [ 5.79879944e-05  0.00000000e+00 -7.10135416e-05  2.16663284e-02
+   4.60542188e-03]
+ [ 6.06863232e-05  5.65976328e-05 -6.36916927e-03 -3.60937903e-03
+   5.42065148e-02]]
+[SINDy] active terms: 66/75 | max|coef| per target: [0.00527 0.0196  0.01262 0.02593 0.05421]
+[SINDy] R2 per target: [0.9956 1.     0.5527 0.1946 0.582 ]
+[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.4431 | max relative term contribution 1.4738
+[SINDy] library: eom | scale heights: [5000.0]
+[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=0.4431 perTarget=[0.996, 1.0, 0.553, 0.195, 0.582]
+[SINDy] physics coefficients trainable: True
+[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
+          ds/dt     curv_vs2           contrib=0.5249 coef=-5.266e-03 ip=1.00
+          ds/dt     1                  contrib=0.2444 coef=-2.452e-03 ip=1.00
+          ds/dt     gravity            contrib=0.2387 coef=+2.395e-03 ip=1.00
+          ds/dt     v_al               contrib=0.0092 coef=-9.200e-05 ip=1.00
+          dh/dt     v_h                contrib=0.9975 coef=+1.960e-02 ip=1.00
+          dh/dt     curv_vs2           contrib=0.0044 coef=-8.606e-05 ip=1.00
+          dh/dt     cor_turn           contrib=0.0029 coef=+5.660e-05 ip=1.00
+          dh/dt     1                  contrib=0.0028 coef=+5.522e-05 ip=1.00
+          dv_s/dt   curv_vs2           contrib=0.7668 coef=-1.262e-02 ip=1.00
+          dv_s/dt   gravity            contrib=0.5857 coef=-9.637e-03 ip=1.00
+          dv_s/dt   aero_q@H=5000      contrib=0.3957 coef=+6.510e-03 ip=1.00
+          dv_s/dt   aero_vert*M1@H=5000 contrib=0.3880 coef=-6.571e-03 ip=1.00
+          dv_al/dt  v_al               contrib=1.0695 coef=-2.593e-02 ip=1.00
+          dv_al/dt  cor_along          contrib=0.8937 coef=+2.167e-02 ip=1.00
+          dv_al/dt  transport_va       contrib=0.6596 coef=-1.599e-02 ip=1.00
+          dv_al/dt  aero_q@H=5000      contrib=0.4389 coef=-1.064e-02 ip=1.00
+          dv_h/dt   cor_turn           contrib=1.4738 coef=+5.421e-02 ip=1.00
+          dv_h/dt   gravity            contrib=0.9880 coef=-3.634e-02 ip=1.00
+          dv_h/dt   aero_along@H=5000  contrib=0.5542 coef=+2.038e-02 ip=1.00
+          dv_h/dt   curv_vs2           contrib=0.5402 coef=-1.987e-02 ip=1.00
 
-Here are 2 more general aerodynamics functions that are common. Alt hold is a different guidance law that anyone who has flown on a plane has experienced. Phugoid is a mode of the aerobody resulting from the system dynamics, but can be represented as a forcing function. The phugoid might struggle because there is no adjustment for changes in atmospheric properties. Usually the altitude amplitude is small enough that those changes are negligible.
- 
- 
-def altitude_hold(s, z_cmd, k_p=0.02, k_d=0.01):
-    """
-    PID‑style vertical control that targets a fixed altitude `z_cmd`.
-    Returns a 3‑vector acceleration; only the z‑component is non‑zero.
-    """
-    # State unpack
-    x, y, z, vx, vy, vz = s
-    # Position error (altitude)
-    e_z = z_cmd - z
-    # Derivative of error = negative vertical speed (since ė = -vz)
-    e_z_dot = -vz
-    # Simple PD (we skip the integral term for SINDy friendliness)
-    a_z = k_p * e_z + k_d * e_z_dot
-    return np.array([0.0, 0.0, a_z])
-def phugoid_mode(s, omega=0.03, k_ph=0.05):
-    """
-    A low‑frequency longitudinal “phugoid‑like” forcing term.
-    It injects an acceleration proportional to a sinusoid of the current
-    altitude error (or to the vertical speed) – a classic way to
-    reproduce the natural phugoid oscillation in a data‑driven model.
-    Parameters
-    ----------
-    omega : float
-        Approximate phugoid natural frequency (rad/s). Typical values for
-        subsonic aircraft are 0.02–0.04 rad/s (≈ 0.3–0.6 Hz).
-    k_ph : float
-        Gain that scales the phugoid forcing term.
-    Returns
-    -------
-    np.ndarray (3,)
-        Acceleration vector; only the z‑component is non‑zero.
-    """
-    # Extract vertical state
-    z  = s[2]                 # altitude
-    vz = s[5]                 # vertical speed
-    # The phugoid is essentially a **coupled** oscillation between
-    # altitude and vertical speed.  One convenient representation is
-    # a second‑order linear system:
-    #
-    #   z̈ + 2ζω ż + ω² (z - z_eq) = 0
-    #
-    # where ζ is a small damping ratio (≈0.1).  To encode it as a
-    # candidate function we can return the left‑hand side as a forcing
-    # acceleration.  Here we treat ζ as an implicit constant and embed it
-    # into the gain `k_ph`.
-    #
-    #   a_ph = -k_ph * ( ω**2 * z + 2*ζ*ω * vz )
-    #
-    # For SINDy we only need a deterministic expression; we therefore
-    # drop the explicit equilibrium term and let the regression decide
-    # the offset.
-    #
-    # Choose a typical small damping ζ≈0.05 → 2ζω ≈ 0.1*ω.
-    damping_term = 0.1 * omega * vz
-    stiffness_term = omega**2 * z
-    a_z = -k_ph * (stiffness_term + damping_term)
-    return np.array([0.0, 0.0, a_z]) 
- 
-Was there a thrust function in the library? I think so?
- 
-Oh other thought that crossed my mind. SINDy should be working on the non-scaled data. All of the math is based on meters and meters/sec. Just blurting things out from my head.
- 
-One other helpful nugget from the LLM. Tuning the guidance law gains. (this seems like a painful way to do it. maybe a better way would be hyperparameters?)
- 
- 
-If you want to parameter‑tune a guidance law (e.g., find the optimal navigation constant N), you can construct a family of functions with different constants using functools.partial before passing them to CustomLibrary.
-from functools import partial
-pn_N4   = partial(mg.pn_basic, N=4.0)
-pn_N5   = partial(mg.pn_basic, N=5.0)
-pn_N6   = partial(mg.pn_basic, N=6.0)
-# add them to the library list
-all_funcs.extend([pn_N4, pn_N5, pn_N6])
-When SINDy runs, the coefficients attached to pn_N4, pn_N5, pn_N6 will tell you which navigation constant best explains the data.
- 
-Last few guidance laws and then I'm going to stop talking. Some of these are repeats sorry.
- 
-# ------------------------------------------------------------
-# Missile‑Guidance function add‑on for pySINDy
-# ------------------------------------------------------------
-# All functions accept the *same* state vector:
-#     s = [x, y, z, vx, vy, vz]       # ownship (missile) Cartesian state
-# They return a 3‑vector acceleration (a_x, a_y, a_z) that would be
-# added to the missile’s equations of motion.
-# ------------------------------------------------------------
-import numpy as np
-from numpy.linalg import norm
-# ------------------------------------------------------------------
-# Helper utilities (shared by many missile laws)
-# ------------------------------------------------------------------
-def los_vector(s_target, s_own):
-    r = s_target[:3] - s_own[:3]
-    return r / norm(r)
-def los_rate(s_target, s_own):
-    r = s_target[:3] - s_own[:3]
-    v_rel = s_target[3:6] - s_own[3:6]
-    return np.cross(r, v_rel) / (norm(r) ** 2)
-def closing_velocity(s_target, s_own):
-    """Positive when missile is closing on target."""
-    lam = los_vector(s_target, s_own)
-    v_rel = s_target[3:6] - s_own[3:6]
-    return -np.dot(v_rel, lam)      # Vc > 0 ⇒ closing
-# ------------------------------------------------------------------
-# 1) Classical Proportional Navigation (PN) – baseline
-# ------------------------------------------------------------------
-def pn_basic(s_own, s_target, N=4.0):
-    """
-    a = N * Vc * (λ̇ × λ̂)
-    """
-    lam = los_vector(s_target, s_own)
-    lam_dot = los_rate(s_target, s_own)
-    Vc = closing_velocity(s_target, s_own)
-    # λ̇ is a vector; the cross product yields a vector orthogonal to LOS
-    a = N * Vc * np.cross(lam_dot, lam)
-    return a
-# ------------------------------------------------------------------
-# 2) Augmented PN (APN) – bias term to counteract target manoeuvres
-# ------------------------------------------------------------------
-def pn_augmented(s_own, s_target, N=4.5, k_bias=0.15):
-    """
-    a = N * Vc * (λ̇ × λ̂) + k_bias * λ̂
-    The bias term provides a small “lead” that helps when the target
-    performs a sudden turn.
-    """
-    a = pn_basic(s_own, s_target, N=N)
-    lam = los_vector(s_target, s_own)
-    a += k_bias * lam
-    return a
-# ------------------------------------------------------------------
-# 3) True‑Line‑of‑Sight (TLOS) – retain a constant LOS angle
-# ------------------------------------------------------------------
-def tlos(s_own, s_target, k_tlos=0.6):
-    """
-    a = -k_tlos * (λ̇ ⟂ λ̂) * Vc * λ̂
-    The term (λ̇ ⟂ λ̂) is the component of LOS rate orthogonal to LOS.
-    """
-    lam = los_vector(s_target, s_own)
-    lam_dot = los_rate(s_target, s_own)
-    # Remove component parallel to λ̂
-    lam_dot_perp = lam_dot - np.dot(lam_dot, lam) * lam
-    Vc = closing_velocity(s_target, s_own)
-    a = -k_tlos * norm(lam_dot_perp) * Vc * lam
-    return a
-# ------------------------------------------------------------------
-# 4) Constant‑Bearing (CB) – zero bearing‑rate law
-# ------------------------------------------------------------------
-def constant_bearing(s_own, s_target, k_cb=0.5):
-    """
-    a = -k_cb * ω_b * Vc * λ̂
-    where ω_b is the magnitude of bearing‑rate (the orthogonal part of λ̇).
-    """
-    lam = los_vector(s_target, s_own)
-    lam_dot = los_rate(s_target, s_own)
-    # Bearing‑rate magnitude (same as |λ̇_perp|)
-    bearing_rate = norm(lam_dot - np.dot(lam_dot, lam) * lam)
-    Vc = closing_velocity(s_target, s_own)
-    return -k_cb * bearing_rate * Vc * lam
-# ------------------------------------------------------------------
-# 5) Lead‑Angle Guidance (LA) – fixed lead ahead of LOS
-# ------------------------------------------------------------------
-def lead_angle(s_own, s_target, psi_lead=np.radians(12), k_la=0.35):
-    """
-    Rotate the LOS unit vector by a constant lead angle ψ_lead
-    in the LOS‑plane and accelerate toward that rotated direction.
-    """
-    lam = los_vector(s_target, s_own)
-    # Choose a reference direction that is not colinear with lam.
-    ref = np.array([1.0, 0.0, 0.0])
-    if np.allclose(np.cross(lam, ref), 0.0):
-        ref = np.array([0.0, 1.0, 0.0])
-    axis = np.cross(lam, ref)
-    axis = axis / norm(axis)
-    # Rodrigues rotation
-    c = np.cos(psi_lead)
-    s = np.sin(psi_lead)
-    lam_lead = (c * lam +
-                s * np.cross(axis, lam) +
-                (1 - c) * np.dot(lam, axis) * axis)
-    return k_la * lam_lead
-# ------------------------------------------------------------------
-# 6) Zero‑Effort‑Miss (ZEM) / Zero‑Effort‑Velocity (ZEV)
-# ------------------------------------------------------------------
-def zem_zev(s_own, s_target, t_go=4.0, k_zem=1.0):
-    """
-    a = -2 (r + v_rel·t_go) / t_go²
-    where r = target – missile position, v_rel = target – missile velocity.
-    """
-    r = s_target[:3] - s_own[:3]
-    v_rel = s_target[3:6] - s_own[3:6]
-    a = -2.0 * (r + v_rel * t_go) / (t_go ** 2)
-    return k_zem * a
-# ------------------------------------------------------------------
-# 7) Integrated Guidance (IG) – combines PN with a line‑of‑sight rate
-#    filter; useful when sensor noise is high.
-# ------------------------------------------------------------------
-def integrated_guidance(s_own, s_target,
-                       N=4.0, tau=0.3, k_i=0.1, state=None):
-    """
-    Implements a first‑order low‑pass filter on LOS rate:
-        λ̇_f = ( -λ̇_f + λ̇ ) / τ
-    The returned acceleration:
-        a = N * Vc * ( λ̇_f × λ̂ ) + k_i * ∫λ̇_f dt
-    `state` is a mutable dict that stores λ̇_f and the integral term.
-    It must be supplied by the caller (e.g., the integration loop) so that
-    the filter can retain memory between successive calls.
-    """
-    if state is None:
-        raise ValueError("IG requires a mutable state dict (e.g., {'lam_dot_f':np.zeros(3), 'int':np.zeros(3)})")
-    lam = los_vector(s_target, s_own)
-    lam_dot = los_rate(s_target, s_own)
-    Vc = closing_velocity(s_target, s_own)
-    # First‑order filter update (explicit Euler)
-    lam_dot_f = state["lam_dot_f"]
-    lam_dot_f[:] = lam_dot_f + (-lam_dot_f + lam_dot) * (1.0 / tau)
-    # Integral update
-    state["int"][:] = state["int"] + lam_dot_f * (1.0 / tau)   # dt≈1/τ for simplicity
-    a = N * Vc * np.cross(lam_dot_f, lam) + k_i * state["int"]
-    return a
-# ------------------------------------------------------------------
-# 8) Energy‑Based Missile Guidance (EBG)
-# ------------------------------------------------------------------
-def energy_based_guidance_missile(s_own, s_target,
-                                 k_e=0.04, V_des=300.0):
-    """
-    Controls the missile’s specific mechanical energy to drive the speed
-    toward a commanded cruise speed `V_des`.  This is useful for “end‑game”
-    where the missile wants to maintain a constant impact velocity.
-    a = -k_e * ( (|v|²/2) - V_des²/2 ) * v̂
-    """
-    v = s_own[3:6]
-    speed = norm(v) + 1e-6
-    e_spec = 0.5 * speed**2
-    e_ref = 0.5 * V_des**2
-    error = e_spec - e_ref
-    a = -k_e * error * v / speed
-    return a
-# ------------------------------------------------------------------
-# 9) Terminal‑Phase “Impact‑Angle” Guidance
-# ------------------------------------------------------------------
-def impact_angle_guidance(s_own, s_target,
-                         theta_imp=np.radians(30),
-                         k_imp=0.5):
-    """
-    Forces the missile to approach the target on a prescribed impact
-    angle θ_imp measured from the target‑centric local horizontal plane.
-    The law creates a lateral acceleration component that rotates the LOS
-    toward the desired impact geometry.
-    a = k_imp * ( λ̂_rot – λ̂ )
-    where λ̂_rot is the LOS vector rotated by θ_imp about the axis
-    perpendicular to the LOS‑plane and the target‑centered local vertical.
-    """
-    lam = los_vector(s_target, s_own)
-    # Define a target‑centric vertical (approximate) as the unit vector
-    # from target to Earth centre: for a high‑altitude missile we can take it as [0,0,1].
-    # If you have a more accurate model replace `z_hat` accordingly.
-    z_hat = np.array([0.0, 0.0, 1.0])
-    # Axis that is orthogonal to both LOS and the vertical
-    axis = np.cross(lam, z_hat)
-    if norm(axis) < 1e-6:                # LOS already aligned with vertical
-        axis = np.array([1.0, 0.0, 0.0])
-    axis = axis / norm(axis)
-    # Rotate LOS by the desired impact angle (away from vertical)
-    c = np.cos(theta_imp)
-    s = np.sin(theta_imp)
-    lam_rot = (c * lam +
-               s * np.cross(axis, lam) +
-               (1 - c) * np.dot(lam, axis) * axis)
-    a = k_imp * (lam_rot - lam)
-    return a
-# ------------------------------------------------------------------
-# Export list for pySINDy (optional)
-# ------------------------------------------------------------------
-missile_guidance_funcs = [
-    pn_basic, pn_augmented, tlos, constant_bearing,
-    lead_angle, zem_zev, integrated_guidance,
-    energy_based_guidance_missile, impact_angle_guidance
-]
-__all__ = [
-    # (existing names from guidance_lib.py stay there)
-    # add the missile‑specific ones
-    "pn_basic", "pn_augmented", "tlos", "constant_bearing",
-    "lead_angle", "zem_zev", "integrated_guidance",
-    "energy_based_guidance_missile", "impact_angle_guidance"
-]
- 
- 
+Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x1429ca0d0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0011590 pos_err: 438.9637451 vel_err: 34.4974442 traj_loss: 0.0011334 node_norm: 0.0000255 lambda: 1.0001296 val_loss: 0.0006596 val_pos_err: 432.4326477 val_vel_err: 36.2949677 val_traj_loss: 0.0006262 val_node_norm: 0.0000333 val_lambda: 1.0001289
+[INFO] Epoch 10: loss: 0.0010968 pos_err: 438.4613342 vel_err: 34.0852776 traj_loss: 0.0010815 node_norm: 0.0000150 lambda: 1.0002828 val_loss: 0.0006319 val_pos_err: 430.4044189 val_vel_err: 36.3205414 val_traj_loss: 0.0006141 val_node_norm: 0.0000176 val_lambda: 1.0002838
+[INFO] Epoch 15: loss: 0.0010475 pos_err: 438.1098633 vel_err: 33.8534241 traj_loss: 0.0010358 node_norm: 0.0000112 lambda: 1.0004352 val_loss: 0.0006179 val_pos_err: 435.3506165 val_vel_err: 34.5023460 val_traj_loss: 0.0006049 val_node_norm: 0.0000127 val_lambda: 1.0004359
+[INFO] Epoch 20: loss: 0.0010065 pos_err: 438.2566223 vel_err: 33.9241867 traj_loss: 0.0009957 node_norm: 0.0000102 lambda: 1.0005873 val_loss: 0.0006126 val_pos_err: 431.0069275 val_vel_err: 35.6058311 val_traj_loss: 0.0006022 val_node_norm: 0.0000100 val_lambda: 1.0005866
+[INFO] [rollout probe @ epoch 25] mean_pos_err=45206.9 disc=21166.5 worst=180544.8 finite=100%
+[INFO] Epoch 25: loss: 0.0009682 pos_err: 438.2329712 vel_err: 33.6728020 traj_loss: 0.0009592 node_norm: 0.0000082 lambda: 1.0007383 val_loss: 0.0006089 val_pos_err: 433.4523621 val_vel_err: 34.7758064 val_traj_loss: 0.0005988 val_node_norm: 0.0000097 val_lambda: 1.0007371 rollout_pos_err: 45206.9112956 rollout_pos_err_worst: 180544.7812500 rollout_pos_err_discounted: 21166.5058557 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0009352 pos_err: 437.8767395 vel_err: 33.8270988 traj_loss: 0.0009267 node_norm: 0.0000077 lambda: 1.0008855 val_loss: 0.0006087 val_pos_err: 432.9259644 val_vel_err: 34.5705452 val_traj_loss: 0.0005984 val_node_norm: 0.0000097 val_lambda: 1.0008869
+[INFO] Epoch 35: loss: 0.0009061 pos_err: 438.5611572 vel_err: 33.5387230 traj_loss: 0.0008977 node_norm: 0.0000075 lambda: 1.0010375 val_loss: 0.0006067 val_pos_err: 432.1878967 val_vel_err: 35.6749191 val_traj_loss: 0.0005989 val_node_norm: 0.0000072 val_lambda: 1.0010368
+[INFO] Epoch 40: loss: 0.0008808 pos_err: 437.8392944 vel_err: 33.7233925 traj_loss: 0.0008727 node_norm: 0.0000070 lambda: 1.0011883 val_loss: 0.0006083 val_pos_err: 432.0011597 val_vel_err: 36.3410873 val_traj_loss: 0.0006025 val_node_norm: 0.0000050 val_lambda: 1.0011864
+[INFO] Epoch 45: loss: 0.0008599 pos_err: 438.1400146 vel_err: 33.7327957 traj_loss: 0.0008519 node_norm: 0.0000069 lambda: 1.0013353 val_loss: 0.0006046 val_pos_err: 431.8760986 val_vel_err: 34.8567276 val_traj_loss: 0.0005970 val_node_norm: 0.0000069 val_lambda: 1.0013361
+[INFO] [rollout probe @ epoch 50] mean_pos_err=29213.2 disc=15273.1 worst=93477.1 finite=100%
+[INFO] Epoch 50: loss: 0.0008444 pos_err: 437.6305237 vel_err: 33.8751373 traj_loss: 0.0008352 node_norm: 0.0000080 lambda: 1.0014863 val_loss: 0.0006061 val_pos_err: 430.5252991 val_vel_err: 35.5816078 val_traj_loss: 0.0005978 val_node_norm: 0.0000074 val_lambda: 1.0014857 rollout_pos_err: 29213.2140299 rollout_pos_err_worst: 93477.1406250 rollout_pos_err_discounted: 15273.1386044 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0008301 pos_err: 438.1311340 vel_err: 33.7077904 traj_loss: 0.0008220 node_norm: 0.0000067 lambda: 1.0016342 val_loss: 0.0006067 val_pos_err: 429.7174683 val_vel_err: 36.3613319 val_traj_loss: 0.0005996 val_node_norm: 0.0000061 val_lambda: 1.0016351
+[INFO] Epoch 60: loss: 0.0008199 pos_err: 438.0471802 vel_err: 33.7884254 traj_loss: 0.0008118 node_norm: 0.0000067 lambda: 1.0017852 val_loss: 0.0006054 val_pos_err: 431.8400574 val_vel_err: 35.6248856 val_traj_loss: 0.0005985 val_node_norm: 0.0000058 val_lambda: 1.0017848
+[INFO] Early stopping triggered at 61
+
+Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x12c223450>, 0.0001)
+[INFO] Epoch 5: loss: 0.0026316 pos_err: 650.5311890 vel_err: 105.5433426 traj_loss: 0.0023120 node_norm: 0.0003188 lambda: 1.0003742 val_loss: 0.0020998 val_pos_err: 672.8054199 val_vel_err: 101.0706100 val_traj_loss: 0.0018250 val_node_norm: 0.0002740 val_lambda: 1.0003749
+[INFO] Epoch 10: loss: 0.0026076 pos_err: 644.6606445 vel_err: 105.0093079 traj_loss: 0.0022820 node_norm: 0.0003237 lambda: 1.0008317 val_loss: 0.0020754 val_pos_err: 671.9445190 val_vel_err: 99.0315018 val_traj_loss: 0.0017937 val_node_norm: 0.0002802 val_lambda: 1.0008317
+[INFO] Epoch 15: loss: 0.0025978 pos_err: 643.7819214 vel_err: 104.4351044 traj_loss: 0.0022668 node_norm: 0.0003281 lambda: 1.0012803 val_loss: 0.0020796 val_pos_err: 723.7352295 val_vel_err: 92.3701019 val_traj_loss: 0.0017819 val_node_norm: 0.0002954 val_lambda: 1.0012797
+[INFO] Epoch 20: loss: 0.0026026 pos_err: 643.1579590 vel_err: 104.5878601 traj_loss: 0.0022706 node_norm: 0.0003280 lambda: 1.0017244 val_loss: 0.0020728 val_pos_err: 705.1221924 val_vel_err: 96.8939667 val_traj_loss: 0.0017649 val_node_norm: 0.0003048 val_lambda: 1.0017246
+[INFO] [rollout probe @ epoch 25] mean_pos_err=11233.7 disc=7105.4 worst=26088.6 finite=100%
+[INFO] Epoch 25: loss: 0.0025950 pos_err: 642.3476562 vel_err: 104.1939926 traj_loss: 0.0022596 node_norm: 0.0003305 lambda: 1.0021685 val_loss: 0.0020788 val_pos_err: 688.9083862 val_vel_err: 96.5021667 val_traj_loss: 0.0017769 val_node_norm: 0.0002981 val_lambda: 1.0021697 rollout_pos_err: 11233.7089844 rollout_pos_err_worst: 26088.5742188 rollout_pos_err_discounted: 7105.4183265 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0025923 pos_err: 640.6014404 vel_err: 104.3286057 traj_loss: 0.0022554 node_norm: 0.0003310 lambda: 1.0026165 val_loss: 0.0020803 val_pos_err: 692.8713379 val_vel_err: 96.5435333 val_traj_loss: 0.0017751 val_node_norm: 0.0003006 val_lambda: 1.0026158
+[INFO] Epoch 35: loss: 0.0025944 pos_err: 640.3359375 vel_err: 104.4016571 traj_loss: 0.0022551 node_norm: 0.0003323 lambda: 1.0030593 val_loss: 0.0020774 val_pos_err: 687.4904175 val_vel_err: 95.2186127 val_traj_loss: 0.0017677 val_node_norm: 0.0003043 val_lambda: 1.0030586
+[INFO] Epoch 40: loss: 0.0025854 pos_err: 639.8593750 vel_err: 103.9128799 traj_loss: 0.0022454 node_norm: 0.0003321 lambda: 1.0035015 val_loss: 0.0020918 val_pos_err: 705.5966187 val_vel_err: 94.9117203 val_traj_loss: 0.0017767 val_node_norm: 0.0003089 val_lambda: 1.0035008
+[INFO] Epoch 45: loss: 0.0025842 pos_err: 639.6744385 vel_err: 104.1656494 traj_loss: 0.0022427 node_norm: 0.0003327 lambda: 1.0039426 val_loss: 0.0020684 val_pos_err: 671.3579102 val_vel_err: 98.0260315 val_traj_loss: 0.0017594 val_node_norm: 0.0003020 val_lambda: 1.0039414
+[INFO] [rollout probe @ epoch 50] mean_pos_err=8063.9 disc=5644.3 worst=15537.9 finite=100%
+[INFO] Epoch 50: loss: 0.0025816 pos_err: 639.5671387 vel_err: 103.9895020 traj_loss: 0.0022397 node_norm: 0.0003320 lambda: 1.0043811 val_loss: 0.0020599 val_pos_err: 671.8253174 val_vel_err: 97.6453781 val_traj_loss: 0.0017538 val_node_norm: 0.0002984 val_lambda: 1.0043821 rollout_pos_err: 8063.9434408 rollout_pos_err_worst: 15537.8798828 rollout_pos_err_discounted: 5644.2823231 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0025830 pos_err: 638.4961548 vel_err: 103.8240814 traj_loss: 0.0022399 node_norm: 0.0003323 lambda: 1.0048236 val_loss: 0.0020803 val_pos_err: 689.9387817 val_vel_err: 95.1460800 val_traj_loss: 0.0017771 val_node_norm: 0.0002947 val_lambda: 1.0048251
+[INFO] Epoch 60: loss: 0.0026017 pos_err: 639.9747314 vel_err: 104.6458206 traj_loss: 0.0022530 node_norm: 0.0003368 lambda: 1.0052644 val_loss: 0.0020634 val_pos_err: 682.6163330 val_vel_err: 96.7945633 val_traj_loss: 0.0017467 val_node_norm: 0.0003075 val_lambda: 1.0052648
+[INFO] Epoch 65: loss: 0.0025790 pos_err: 638.6044922 vel_err: 103.9758224 traj_loss: 0.0022323 node_norm: 0.0003340 lambda: 1.0057067 val_loss: 0.0020861 val_pos_err: 691.8366699 val_vel_err: 95.4860611 val_traj_loss: 0.0017621 val_node_norm: 0.0003140 val_lambda: 1.0057060
+[INFO] Epoch 70: loss: 0.0025796 pos_err: 637.1925049 vel_err: 104.0854797 traj_loss: 0.0022327 node_norm: 0.0003332 lambda: 1.0061435 val_loss: 0.0020889 val_pos_err: 675.4455566 val_vel_err: 100.6245956 val_traj_loss: 0.0017673 val_node_norm: 0.0003107 val_lambda: 1.0061445
+[INFO] [rollout probe @ epoch 75] mean_pos_err=8872.8 disc=6146.1 worst=18482.0 finite=100%
+[INFO] Epoch 75: loss: 0.0025791 pos_err: 638.2792969 vel_err: 103.8510208 traj_loss: 0.0022306 node_norm: 0.0003338 lambda: 1.0065840 val_loss: 0.0020571 val_pos_err: 671.3548584 val_vel_err: 97.4025803 val_traj_loss: 0.0017338 val_node_norm: 0.0003119 val_lambda: 1.0065837 rollout_pos_err: 8872.7998047 rollout_pos_err_worst: 18481.9765625 rollout_pos_err_discounted: 6146.1115751 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0025749 pos_err: 637.0587158 vel_err: 103.7470856 traj_loss: 0.0022253 node_norm: 0.0003339 lambda: 1.0070195 val_loss: 0.0020724 val_pos_err: 673.9176025 val_vel_err: 99.1461411 val_traj_loss: 0.0017609 val_node_norm: 0.0002991 val_lambda: 1.0070205
+[INFO] Epoch 85: loss: 0.0025779 pos_err: 637.9346924 vel_err: 103.8277512 traj_loss: 0.0022271 node_norm: 0.0003342 lambda: 1.0074614 val_loss: 0.0020704 val_pos_err: 697.6716309 val_vel_err: 94.1199875 val_traj_loss: 0.0017346 val_node_norm: 0.0003229 val_lambda: 1.0074611
+[INFO] Epoch 90: loss: 0.0025771 pos_err: 637.0894775 vel_err: 103.8730698 traj_loss: 0.0022256 node_norm: 0.0003339 lambda: 1.0078965 val_loss: 0.0020624 val_pos_err: 661.0150757 val_vel_err: 99.9426956 val_traj_loss: 0.0017474 val_node_norm: 0.0003012 val_lambda: 1.0078969
+[INFO] Epoch 95: loss: 0.0025812 pos_err: 637.4292603 vel_err: 104.0368652 traj_loss: 0.0022265 node_norm: 0.0003362 lambda: 1.0083318 val_loss: 0.0020873 val_pos_err: 703.9987793 val_vel_err: 95.4284668 val_traj_loss: 0.0017506 val_node_norm: 0.0003221 val_lambda: 1.0083331
+[INFO] [rollout probe @ epoch 100] mean_pos_err=9465.9 disc=6416.0 worst=22815.8 finite=100%
+[INFO] Epoch 100: loss: 0.0025793 pos_err: 635.8790894 vel_err: 104.0176239 traj_loss: 0.0022236 node_norm: 0.0003363 lambda: 1.0087734 val_loss: 0.0020826 val_pos_err: 673.5159912 val_vel_err: 97.7550735 val_traj_loss: 0.0017583 val_node_norm: 0.0003088 val_lambda: 1.0087727 rollout_pos_err: 9465.8842773 rollout_pos_err_worst: 22815.7578125 rollout_pos_err_discounted: 6415.9615733 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0025759 pos_err: 636.8713989 vel_err: 103.7776337 traj_loss: 0.0022197 node_norm: 0.0003358 lambda: 1.0092082 val_loss: 0.0020694 val_pos_err: 669.9688110 val_vel_err: 100.0935822 val_traj_loss: 0.0017435 val_node_norm: 0.0003098 val_lambda: 1.0092076
+[INFO] Epoch 110: loss: 0.0025785 pos_err: 638.2695312 vel_err: 103.8641510 traj_loss: 0.0022223 node_norm: 0.0003347 lambda: 1.0096434 val_loss: 0.0020661 val_pos_err: 658.9689941 val_vel_err: 100.7677383 val_traj_loss: 0.0017374 val_node_norm: 0.0003120 val_lambda: 1.0096432
+[INFO] Epoch 115: loss: 0.0025752 pos_err: 636.4099121 vel_err: 103.7747726 traj_loss: 0.0022191 node_norm: 0.0003338 lambda: 1.0100783 val_loss: 0.0020592 val_pos_err: 667.0105591 val_vel_err: 99.4473419 val_traj_loss: 0.0017289 val_node_norm: 0.0003129 val_lambda: 1.0100783
+[INFO] Early stopping triggered at 116
+
+Running length strategy: (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x1429caad0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0027806 pos_err: 694.5844727 vel_err: 112.0511932 traj_loss: 0.0023121 node_norm: 0.0004676 lambda: 1.0004115 val_loss: 0.0025161 val_pos_err: 897.4202881 val_vel_err: 99.2259827 val_traj_loss: 0.0020503 val_node_norm: 0.0004649 val_lambda: 1.0004106
+[INFO] Epoch 10: loss: 0.0027705 pos_err: 693.4022827 vel_err: 111.6539536 traj_loss: 0.0022983 node_norm: 0.0004702 lambda: 1.0008984 val_loss: 0.0024637 val_pos_err: 863.8148804 val_vel_err: 101.3624039 val_traj_loss: 0.0019963 val_node_norm: 0.0004656 val_lambda: 1.0008966
+[INFO] Epoch 15: loss: 0.0027554 pos_err: 685.7120972 vel_err: 110.2807236 traj_loss: 0.0022830 node_norm: 0.0004693 lambda: 1.0013944 val_loss: 0.0024466 val_pos_err: 810.1593628 val_vel_err: 112.6041565 val_traj_loss: 0.0019888 val_node_norm: 0.0004550 val_lambda: 1.0013933
+[INFO] Epoch 20: loss: 0.0027493 pos_err: 684.8750610 vel_err: 110.4266663 traj_loss: 0.0022764 node_norm: 0.0004686 lambda: 1.0018767 val_loss: 0.0023339 val_pos_err: 837.9795532 val_vel_err: 106.2369003 val_traj_loss: 0.0018649 val_node_norm: 0.0004655 val_lambda: 1.0018759
+[INFO] [rollout probe @ epoch 25] mean_pos_err=7574.8 disc=5465.1 worst=16633.0 finite=100%
+[INFO] Epoch 25: loss: 0.0027554 pos_err: 686.6029053 vel_err: 110.5616074 traj_loss: 0.0022818 node_norm: 0.0004683 lambda: 1.0023594 val_loss: 0.0024072 val_pos_err: 801.3969116 val_vel_err: 109.6161118 val_traj_loss: 0.0019294 val_node_norm: 0.0004732 val_lambda: 1.0023612 rollout_pos_err: 7574.7627360 rollout_pos_err_worst: 16632.9707031 rollout_pos_err_discounted: 5465.1181945 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0027377 pos_err: 680.3250732 vel_err: 110.0719223 traj_loss: 0.0022613 node_norm: 0.0004699 lambda: 1.0028456 val_loss: 0.0023403 val_pos_err: 835.1217651 val_vel_err: 104.8830032 val_traj_loss: 0.0018826 val_node_norm: 0.0004524 val_lambda: 1.0028453
+[INFO] Epoch 35: loss: 0.0027501 pos_err: 686.0411377 vel_err: 109.6871414 traj_loss: 0.0022730 node_norm: 0.0004696 lambda: 1.0033193 val_loss: 0.0023544 val_pos_err: 825.7598877 val_vel_err: 111.0291290 val_traj_loss: 0.0018886 val_node_norm: 0.0004595 val_lambda: 1.0033206
+[INFO] Epoch 40: loss: 0.0027311 pos_err: 678.7662354 vel_err: 109.5226898 traj_loss: 0.0022519 node_norm: 0.0004706 lambda: 1.0038055 val_loss: 0.0023856 val_pos_err: 764.8422241 val_vel_err: 113.7514648 val_traj_loss: 0.0019266 val_node_norm: 0.0004517 val_lambda: 1.0038043
+[INFO] Epoch 45: loss: 0.0027357 pos_err: 680.9345093 vel_err: 110.0108871 traj_loss: 0.0022567 node_norm: 0.0004693 lambda: 1.0042878 val_loss: 0.0023885 val_pos_err: 918.9843140 val_vel_err: 107.4410553 val_traj_loss: 0.0019297 val_node_norm: 0.0004505 val_lambda: 1.0042878
+[INFO] [rollout probe @ epoch 50] mean_pos_err=8074.9 disc=6234.8 worst=13265.0 finite=100%
+[INFO] Epoch 50: loss: 0.0027512 pos_err: 684.7467041 vel_err: 109.8815613 traj_loss: 0.0022685 node_norm: 0.0004718 lambda: 1.0047685 val_loss: 0.0024937 val_pos_err: 871.0076904 val_vel_err: 112.5197449 val_traj_loss: 0.0020392 val_node_norm: 0.0004448 val_lambda: 1.0047688 rollout_pos_err: 8074.8632812 rollout_pos_err_worst: 13264.9785156 rollout_pos_err_discounted: 6234.8113219 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0027405 pos_err: 681.1547852 vel_err: 109.8509521 traj_loss: 0.0022582 node_norm: 0.0004704 lambda: 1.0052567 val_loss: 0.0024132 val_pos_err: 921.4962158 val_vel_err: 108.8685150 val_traj_loss: 0.0019524 val_node_norm: 0.0004506 val_lambda: 1.0052567
+[INFO] Epoch 60: loss: 0.0027306 pos_err: 678.3044434 vel_err: 109.1307373 traj_loss: 0.0022459 node_norm: 0.0004719 lambda: 1.0057316 val_loss: 0.0023886 val_pos_err: 861.4364624 val_vel_err: 112.7623749 val_traj_loss: 0.0019286 val_node_norm: 0.0004489 val_lambda: 1.0057334
+[INFO] Epoch 65: loss: 0.0027288 pos_err: 677.4411621 vel_err: 109.5171356 traj_loss: 0.0022442 node_norm: 0.0004707 lambda: 1.0062270 val_loss: 0.0023163 val_pos_err: 820.9741821 val_vel_err: 106.2320938 val_traj_loss: 0.0018393 val_node_norm: 0.0004655 val_lambda: 1.0062276
+[INFO] Epoch 70: loss: 0.0027231 pos_err: 672.0585938 vel_err: 109.3305740 traj_loss: 0.0022350 node_norm: 0.0004731 lambda: 1.0067154 val_loss: 0.0023936 val_pos_err: 871.0733032 val_vel_err: 113.8322830 val_traj_loss: 0.0019255 val_node_norm: 0.0004552 val_lambda: 1.0067163
+[INFO] [rollout probe @ epoch 75] mean_pos_err=9599.8 disc=6930.7 worst=18414.9 finite=100%
+[INFO] Epoch 75: loss: 0.0027349 pos_err: 677.5659180 vel_err: 109.8860703 traj_loss: 0.0022483 node_norm: 0.0004704 lambda: 1.0072020 val_loss: 0.0023722 val_pos_err: 874.1842041 val_vel_err: 110.9083023 val_traj_loss: 0.0019013 val_node_norm: 0.0004572 val_lambda: 1.0072020 rollout_pos_err: 9599.8436686 rollout_pos_err_worst: 18414.9296875 rollout_pos_err_discounted: 6930.7097753 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0027372 pos_err: 676.5591431 vel_err: 109.9650345 traj_loss: 0.0022476 node_norm: 0.0004723 lambda: 1.0076833 val_loss: 0.0024389 val_pos_err: 804.5834961 val_vel_err: 109.2244263 val_traj_loss: 0.0019538 val_node_norm: 0.0004701 val_lambda: 1.0076846
+[INFO] Epoch 85: loss: 0.0027309 pos_err: 676.4204712 vel_err: 109.5612411 traj_loss: 0.0022397 node_norm: 0.0004729 lambda: 1.0081713 val_loss: 0.0025095 val_pos_err: 899.8137207 val_vel_err: 114.8055954 val_traj_loss: 0.0020380 val_node_norm: 0.0004548 val_lambda: 1.0081719
+[INFO] Epoch 90: loss: 0.0027366 pos_err: 676.6781006 vel_err: 109.6351776 traj_loss: 0.0022461 node_norm: 0.0004711 lambda: 1.0086600 val_loss: 0.0023974 val_pos_err: 770.5422363 val_vel_err: 112.2433472 val_traj_loss: 0.0019211 val_node_norm: 0.0004597 val_lambda: 1.0086613
+[INFO] Epoch 95: loss: 0.0027455 pos_err: 679.8037720 vel_err: 109.8128510 traj_loss: 0.0022509 node_norm: 0.0004741 lambda: 1.0091385 val_loss: 0.0023919 val_pos_err: 826.1757812 val_vel_err: 110.9869766 val_traj_loss: 0.0019116 val_node_norm: 0.0004629 val_lambda: 1.0091376
+[INFO] [rollout probe @ epoch 100] mean_pos_err=7678.3 disc=5696.4 worst=13515.8 finite=100%
+[INFO] Epoch 100: loss: 0.0027216 pos_err: 671.7412720 vel_err: 109.2275696 traj_loss: 0.0022268 node_norm: 0.0004734 lambda: 1.0096267 val_loss: 0.0023861 val_pos_err: 828.5512695 val_vel_err: 106.7951355 val_traj_loss: 0.0019032 val_node_norm: 0.0004645 val_lambda: 1.0096259 rollout_pos_err: 7678.2644857 rollout_pos_err_worst: 13515.7890625 rollout_pos_err_discounted: 5696.3940883 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0027248 pos_err: 672.7609863 vel_err: 109.0991898 traj_loss: 0.0022297 node_norm: 0.0004725 lambda: 1.0101147 val_loss: 0.0024107 val_pos_err: 805.8464966 val_vel_err: 110.2740860 val_traj_loss: 0.0019335 val_node_norm: 0.0004576 val_lambda: 1.0101132
+[INFO] Early stopping triggered at 109
+
+Running length strategy: (0.7, 2000, <neural_ode_mod.EarlyStopper object at 0x142a03fd0>, 0.0001)
+[INFO] Epoch 5: loss: 0.0027082 pos_err: 785.2985840 vel_err: 109.9925461 traj_loss: 0.0022900 node_norm: 0.0004170 lambda: 1.0005034 val_loss: 0.0026697 val_pos_err: 979.9536743 val_vel_err: 117.9452820 val_traj_loss: 0.0022229 val_node_norm: 0.0004457 val_lambda: 1.0005027
+[INFO] Epoch 10: loss: 0.0026564 pos_err: 764.3831787 vel_err: 108.8444672 traj_loss: 0.0022340 node_norm: 0.0004200 lambda: 1.0010906 val_loss: 0.0028184 val_pos_err: 997.6412964 val_vel_err: 117.5265808 val_traj_loss: 0.0023848 val_node_norm: 0.0004310 val_lambda: 1.0010899
+[INFO] Epoch 15: loss: 0.0026688 pos_err: 765.3577881 vel_err: 109.0786743 traj_loss: 0.0022452 node_norm: 0.0004198 lambda: 1.0017012 val_loss: 0.0027504 val_pos_err: 1108.6265869 val_vel_err: 114.4649429 val_traj_loss: 0.0022968 val_node_norm: 0.0004497 val_lambda: 1.0017012
+[INFO] Epoch 20: loss: 0.0026730 pos_err: 770.2903442 vel_err: 109.1955414 traj_loss: 0.0022460 node_norm: 0.0004218 lambda: 1.0022969 val_loss: 0.0030142 val_pos_err: 1201.2841797 val_vel_err: 120.8608475 val_traj_loss: 0.0025786 val_node_norm: 0.0004297 val_lambda: 1.0022979
+[INFO] [rollout probe @ epoch 25] mean_pos_err=8423.9 disc=6054.7 worst=16726.8 finite=100%
+[INFO] Epoch 25: loss: 0.0026516 pos_err: 757.6838989 vel_err: 108.2472458 traj_loss: 0.0022246 node_norm: 0.0004205 lambda: 1.0029149 val_loss: 0.0027986 val_pos_err: 1144.9604492 val_vel_err: 115.7117386 val_traj_loss: 0.0023402 val_node_norm: 0.0004516 val_lambda: 1.0029162 rollout_pos_err: 8423.9218343 rollout_pos_err_worst: 16726.7929688 rollout_pos_err_discounted: 6054.7189336 rollout_frac_finite: 1.0000000
+[INFO] Epoch 30: loss: 0.0026547 pos_err: 760.4048462 vel_err: 109.1117401 traj_loss: 0.0022265 node_norm: 0.0004204 lambda: 1.0035020 val_loss: 0.0028912 val_pos_err: 1139.4488525 val_vel_err: 118.2797546 val_traj_loss: 0.0024454 val_node_norm: 0.0004372 val_lambda: 1.0035020
+[INFO] Epoch 35: loss: 0.0026270 pos_err: 743.6483765 vel_err: 107.7641525 traj_loss: 0.0021986 node_norm: 0.0004193 lambda: 1.0040989 val_loss: 0.0027361 val_pos_err: 1111.3620605 val_vel_err: 112.8681870 val_traj_loss: 0.0022917 val_node_norm: 0.0004349 val_lambda: 1.0041004
+[INFO] Epoch 40: loss: 0.0026865 pos_err: 774.8252563 vel_err: 109.7081146 traj_loss: 0.0022563 node_norm: 0.0004196 lambda: 1.0046862 val_loss: 0.0028191 val_pos_err: 1025.5593262 val_vel_err: 119.1350021 val_traj_loss: 0.0023680 val_node_norm: 0.0004400 val_lambda: 1.0046874
+[INFO] Epoch 45: loss: 0.0026477 pos_err: 751.3064575 vel_err: 109.1931915 traj_loss: 0.0022172 node_norm: 0.0004187 lambda: 1.0053105 val_loss: 0.0027624 val_pos_err: 1074.3483887 val_vel_err: 116.4511032 val_traj_loss: 0.0023287 val_node_norm: 0.0004213 val_lambda: 1.0053120
+[INFO] [rollout probe @ epoch 50] mean_pos_err=7544.9 disc=5511.6 worst=15079.1 finite=100%
+[INFO] Epoch 50: loss: 0.0026631 pos_err: 758.4562378 vel_err: 108.5989456 traj_loss: 0.0022272 node_norm: 0.0004228 lambda: 1.0059203 val_loss: 0.0028586 val_pos_err: 1077.6749268 val_vel_err: 117.5029602 val_traj_loss: 0.0024052 val_node_norm: 0.0004392 val_lambda: 1.0059196 rollout_pos_err: 7544.9207764 rollout_pos_err_worst: 15079.1396484 rollout_pos_err_discounted: 5511.5916659 rollout_frac_finite: 1.0000000
+[INFO] Epoch 55: loss: 0.0026301 pos_err: 751.5371704 vel_err: 108.3827896 traj_loss: 0.0021960 node_norm: 0.0004199 lambda: 1.0065137 val_loss: 0.0026005 val_pos_err: 955.2902222 val_vel_err: 115.6537476 val_traj_loss: 0.0021525 val_node_norm: 0.0004340 val_lambda: 1.0065126
+[INFO] Epoch 60: loss: 0.0026383 pos_err: 753.0117188 vel_err: 108.7960663 traj_loss: 0.0022037 node_norm: 0.0004190 lambda: 1.0070882 val_loss: 0.0027699 val_pos_err: 936.6472778 val_vel_err: 118.1542511 val_traj_loss: 0.0023135 val_node_norm: 0.0004400 val_lambda: 1.0070896
+[INFO] Epoch 65: loss: 0.0026416 pos_err: 750.4035034 vel_err: 108.0329742 traj_loss: 0.0022047 node_norm: 0.0004199 lambda: 1.0076756 val_loss: 0.0027277 val_pos_err: 1062.3121338 val_vel_err: 116.6060333 val_traj_loss: 0.0022724 val_node_norm: 0.0004378 val_lambda: 1.0076771
+[INFO] Epoch 70: loss: 0.0026400 pos_err: 746.8272095 vel_err: 107.8294601 traj_loss: 0.0022011 node_norm: 0.0004207 lambda: 1.0082760 val_loss: 0.0027689 val_pos_err: 1039.0278320 val_vel_err: 119.0960083 val_traj_loss: 0.0023261 val_node_norm: 0.0004235 val_lambda: 1.0082750
+[INFO] [rollout probe @ epoch 75] mean_pos_err=6715.0 disc=5044.3 worst=9947.0 finite=100%
+[INFO] Epoch 75: loss: 0.0026437 pos_err: 753.7304077 vel_err: 107.9615555 traj_loss: 0.0022051 node_norm: 0.0004190 lambda: 1.0088884 val_loss: 0.0028990 val_pos_err: 1019.5480957 val_vel_err: 119.2853317 val_traj_loss: 0.0024289 val_node_norm: 0.0004485 val_lambda: 1.0088884 rollout_pos_err: 6714.9647624 rollout_pos_err_worst: 9947.0361328 rollout_pos_err_discounted: 5044.2600353 rollout_frac_finite: 1.0000000
+[INFO] Epoch 80: loss: 0.0026219 pos_err: 737.8797607 vel_err: 107.7701950 traj_loss: 0.0021818 node_norm: 0.0004195 lambda: 1.0094622 val_loss: 0.0028357 val_pos_err: 1180.8272705 val_vel_err: 116.9049301 val_traj_loss: 0.0023819 val_node_norm: 0.0004313 val_lambda: 1.0094634
+[INFO] Epoch 85: loss: 0.0026188 pos_err: 737.5409546 vel_err: 107.8573532 traj_loss: 0.0021755 node_norm: 0.0004214 lambda: 1.0100631 val_loss: 0.0027980 val_pos_err: 1248.4274902 val_vel_err: 118.6060867 val_traj_loss: 0.0023371 val_node_norm: 0.0004374 val_lambda: 1.0100631
+[INFO] Epoch 90: loss: 0.0026613 pos_err: 753.2977905 vel_err: 108.1991959 traj_loss: 0.0022186 node_norm: 0.0004189 lambda: 1.0106807 val_loss: 0.0030932 val_pos_err: 1174.1037598 val_vel_err: 121.3012924 val_traj_loss: 0.0026340 val_node_norm: 0.0004310 val_lambda: 1.0106796
+[INFO] Epoch 95: loss: 0.0026140 pos_err: 731.5321045 vel_err: 107.9878006 traj_loss: 0.0021699 node_norm: 0.0004196 lambda: 1.0113007 val_loss: 0.0027700 val_pos_err: 1157.3277588 val_vel_err: 117.6103745 val_traj_loss: 0.0023114 val_node_norm: 0.0004326 val_lambda: 1.0113014
+[INFO] [rollout probe @ epoch 100] mean_pos_err=8746.0 disc=6161.1 worst=19716.2 finite=100%
+[INFO] Epoch 100: loss: 0.0026188 pos_err: 736.4746704 vel_err: 107.5995789 traj_loss: 0.0021724 node_norm: 0.0004206 lambda: 1.0119020 val_loss: 0.0028510 val_pos_err: 1125.0922852 val_vel_err: 118.3384781 val_traj_loss: 0.0023895 val_node_norm: 0.0004330 val_lambda: 1.0119023 rollout_pos_err: 8746.0206299 rollout_pos_err_worst: 19716.2343750 rollout_pos_err_discounted: 6161.1165769 rollout_frac_finite: 1.0000000
+[INFO] Epoch 105: loss: 0.0026170 pos_err: 739.1621704 vel_err: 108.3129807 traj_loss: 0.0021694 node_norm: 0.0004204 lambda: 1.0125103 val_loss: 0.0027419 val_pos_err: 1132.3277588 val_vel_err: 117.9280777 val_traj_loss: 0.0022725 val_node_norm: 0.0004410 val_lambda: 1.0125089
+[INFO] Epoch 110: loss: 0.0026215 pos_err: 735.0390015 vel_err: 107.6585007 traj_loss: 0.0021731 node_norm: 0.0004199 lambda: 1.0130996 val_loss: 0.0027131 val_pos_err: 1017.1297607 val_vel_err: 112.3305206 val_traj_loss: 0.0022388 val_node_norm: 0.0004449 val_lambda: 1.0130993
+[INFO] Epoch 115: loss: 0.0026645 pos_err: 756.6859131 vel_err: 107.8963013 traj_loss: 0.0022136 node_norm: 0.0004206 lambda: 1.0136931 val_loss: 0.0028264 val_pos_err: 1049.4344482 val_vel_err: 116.1091461 val_traj_loss: 0.0023588 val_node_norm: 0.0004353 val_lambda: 1.0136920
+[INFO] Epoch 120: loss: 0.0026242 pos_err: 735.7496948 vel_err: 108.1083298 traj_loss: 0.0021722 node_norm: 0.0004209 lambda: 1.0142976 val_loss: 0.0026623 val_pos_err: 1126.7034912 val_vel_err: 114.8503418 val_traj_loss: 0.0022026 val_node_norm: 0.0004282 val_lambda: 1.0142976
+[INFO] [rollout probe @ epoch 125] mean_pos_err=8018.5 disc=5619.5 worst=14387.2 finite=100%
+[INFO] Epoch 125: loss: 0.0026205 pos_err: 728.7562256 vel_err: 107.5722351 traj_loss: 0.0021682 node_norm: 0.0004200 lambda: 1.0148792 val_loss: 0.0029254 val_pos_err: 1078.2548828 val_vel_err: 119.8747787 val_traj_loss: 0.0024665 val_node_norm: 0.0004222 val_lambda: 1.0148810 rollout_pos_err: 8018.5249430 rollout_pos_err_worst: 14387.2001953 rollout_pos_err_discounted: 5619.4636009 rollout_frac_finite: 1.0000000
+[INFO] Epoch 130: loss: 0.0026693 pos_err: 759.1245117 vel_err: 108.7553024 traj_loss: 0.0022149 node_norm: 0.0004200 lambda: 1.0155264 val_loss: 0.0028786 val_pos_err: 1053.3159180 val_vel_err: 113.4458694 val_traj_loss: 0.0023973 val_node_norm: 0.0004441 val_lambda: 1.0155276
+[INFO] Epoch 135: loss: 0.0026217 pos_err: 731.9607544 vel_err: 107.9263382 traj_loss: 0.0021655 node_norm: 0.0004212 lambda: 1.0161271 val_loss: 0.0029872 val_pos_err: 1140.0771484 val_vel_err: 121.9774094 val_traj_loss: 0.0025285 val_node_norm: 0.0004180 val_lambda: 1.0161265
+[INFO] Early stopping triggered at 136
+
+Running length strategy: (1.0, 1500, <neural_ode_mod.EarlyStopper object at 0x142a03d10>, 0.0002)
+[INFO] Saved checkpoint at 2
+[INFO] Saved checkpoint at 3
+[INFO] Saved checkpoint at 4
+[INFO] Epoch 5: loss: 0.0026214 pos_err: 919.5974731 vel_err: 108.7721939 traj_loss: 0.0022717 node_norm: 0.0003480 lambda: 1.0007232 val_loss: 0.0044075 val_pos_err: 1555.4619141 val_vel_err: 127.3953323 val_traj_loss: 0.0040081 val_node_norm: 0.0003966 val_lambda: 1.0007221

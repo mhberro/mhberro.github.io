@@ -339,3 +339,293 @@ Fast time‑optimal capture	lead_angle or zero_effort_miss	Provides aggressive l
 General nonlinear discovery	Include all functions in the library	Gives SINDy a rich candidate set to pick the most explanatory terms
 Feel free to edit any of the gains, constants, or add more parameters (e.g., target orbital rate n for a true CW model). The functions are deliberately written stateless and vectorised, so they work efficiently with large training datasets.
 If you need a different state ordering (e.g., [vx, vy, vz, x, y, z]) just adjust the indexing in each routine or write thin wrappers that reorder the array before calling the core function.
+
+
+Here are 2 more general aerodynamics functions that are common. Alt hold is a different guidance law that anyone who has flown on a plane has experienced. Phugoid is a mode of the aerobody resulting from the system dynamics, but can be represented as a forcing function. The phugoid might struggle because there is no adjustment for changes in atmospheric properties. Usually the altitude amplitude is small enough that those changes are negligible.
+ 
+ 
+def altitude_hold(s, z_cmd, k_p=0.02, k_d=0.01):
+    """
+    PID‑style vertical control that targets a fixed altitude `z_cmd`.
+    Returns a 3‑vector acceleration; only the z‑component is non‑zero.
+    """
+    # State unpack
+    x, y, z, vx, vy, vz = s
+    # Position error (altitude)
+    e_z = z_cmd - z
+    # Derivative of error = negative vertical speed (since ė = -vz)
+    e_z_dot = -vz
+    # Simple PD (we skip the integral term for SINDy friendliness)
+    a_z = k_p * e_z + k_d * e_z_dot
+    return np.array([0.0, 0.0, a_z])
+def phugoid_mode(s, omega=0.03, k_ph=0.05):
+    """
+    A low‑frequency longitudinal “phugoid‑like” forcing term.
+    It injects an acceleration proportional to a sinusoid of the current
+    altitude error (or to the vertical speed) – a classic way to
+    reproduce the natural phugoid oscillation in a data‑driven model.
+    Parameters
+    ----------
+    omega : float
+        Approximate phugoid natural frequency (rad/s). Typical values for
+        subsonic aircraft are 0.02–0.04 rad/s (≈ 0.3–0.6 Hz).
+    k_ph : float
+        Gain that scales the phugoid forcing term.
+    Returns
+    -------
+    np.ndarray (3,)
+        Acceleration vector; only the z‑component is non‑zero.
+    """
+    # Extract vertical state
+    z  = s[2]                 # altitude
+    vz = s[5]                 # vertical speed
+    # The phugoid is essentially a **coupled** oscillation between
+    # altitude and vertical speed.  One convenient representation is
+    # a second‑order linear system:
+    #
+    #   z̈ + 2ζω ż + ω² (z - z_eq) = 0
+    #
+    # where ζ is a small damping ratio (≈0.1).  To encode it as a
+    # candidate function we can return the left‑hand side as a forcing
+    # acceleration.  Here we treat ζ as an implicit constant and embed it
+    # into the gain `k_ph`.
+    #
+    #   a_ph = -k_ph * ( ω**2 * z + 2*ζ*ω * vz )
+    #
+    # For SINDy we only need a deterministic expression; we therefore
+    # drop the explicit equilibrium term and let the regression decide
+    # the offset.
+    #
+    # Choose a typical small damping ζ≈0.05 → 2ζω ≈ 0.1*ω.
+    damping_term = 0.1 * omega * vz
+    stiffness_term = omega**2 * z
+    a_z = -k_ph * (stiffness_term + damping_term)
+    return np.array([0.0, 0.0, a_z]) 
+ 
+Was there a thrust function in the library? I think so?
+ 
+Oh other thought that crossed my mind. SINDy should be working on the non-scaled data. All of the math is based on meters and meters/sec. Just blurting things out from my head.
+ 
+One other helpful nugget from the LLM. Tuning the guidance law gains. (this seems like a painful way to do it. maybe a better way would be hyperparameters?)
+ 
+ 
+If you want to parameter‑tune a guidance law (e.g., find the optimal navigation constant N), you can construct a family of functions with different constants using functools.partial before passing them to CustomLibrary.
+from functools import partial
+pn_N4   = partial(mg.pn_basic, N=4.0)
+pn_N5   = partial(mg.pn_basic, N=5.0)
+pn_N6   = partial(mg.pn_basic, N=6.0)
+# add them to the library list
+all_funcs.extend([pn_N4, pn_N5, pn_N6])
+When SINDy runs, the coefficients attached to pn_N4, pn_N5, pn_N6 will tell you which navigation constant best explains the data.
+ 
+Last few guidance laws and then I'm going to stop talking. Some of these are repeats sorry.
+ 
+# ------------------------------------------------------------
+# Missile‑Guidance function add‑on for pySINDy
+# ------------------------------------------------------------
+# All functions accept the *same* state vector:
+#     s = [x, y, z, vx, vy, vz]       # ownship (missile) Cartesian state
+# They return a 3‑vector acceleration (a_x, a_y, a_z) that would be
+# added to the missile’s equations of motion.
+# ------------------------------------------------------------
+import numpy as np
+from numpy.linalg import norm
+# ------------------------------------------------------------------
+# Helper utilities (shared by many missile laws)
+# ------------------------------------------------------------------
+def los_vector(s_target, s_own):
+    r = s_target[:3] - s_own[:3]
+    return r / norm(r)
+def los_rate(s_target, s_own):
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    return np.cross(r, v_rel) / (norm(r) ** 2)
+def closing_velocity(s_target, s_own):
+    """Positive when missile is closing on target."""
+    lam = los_vector(s_target, s_own)
+    v_rel = s_target[3:6] - s_own[3:6]
+    return -np.dot(v_rel, lam)      # Vc > 0 ⇒ closing
+# ------------------------------------------------------------------
+# 1) Classical Proportional Navigation (PN) – baseline
+# ------------------------------------------------------------------
+def pn_basic(s_own, s_target, N=4.0):
+    """
+    a = N * Vc * (λ̇ × λ̂)
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    Vc = closing_velocity(s_target, s_own)
+    # λ̇ is a vector; the cross product yields a vector orthogonal to LOS
+    a = N * Vc * np.cross(lam_dot, lam)
+    return a
+# ------------------------------------------------------------------
+# 2) Augmented PN (APN) – bias term to counteract target manoeuvres
+# ------------------------------------------------------------------
+def pn_augmented(s_own, s_target, N=4.5, k_bias=0.15):
+    """
+    a = N * Vc * (λ̇ × λ̂) + k_bias * λ̂
+    The bias term provides a small “lead” that helps when the target
+    performs a sudden turn.
+    """
+    a = pn_basic(s_own, s_target, N=N)
+    lam = los_vector(s_target, s_own)
+    a += k_bias * lam
+    return a
+# ------------------------------------------------------------------
+# 3) True‑Line‑of‑Sight (TLOS) – retain a constant LOS angle
+# ------------------------------------------------------------------
+def tlos(s_own, s_target, k_tlos=0.6):
+    """
+    a = -k_tlos * (λ̇ ⟂ λ̂) * Vc * λ̂
+    The term (λ̇ ⟂ λ̂) is the component of LOS rate orthogonal to LOS.
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    # Remove component parallel to λ̂
+    lam_dot_perp = lam_dot - np.dot(lam_dot, lam) * lam
+    Vc = closing_velocity(s_target, s_own)
+    a = -k_tlos * norm(lam_dot_perp) * Vc * lam
+    return a
+# ------------------------------------------------------------------
+# 4) Constant‑Bearing (CB) – zero bearing‑rate law
+# ------------------------------------------------------------------
+def constant_bearing(s_own, s_target, k_cb=0.5):
+    """
+    a = -k_cb * ω_b * Vc * λ̂
+    where ω_b is the magnitude of bearing‑rate (the orthogonal part of λ̇).
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    # Bearing‑rate magnitude (same as |λ̇_perp|)
+    bearing_rate = norm(lam_dot - np.dot(lam_dot, lam) * lam)
+    Vc = closing_velocity(s_target, s_own)
+    return -k_cb * bearing_rate * Vc * lam
+# ------------------------------------------------------------------
+# 5) Lead‑Angle Guidance (LA) – fixed lead ahead of LOS
+# ------------------------------------------------------------------
+def lead_angle(s_own, s_target, psi_lead=np.radians(12), k_la=0.35):
+    """
+    Rotate the LOS unit vector by a constant lead angle ψ_lead
+    in the LOS‑plane and accelerate toward that rotated direction.
+    """
+    lam = los_vector(s_target, s_own)
+    # Choose a reference direction that is not colinear with lam.
+    ref = np.array([1.0, 0.0, 0.0])
+    if np.allclose(np.cross(lam, ref), 0.0):
+        ref = np.array([0.0, 1.0, 0.0])
+    axis = np.cross(lam, ref)
+    axis = axis / norm(axis)
+    # Rodrigues rotation
+    c = np.cos(psi_lead)
+    s = np.sin(psi_lead)
+    lam_lead = (c * lam +
+                s * np.cross(axis, lam) +
+                (1 - c) * np.dot(lam, axis) * axis)
+    return k_la * lam_lead
+# ------------------------------------------------------------------
+# 6) Zero‑Effort‑Miss (ZEM) / Zero‑Effort‑Velocity (ZEV)
+# ------------------------------------------------------------------
+def zem_zev(s_own, s_target, t_go=4.0, k_zem=1.0):
+    """
+    a = -2 (r + v_rel·t_go) / t_go²
+    where r = target – missile position, v_rel = target – missile velocity.
+    """
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    a = -2.0 * (r + v_rel * t_go) / (t_go ** 2)
+    return k_zem * a
+# ------------------------------------------------------------------
+# 7) Integrated Guidance (IG) – combines PN with a line‑of‑sight rate
+#    filter; useful when sensor noise is high.
+# ------------------------------------------------------------------
+def integrated_guidance(s_own, s_target,
+                       N=4.0, tau=0.3, k_i=0.1, state=None):
+    """
+    Implements a first‑order low‑pass filter on LOS rate:
+        λ̇_f = ( -λ̇_f + λ̇ ) / τ
+    The returned acceleration:
+        a = N * Vc * ( λ̇_f × λ̂ ) + k_i * ∫λ̇_f dt
+    `state` is a mutable dict that stores λ̇_f and the integral term.
+    It must be supplied by the caller (e.g., the integration loop) so that
+    the filter can retain memory between successive calls.
+    """
+    if state is None:
+        raise ValueError("IG requires a mutable state dict (e.g., {'lam_dot_f':np.zeros(3), 'int':np.zeros(3)})")
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    Vc = closing_velocity(s_target, s_own)
+    # First‑order filter update (explicit Euler)
+    lam_dot_f = state["lam_dot_f"]
+    lam_dot_f[:] = lam_dot_f + (-lam_dot_f + lam_dot) * (1.0 / tau)
+    # Integral update
+    state["int"][:] = state["int"] + lam_dot_f * (1.0 / tau)   # dt≈1/τ for simplicity
+    a = N * Vc * np.cross(lam_dot_f, lam) + k_i * state["int"]
+    return a
+# ------------------------------------------------------------------
+# 8) Energy‑Based Missile Guidance (EBG)
+# ------------------------------------------------------------------
+def energy_based_guidance_missile(s_own, s_target,
+                                 k_e=0.04, V_des=300.0):
+    """
+    Controls the missile’s specific mechanical energy to drive the speed
+    toward a commanded cruise speed `V_des`.  This is useful for “end‑game”
+    where the missile wants to maintain a constant impact velocity.
+    a = -k_e * ( (|v|²/2) - V_des²/2 ) * v̂
+    """
+    v = s_own[3:6]
+    speed = norm(v) + 1e-6
+    e_spec = 0.5 * speed**2
+    e_ref = 0.5 * V_des**2
+    error = e_spec - e_ref
+    a = -k_e * error * v / speed
+    return a
+# ------------------------------------------------------------------
+# 9) Terminal‑Phase “Impact‑Angle” Guidance
+# ------------------------------------------------------------------
+def impact_angle_guidance(s_own, s_target,
+                         theta_imp=np.radians(30),
+                         k_imp=0.5):
+    """
+    Forces the missile to approach the target on a prescribed impact
+    angle θ_imp measured from the target‑centric local horizontal plane.
+    The law creates a lateral acceleration component that rotates the LOS
+    toward the desired impact geometry.
+    a = k_imp * ( λ̂_rot – λ̂ )
+    where λ̂_rot is the LOS vector rotated by θ_imp about the axis
+    perpendicular to the LOS‑plane and the target‑centered local vertical.
+    """
+    lam = los_vector(s_target, s_own)
+    # Define a target‑centric vertical (approximate) as the unit vector
+    # from target to Earth centre: for a high‑altitude missile we can take it as [0,0,1].
+    # If you have a more accurate model replace `z_hat` accordingly.
+    z_hat = np.array([0.0, 0.0, 1.0])
+    # Axis that is orthogonal to both LOS and the vertical
+    axis = np.cross(lam, z_hat)
+    if norm(axis) < 1e-6:                # LOS already aligned with vertical
+        axis = np.array([1.0, 0.0, 0.0])
+    axis = axis / norm(axis)
+    # Rotate LOS by the desired impact angle (away from vertical)
+    c = np.cos(theta_imp)
+    s = np.sin(theta_imp)
+    lam_rot = (c * lam +
+               s * np.cross(axis, lam) +
+               (1 - c) * np.dot(lam, axis) * axis)
+    a = k_imp * (lam_rot - lam)
+    return a
+# ------------------------------------------------------------------
+# Export list for pySINDy (optional)
+# ------------------------------------------------------------------
+missile_guidance_funcs = [
+    pn_basic, pn_augmented, tlos, constant_bearing,
+    lead_angle, zem_zev, integrated_guidance,
+    energy_based_guidance_missile, impact_angle_guidance
+]
+__all__ = [
+    # (existing names from guidance_lib.py stay there)
+    # add the missile‑specific ones
+    "pn_basic", "pn_augmented", "tlos", "constant_bearing",
+    "lead_angle", "zem_zev", "integrated_guidance",
+    "energy_based_guidance_missile", "impact_angle_guidance"
+]
+ 
+ 

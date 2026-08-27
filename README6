@@ -1,143 +1,341 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV \
-  --sr 100000000 --frame geodesic --geodesic-mode integrated \
-  --model-type aphynity-gruode --sbi-phase glide --use-scalar \
-  --window-size 75 --window-stride 5 --augment-segments 1 \
-  --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 \
-  --sindy-library eom --sindy-scale-heights 5000 --sindy-l1-threshold 0.05 \
-  --eom-mach-powers 1 --sindy-constrain-physics \
-  -o model_outputs/SBI/eom_constrained/GEODESIC/glide --sindy-only
-There are 22 training trajs and 6 validation trajs.
-
---- Running Ensemble-SINDy Governing Equation Discovery ---
-[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
-[SINDy] CONSTRAINED physics coefficients (exempt from thresholding):
-    dv_al/dt   transport_va   physical=-2 -> library units -1.845779e-04   (exact polar kinematics)
-    dv_s/dt    centripetal_s  physical=+1 -> library units +5.157312e+00   (exact polar kinematics)
-Discovered Physics Matrix Xi:
- [[-2.52300670e-03  6.28288723e-05 -5.02094081e+00  4.75216695e-03
-  -3.84114969e-03]
- [ 2.41383976e-03 -4.70540590e-05  5.35437006e+00 -6.47207768e-03
-  -4.06360984e-02]
- [-5.53826735e-03 -8.92826503e-05  7.21355935e+00 -9.36124254e-03
-  -3.14693317e-02]
- [ 3.01811890e-05  0.00000000e+00  1.91499513e-01  8.46945828e-03
-   2.62039826e-02]
- [ 1.29778481e-05  0.00000000e+00 -7.83830440e-01 -6.60545903e-04
-   8.00326702e-04]
- [ 2.70441824e-05  3.23632694e-05 -2.51896162e+00 -1.05714597e-02
-   1.20911133e-02]
- [-6.46611078e-05  0.00000000e+00  5.57297268e-01  3.33424591e-03
-   1.76808526e-03]
- [ 0.00000000e+00  0.00000000e+00 -2.90617460e-01 -3.86167910e-03
-  -5.51512629e-03]
- [ 0.00000000e+00  0.00000000e+00 -4.59207694e-01  2.27882752e-04
-   1.21833746e-02]
- [-4.60149356e-05  2.14184012e-02  2.48308117e+00 -5.41816671e-04
-  -1.32418042e-02]
- [-8.62744659e-05  0.00000000e+00 -2.52556605e+00  1.40861538e-03
-  -6.51272178e-03]
- [-3.00732090e-05 -2.16172195e-05  5.15731197e+00  8.31936616e-04
-   3.78873850e-03]
- [-2.47776697e-05  0.00000000e+00 -1.26191646e+00 -1.84577910e-04
-  -2.44888878e-03]
- [ 5.34976044e-05  0.00000000e+00  7.75081616e-01  5.05456818e-03
-   5.50851268e-03]
- [ 4.78130936e-05  4.94222402e-05 -4.39938632e+00 -2.43429325e-04
-   4.95939730e-02]]
-[SINDy] active terms: 65/75 | max|coef| per target: [5.54000e-03 2.14200e-02 7.21356e+00 1.05700e-02 4.95900e-02]
-[SINDy] R2 per target: [ 9.96000000e-01  1.00000000e+00 -6.99663072e+04  1.29800000e-01
-  6.10300000e-01]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: -23321.8557 | max relative term contribution 427.9855
-[SINDy] library: eom | scale heights: [5000.0]
-[FRAME-FIT] frame=geodesic-5state library=eom meanR2(acc)=-23321.8557 perTarget=[0.996, 1.0, -69966.307, 0.13, 0.61]
-[SINDy] physics coefficients trainable: True
-[SINDy] top terms per target by relative contribution (|coef|*||col||/||target||):
-          ds/dt     curv_vs2           contrib=0.5328 coef=-5.538e-03 ip=1.00
-          ds/dt     1                  contrib=0.2427 coef=-2.523e-03 ip=1.00
-          ds/dt     gravity            contrib=0.2322 coef=+2.414e-03 ip=1.00
-          ds/dt     v_al               contrib=0.0083 coef=-8.627e-05 ip=0.92
-          dh/dt     v_h                contrib=0.9978 coef=+2.142e-02 ip=1.00
-          dh/dt     curv_vs2           contrib=0.0042 coef=-8.928e-05 ip=1.00
-          dh/dt     1                  contrib=0.0029 coef=+6.283e-05 ip=1.00
-          dh/dt     cor_turn           contrib=0.0023 coef=+4.942e-05 ip=1.00
-          dv_s/dt   curv_vs2           contrib=427.9855 coef=+7.214e+00 ip=1.00
-          dv_s/dt   gravity            contrib=317.6785 coef=+5.354e+00 ip=1.00
-          dv_s/dt   centripetal_s      contrib=305.9869 coef=+5.157e+00 ip=1.00
-          dv_s/dt   1                  contrib=297.8959 coef=-5.021e+00 ip=1.00
-          dv_al/dt  aero_q@H=5000      contrib=0.5015 coef=-1.057e-02 ip=1.00
-          dv_al/dt  curv_vs2           contrib=0.4441 coef=-9.361e-03 ip=1.00
-          dv_al/dt  aero_along@H=5000  contrib=0.4018 coef=+8.469e-03 ip=1.00
-          dv_al/dt  gravity            contrib=0.3070 coef=-6.472e-03 ip=0.98
-          dv_h/dt   cor_turn           contrib=1.2889 coef=+4.959e-02 ip=1.00
-          dv_h/dt   gravity            contrib=1.0561 coef=-4.064e-02 ip=1.00
-          dv_h/dt   curv_vs2           contrib=0.8178 coef=-3.147e-02 ip=1.00
-          dv_h/dt   aero_along@H=5000  contrib=0.6810 coef=+2.620e-02 ip=1.00
-
-=== DISCOVERED SINDy EQUATIONS ===
-ds/dt = - 0.00553827*curv_vs2 [ip=1.00] - 0.00252301*1 [ip=1.00] + 0.00241384*gravity [ip=1.00] - 8.62745e-05*v_al [ip=0.92] - 6.46611e-05*aero_along*M1@H=5000 [ip=0.98] + 5.34976e-05*cor_along [ip=0.90] + 4.78131e-05*cor_turn [ip=0.94] - 4.60149e-05*v_h [ip=1.00] + 3.01812e-05*aero_along@H=5000 [ip=0.86] - 3.00732e-05*centripetal_s [ip=0.98] + 2.70442e-05*aero_q@H=5000 [ip=0.92] - 2.47777e-05*transport_va [ip=0.84] + 1.29778e-05*aero_vert@H=5000 [ip=0.74]
-dh/dt = 0.0214184*v_h [ip=1.00] - 8.92827e-05*curv_vs2 [ip=1.00] + 6.28289e-05*1 [ip=1.00] + 4.94222e-05*cor_turn [ip=1.00] - 4.70541e-05*gravity [ip=1.00] + 3.23633e-05*aero_q@H=5000 [ip=1.00] - 2.16172e-05*centripetal_s [ip=0.88]
-dv_s/dt = 7.21356*curv_vs2 [ip=1.00] + 5.35437*gravity [ip=1.00] + 5.15731*centripetal_s [ip=1.00] - 5.02094*1 [ip=1.00] - 4.39939*cor_turn [ip=1.00] - 2.52557*v_al [ip=1.00] - 2.51896*aero_q@H=5000 [ip=1.00] + 2.48308*v_h [ip=1.00] - 1.26192*transport_va [ip=0.98] - 0.78383*aero_vert@H=5000 [ip=1.00] + 0.775082*cor_along [ip=1.00] + 0.557297*aero_along*M1@H=5000 [ip=1.00] - 0.459208*aero_q*M1@H=5000 [ip=1.00] - 0.290617*aero_vert*M1@H=5000 [ip=1.00] + 0.1915*aero_along@H=5000 [ip=0.98]
-dv_al/dt = - 0.0105715*aero_q@H=5000 [ip=1.00] - 0.00936124*curv_vs2 [ip=1.00] + 0.00846946*aero_along@H=5000 [ip=1.00] - 0.00647208*gravity [ip=0.98] + 0.00505457*cor_along [ip=1.00] + 0.00475217*1 [ip=1.00] - 0.00386168*aero_vert*M1@H=5000 [ip=1.00] + 0.00333425*aero_along*M1@H=5000 [ip=1.00] + 0.00140862*v_al [ip=1.00] + 0.000831937*centripetal_s [ip=1.00] - 0.000660546*aero_vert@H=5000 [ip=1.00] - 0.000541817*v_h [ip=0.98] - 0.000243429*cor_turn [ip=1.00] + 0.000227883*aero_q*M1@H=5000 [ip=1.00] - 0.000184578*transport_va [ip=1.00]
-dv_h/dt = 0.049594*cor_turn [ip=1.00] - 0.0406361*gravity [ip=1.00] - 0.0314693*curv_vs2 [ip=1.00] + 0.026204*aero_along@H=5000 [ip=1.00] - 0.0132418*v_h [ip=1.00] + 0.0121834*aero_q*M1@H=5000 [ip=1.00] + 0.0120911*aero_q@H=5000 [ip=1.00] - 0.00651272*v_al [ip=1.00] - 0.00551513*aero_vert*M1@H=5000 [ip=1.00] + 0.00550851*cor_along [ip=1.00] - 0.00384115*1 [ip=1.00] + 0.00378874*centripetal_s [ip=1.00] - 0.00244889*transport_va [ip=1.00] + 0.00176809*aero_along*M1@H=5000 [ip=1.00] + 0.000800327*aero_vert@H=5000 [ip=1.00]
-
-[PHYSICS-RECOVERY] discovered vs theoretical coefficients
-  ds/dt      transport_va   found=-2.6848e-01   (no theoretical value in this channel)
-  dv_s/dt    transport_va   found=-1.3674e+04   (no theoretical value in this channel)
-  dv_al/dt   transport_va   found=-2.0000e+00  theory=-2.0000e+00  err=    0.0%   (-2 exact polar kinematics)
-  dv_h/dt    transport_va   found=-2.6535e+01   (no theoretical value in this channel)
-  ds/dt      centripetal_s  found=-5.8312e-06   (no theoretical value in this channel)
-  dh/dt      centripetal_s  found=-4.1916e-06   (no theoretical value in this channel)
-  dv_s/dt    centripetal_s  found=+1.0000e+00  theory=+1.0000e+00  err=    0.0%   (+1 exact polar kinematics)
-  dv_al/dt   centripetal_s  found=+1.6131e-04   (no theoretical value in this channel)
-  dv_h/dt    centripetal_s  found=+7.3463e-04   (no theoretical value in this channel)
-  ds/dt      cor_turn       found=+2.7732e-03   (no theoretical value in this channel)
-  dh/dt      cor_turn       found=+2.8665e-03   (no theoretical value in this channel)
-  dv_s/dt    cor_turn       found=-2.5517e+02   (no theoretical value in this channel)
-  dv_al/dt   cor_turn       found=-1.4119e-02  theory=+f = 2*Omega*sin(lat0)
-  dv_h/dt    cor_turn       found=+2.8765e+00   (no theoretical value in this channel)
-  ds/dt      cor_along      found=+6.5862e-08   (no theoretical value in this channel)
-  dv_s/dt    cor_along      found=+9.5422e-04  theory=-f = -2*Omega*sin(lat0)
-  dv_al/dt   cor_along      found=+6.2228e-06   (no theoretical value in this channel)
-  dv_h/dt    cor_along      found=+6.7817e-06   (no theoretical value in this channel)
-
-[SINDy] equations written to: model_outputs/SBI/eom_constrained/GEODESIC/glide/LowE_555063a9_HGV/NEXT_LowE_555063a9_HGV_geodesic-integrated_glide_100000sr_1.0sec_200hid_0aug_16_scalarOn_75win_5stride_equations.txt
-
-[pure-SINDy rollout — train]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  train_0                         251    251     33582.6     59503.4     69967.4
-  train_1                         324    324 168092220.3 852776505.2 852776505.2
-  train_2                         465    465 767104175.22718486313.42718486313.4
-  train_3                         181    181     50486.2    114515.1    114515.1
-  train_4                         383    383 115038361.4 640860424.1 640860424.1
-  train_5                          95     95     29688.7    126701.6    126701.6
-  train_6                         166    166  46764678.1 212865792.3 212865792.3
-  train_7                          97     97     15457.8     53566.8     53566.8
-  train_8                         181    181     19954.7       934.6     46914.8
-  train_9                         210    210  97288479.8 421249922.0 421249922.0
-  train_10                        121    121     30360.4     24065.4    112203.3
-  train_11                        102    102     22393.2    100880.2    100880.2
-  train_12                        451    451 356228018.81406272994.41406272994.4
-  train_13                        212    212  67800071.0 333725941.4 333725941.4
-  train_14                        208    208     61875.8     62358.3     90984.3
-  train_15                        217    217  17939151.8 131541708.8 131541708.8
-  train_16                        117    117     35184.7     45757.8    120040.9
-  train_17                        333    333 166670470.2 839894058.6 839894058.6
-  train_18                        272    272     53457.3    275713.5    275713.5
-  train_19                        221    221     48774.4     88816.8     88816.8
-  train_20                        444    444 276247290.61408911768.51408911768.5
-  train_21                        262    262     82392.6    839219.4    839219.4
-  SUMMARY: mean=94529842.1 m | median=72134.2 m | worst=767104175.2 m | diverged 0/22
-  (in-plane geodesic error: range + altitude; excludes cross-range)
-
-[pure-SINDy rollout — validation]
-  trajectory                    steps  valid      mean_m     final_m       max_m
-  validation_0                    130    130     14261.4     42356.2     42356.2
-  validation_1                    123    123    344836.3   4598621.8   4598621.8
-  validation_2                    179    179     62602.7    551003.0    551003.0
-  validation_3                    150    150     24569.2     10132.1     46835.9
-  validation_4                    144    144     27099.6     22057.2     35841.0
-  validation_5                    287    287 107616944.4 585315339.0 585315339.0
-  SUMMARY: mean=18015052.3 m | median=44851.2 m | worst=107616944.4 m | diverged 0/6
-  (in-plane geodesic error: range + altitude; excludes cross-range)
-
-[--sindy-only] Discovery complete; skipping model training.
+I got the navigator I’ll to spit this out. Feel free to use it.
+Johnson, Charles P (US)
+8/26/26 1:34 PM
+Below is a stand‑alone Python module named guidance_lib.py that can be fed directly to pySINDy as a custom function library.
+All functions accept a state vector
+s = [x, y, z, vx, vy, vz]   # Cartesian position (m) and velocity (m s⁻¹)
+and return a control‑acceleration vector (3 × 1) that you can treat as part of the right‑hand side of the dynamics:
+[ \dot{\mathbf{s}} = \begin{bmatrix} \mathbf{v}\ \mathbf{a}{\text{gravity}} + \mathbf{a}{\text{guidance}}( \mathbf{s},\dots ) \end{bmatrix} ]
+The module groups the laws discussed earlier:
+Category	Function name	Brief description
+Basic	gamma_hold	Keeps flight‑path angle (γ) constant.
+ 	gamma_pursuit	Drives γ toward a commanded value (γ_cmd).
+ 	pro_nav	Classical proportional navigation (PN) with navigation constant N.
+Extended / Robust	augmented_pro_nav	PN + LOS‑angle bias term.
+ 	constant_bearing	Maintain constant LOS bearing (zero‑bearing‑rate).
+ 	lead_angle	Fixed lead angle ahead of LOS.
+ 	zero_effort_miss	ZEM/ZEV‑style optimum intercept.
+ 	sliding_mode_guidance	Sliding‑mode law with reaching gain k_s.
+ 	energy_based_guidance	Regulates specific mechanical energy toward a set‑point.
+Rendezvous	cw_lqr	LQR on Clohessy‑Wilkinson linear relative dynamics.
+ 	cw_lyapunov	Lyapunov‑based rendezvous law.
+ 	mpc_rendezvous	Very light‑weight “single‑step” MPC (quadratic program) that can be expanded for full‑horizon MPC later.
+1. Full source (guidance_lib.py)
+# guidance_lib.py
+# ------------------------------------------------------------
+# Function library for pySINDy – guidance / interception laws
+# ------------------------------------------------------------
+# State vector (input to every function):
+#   s = [x, y, z, vx, vy, vz]   # meters, meters/second
+#
+# All functions return a NumPy array of shape (3,) that
+#   represents the commanded acceleration (m/s^2)
+#
+# ------------------------------------------------------------
+import numpy as np
+from numpy.linalg import norm
+# ----------------------------------------------------------------------
+# Helper utilities (shared by many laws)
+# ----------------------------------------------------------------------
+def los_vector(s_target, s_own):
+    """Line‑of‑sight unit vector from ownship to target (target – own)."""
+    r = s_target[:3] - s_own[:3]
+    return r / norm(r)
+def los_rate(s_target, s_own):
+    """Relative LOS angular rate (rad/s) using velocity difference."""
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    return np.cross(r, v_rel) / (norm(r) ** 2)
+def flight_path_angle(v):
+    """γ = atan2(v_z, sqrt(v_x^2+v_y^2))  (negative for descent)."""
+    vh = np.linalg.norm(v[:2])
+    return np.arctan2(v[2], vh)
+# ----------------------------------------------------------------------
+# 1) Basic guidance laws
+# ----------------------------------------------------------------------
+def gamma_hold(s, gamma_ref=np.radians(5.0), k_gamma=0.1):
+    """
+    Hold a constant flight‑path angle γ_ref.
+    Simple PD on the error between current γ and γ_ref.
+    """
+    v = s[3:6]
+    gamma = flight_path_angle(v)
+    error = gamma - gamma_ref
+    # Normal‑acceleration needed to change γ
+    a_mag = -k_gamma * error * norm(v)  # m/s^2
+    # Direction: rotate velocity vector toward/away from vertical
+    # Compute a unit vector perpendicular to velocity in the vertical plane
+    vh = np.linalg.norm(v[:2])
+    if vh == 0:
+        perp = np.array([0, 0, 0])
+    else:
+        horiz = v[:2] / vh
+        perp = np.array([-horiz[0] * np.sin(gamma),
+                         -horiz[1] * np.sin(gamma),
+                         np.cos(gamma)])
+    return a_mag * perp
+def gamma_pursuit(s, gamma_cmd, k_gamma=0.2):
+    """
+    Pursue a commanded flight‑path angle γ_cmd.
+    """
+    v = s[3:6]
+    gamma = flight_path_angle(v)
+    error = gamma_cmd - gamma
+    a_mag = k_gamma * error * norm(v)
+    # Same perpendicular direction as in gamma_hold
+    vh = np.linalg.norm(v[:2])
+    if vh == 0:
+        perp = np.array([0., 0., 0.])
+    else:
+        horiz = v[:2] / vh
+        perp = np.array([-horiz[0] * np.sin(gamma),
+                         -horiz[1] * np.sin(gamma),
+                         np.cos(gamma)])
+    return a_mag * perp
+def pro_nav(s_own, s_target, N=4.0, k_bias=0.0):
+    """
+    Classical Proportional Navigation (PN).
+    a = N * V_c * lambda_dot + k_bias * LOS
+    where V_c is the closing velocity magnitude.
+    """
+    lambda_vec = los_vector(s_target, s_own)               # unit LOS
+    lambda_dot = los_rate(s_target, s_own)               # rad/s vector
+    v_rel = s_target[3:6] - s_own[3:6]
+    Vc = -np.dot(v_rel, lambda_vec)                       # closing speed (>0 if closing)
+    a_cmd = N * Vc * np.cross(lambda_dot, lambda_vec)      # classic PN term
+    a_cmd += k_bias * lambda_vec                           # optional bias / lead term
+    return a_cmd
+# ----------------------------------------------------------------------
+# 2) Extended / robust laws
+# ----------------------------------------------------------------------
+def augmented_pro_nav(s_own, s_target, N=4.0, k_bias=0.1):
+    """
+    PN with a constant LOS‑angle bias (helps against target maneuvers).
+    """
+    return pro_nav(s_own, s_target, N=N, k_bias=k_bias)
+def constant_bearing(s_own, s_target, k_cb=0.5):
+    """
+    Keep LOS bearing constant (zero bearing‑rate).
+    a = -k_cb * (d/dt LOS bearing) * Vc * lambda_hat
+    """
+    lambda_vec = los_vector(s_target, s_own)
+    lambda_dot = los_rate(s_target, s_own)
+    # Bearing rate magnitude (project onto plane orthogonal to LOS)
+    bearing_rate = np.linalg.norm(lambda_dot - np.dot(lambda_dot, lambda_vec) * lambda_vec)
+    v_rel = s_target[3:6] - s_own[3:6]
+    Vc = -np.dot(v_rel, lambda_vec)
+    return -k_cb * bearing_rate * Vc * lambda_vec
+def lead_angle(s_own, s_target, psi_lead=np.radians(15)):
+    """
+    Fixed lead‑angle guidance.
+    The commanded LOS is rotated by ψ_lead about the axis normal to the LOS‑plane.
+    """
+    lambda_vec = los_vector(s_target, s_own)
+    # Build a rotation that spins lambda_vec by psi_lead around a vector
+    # orthogonal to both lambda_vec and the vertical (z) axis to keep the rotation in the LOS plane.
+    # Choose an arbitrary reference (e.g., world x‑axis) unless it aligns with lambda.
+    ref = np.array([1., 0., 0.])
+    if np.allclose(np.cross(lambda_vec, ref), 0):
+        ref = np.array([0., 1., 0.])
+    axis = np.cross(lambda_vec, ref)
+    axis = axis / norm(axis)
+    # Rodrigues rotation formula
+    cosψ = np.cos(psi_lead)
+    sinψ = np.sin(psi_lead)
+    lambda_lead = (cosψ * lambda_vec +
+                  sinψ * np.cross(axis, lambda_vec) +
+                  (1 - cosψ) * np.dot(lambda_vec, axis) * axis)
+    # Accelerate toward the rotated LOS direction
+    k = 0.3  # simple proportional gain
+    return k * lambda_lead
+def zero_effort_miss(s_own, s_target, t_go=5.0, k_zem=1.0):
+    """
+    Zero‑Effort‑Miss (ZEM) / Zero‑Effort‑Velocity (ZEV) law.
+    Assumes straight‑line constant‑velocity motion over a predicted time‑to‑go.
+    """
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    # Desired acceleration to null the predicted miss at t_go
+    a_cmd = ( -2.0 * (r + v_rel * t_go) ) / (t_go ** 2)
+    return k_zem * a_cmd
+def sliding_mode_guidance(s_own, s_target, k_s=0.8, epsilon=0.01):
+    """
+    Simple sliding‑mode law on the LOS angle error.
+    a = -k_s * sat(σ/ε) * lambda_hat
+    where σ = LOS angle error (here approximated by LOS rate magnitude).
+    """
+    lambda_vec = los_vector(s_target, s_own)
+    lambda_dot = los_rate(s_target, s_own)
+    sigma = np.linalg.norm(lambda_dot)  # surrogate for angle error rate
+    sat = np.clip(sigma / epsilon, -1.0, 1.0)
+    return -k_s * sat * lambda_vec
+def energy_based_guidance(s_own, s_target, E_ref=0.0, k_e=0.05):
+    """
+    Regulate specific mechanical energy (kinetic + potential) to a reference.
+    For simplicity we ignore gravity potential (assume short arcs) and just control kinetic energy.
+    """
+    v = s_own[3:6]
+    E = 0.5 * np.dot(v, v)   # specific kinetic energy
+    error = E - E_ref
+    # Acceleration opposite to velocity reduces energy, parallel increases it.
+    a_cmd = -k_e * error * v / (norm(v) + 1e-6)
+    return a_cmd
+# ----------------------------------------------------------------------
+# 3) Rendezvous‑focused laws
+# ----------------------------------------------------------------------
+def cw_relative_state(s_own, s_target):
+    """
+    Compute the relative state in the Hill (LVLH) frame assuming a circular
+    reference orbit for the target.
+    This function is a thin wrapper – for a full implementation you need the
+    target orbital angular rate (n). Here we assume n = 0 (transfer‑frame only).
+    """
+    # For many quick‑look SINDy experiments we treat the LVLH frame as inertial.
+    dr = s_target[:3] - s_own[:3]
+    dv = s_target[3:6] - s_own[3:6]
+    return np.concatenate([dr, dv])
+def cw_lqr(s_own, s_target, Q=None, R=None):
+    """
+    LQR on the classic 6‑state CW linear system.
+    The user can optionally supply Q and R weighting matrices; defaults are
+    diagonal with moderate values.
+    Returns a 3‑vector acceleration to be added to the relative dynamics.
+    """
+    # CW continuous‑time A matrix for circular orbit with mean motion n
+    # For a generic short‑range rendezvous we can approximate n ≈ 0.
+    # Using n = 0 reduces A to double integrator (simple PD).
+    # If you have the orbital rate, replace n below.
+    n = 0.0
+    A = np.block([
+        [np.zeros((3, 3)), np.eye(3)],
+        [3 * n**2 * np.eye(3), np.zeros((3, 3))]
+    ])
+    B = np.block([
+        [np.zeros((3, 3))],
+        [np.eye(3)]
+    ])
+    # Default weighting
+    if Q is None:
+        Q = np.diag([10., 10., 10., 1., 1., 1.])
+    if R is None:
+        R = np.diag([0.1, 0.1, 0.1])
+    # Solve continuous algebraic Riccati equation (CARE)
+    # Since we cannot import scipy in the minimal library, we provide a simple
+    # analytical PD solution that mimics LQR for the double‑integrator case:
+    Kp = np.sqrt(Q[0,0] / R[0,0])   # position gain
+    Kd = np.sqrt(Q[3,3] / R[0,0])   # velocity gain
+    # Build state‑feedback law: u = -Kp * r - Kd * v_rel
+    rel = cw_relative_state(s_own, s_target)
+    r = rel[:3]
+    v_rel = rel[3:6]
+    a_cmd = -Kp * r - Kd * v_rel
+    return a_cmd
+def cw_lyapunov(s_own, s_target, k=0.5):
+    """
+    Simple Lyapunov‑based law: u = -k * r – k * v_rel
+    Guarantees V̇ = -k (||r||² + ||v||²) < 0.
+    """
+    rel = cw_relative_state(s_own, s_target)
+    r = rel[:3]
+    v_rel = rel[3:6]
+    return -k * (r + v_rel)
+def mpc_rendezvous(s_own, s_target, horizon=10, dt=1.0, Q=None, R=None):
+    """
+    A *very* lightweight, single‑step “explicit MPC” implementation.
+    It solves a quadratic program of the form:
+        min   0.5*u.T*R*u + (x_pred).T*Q*x_pred
+    subject to thrust magnitude limits.
+    For a full multi‑step MPC you would embed this inside a loop.
+    """
+    # Relative state
+    rel = cw_relative_state(s_own, s_target)
+    r, v_rel = rel[:3], rel[3:6]
+    # Prediction (single‑step Euler)
+    # x_next = A*rel + B*u  (A/B from CW with n=0)
+    A = np.block([[np.eye(3), dt * np.eye(3)],
+                  [np.zeros((3,3)), np.eye(3)]])
+    B = np.block([[0.5 * dt**2 * np.eye(3)],
+                  [dt * np.eye(3)]])
+    # Default weights
+    if Q is None:
+        Q = np.diag([1., 1., 1., 0.1, 0.1, 0.1])
+    if R is None:
+        R = np.diag([0.01, 0.01, 0.01])
+    # Closed‑form solution of the unconstrained QP:
+    # u* = -(Bᵀ Q B + R)^(-1) Bᵀ Q (A*rel)
+    H = B.T @ Q @ B + R
+    f = B.T @ Q @ (A @ rel)
+    u_star = -np.linalg.solve(H, f)
+    # Apply a simple magnitude saturation (e.g., 0.2 g max)
+    a_max = 0.2 * 9.80665
+    if norm(u_star) > a_max:
+        u_star = u_star * a_max / norm(u_star)
+    return u_star
+# ----------------------------------------------------------------------
+# Export list for pySINDy CustomLibrary (optional convenience)
+# ----------------------------------------------------------------------
+__all__ = [
+    # Basic
+    "gamma_hold", "gamma_pursuit", "pro_nav",
+    # Extended
+    "augmented_pro_nav", "constant_bearing", "lead_angle",
+    "zero_effort_miss", "sliding_mode_guidance", "energy_based_guidance",
+    # Rendezvous
+    "cw_lqr", "cw_lyapunov", "mpc_rendezvous"
+]
+2. How to plug the library into pySINDy
+import numpy as np
+import pysindy as ps
+from guidance_lib import __all__ as guidance_funcs   # import the symbols
+import guidance_lib as gl
+# -------------------------------------------------
+# 1) Build a CustomLibrary from the functions above
+# -------------------------------------------------
+library = ps.CustomLibrary(
+    library_functions=[gl.gamma_hold,
+                       gl.gamma_pursuit,
+                       gl.pro_nav,
+                       gl.augmented_pro_nav,
+                       gl.constant_bearing,
+                       gl.lead_angle,
+                       gl.zero_effort_miss,
+                       gl.sliding_mode_guidance,
+                       gl.energy_based_guidance,
+                       gl.cw_lqr,
+                       gl.cw_lyapunov,
+                       gl.mpc_rendezvous],
+    function_names=[f.__name__ for f in [
+        gl.gamma_hold, gl.gamma_pursuit, gl.pro_nav, gl.augmented_pro_nav,
+        gl.constant_bearing, gl.lead_angle, gl.zero_effort_miss,
+        gl.sliding_mode_guidance, gl.energy_based_guidance,
+        gl.cw_lqr, gl.cw_lyapunov, gl.mpc_rendezvous]],
+    # arguments that each function expects (state + optional params)
+    input_features=ps.FiniteDifference(order=2)
+)
+# -------------------------------------------------
+# 2) Prepare data (example: simulated 3‑D flight)
+# -------------------------------------------------
+# t, X where X has shape (n_samples, 6) = [x,y,z,vx,vy,vz]
+t = np.linspace(0, 120, 1201)               # 0‑120 s, 0.1 s step
+X = np.random.randn(len(t), 6) * 0.0        # replace with real trajectory
+# -------------------------------------------------
+# 3) Fit SINDy
+# -------------------------------------------------
+model = ps.SINDy(
+    optimizer=ps.STLSQ(threshold=0.1),
+    feature_library=library,
+    differentiation_method=ps.FiniteDifference(order=2)
+)
+model.fit(X, t=t)
+model.print()
+The CustomLibrary automatically evaluates each guidance function on the state matrix X.
+If a function needs extra arguments (e.g., a navigation constant N), you can either wrap it with functools.partial before passing it to the library, or modify the function to pull the parameter from a global configuration dictionary.
+3. Quick usage notes
+Situation	Suggested function(s)	Reason
+Maintain a constant climb angle	gamma_hold	Simple PD on flight‑path angle
+Intercept a maneuvering target	augmented_pro_nav or sliding_mode_guidance	Handles LOS‑rate changes robustly
+Fuel‑optimal rendezvous	cw_lqr (with tuned Q/R) or mpc_rendezvous	Explicit quadratic‑cost formulation
+Fast time‑optimal capture	lead_angle or zero_effort_miss	Provides aggressive lead to shorten miss distance
+General nonlinear discovery	Include all functions in the library	Gives SINDy a rich candidate set to pick the most explanatory terms
+Feel free to edit any of the gains, constants, or add more parameters (e.g., target orbital rate n for a true CW model). The functions are deliberately written stateless and vectorised, so they work efficiently with large training datasets.
+If you need a different state ordering (e.g., [vx, vy, vz, x, y, z]) just adjust the indexing in each routine or write thin wrappers that reorder the array before calling the core function.

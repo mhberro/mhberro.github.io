@@ -1,512 +1,1893 @@
-# eom_library.py
-"""Parametric Equations-of-Motion (EOM) basis for the physics backbone.
+# NEXT_training.py
+# Built-ins
+import argparse
+import json
+import math
+import multiprocessing as mp
+import os
+import pickle
+from copy import deepcopy
+from pathlib import Path
 
-The idea
---------
-SINDy exists to discover *unknown structure*. But the structure of atmospheric
-glide flight is not unknown -- it is textbook 3-DoF point-mass physics: gravity,
-aerodynamic drag along the velocity vector, aerodynamic lift perpendicular to it,
-and geometric curvature terms. What is genuinely unknown for a given threat is a
-handful of AERODYNAMIC COEFFICIENTS (C_D*A/m, C_L*A/m and their lateral analogue).
-
-Asking a sparse-regression search to rediscover Newton from ~22 noisy flights is
-badly under-determined: it invents non-physical positive-feedback terms (h*h, s*s)
-that fit one step and destroy the rollout. This module instead writes the known
-force laws down and leaves only the unknown coefficients free.
-
-The crucial property that makes this a drop-in: the EOM are **linear in the unknown
-coefficients**, so the same `stridge` / ensemble machinery and the same standalone
-rollout evaluation work unchanged -- only the candidate columns differ. Instead of
-~85 polynomial columns we offer ~6 physically-derived ones.
-
-Basis columns (all evaluated in PHYSICAL units, then normalised)
----------------------------------------------------------------
-With V = sqrt(v_s^2 + v_h^2), dynamic-pressure-like factor q = 0.5*rho(h)*V^2 and
-rho(h) = exp(-h/H):
-
-  drag_s   = -q * v_s / V        (drag, along-track component)   -> coeff k_D
-  drag_h   = -q * v_h / V        (drag, vertical component)      -> coeff k_D
-  lift_s   = +q * v_h / V        (in-plane lift, along-track)    -> coeff k_L
-  lift_h   = -q * v_s / V        (in-plane lift, vertical)       -> coeff k_L
-  lat_aero =  q                  (lateral/bank force -> turn rate) -> coeff k_lat
-  gravity  = -g0*(Re/(Re+h))^2   (gravity, vertical)             -> coeff ~1 (fixed form)
-  curv     = +v_s^2/(Re+h)       (centrifugal/curvature, vertical) -> coeff ~1
-  bias     =  1                  (small constant offset / trim)
-
-Every column is a genuine force term. There is no term whose magnitude grows with
-POSITION in a way that feeds back on itself, so a fitted model is structurally
-incapable of the runaway that the polynomial library produced.
-"""
-
-from __future__ import annotations
-
+# 3rd party
+import matplotlib.pyplot as plt
 import numpy as np
+import onnx
+import pandas as pd
+import psutil
+import scipy
+import seaborn as sns
+import torch
+from scipy.interpolate import make_interp_spline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
 
-EARTH_RADIUS_M = 6371000.0
-G0 = 9.80665
-# Speed-of-sound model for the Mach proxy. A simple two-layer ISA-like temperature
-# profile is enough: what matters for the library is that M varies correctly with
-# altitude and speed, not absolute atmospheric fidelity (the fitted coefficients
-# absorb any constant offset).
-GAMMA_AIR = 1.4
-R_SPECIFIC = 287.05
-T_SEA = 288.15
-T_LAPSE = 0.0065
-T_TROPO = 216.65
-T_MIN, T_MAX = 180.0, 320.0
-_V_EPS = 1e-9
-_EXP_ARG_MAX = 10.0
+# LM packages
+from lm_ai_torch_models.activations import Activation
+from lm_ai_torch_training.configuration import TrainingConfiguration
+from lm_ai_torch_training.hyperparameters import TrainingParam
+from lm_ai_torch_training.lr_schedulers.reduce_on_plateau import ReduceLROnPlateauConfiguration
+from lm_ai_torch_training.optimizers.adam import AdamOptimizer
+from prediction.mlearn.ffnn.architecture import FFNNArchitecture
+from prediction.mlearn.ffnn.model import FFNNModel
+from prediction.mlearn.neural_ode.solvers.euler_solver import EulerSolver
+from prediction.mlearn.neural_ode.solvers.rk4_solver import RK4Solver
 
+# Local
+from coordinate_transform_functions import (
+    dcu_to_ned,
+    ecef_to_ned,
+    ecef_to_ned_velocity,
+    frd_to_dcu,
+    ned_to_dcu,
+    ned_to_ecef,
+    ned_to_ecef_velocity,
+)
+from energy_functions import mechanical_energy
+from load_truth import load_single_truth
+from loss_functions import EnergyMSELoss, PhysicsSplitMSELoss, SecondOrderSplitMSELoss, WeightedHuberLoss, WrappedMSELoss
+from gru_ode import GRUODEFunc, GRUODEPredictorModel
 
-class EOMLibrary:
-    """Physically-derived candidate columns for glide-phase equations of motion."""
+from neural_ode_mod import (
+    DEFAULT_LOSS,
+    EarlyStopper,
+    ModelCheckpoint,
+    NODEPredictor,
+)
+from NEXT_frames import (
+    ecef_to_local_geodesic_vec,
+    ecef_to_next_dcu,
+    ecef_to_next_grdth,
+    local_geodesic_to_ecef_vec,
+    next_dcu_to_ecef,
+    next_grdth_to_ecef,
+)
 
-    def __init__(
-        self,
-        state_vector_len: int = 5,
-        h_idx: int = 1,
-        vs_idx: int = 2,
-        va_idx: int = 3,
-        vh_idx: int = 4,
-        h_sign: float = 1.0,
-        s_idx: int = 0,
-        include_frame_transport: bool = True,
-        s_floor: float = 5000.0,
-        mach_powers: tuple[int, ...] = (),
-        include_flight_path_angle: bool = False,
-        include_guidance_terms: bool = False,
-        scale_heights: tuple[float, ...] = (7200.0,),
-        earth_radius: float = EARTH_RADIUS_M,
-        feature_mean=None,
-        feature_scale=None,
-        include_bias: bool = True,
-        include_linear_velocity: bool = True,
-        clip: float = 8.0,
-        # kept for interface compatibility with the other libraries
-        degree: int = 2,
-        pos_idx=(0, 1),
-        vel_idx=(2, 4),
-        poly_mode: str = "eom",
-    ):
-        self.state_vector_len = state_vector_len
-        self.h_idx, self.vs_idx, self.va_idx, self.vh_idx = h_idx, vs_idx, va_idx, vh_idx
-        # See PhysicsInformedLibrary.h_sign. Converts the frame's altitude-like
-        # channel to TRUE ALTITUDE (positive up): +1 for geodesic h and DCU Up,
-        # -1 for grdth's NED Down. Feeds rho(h)=exp(-h/H), the gravity term
-        # g0*(Re/(Re+h))^2 and the curvature denominator, all of which are wrong
-        # (and the first of which saturates) if the sign is inverted.
-        self.h_sign = float(h_sign)
-        # --- polar-frame transport / rotating-frame terms -------------------
-        # The geodesic-integrated frame is a POLAR system centred on the impact
-        # point: s = radius, azimuth = polar angle, v_s = radial rate, v_alpha ~
-        # angular rate (see NEXT_geodesic_frame.ecef_to_local_geodesic_vec). A polar
-        # frame has MANDATORY transport (fictitious) terms -- they are not optional
-        # physics, they are what the coordinate system itself requires:
-        #     dv_r/dt   = a_radial + r*omega^2          (centripetal)
-        #     domega/dt = a_tang/r - 2*v_r*omega/r      (Coriolis/transport)
-        # Neither was present in the original basis. Measured on representative
-        # glide numbers (s=1000 km, v_s=-5 km/s, v_alpha=1e-4) the transport term
-        # alone changes v_alpha by ~3x its own typical magnitude over 300 s.
-        #
-        # Separately, ECEF is a ROTATING frame, so true Coriolis appears. Projecting
-        # a_cor = -2*Omega x v onto this frame's (radial, tangential) axes, the
-        # azimuth dependence CANCELS for the sin(lat0) part:
-        #     a_cor . t_hat = -f * v_l ,   a_cor . l_hat = +f * v_s ,   f = 2*Om*sin(lat0)
-        # so the dominant (f-plane) Coriolis IS expressible in this state. The
-        # residual cos(lat0)*v_h terms require the azimuth, which is not a state
-        # variable, and are therefore left to the neural residual.
-        # f*|v_s| ~ 0.42 m/s^2 at 35 deg latitude -> ~19 km of cross-range over 300 s,
-        # which exceeds the entire current error budget. Omitting it forces the fit
-        # to absorb a large, systematic, coherent force.
-        self.s_idx = int(s_idx)
-        self.include_frame_transport = bool(include_frame_transport)
-        # Division by s is guarded: s -> 0 at the impact point (the frame origin),
-        # mirroring NEXT_geodesic_frame's own S_EPS_M guard but with a larger floor,
-        # because these columns divide by s rather than merely evaluating at it.
-        self.s_floor = float(s_floor)
-        # --- Mach-dependent aerodynamic coefficients ------------------------
-        # The base aero columns (aero_along/aero_vert/aero_q) each carry ONE fitted
-        # constant, i.e. they assume C_L and C_D are constant. Measured on the real
-        # 28-trajectory set that is false: the effective C_L has a within-flight
-        # coefficient of variation of 0.45 (smoothed, so not differentiation noise)
-        # and a 2.7x spread of per-flight means, and ~53% of that variation is
-        # predictable from (Mach, altitude, V). A single constant therefore cannot
-        # represent the lift, and no amount of ADDITIONAL constant-coefficient terms
-        # helps -- it is a functional-form limitation, not a term-selection one.
-        #
-        # Real hypersonic aero uses C_L(Mach, alpha) tables; hand-derived models
-        # encode that dependence explicitly. `mach_powers` reproduces it in a
-        # SINDy-compatible way: for each power k, an extra column (base_aero * M^k)
-        # is offered, so sparse regression can assemble
-        #     C(M) = c0 + c1*M + c2*M^2 + ...
-        # Each column remains LINEAR in its coefficient, so E-SINDy, the trainable-Xi
-        # co-learning and ONNX export are all unchanged.
-        #
-        # Empty tuple () = original constant-coefficient behaviour.
-        self.mach_powers = tuple(int(k) for k in mach_powers if int(k) != 0)
-        # --- angle terms and guidance-law terms -----------------------------
-        # Both were requested directly by the flight-mechanics SMEs in the
-        # 2026-08-26 technical exchange:
-        #
-        #   "a lot of those important coefficients effectively are going to be your
-        #    angles and angular rates fed directly into the model. That's how we do
-        #    it now, even."                                        -- on the turn channel
-        #
-        #   "we could just put in functions for control laws ... you could put in
-        #    ProNav or gamma hold ... Cindy would just identify, hey, this function
-        #    matches pretty well, latch onto it and throw away everything else."
-        #
-        # FLIGHT-PATH ANGLE (include_flight_path_angle):
-        #   gamma = atan2(v_h, sqrt(v_s^2 + v_l^2)). An ARCTANGENT cannot be built
-        #   from products of the existing columns, so this is genuinely new
-        #   expressive power rather than a rearrangement of what we already have.
-        #   We offer gamma, sin(gamma) and cos(gamma): combined with the existing
-        #   gravity/aero columns, sin/cos span the standard (g/V)*cos(gamma)
-        #   gravity-turn structure of the real EOM.
-        #
-        #   NOTE ON GAMMA-RATE: true d(gamma)/dt requires ACCELERATIONS, which are
-        #   exactly the quantities SINDy is solving for. Feeding them as inputs
-        #   would be circular and would break the linear-in-coefficients property
-        #   the method depends on. sin/cos(gamma) are the safe substitute.
-        #
-        # GUIDANCE / PRONAV (include_guidance_terms):
-        #   Proportional navigation commands a_lat = N * V_c * lambda_dot. In this
-        #   impact-centred frame the LOS rate IS v_alpha and the closing velocity is
-        #   -v_s, so the command is  -N * v_s * v_alpha.  We offer that product
-        #   WITHOUT the 1/s factor deliberately: transport_va already supplies
-        #   v_s*v_alpha/s, and keeping them separate (measured correlation 0.80, so
-        #   they are separable) lets the kinematic transport coefficient and the
-        #   guidance coefficient be estimated independently instead of confounded
-        #   in one number. If the vehicle really is flying ProNav, this column
-        #   should be selected with a coefficient whose magnitude is the navigation
-        #   constant N (conventionally 3-5).
-        self.include_flight_path_angle = bool(include_flight_path_angle)
-        self.include_guidance_terms = bool(include_guidance_terms)
-        self.scale_heights = tuple(float(H) for H in scale_heights)
-        self.earth_radius = float(earth_radius)
-        self.include_bias = bool(include_bias)
-        # A small linear-in-velocity block lets the fit absorb mild unmodelled damping
-        # without introducing any position dependence (hence no feedback risk).
-        self.include_linear_velocity = bool(include_linear_velocity)
-        self.clip = float(clip)
-        self.feature_mean = None if feature_mean is None else np.asarray(feature_mean, float)
-        self.feature_scale = None if feature_scale is None else np.asarray(feature_scale, float)
-        self.col_scale_ = None  # frozen normalisation, set on first fit_transform
-        # Frozen Mach centring/scaling reference, set on the first fit_transform and
-        # shared with the torch path via library_spec. Mach spans only ~8.5-10.3 over a
-        # glide (a 19% relative range), so an UNCENTRED factor M makes (base*M) a
-        # rescaled copy of base -- measured correlation 0.9999, i.e. rank-deficient and
-        # useless to sparse regression. Centring on the training-set mean makes the
-        # column encode the Mach VARIATION (the actual C_L(Mach) dependence), dropping
-        # the correlation to ~0.995. The reference must be FROZEN, not recomputed per
-        # call, or the numpy (discovery) and torch (model) columns would disagree.
-        self.mach_ref_ = None   # (mean, std)
-        self.pos_idx = tuple(int(i) for i in pos_idx)
-        self.vel_idx = tuple(int(i) for i in vel_idx)
+from NEXT_geodesic_frame import (
+    ecef_to_local_geodesic_vec as ecef_to_local_geodesic_vec_frame_trick,
+    local_geodesic_to_ecef_vec as local_geodesic_to_ecef_vec_frame_trick,
+)
+from torchdiffeq_solver import TorchdiffeqSolver
+from trajectory_helpers import (
+    ACC_SLICE,
+    DOWN_DOT_INDEX,
+    DOWN_INDEX,
+    GR_DOT_INDEX,
+    GR_INDEX,
+    POS_SLICE,
+    THETA_DOT_INDEX,
+    TIME_INDEX,
+    VEL_SLICE,
+    check_time_series,
+    resample_traj_data,
+)
 
-        # (name, kind, scale_height_or_None)
-        self.terms: list[tuple[str, str, float | None]] = []
-        if self.include_bias:
-            self.terms.append(("1", "bias", None))
-        self.terms.append(("gravity", "gravity", None))
-        self.terms.append(("curv_vs2", "curv", None))
-        for H in self.scale_heights:
-            # IMPORTANT -- avoid degenerate columns. In the in-plane 3-DoF form,
-            # drag_s = -q*v_s/V and lift_h = -q*v_s/V are the SAME column, and
-            # drag_h = -q*v_h/V is the negative of lift_s. Offering all four makes the
-            # regression rank-deficient: coefficients split arbitrarily between exact
-            # duplicates (observed as identical coefficients on paired terms). Offer
-            # only the two independent in-plane aero directions, plus the lateral term.
-            self.terms.append((f"aero_along@H={int(H)}", "drag_s", H))   # ~ -q*v_s/V
-            self.terms.append((f"aero_vert@H={int(H)}", "drag_h", H))    # ~ -q*v_h/V
-            self.terms.append((f"aero_q@H={int(H)}", "lat_aero", H))     # ~  q (bank/lateral)
-            # Mach-scaled replicas: (base aero) * M^k. Together with the k=0 base
-            # column above, sparse regression can build a Mach polynomial for each
-            # aerodynamic coefficient instead of being forced to a single constant.
-            for k in self.mach_powers:
-                self.terms.append((f"aero_along*M{k}@H={int(H)}", f"drag_s_m{k}", H))
-                self.terms.append((f"aero_vert*M{k}@H={int(H)}", f"drag_h_m{k}", H))
-                self.terms.append((f"aero_q*M{k}@H={int(H)}", f"lat_aero_m{k}", H))
-        if self.include_linear_velocity:
-            # v_s is nearly collinear with the aero columns on glide data (both track
-            # speed), so it is excluded; v_h and v_al add independent information.
-            self.terms.append(("v_h", "lin_vh", None))
-            self.terms.append(("v_al", "lin_va", None))
-
-        if self.include_frame_transport:
-            # Polar-frame transport terms (mandatory kinematics of this frame).
-            #   centripetal : s * v_alpha^2      -> feeds dv_s/dt
-            #   transport   : v_s * v_alpha / s  -> feeds dv_alpha/dt (the -2 v_r w / r term)
-            # Rotating-Earth (f-plane) Coriolis, azimuth-independent components:
-            #   cor_along   : v_l = s * v_alpha  -> feeds dv_s/dt   (coefficient ~ -f)
-            #   cor_turn    : v_s / s            -> feeds dv_alpha/dt (coefficient ~ +f)
-            # NOTE: a "total horizontal speed" curvature column
-            # (v_s^2 + v_l^2)/(Re+h) was evaluated and REJECTED: on glide data it is
-            # 0.998-collinear with the existing curv_vs2 (v_l ~ 137 m/s vs v_s ~ 5200
-            # m/s, a 0.07% correction), so it only adds rank deficiency. The library
-            # docstring's own warning about degenerate columns applies.
-            self.terms.append(("centripetal_s", "centripetal", None))
-            self.terms.append(("transport_va", "transport", None))
-            self.terms.append(("cor_along", "cor_along", None))
-            self.terms.append(("cor_turn", "cor_turn", None))
-
-        if self.include_flight_path_angle:
-            self.terms.append(("gamma", "gamma", None))
-            self.terms.append(("sin_gamma", "sin_gamma", None))
-            self.terms.append(("cos_gamma", "cos_gamma", None))
-
-        if self.include_guidance_terms:
-            # ProNav lateral command: -N * v_s * v_alpha. Coefficient magnitude
-            # should read out as the navigation constant N if the vehicle flies it.
-            self.terms.append(("pronav", "pronav", None))
-
-    # ------------------------------------------------------------- interface
-
-    def term_names(self) -> list[str]:
-        return [t[0] for t in self.terms]
-
-    def term_combos(self, n_features: int | None = None) -> list:
-        """Bias reported as the empty tuple so callers can locate it; rest opaque."""
-        return [() if t[1] == "bias" else None for t in self.terms]
-
-    @property
-    def n_terms(self) -> int:
-        return len(self.terms)
-
-    def library_spec(self) -> dict:
-        return {
-            "kind": "eom",
-            "state_vector_len": self.state_vector_len,
-            "terms": [(n, k, H) for (n, k, H) in self.terms],
-            "h_idx": self.h_idx, "vs_idx": self.vs_idx,
-            "va_idx": self.va_idx, "vh_idx": self.vh_idx,
-            "h_sign": self.h_sign,
-            "s_idx": self.s_idx,
-            "s_floor": self.s_floor,
-            "mach_ref": None if self.mach_ref_ is None else list(self.mach_ref_),
-            "earth_radius": self.earth_radius,
-            "feature_mean": None if self.feature_mean is None else self.feature_mean.tolist(),
-            "feature_scale": None if self.feature_scale is None else self.feature_scale.tolist(),
-            "clip": self.clip,
-            "col_scale": None if self.col_scale_ is None else list(self.col_scale_),
-            "poly_combos": [],
-            "physics_terms": [],
-        }
-
-    # ------------------------------------------------------------ evaluation
-
-    def _to_physical(self, Y: np.ndarray) -> np.ndarray:
-        if self.feature_mean is None or self.feature_scale is None:
-            return Y
-        return Y * self.feature_scale + self.feature_mean
-
-    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
-        n = Y.shape[0]
-        P = self._to_physical(Y)
-        h = self.h_sign * P[:, self.h_idx]  # true altitude, positive up
-        vs = P[:, self.vs_idx]
-        va = P[:, self.va_idx]
-        vh = P[:, self.vh_idx]
-
-        V = np.sqrt(vs * vs + vh * vh + _V_EPS)
-        Re = self.earth_radius
-        g = G0 * (Re / (Re + h)) ** 2
-
-        # Mach proxy for the Mach-dependent aero columns.
-        T = np.where(h < 11000.0, T_SEA - T_LAPSE * h,
-                     np.where(h < 20000.0, T_TROPO, T_TROPO + 0.001 * (h - 20000.0)))
-        T = np.clip(T, T_MIN, T_MAX)
-        mach = V / np.sqrt(GAMMA_AIR * R_SPECIFIC * T)
-        if self.mach_powers:
-            if self.mach_ref_ is None:
-                _mu = float(np.mean(mach))
-                _sd = float(np.std(mach))
-                self.mach_ref_ = (_mu, _sd if _sd > 1e-9 else 1.0)
-            mach = (mach - self.mach_ref_[0]) / self.mach_ref_[1]
-
-        cols = np.empty((n, self.n_terms), dtype=float)
-        # Guarded radius and tangential velocity, shared by the transport columns.
-        s_raw = P[:, self.s_idx] if self.s_idx < P.shape[1] else np.zeros(n)
-        s_g = np.where(np.abs(s_raw) < self.s_floor,
-                       np.sign(s_raw) * self.s_floor + (s_raw == 0) * self.s_floor,
-                       s_raw)
-        v_l = s_g * va  # tangential velocity implied by the scaled angular rate
-        # Flight-path angle: angle of the velocity vector above/below horizontal.
-        v_horiz = np.sqrt(vs * vs + v_l * v_l + _V_EPS)
-        gamma = np.arctan2(vh, v_horiz)
-
-        for j, (_, kind, H) in enumerate(self.terms):
-            if kind == "bias":
-                cols[:, j] = 1.0
-            elif kind == "gravity":
-                cols[:, j] = -g
-            elif kind == "curv":
-                cols[:, j] = vs * vs / (Re + h)
-            elif kind == "centripetal":
-                cols[:, j] = s_g * va * va
-            elif kind == "transport":
-                cols[:, j] = vs * va / s_g
-            elif kind == "cor_along":
-                cols[:, j] = v_l
-            elif kind == "cor_turn":
-                cols[:, j] = vs / s_g
-            elif kind == "gamma":
-                cols[:, j] = gamma
-            elif kind == "sin_gamma":
-                cols[:, j] = np.sin(gamma)
-            elif kind == "cos_gamma":
-                cols[:, j] = np.cos(gamma)
-            elif kind == "pronav":
-                cols[:, j] = -vs * va
-            elif kind == "curv_horiz":
-                cols[:, j] = (vs * vs + v_l * v_l) / (Re + h)
-            elif kind == "lin_vs":
-                cols[:, j] = vs
-            elif kind == "lin_vh":
-                cols[:, j] = vh
-            elif kind == "lin_va":
-                cols[:, j] = va
-            else:
-                rho = np.exp(np.minimum(-h / H, _EXP_ARG_MAX))
-                q = 0.5 * rho * V * V
-                if kind == "drag_s":
-                    cols[:, j] = -q * vs / V
-                elif kind == "drag_h":
-                    cols[:, j] = -q * vh / V
-                elif kind == "lift_s":
-                    cols[:, j] = q * vh / V
-                elif kind == "lift_h":
-                    cols[:, j] = -q * vs / V
-                elif kind == "lat_aero":
-                    cols[:, j] = q
-                elif kind.startswith(("drag_s_m", "drag_h_m", "lat_aero_m")):
-                    base, _, kpow = kind.rpartition("_m")
-                    mk = mach ** int(kpow)
-                    if base == "drag_s":
-                        cols[:, j] = -q * vs / V * mk
-                    elif base == "drag_h":
-                        cols[:, j] = -q * vh / V * mk
-                    else:  # lat_aero
-                        cols[:, j] = q * mk
-                else:
-                    raise ValueError(f"unknown EOM term kind: {kind}")
-
-        # Freeze per-column RMS on the first (training) call, then always normalise
-        # and clip. Same reasoning as the physics library: exp(-h/H) is unbounded
-        # outside the training envelope and would otherwise destabilise a rollout
-        # that wanders below it.
-        if self.col_scale_ is None:
-            rms = np.sqrt(np.mean(cols ** 2, axis=0))
-            rms[~np.isfinite(rms) | (rms <= 0)] = 1.0
-            self.col_scale_ = rms
-        return np.clip(cols / self.col_scale_, -self.clip, self.clip)
+# Hybrid Continuous-Time Extensions
+from ensemble_sindy import (
+    EnsembleSINDyDiscoverer,
+    SINDyPhysicsModel,
+    build_physics_constraints,
+)
+from physics_library import PhysicsInformedLibrary
+from eom_library import EOMLibrary
+from sindy_standalone import (
+    library_term_names,
+    format_sindy_equations,
+    physics_recovery_report,
+    evaluate_sindy,
+    format_evaluation,
+    stability_score,
+    stability_rank_key,
+)
+from aphynity_gru_ode import APHYNITYGRUODEPredictorModel
+from aphynity_node import APHYNITYNODEPredictorModel
+from aphynity_loss import APHYNITYAdaptiveLossWrapper
 
 
-def evaluate_eom_library_torch(y, spec: dict):
-    """Torch mirror of `EOMLibrary.fit_transform` (identical column order)."""
-    import torch
+HAVE_HIGH_MEMORY = False
+if psutil.virtual_memory().total > 64e9:
+    HAVE_HIGH_MEMORY = True
 
-    mean, scale = spec.get("feature_mean"), spec.get("feature_scale")
-    if mean is not None and scale is not None:
-        mean_t = torch.as_tensor(mean, dtype=y.dtype, device=y.device)
-        scale_t = torch.as_tensor(scale, dtype=y.dtype, device=y.device)
-        P = y * scale_t + mean_t
-    else:
-        P = y
+HAVE_GPU = False
+if torch.cuda.device_count() != 0:
+    HAVE_GPU = True
+    print("there is a gpu in this node")
+    for i in range(torch.cuda.device_count()):
+        print(torch.cuda.get_device_properties(i))
 
-    hi, vsi, vai, vhi = spec["h_idx"], spec["vs_idx"], spec["va_idx"], spec["vh_idx"]
-    # Default +1.0 preserves the behaviour of specs written before h_sign existed.
-    h_sign = float(spec.get("h_sign", 1.0))
-    h = h_sign * P[..., hi : hi + 1]
-    vs = P[..., vsi : vsi + 1]
-    va = P[..., vai : vai + 1]
-    vh = P[..., vhi : vhi + 1]
-    V = torch.sqrt(vs * vs + vh * vh + _V_EPS)
-    Re = spec["earth_radius"]
-    g = G0 * (Re / (Re + h)) ** 2
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
 
-    # Mach proxy -- must mirror the numpy path exactly.
-    T = torch.where(h < 11000.0, T_SEA - T_LAPSE * h,
-                    torch.where(h < 20000.0,
-                                torch.full_like(h, T_TROPO),
-                                T_TROPO + 0.001 * (h - 20000.0)))
-    T = torch.clamp(T, min=T_MIN, max=T_MAX)
-    mach = V / torch.sqrt(GAMMA_AIR * R_SPECIFIC * T)
-    _mref = spec.get("mach_ref")
-    if _mref is not None:
-        mach = (mach - float(_mref[0])) / float(_mref[1])
+BUCKET_SIZE = 5000  # [m]
 
-    # Guarded radius / tangential velocity for the polar-transport columns.
-    s_idx = spec.get("s_idx", 0)
-    s_floor = float(spec.get("s_floor", 5000.0))
-    s_raw = P[..., s_idx : s_idx + 1]
-    s_sign = torch.where(s_raw < 0, -torch.ones_like(s_raw), torch.ones_like(s_raw))
-    s_g = torch.where(torch.abs(s_raw) < s_floor, s_sign * s_floor, s_raw)
-    v_l = s_g * va
-    v_horiz = torch.sqrt(vs * vs + v_l * v_l + _V_EPS)
-    gamma = torch.atan2(vh, v_horiz)
 
-    cols = []
-    for (_, kind, H) in spec["terms"]:
-        if kind == "bias":
-            cols.append(torch.ones_like(h))
-        elif kind == "gravity":
-            cols.append(-g)
-        elif kind == "curv":
-            cols.append(vs * vs / (Re + h))
-        elif kind == "centripetal":
-            cols.append(s_g * va * va)
-        elif kind == "transport":
-            cols.append(vs * va / s_g)
-        elif kind == "cor_along":
-            cols.append(v_l)
-        elif kind == "cor_turn":
-            cols.append(vs / s_g)
-        elif kind == "gamma":
-            cols.append(gamma)
-        elif kind == "sin_gamma":
-            cols.append(torch.sin(gamma))
-        elif kind == "cos_gamma":
-            cols.append(torch.cos(gamma))
-        elif kind == "pronav":
-            cols.append(-vs * va)
-        elif kind == "curv_horiz":
-            cols.append((vs * vs + v_l * v_l) / (Re + h))
-        elif kind == "lin_vs":
-            cols.append(vs)
-        elif kind == "lin_vh":
-            cols.append(vh)
-        elif kind == "lin_va":
-            cols.append(va)
+class ODEfunc(torch.nn.Module):
+    def __init__(self, state_vector_len: int, nhidden: int, aug_dim: int = 0, order_shift_slice: slice | None = None):
+        super(ODEfunc, self).__init__()
+        self.order_shift_slice = order_shift_slice
+        self.len_of_order_shift_slice = 0
+        if self.order_shift_slice is not None:
+            order_indicies = tuple(range(*self.order_shift_slice.indices(state_vector_len)))
+            self.len_of_order_shift_slice = len(order_indicies)
+        self.act1 = torch.nn.SiLU(inplace=False)
+        self.act2 = torch.nn.SiLU(inplace=False)
+        self.fc1 = torch.nn.Linear(state_vector_len + aug_dim, nhidden)
+        self.fc2 = torch.nn.Linear(nhidden, nhidden)
+        self.fc4 = torch.nn.Linear(nhidden, (state_vector_len - self.len_of_order_shift_slice) + aug_dim)
+        self.nfe = 0
+
+    def forward(self, t, x: torch.Tensor) -> torch.Tensor:
+        if self.order_shift_slice is not None:
+            v = torch.narrow(x, dim=-1, start=self.order_shift_slice.start, length=self.len_of_order_shift_slice)
+        self.nfe += 1
+        out = self.fc1(x)
+        out = self.act1(out)
+        out = self.fc2(out)
+        out = self.act2(out)
+        out = self.fc4(out)
+        if self.order_shift_slice is not None:
+            return torch.cat((v, out), dim=x.ndim - 1)
         else:
-            rho = torch.exp(torch.clamp(-h / H, max=_EXP_ARG_MAX))
-            q = 0.5 * rho * V * V
-            if kind == "drag_s":
-                cols.append(-q * vs / V)
-            elif kind == "drag_h":
-                cols.append(-q * vh / V)
-            elif kind == "lift_s":
-                cols.append(q * vh / V)
-            elif kind == "lift_h":
-                cols.append(-q * vs / V)
-            elif kind == "lat_aero":
-                cols.append(q)
-            elif kind.startswith(("drag_s_m", "drag_h_m", "lat_aero_m")):
-                base, _, kpow = kind.rpartition("_m")
-                mk = mach ** int(kpow)
-                if base == "drag_s":
-                    cols.append(-q * vs / V * mk)
-                elif base == "drag_h":
-                    cols.append(-q * vh / V * mk)
-                else:
-                    cols.append(q * mk)
-            else:
-                raise ValueError(f"unknown EOM term kind: {kind}")
+            return out
 
-    out = torch.cat(cols, dim=-1)
-    cs = spec.get("col_scale")
-    clip = float(spec.get("clip", 8.0))
-    if cs is not None:
-        cs_t = torch.as_tensor(cs, dtype=out.dtype, device=out.device)
-        out = torch.clamp(out / cs_t, -clip, clip)
+
+def _parse_mach_powers(spec: str):
+    """Parse '--eom-mach-powers 1,2' into (1, 2); empty string -> ()."""
+    if not spec:
+        return ()
+    out = []
+    for tok in str(spec).replace(" ", "").split(","):
+        if tok:
+            try:
+                k = int(tok)
+            except ValueError:
+                raise SystemExit(f"--eom-mach-powers: '{tok}' is not an integer")
+            if k != 0:
+                out.append(k)
+    return tuple(out)
+
+
+def frame_index_map(frame: str, model_states: int) -> dict:
+    """Map a frame's state layout onto the physics libraries' semantic channels.
+
+    The physics/EOM libraries need to know WHICH state column is altitude, which
+    is along-track speed, which is the lateral/turn channel and which is vertical
+    speed. Those positions differ per frame. Previously they were hardcoded to the
+    5-state geodesic layout (h@1, v_s@2, v_al@3, v_h@4) for EVERY frame, so in any
+    other frame the library silently computed physics terms on the wrong columns.
+
+    Layouts (model state = the truth table with its leading time column dropped):
+
+      geodesic-integrated (5): [s, h, v_s, v_alpha, v_h]
+      geodesic-original   (6): [s, az, h, v_s, v_alpha, v_h]
+      grdth               (5): [GR, Down, dotGR, dotD, VTheta]
+      dcu                 (6): [Downrange, Cross, Up, dotDR, dotCross, dotUp]
+
+    Two frame-specific subtleties this encodes:
+
+    * grdth stores NED **Down** (positive downward) at index 1, so true altitude is
+      its NEGATIVE -> h_sign = -1. Without this, -h/H is large and POSITIVE for the
+      whole glide and every atmosphere column pins against the exponent clip, i.e.
+      the drag/lift basis degenerates to a constant.
+    * grdth's index 3 is dotD (a vertical speed) and index 4 is VTheta (a turn
+      rate) -- the OPPOSITE order to the geodesic frame, so va/vh must be swapped.
+
+    DCU's index 2 is Up (positive up: the NED->DCU rotation's third row is -D), so
+    despite the "Down" label in the plotting column names it needs no sign flip;
+    that label refers to DOWNRANGE.
+    """
+    if frame == "geodesic":
+        if model_states == 5:  # integrated: [s, h, v_s, v_alpha, v_h]
+            return dict(h_idx=1, vs_idx=2, va_idx=3, vh_idx=4, h_sign=1.0)
+        # original: [s, az, h, v_s, v_alpha, v_h]
+        return dict(h_idx=2, vs_idx=3, va_idx=4, vh_idx=5, h_sign=1.0)
+    if frame == "grdth":  # [GR, Down, dotGR, dotD, VTheta]
+        return dict(h_idx=1, vs_idx=2, va_idx=4, vh_idx=3, h_sign=-1.0)
+    if frame == "dcu":  # [Downrange, Cross, Up, dotDR, dotCross, dotUp]
+        return dict(h_idx=2, vs_idx=3, va_idx=4, vh_idx=5, h_sign=1.0)
+    raise ValueError(f"Unknown frame {frame!r}; cannot map physics-library indices.")
+
+
+def train_NEXT(
+    model_name,
+    traj_targets_train,
+    traj_targets_test,
+    scaler_traj,
+    model_save_path,
+    trajectory_dt,
+    batch_size,
+    use_scalar,
+    model_states,
+    aug_dim,
+    nhidden,
+    gpu_index,
+    model_type: str = "node",
+    frame: str = "dcu",
+    window_size: int = 0,
+    window_stride: int = 1,
+    solver_substeps: int = 4,
+    pos_weight: float = 30.0,
+    temporal_weighting: str = "early",
+    sindy_trainable: bool = True,
+    sindy_only: bool = False,
+    sindy_library: str = "polynomial",
+    sindy_scale_heights: tuple = (7200.0,),
+    sindy_scan_scale_heights: tuple = (),
+    sindy_l1_threshold: float = 0.01,
+    sindy_library_bagging: bool = False,
+    sindy_analytic_pos_rows: bool = True,
+    sindy_scan_l1: tuple = (),
+    aphynity_tau2: float = 0.05,
+    aphynity_max_lambda: float = 10.0,
+    aphynity_node_weight: float = 1.0,
+    aphynity_node_norm_mode: str = "sqnorm",
+    aphynity_residual_type: str = "mlp",
+    checkpoint_on_probe: bool = False,
+    probe_discount_gamma: float = 0.99,
+    eom_frame_transport: bool = True,
+    eom_s_floor: float = 5000.0,
+    eom_mach_powers: tuple = (),
+    eom_flight_path_angle: bool = False,
+    eom_guidance_terms: bool = False,
+    sindy_constrain_physics: bool = False,
+    sindy_origin_lat: float = None,
+):
+    training_configuration = TrainingConfiguration(
+        n_epochs=1,
+        optimizer=AdamOptimizer(learning_rate=1e-3),
+        batch_size=batch_size,
+        num_workers=2,
+        verbose=True,
+    )
+
+    # RK4 sub-steps per dt. At dt=1s and ~3-5 km/s, 4 substeps means the vehicle
+    # travels ~1 km per integration step, so truncation error is non-trivial and is
+    # independent of model quality. Raising this reduces integration error at
+    # roughly linear cost. IMPORTANT: the evaluator must use the SAME value
+    # (standalone_direct_evaluator.py --sub-steps), or train/eval dynamics differ.
+    ode_solver = TorchdiffeqSolver(
+        dt=trajectory_dt, method="rk4", adjoint=False, substeps=solver_substeps
+    )
+
+    if frame == "dcu":
+        velocity_indicies = (3, 4, 5)
+    elif frame in ("grdth", "geodesic"):
+        velocity_indicies = (2, 3, 4) if model_states == 5 else (3, 4, 5)
+    else:
+        raise ValueError("Unknown frame")
+
+    # Monitor physical trajectory loss for early stopping
+    early_stop_metric_name = "val_traj_loss" if model_type in ("aphynity-gruode", "aphynity-node") else "val_loss"
+
+    loss_func = WrappedMSELoss(
+        height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+        vel_indices=velocity_indicies,
+        scaler=scaler_traj if use_scalar else None,
+        N_FEATURES=model_states,
+        position_loss_weight=80.0,
+        l2_reg=1e-4,
+    )
+
+    node = NODEPredictor(
+        architecture=FFNNArchitecture(layer_channels=[5, 5], layer_activation=Activation.SILU),
+        training_configuration=training_configuration,
+        solver=ode_solver,
+        logging_interval=5,
+        loss_func=loss_func,
+        early_stopper=EarlyStopper(60, 1e-2, metric_name=early_stop_metric_name),
+        checkpoint=ModelCheckpoint(min_epochs=1, directory=model_save_path, model_name=model_name + ".checkpoint"),
+        aug_dim=aug_dim,
+    )
+
+    # Separate checkpoint keyed on the DISCOUNTED rollout probe. It writes its own
+    # .pt (…_probe.checkpoint.pt) so both the val-loss-selected and probe-selected
+    # models exist after training; --checkpoint-on-probe decides which is promoted
+    # to the deployed model_name below.
+    probe_checkpoint = ModelCheckpoint(
+        min_epochs=1, directory=model_save_path, model_name=model_name + "_probe.checkpoint"
+    )
+
+    if HAVE_GPU:
+        node.device = torch.device(f"cuda:{gpu_index}")
+        node._initialize_losses(node.criterion)
+        node._initialize_model()
+        node._initialize_optimizer()
+
+    latent_dim = max(2 * model_states, nhidden // 2 if nhidden >= 20 else 16)
+    if model_type in ("gruode", "aphynity-gruode", "aphynity-node"):
+        enc_in_idx = None
+
+        # The GRU-ODE func/latent is only for the gruode variants. aphynity-node
+        # integrates the physical state directly (f_phys(y) + MLP(y)), so it has no
+        # latent func to build.
+        gruode_func = None
+        if model_type in ("gruode", "aphynity-gruode"):
+            gruode_func = GRUODEFunc(
+                state_vector_len=model_states,
+                nhidden=nhidden,
+                latent_dim=latent_dim,
+                minimal=False,
+                encoder_input_idx=enc_in_idx,
+                encoder_dropout=0.1,
+                cell_input_size=model_states,
+            ).to(node.device)
+
+        if frame == "dcu" or (frame == "geodesic" and model_states == 6):
+            pos_idx, vel_idx = [0, 1, 2], [3, 4, 5]
+        elif frame == "geodesic" and model_states == 5:
+            pos_idx, vel_idx = [0, 1], [2, 4]
+        elif frame == "grdth":
+            pos_idx, vel_idx = [0, 1], [2, 3]
+        else:
+            pos_idx, vel_idx = None, None
+
+        so_pos_scale = so_vel_scale = so_vel_mean = None
+        if use_scalar and pos_idx is not None and isinstance(scaler_traj, StandardScaler):
+            so_pos_scale = scaler_traj.scale_[pos_idx]
+            so_vel_scale = scaler_traj.scale_[vel_idx]
+            so_vel_mean = scaler_traj.mean_[vel_idx]
+
+        base_physics_loss = PhysicsSplitMSELoss(
+            height_idx=(2 if (frame == "dcu" or (frame == "geodesic" and model_states == 6)) else 1),
+            pos_indices=pos_idx,
+            vel_indices=vel_idx,
+            dt=trajectory_dt,
+            # Rebalanced from the original pos_weight=80, under which the three
+            # velocity/rate channels received only ~1.8% of the total loss. Position
+            # is the time-integral of velocity, so underfit velocity gives position
+            # error growing linearly with rollout horizon. 30:1 is a deliberately
+            # MODEST step from 80:1 (velocity share ~1.8% -> ~5%) so the change can be
+            # evaluated without also shifting the overall loss magnitude much;
+            # tune with --pos-weight.
+            pos_weight=pos_weight,
+            vel_weight=1.0,
+            rate_weight=1.0,  # v_alpha: previously left at an accidental default
+            physics_weight=0.25,
+            scaler=scaler_traj if use_scalar else None,
+            N_FEATURES=model_states,
+            l2_reg=1e-6,
+            # Weight EARLY timesteps more: in an autoregressive rollout early errors
+            # compound into all later steps. The original ramp (1 -> 4) emphasised late
+            # steps, which is backwards for compounding dynamics. Note this ramp is
+            # mean-normalised (the original was not, silently multiplying the loss by
+            # ~2.5), so loss magnitudes are comparable across settings.
+            temporal_weighting=temporal_weighting,
+        )
+
+        if model_type in ("aphynity-gruode", "aphynity-node"):
+            print("\n--- Running Ensemble-SINDy Governing Equation Discovery ---")
+            if use_scalar:
+                sindy_train_data = [scaler_traj.transform(t.numpy()[:, 0 : model_states + 1])[:, :model_states] for t in traj_targets_train]
+            else:
+                sindy_train_data = [t.numpy()[:, 1 : model_states + 1] for t in traj_targets_train]
+
+            # Validation trajectories and the kinematic-override constants, prepared
+            # up front so the hyper-parameter scans below can score candidates by
+            # how well they ROLL OUT (the metric that actually matters for a
+            # backbone) rather than only by one-step R^2.
+            if use_scalar:
+                _val_data = [
+                    scaler_traj.transform(t_.numpy()[:, 0 : model_states + 1])[:, :model_states]
+                    for t_ in traj_targets_test
+                ]
+            else:
+                _val_data = [t_.numpy()[:, 1 : model_states + 1] for t_ in traj_targets_test]
+
+            _ratio = _offset = None
+            if so_pos_scale is not None and so_vel_scale is not None:
+                _ratio = np.asarray(so_vel_scale) / np.asarray(so_pos_scale)
+                _offset = (np.asarray(so_vel_mean) / np.asarray(so_pos_scale)
+                           if so_vel_mean is not None else np.zeros_like(_ratio))
+
+            def _score_stability(_disc, _Xi):
+                """Roll the candidate out on validation flights and score stability."""
+                try:
+                    return stability_score(
+                        _disc.library_builder, _Xi, _val_data, scaler_traj,
+                        dt=trajectory_dt, substeps=solver_substeps,
+                        pos_idx=tuple(pos_idx), vel_idx=tuple(vel_idx),
+                        so_ratio=_ratio, so_offset=_offset,
+                    )
+                except Exception:
+                    return {"frac_diverged": 1.0, "n_diverged": -1, "n_trajectories": 0,
+                            "median_pos_err_m": float("nan"), "mean_pos_err_m": float("nan"),
+                            "worst_pos_err_m": float("nan")}
+
+            # Candidate library. "physics" adds atmosphere/drag/curvature terms that a
+            # polynomial basis cannot express (drag ~ rho(h)*V^2, rho exponential in h).
+            feat_mean = scaler_traj.mean_ if use_scalar else None
+            feat_scale = scaler_traj.scale_ if use_scalar else None
+
+            # Resolve the frame's semantic channel positions ONCE, so the numpy
+            # discovery library and the torch model library cannot disagree.
+            _fidx = frame_index_map(frame, model_states)
+            print(
+                f"[FRAME-IDX] frame={frame} states={model_states} -> "
+                f"h@{_fidx['h_idx']} v_s@{_fidx['vs_idx']} v_al@{_fidx['va_idx']} "
+                f"v_h@{_fidx['vh_idx']} h_sign={_fidx['h_sign']:+.0f}"
+            )
+
+            def _build_library(scale_heights):
+                if sindy_library == "eom":
+                    # Known equations of motion: gravity, drag, lift, curvature.
+                    # Only the aero coefficients are free (~6-11 columns), instead of
+                    # rediscovering Newton from an 85-term polynomial library.
+                    return EOMLibrary(
+                        state_vector_len=model_states,
+                        h_idx=_fidx["h_idx"], vs_idx=_fidx["vs_idx"],
+                        va_idx=_fidx["va_idx"], vh_idx=_fidx["vh_idx"],
+                        h_sign=_fidx["h_sign"],
+                        s_idx=(pos_idx[0] if pos_idx else 0),
+                        include_frame_transport=eom_frame_transport,
+                        s_floor=eom_s_floor,
+                        mach_powers=tuple(eom_mach_powers),
+                        include_flight_path_angle=eom_flight_path_angle,
+                        include_guidance_terms=eom_guidance_terms,
+                        scale_heights=tuple(scale_heights),
+                        feature_mean=feat_mean, feature_scale=feat_scale,
+                        pos_idx=tuple(pos_idx), vel_idx=tuple(vel_idx),
+                    )
+                if sindy_library not in ("physics", "physics-stable"):
+                    return None
+                return PhysicsInformedLibrary(
+                    state_vector_len=model_states,
+                    degree=2,
+                    h_idx=_fidx["h_idx"], vs_idx=_fidx["vs_idx"],
+                    va_idx=_fidx["va_idx"], vh_idx=_fidx["vh_idx"],
+                    h_sign=_fidx["h_sign"],
+                    scale_heights=tuple(scale_heights),
+                    feature_mean=feat_mean,
+                    feature_scale=feat_scale,
+                    pos_idx=tuple(pos_idx),
+                    vel_idx=tuple(vel_idx),
+                    # "physics-stable" forbids positional positive-feedback polynomial
+                    # terms (h*h, h*v_s, s*v_s, ...) that fit one-step but blow up a
+                    # long rollout, keeping only physically-admissible candidates
+                    # (gravity, restoring drag/atmosphere, damping velocity products).
+                    poly_mode=("stable" if sindy_library == "physics-stable" else "full"),
+                )
+
+            def _relative_contribution(disc, Xi_, n_poly, cols):
+                """|coef| * ||column|| / ||target||: dimensionless, scale-free."""
+                cn = disc.column_norms_[:, None]
+                tn = np.where(disc.target_norms_ > 0, disc.target_norms_, 1.0)[None, :]
+                rc = np.abs(Xi_) * cn / tn
+                return rc[n_poly:, cols] if n_poly < rc.shape[0] else rc[:0, cols]
+
+            def _run_discovery(scale_heights):
+                lib = _build_library(scale_heights)
+                d = EnsembleSINDyDiscoverer(
+                    degree=2, n_bootstraps=50, subsample_ratio=1.0,
+                    l1_threshold=sindy_l1_threshold, inclusion_prob_threshold=0.6,
+                    aggregation="bragging", pos_idx=pos_idx, vel_idx=vel_idx,
+                    pos_scale=so_pos_scale, vel_scale=so_vel_scale, vel_mean=so_vel_mean,
+                    library=lib, library_bagging=sindy_library_bagging,
+                    analytic_position_rows=sindy_analytic_pos_rows,
+                )
+                # Equality constraints on the coefficients theory fixes exactly.
+                # Attached before fit() so every bootstrap enforces them.
+                if sindy_constrain_physics:
+                    try:
+                        d.physics_constraints = build_physics_constraints(
+                            library_term_names(lib, model_states),
+                            library=lib,
+                            origin_lat_deg=sindy_origin_lat,
+                        )
+                    except Exception as _ce:
+                        print(f"[SINDy] constraint setup skipped: {_ce}")
+                Xi_, ip_ = d.fit(sindy_train_data, dt=trajectory_dt)
+                return Xi_, ip_, lib
+
+            # Sparsity scan. l1_threshold -- not library bagging -- is the primary
+            # per-cell sparsity control; library bagging prunes the candidate SET
+            # (reducing collinearity) but can over-prune and cost fit quality.
+            if sindy_scan_l1:
+                acc_l1 = sorted(set(range(model_states)) - set(pos_idx or []))
+                print("\n[SINDy scan] l1_threshold sweep")
+                print("  Ranked by ROLLOUT STABILITY, not R2. R2 measures one-step fit and")
+                print("  does not predict whether the equation stays bounded when integrated:")
+                print("  positive-feedback terms (h*h, h*v_s) can give a high R2 and still")
+                print("  explode over hundreds of steps. Fewest divergences wins, then lowest")
+                print("  median rollout error. R2 is shown for context only.")
+                print(f"  {'l1':>8} {'active':>8} {'%dense':>8} {'meanR2':>9}"
+                      f" {'diverged':>10} {'medianErr_m':>13} {'worstErr_m':>13}")
+                _l1_results = []
+                for _l1 in sindy_scan_l1:
+                    _lb = _build_library(list(sindy_scale_heights))
+                    _d = EnsembleSINDyDiscoverer(
+                        degree=2, n_bootstraps=50, subsample_ratio=1.0,
+                        l1_threshold=_l1, inclusion_prob_threshold=0.6,
+                        aggregation="bragging", pos_idx=pos_idx, vel_idx=vel_idx,
+                        pos_scale=so_pos_scale, vel_scale=so_vel_scale,
+                        vel_mean=so_vel_mean, library=_lb,
+                        library_bagging=sindy_library_bagging,
+                        analytic_position_rows=sindy_analytic_pos_rows,
+                    )
+                    _Xi, _ = _d.fit(sindy_train_data, dt=trajectory_dt)
+                    _a = int((np.abs(_Xi) > 1e-8).sum())
+                    _r2 = float(np.mean(_d.r2_[acc_l1]))
+                    _sc = _score_stability(_d, _Xi)
+                    _l1_results.append((_l1, _a, _r2, _sc))
+                    print(f"  {_l1:>8.3f} {_a:>8d} {_a/_Xi.size:>7.0%} {_r2:>9.4f}"
+                          f" {(str(_sc['n_diverged']) + '/' + str(_sc['n_trajectories'])):>10}"
+                          f" {_sc['median_pos_err_m']:>13.1f} {_sc['worst_pos_err_m']:>13.1f}")
+
+                if _l1_results:
+                    _best = sorted(_l1_results, key=lambda r: stability_rank_key(r[3]))[0]
+                    print(f"  -> most STABLE backbone: l1 = {_best[0]:.3f} "
+                          f"({_best[1]} terms, R2 {_best[2]:.4f}, "
+                          f"{_best[3]['n_diverged']}/{_best[3]['n_trajectories']} diverged, "
+                          f"median {_best[3]['median_pos_err_m']:.1f} m)")
+                    if _best[3]["frac_diverged"] > 0:
+                        print("  NOTE: every candidate still diverges on at least one flight. "
+                              "Sparsity alone cannot fix this -- the instability comes from "
+                              "WHICH terms are present (positive-feedback polynomials that "
+                              "survive because they carry the fit), not from how many.")
+
+            # Scan mode: the generating atmosphere model may be unknown. Fitting each
+            # candidate scale height SEPARATELY avoids the collinearity trap (nearby
+            # exponentials are near-duplicates; bootstrap selection flips between them
+            # and every inclusion probability falls below threshold, zeroing them all).
+            if sindy_scan_scale_heights:
+                acc_cols_scan = sorted(set(range(model_states)) - set(pos_idx or []))
+                print("\n[SINDy scan] separate fit per scale height "
+                      "(higher mean R2 on acceleration channels = better basis)")
+                print(f"  {'H (m)':>8} {'active':>8} {'meanR2':>9}"
+                      f" {'diverged':>10} {'medianErr_m':>13} {'worstErr_m':>13}")
+                # Was never initialised -> NameError on the first append, making
+                # --sindy-scan-scale-heights unusable. The header above is also
+                # corrected to match the columns actually printed in the loop.
+                _h_results = []
+                for H in sindy_scan_scale_heights:
+                    lib_h = _build_library([H])
+                    d_h = EnsembleSINDyDiscoverer(
+                        degree=2, n_bootstraps=50, subsample_ratio=1.0,
+                        l1_threshold=sindy_l1_threshold, inclusion_prob_threshold=0.6,
+                        aggregation="bragging", pos_idx=pos_idx, vel_idx=vel_idx,
+                        pos_scale=so_pos_scale, vel_scale=so_vel_scale,
+                        vel_mean=so_vel_mean, library=lib_h,
+                        library_bagging=sindy_library_bagging,
+                        analytic_position_rows=sindy_analytic_pos_rows,
+                    )
+                    Xi_h, _ = d_h.fit(sindy_train_data, dt=trajectory_dt)
+                    a = float(np.mean(d_h.r2_[acc_cols_scan])) if acc_cols_scan else 0.0
+                    n_act = int((np.abs(Xi_h) > 1e-8).sum())
+                    sc_h = _score_stability(d_h, Xi_h)
+                    _h_results.append((H, n_act, a, sc_h))
+                    print(f"  {H:>8.0f} {n_act:>8d} {a:>9.4f}"
+                          f" {(str(sc_h['n_diverged']) + '/' + str(sc_h['n_trajectories'])):>10}"
+                          f" {sc_h['median_pos_err_m']:>13.1f} {sc_h['worst_pos_err_m']:>13.1f}")
+
+                _best_h = sorted(_h_results, key=lambda r: stability_rank_key(r[3]))[0]
+                print(f"  -> most STABLE scale height: H = {_best_h[0]:.0f} m "
+                      f"(R2 {_best_h[2]:.4f}, {_best_h[3]['n_diverged']}/"
+                      f"{_best_h[3]['n_trajectories']} diverged, "
+                      f"median {_best_h[3]['median_pos_err_m']:.1f} m)")
+                scale_heights_used = [_best_h[0]]
+            else:
+                scale_heights_used = list(sindy_scale_heights)
+
+            # CRITICAL: one library INSTANCE shared between the fit and the exported
+            # spec. The library freezes RMS normalisation statistics on its first
+            # fit_transform; a second instance would carry physics_scale=None and the
+            # model would then evaluate UNNORMALISED physics columns while Xi was fit
+            # against normalised ones -- a silent train/inference mismatch.
+            _lib_used = _build_library(scale_heights_used)
+            discoverer = EnsembleSINDyDiscoverer(
+                degree=2,
+                n_bootstraps=50,
+                # Paper-aligned: full-size bootstrap (0.632 coverage) and tol=0.6
+                # for data-bootstrap b(r)agging.
+                subsample_ratio=1.0,
+                l1_threshold=sindy_l1_threshold,
+                inclusion_prob_threshold=0.6,
+                aggregation="bragging",
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+                # Required so the velocity identity is expressed correctly when the
+                # SINDy data is in StandardScaler space.
+                pos_scale=so_pos_scale,
+                vel_scale=so_vel_scale,
+                vel_mean=so_vel_mean,
+                library=_lib_used,
+                library_bagging=sindy_library_bagging,
+                analytic_position_rows=sindy_analytic_pos_rows,
+            )
+            Xi_sparse, inclusion_probs = discoverer.fit(sindy_train_data, dt=trajectory_dt)
+            physics_model = SINDyPhysicsModel(
+                Xi_sparse,
+                state_vector_len=model_states,
+                degree=2,
+                trainable=sindy_trainable,
+                library_spec=(_lib_used.library_spec() if _lib_used is not None else None),
+            ).to(node.device)
+            print("Discovered Physics Matrix Xi:\n", Xi_sparse)
+
+            # Discovery diagnostics: is there actually any physics in the
+            # acceleration/rate channels, or only the (overwritten) kinematic rows?
+            acc_cols = sorted(set(range(model_states)) - set(pos_idx or []))
+            n_active = int((np.abs(Xi_sparse) > 1e-8).sum())
+            print(
+                f"[SINDy] active terms: {n_active}/{Xi_sparse.size} | "
+                f"max|coef| per target: {np.round(np.abs(Xi_sparse).max(axis=0), 5)}"
+            )
+            if acc_cols:
+                # Scale-aware: raw |coef| is not comparable across columns whose
+                # magnitudes differ by orders of magnitude (a physical drag column
+                # is ~1e6, a scaled polynomial column ~1). Rank by contribution.
+                _cn = discoverer.column_norms_[:, None]
+                _tn = np.where(discoverer.target_norms_ > 0, discoverer.target_norms_, 1.0)[None, :]
+                _rc = np.abs(Xi_sparse) * _cn / _tn
+                acc_max = float(_rc[:, acc_cols].max())
+                _r2 = discoverer.r2_
+                print(f"[SINDy] R2 per target: {np.round(_r2, 4)}")
+                print(
+                    f"[SINDy] mean R2 on acceleration/rate channels {acc_cols}: "
+                    f"{float(np.mean(_r2[acc_cols])):.4f} | max relative term "
+                    f"contribution {acc_max:.4f}"
+                )
+            print(f"[SINDy] library: {sindy_library} | scale heights: {scale_heights_used}")
+            # One tagged, greppable line so the same command run under each --frame can
+            # be compared directly: which coordinate frame lets the physics explain the
+            # accelerations best (higher R2). Rollout error is in the pure-SINDy summary.
+            try:
+                _fr2 = discoverer.r2_
+                _ftag = f"{frame}" + (f"-{model_states}state" if frame == "geodesic" else "")
+                print(
+                    f"[FRAME-FIT] frame={_ftag} library={sindy_library} "
+                    f"meanR2(acc)={float(np.mean(_fr2[acc_cols])):.4f} "
+                    f"perTarget={np.round(_fr2, 3).tolist()}"
+                )
+            except Exception:
+                pass
+            print(f"[SINDy] physics coefficients trainable: {sindy_trainable}")
+            if _lib_used is not None:
+                _names = _lib_used.term_names()
+                _tgt_default = ["ds/dt", "dh/dt", "dv_s/dt", "dv_al/dt", "dv_h/dt"]
+                # The default labels describe the 5-state geodesic frame. Other frames
+                # (e.g. 6-state DCU / geodesic-original) have a different count, so pad
+                # with generic d(x_i)/dt labels rather than indexing off the end.
+                if Xi_sparse.shape[1] == len(_tgt_default):
+                    _tgt = _tgt_default
+                else:
+                    _tgt = [f"d(x{i})/dt" for i in range(Xi_sparse.shape[1])]
+                _cn2 = discoverer.column_norms_[:, None]
+                _tn2 = np.where(discoverer.target_norms_ > 0, discoverer.target_norms_, 1.0)[None, :]
+                _rc2 = np.abs(Xi_sparse) * _cn2 / _tn2
+                print("[SINDy] top terms per target by relative contribution "
+                      "(|coef|*||col||/||target||):")
+                for _c in range(Xi_sparse.shape[1]):
+                    _ord = np.argsort(-_rc2[:, _c])[:4]
+                    for _r in _ord:
+                        if _rc2[_r, _c] <= 1e-6:
+                            continue
+                        print(f"          {_tgt[_c]:<9} {_names[_r]:<18} "
+                              f"contrib={_rc2[_r, _c]:.4f} coef={Xi_sparse[_r, _c]:+.3e} "
+                              f"ip={inclusion_probs[_r, _c]:.2f}")
+
+            if sindy_only:
+                # ---- Standalone physics-backbone assessment -------------------
+                # Judge the discovered physics BY ITSELF: print the equations, then
+                # integrate f_phys alone (no neural residual) and measure drift from
+                # truth. If the backbone isn't good enough on its own, layering a
+                # residual learner on top has no reason to rescue it.
+                _lib_eval = discoverer.library_builder
+                _term_names = library_term_names(_lib_eval, model_states)
+                _eq_text = format_sindy_equations(
+                    Xi_sparse, _term_names,
+                    min_coef=0.0, inclusion_probs=inclusion_probs,
+                )
+                print("\n=== DISCOVERED SINDy EQUATIONS ===")
+                print(_eq_text)
+
+                # Falsifiable check: the polar-transport and Coriolis columns have
+                # coefficients fixed by theory (-2, +1, +/-f). Recovering them is
+                # direct evidence the discovery found real physics, not a curve fit.
+                # origin_lat_deg is not in scope here, so the report back-solves the
+                # latitude implied by the discovered f -- if that lands near the
+                # scenario's actual impact latitude, the Coriolis term is confirmed.
+                try:
+                    print()
+                    print(physics_recovery_report(
+                        Xi_sparse, _term_names, library=_lib_eval,
+                    ))
+                except Exception as _e:
+                    print(f"[PHYSICS-RECOVERY] skipped: {_e}")
+
+                # Persist so the equations can be diffed against another
+                # implementation term-by-term.
+                try:
+                    _eq_path = os.path.join(model_save_path, model_name + "_equations.txt")
+                    os.makedirs(model_save_path, exist_ok=True)
+                    with open(_eq_path, "w") as _f:
+                        _f.write("# Discovered SINDy equations\n")
+                        _f.write(f"# library={sindy_library} scale_heights={scale_heights_used} "
+                                 f"l1_threshold={sindy_l1_threshold}\n")
+                        _f.write(f"# R2 per target: {np.round(discoverer.r2_, 4).tolist()}\n\n")
+                        _f.write(_eq_text + "\n")
+                    print(f"\n[SINDy] equations written to: {_eq_path}")
+                except Exception as _e:
+                    print(f"[SINDy] could not write equations file: {_e}")
+
+                # Pure-physics rollout on train and validation sets.
+                # (_val_data, _ratio and _offset were prepared before the scans.)
+                print()
+                for _label, _data in (("train", sindy_train_data), ("validation", _val_data)):
+                    try:
+                        _res = evaluate_sindy(
+                            _lib_eval, Xi_sparse, _data, scaler_traj,
+                            dt=trajectory_dt, substeps=solver_substeps,
+                            pos_idx=tuple(pos_idx), vel_idx=tuple(vel_idx),
+                            so_ratio=_ratio, so_offset=_offset,
+                            names=[f"{_label}_{i}" for i in range(len(_data))],
+                        )
+                        print(format_evaluation(_res, _label))
+                        print()
+                    except Exception as _e:
+                        print(f"[SINDy] rollout evaluation failed for {_label}: {_e}")
+
+                print("[--sindy-only] Discovery complete; skipping model training.")
+                return None, None
+
+            if model_type == "aphynity-node":
+                # Ben / paper architecture: f_phys(y) + MLP(y). No latent, 5-dim state.
+                node.model = APHYNITYNODEPredictorModel(
+                    physics_model=physics_model,
+                    n_features=model_states,
+                    pos_idx=pos_idx,
+                    vel_idx=vel_idx,
+                    pos_scale=so_pos_scale,
+                    vel_scale=so_vel_scale,
+                    vel_mean=so_vel_mean,
+                    hidden=nhidden,
+                    n_layers=3,
+                    residual_type=aphynity_residual_type,
+                ).to(node.device)
+                aphynity_is_node = True
+            else:
+                node.model = APHYNITYGRUODEPredictorModel(
+                    func=gruode_func,
+                    physics_model=physics_model,
+                    pos_idx=pos_idx,
+                    vel_idx=vel_idx,
+                    pos_scale=so_pos_scale,
+                    vel_scale=so_vel_scale,
+                    vel_mean=so_vel_mean,
+                    residual_type=("dissipative"
+                                   if aphynity_residual_type == "dissipative"
+                                   else "decode"),
+                ).to(node.device)
+                aphynity_is_node = False
+
+            loss_func = APHYNITYAdaptiveLossWrapper(
+                base_criterion=base_physics_loss,
+                lambda_init=1.0,
+                # The dual update is lambda += tau2 * L_traj, capped at max_lambda.
+                # With tau2=5.0 this pins lambda to its cap within a few epochs
+                # whenever L_traj is O(0.1) or larger, after which lambda*traj_loss
+                # dominates total_loss and training stalls or diverges.
+                # This was previously conditioned on window_size == 0, but the
+                # runaway depends on the LOSS MAGNITUDE, not the window length -- a
+                # window_size=150 run with a rebalanced data loss hit the same cap.
+                # Use the gentle schedule unconditionally; it still lets lambda rise
+                # (it reached ~1.1 over 255 epochs in practice) without overdriving.
+                # tau2 is only meaningful relative to the MAGNITUDE of L_traj
+                # (lambda += tau2 * L_traj). With the corrected ||F_a|| norm the
+                # loss sits at ~4e-3, for which tau2~10 ramps lambda from 1 to ~9
+                # over 200 epochs: the least-action constraint bites early, and the
+                # trajectory term progressively takes over -- the paper's intent.
+                # The earlier tau2=0.05 was a stopgap for an inflated L_traj~1.3 and
+                # leaves the constraint completely inert at the correct scale.
+                tau2=aphynity_tau2,
+                max_lambda=aphynity_max_lambda,
+                node_norm_weight=aphynity_node_weight,
+            )
+            if hasattr(node.model, "node_norm_mode"):
+                node.model.node_norm_mode = aphynity_node_norm_mode
+        else:
+            node.model = GRUODEPredictorModel(
+                func=gruode_func,
+                pos_idx=pos_idx,
+                vel_idx=vel_idx,
+                pos_scale=so_pos_scale,
+                vel_scale=so_vel_scale,
+                vel_mean=so_vel_mean,
+            ).to(node.device)
+            loss_func = base_physics_loss
+
+        if model_type == "aphynity-node":
+            node.aug_dim = 0        # no latent: state vector is the physical state
+            aug_dim = 0
+        else:
+            node.aug_dim = latent_dim
+            aug_dim = latent_dim
+        node._initialize_losses(loss_func)
+
+    if hasattr(node.criterion, "set_model"):
+        node.criterion.set_model(node.model)
+
+    # Prepare trajectory targets...
+    if use_scalar:
+        scaled_traj_targets_train_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_train
+        ]
+        scaled_traj_targets_test_posvel = [
+            torch.Tensor(scaler_traj.transform(i[:, 0 : model_states + 1])) for i in traj_targets_test
+        ]
+    else:
+        scaled_traj_targets_train_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_train]
+        scaled_traj_targets_test_posvel = [torch.Tensor(i[:, 0 : model_states + 1]) for i in traj_targets_test]
+
+    # Full-length validation trajectories, captured BEFORE windowing, so the
+    # free-rollout probe evaluates end-to-end autonomous rollout (the real target)
+    # rather than 150-step teacher-forced windows.
+    full_val_trajectories = [t.clone() for t in scaled_traj_targets_test_posvel]
+
+    if window_size > 0:
+        scaled_traj_targets_train_posvel = make_sliding_windows(
+            scaled_traj_targets_train_posvel, window_size, window_stride
+        )
+        scaled_traj_targets_test_posvel = make_sliding_windows(
+            scaled_traj_targets_test_posvel, window_size, window_stride
+        )
+
+    gen_model = False
+    try:
+        node.load(directory=model_save_path, model_name=model_name)
+    except ValueError:
+        gen_model = True
+    except RuntimeError as _e:
+        # A checkpoint exists but does not match the current model -- almost always a
+        # library-size mismatch from reusing an output directory across runs with
+        # different libraries (e.g. Xi shape [17,5] on disk vs [26,5] now). Retrain
+        # rather than crash; the previous narrow `except ValueError` let this become
+        # a hard failure AFTER a full training run had already completed elsewhere.
+        if "size mismatch" in str(_e) or "state_dict" in str(_e):
+            print(f"[WARN] Existing checkpoint is incompatible with the current "
+                  f"model ({_e.__class__.__name__}: shape mismatch). Ignoring the "
+                  f"stale checkpoint and training from scratch. If you meant to reuse "
+                  f"a trained model, point -o at its original directory.")
+            gen_model = True
+        else:
+            raise
+
+    if gen_model:
+        length_strategies = [
+            (0.1, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.3, 5000, EarlyStopper(60, 1e-4, metric_name=early_stop_metric_name), 1e-4),
+            (0.5, 3000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (0.7, 2000, EarlyStopper(60, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 2e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-4),
+            (1.0, 1500, EarlyStopper(80, 5e-5, metric_name=early_stop_metric_name), 1e-5),
+            (1.0, 5000, EarlyStopper(80, 1e-5, metric_name=early_stop_metric_name), 1e-7),
+        ]
+
+        for len_strat in length_strategies:
+            print("\nRunning length strategy:", len_strat)
+            data_fraction, epochs, early_stopper, learning_rate = len_strat
+
+            # RESET STATE AT STRATEGY BOUNDARIES
+            if hasattr(node.criterion, "reset_lagrangian"):
+                node.criterion.reset_lagrangian()
+            if node.checkpoint is not None:
+                node.checkpoint.min_metric = float("inf")
+
+            node.training_configuration = TrainingConfiguration(
+                n_epochs=epochs,
+                optimizer=AdamOptimizer(learning_rate=learning_rate),
+                batch_size=batch_size,
+                num_workers=2,
+                verbose=True,
+            )
+
+            node.optimizer_config = node.training_configuration.optimizer
+            node.n_epochs = node.training_configuration.get_param(TrainingParam.N_EPOCHS)
+            node.training_metrics = {}
+            node._initialize_optimizer()
+            node.early_stopper = early_stopper
+
+            min_states = 5
+            fraction_of_data = [
+                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                for x in scaled_traj_targets_train_posvel
+            ]
+            fraction_of_data_val = [
+                x[: max(math.ceil(x.shape[0] * data_fraction), min_states), :]
+                for x in scaled_traj_targets_test_posvel
+            ]
+
+            metrics = node.fit(
+                x=fraction_of_data,
+                validation_data=fraction_of_data_val,
+                enable_checkpoints=True if data_fraction == 1.0 else False,
+                # Free-rollout probe on FULL (un-windowed, un-fractioned) validation
+                # trajectories, in physical units. This is the metric that predicts
+                # the standalone-evaluator number; logging it during training lets a
+                # candidate be judged within a stage instead of after a full run.
+                rollout_probe_data=full_val_trajectories,
+                rollout_probe_every=25,
+                rollout_probe_scaler=(scaler_traj if use_scalar else None),
+                # Position channels are contiguous from 0 in every supported frame
+                # (geodesic [s,h] / [s,az,h], grdth [GR,Down], dcu [DR,Cross,Up]),
+                # so derive the slice from pos_idx. Hardcoding slice(0,2) silently
+                # dropped the third position channel in the 6-state DCU and
+                # geodesic-original frames, under-reporting their probe error and
+                # making cross-frame comparison invalid.
+                rollout_probe_pos_slice=slice(0, len(pos_idx) if pos_idx else 2),
+                rollout_probe_discount_gamma=probe_discount_gamma,
+                checkpoint_on_probe=(checkpoint_on_probe and data_fraction == 1.0),
+                probe_checkpoint=probe_checkpoint,
+            )
+
+        # Promote the selected checkpoint to the deployed model_name. By default
+        # the val-loss checkpoint is promoted (original behaviour). With
+        # --checkpoint-on-probe, the probe-selected checkpoint is promoted instead
+        # when it exists, so the exported model is the one with the lowest
+        # DISCOUNTED free-rollout error rather than the lowest one-step val loss.
+        probe_ckpt = Path(model_save_path, model_name + "_probe.checkpoint.pt")
+        val_ckpt = Path(model_save_path, model_name + ".checkpoint.pt")
+        if checkpoint_on_probe and probe_ckpt.exists():
+            target = Path(model_save_path, model_name + ".pt")
+            if target.exists():
+                target.unlink()
+            probe_ckpt.rename(target)
+            logger.info(f"Promoted PROBE checkpoint to deployed model: {target.name}")
+            if val_ckpt.exists():
+                # keep the val-loss checkpoint on disk for comparison, un-promoted
+                val_ckpt.rename(Path(model_save_path, model_name + "_valloss.pt"))
+        else:
+            if checkpoint_on_probe and not probe_ckpt.exists():
+                logger.info(
+                    "--checkpoint-on-probe set but no probe checkpoint was written "
+                    "(no finite probe improvement at data_fraction==1.0); "
+                    "falling back to the val-loss checkpoint."
+                )
+            if val_ckpt.exists():
+                val_ckpt.rename(Path(val_ckpt.parent, val_ckpt.name.replace(".checkpoint", "")))
+
+    node.load(directory=model_save_path, model_name=model_name)
+    node.model.eval()
+
+    class _AutonomousFieldExport(torch.nn.Module):
+        def __init__(self, model: torch.nn.Module):
+            super().__init__()
+            self.model = model
+
+        def forward(self, state: torch.Tensor) -> torch.Tensor:
+            t0 = torch.zeros((), dtype=state.dtype, device=state.device)
+            return self.model(t0, state)
+
+    example_input = torch.cat((scaled_traj_targets_train_posvel[0][0], torch.zeros(aug_dim))).to(node.device)
+    model_onx = torch.onnx.export(
+        _AutonomousFieldExport(node.model).to(node.device).eval(),
+        example_input,
+        os.path.join(model_save_path, model_name + ".onnx"),
+        export_params=True,
+        opset_version=18,
+        external_data=False,
+        input_names=["input"],
+        output_names=["output"],
+    )
+
+    if hasattr(node.model, "func") and hasattr(node.model.func, "encode"):
+        class _EncoderExportWrapper(torch.nn.Module):
+            def __init__(self, func):
+                super().__init__()
+                self.func = func
+
+            def forward(self, y0: torch.Tensor) -> torch.Tensor:
+                return self.func.encode(y0)
+
+        encoder_example = scaled_traj_targets_train_posvel[0][0].to(node.device)
+        torch.onnx.export(
+            _EncoderExportWrapper(node.model.func).to(node.device).eval(),
+            encoder_example,
+            os.path.join(model_save_path, model_name + "_encoder.onnx"),
+            export_params=True,
+            opset_version=18,
+            external_data=False,
+            input_names=["y0"],
+            output_names=["h0"],
+        )
+
+    with open(os.path.join(model_save_path, model_name + "_plain.onnx"), "w") as f:
+        f.write(onnx.printer.to_text(model_onx.model_proto))
+
+    if isinstance(scaler_traj, MinMaxScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for m, s, dmin, dmax in zip(scaler_traj.min_, scaler_traj.scale_, scaler_traj.data_min_, scaler_traj.data_max_):
+                f.write(f"InputScaleFactorsMinMaxScaler\n{{\n\tMin: {m}\n\tScale: {s}\n\tDataMin: {dmin}\n\tDataMax: {dmax}\n}}\n")
+    elif isinstance(scaler_traj, StandardScaler):
+        with open(os.path.join(model_save_path, f"{model_name}_scalar_params_and_test_inputs.txt"), "w", encoding="utf-8") as f:
+            for s, m, v in zip(scaler_traj.scale_, scaler_traj.mean_, scaler_traj.var_):
+                f.write(f"InputScaleFactorsStandardScaler\n{{\n\tScale: {s}\n\tMean: {m}\n\tVariance: {v}\n}}\n")
+
+    return node, model_name
+
+
+def prep_trajectory(x):
+    ecef_data, traj_number, max_sr, trajectory_dt, args = x
+    ecef_data = ecef_data[:, 0:7]
+    print("prepping traj", traj_number)
+    ref_ecef = deepcopy(ecef_data[-1, POS_SLICE])
+
+    while np.any(np.isclose(ecef_data[0, VEL_SLICE], 0)):
+        ecef_data = ecef_data[1:]
+
+    sr_ecef_data = np.asarray(
+        tuple(x for x in ecef_data if np.linalg.norm(x[POS_SLICE] - ecef_data[-1, POS_SLICE]) < max_sr),
+        dtype=np.float64,
+    )
+
+    if sr_ecef_data.shape[-1] < 5:
+        print(f"{traj_number} does not have enough time stamps for this slant range")
+        return None, None
+    time_diff = np.diff(sr_ecef_data[:, TIME_INDEX])
+    unique_time_diff = np.unique(np.round(time_diff, decimals=2))
+    if np.any(time_diff < 0):
+        raise ValueError(
+            f"warning: {traj_number} has time that goes backwards. Time diffs are {unique_time_diff}, excluding from data pool"
+        )
+
+    new_times = np.arange(sr_ecef_data[0, 0], sr_ecef_data[-1, 0] + trajectory_dt, trajectory_dt)
+
+    try:
+        resampled_sr_ecef_data = np.hstack(
+            [np.atleast_2d(new_times).T]
+            + [
+                make_interp_spline(
+                    sr_ecef_data[:, 0],
+                    sr_ecef_data[:, 1:],
+                    bc_type="not-a-knot",
+                )(new_times, extrapolate=True)
+            ]
+        )
+    except Exception as e:
+        print(f"warning: {traj_number} had the error with interpolation")
+        raise e
+
+    if args.frame == "grdth":
+        next_frame_data, initial_point_heading = ecef_to_next_grdth(resampled_sr_ecef_data, ref_ecef)
+        check_ecef = next_grdth_to_ecef(next_frame_data, ref_ecef, initial_point_heading)
+    elif args.frame == "geodesic":
+        next_frame_data = ecef_to_local_geodesic_vec(
+            resampled_sr_ecef_data[:, POS_SLICE],
+            resampled_sr_ecef_data[:, VEL_SLICE],
+            np.zeros_like(resampled_sr_ecef_data[:, VEL_SLICE]),
+            ref_ecef,
+        )
+        next_frame_data = np.hstack([resampled_sr_ecef_data[:, TIME_INDEX][..., np.newaxis], next_frame_data[:, :6]])
+    elif args.frame == "dcu":
+        next_frame_data, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_sr_ecef_data, ref_ecef)
+        check_ecef = next_dcu_to_ecef(next_frame_data, ref_ecef, initial_point_heading, flip_c)
+    else:
+        raise NotImplementedError("That frame is not supported yet")
+
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[0]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[1]]
+    next_frame_data = np.c_[next_frame_data, np.ones(next_frame_data.shape[0]) * ref_ecef[2]]
+
+    return next_frame_data, traj_number
+
+
+def load_data_dir(path: str, trajectory_dt: float, args, do_prep: bool = True):
+    boost_ecef = []
+    glide_ecef = []
+    dest_ecef = []
+    target_path = Path(path)
+    for phase in ["boost", "glide", "impact"]:
+        phase_path = target_path / phase
+        traj_files = [Path(phase_path, x) for x in sorted(os.listdir(phase_path))]
+
+        if len(traj_files) == 0:
+            raise ValueError("bad target path", path)
+
+        # Impact-phase files are single-row reference points (the impact ECEF state
+        # that defines the geodesic frame origin), not multi-step trajectories, so
+        # they are legitimately 1 row. Boost/glide are real trajectories and keep the
+        # strict >=3 timestep requirement.
+        phase_min_timesteps = 1 if phase == "impact" else 3
+
+        traj_targets = [
+            load_single_truth(
+                x,
+                debug=False,
+                low_memory=not HAVE_HIGH_MEMORY,
+                memory_map=HAVE_HIGH_MEMORY,
+                min_state_vector_size=7,
+                min_timesteps=phase_min_timesteps,
+            )
+            for x in traj_files
+        ]
+        if phase == "boost":
+            boost_ecef = traj_targets
+        elif phase == "glide":
+            glide_ecef = traj_targets
+        elif phase == "impact":
+            dest_ecef = traj_targets
+        else:
+            raise NotImplementedError("That phase is not handled yet.")
+
+    if not do_prep:
+        return list(
+            zip(
+                list(zip(boost_ecef, glide_ecef, dest_ecef)),
+                [x.name for x in traj_files],
+            )
+        )
+
+    cpu_count = psutil.cpu_count(logical=False)
+    if cpu_count is None:
+        cpu_count = mp.cpu_count()
+    print(f"there are {cpu_count} cpus being used for trajectory prep")
+    with mp.Pool(processes=cpu_count) as pool:
+        tmp_data = pool.map(prep_trajectory, traj_targets)
+
+    tmp_data = [x for x in tmp_data if x[0] is not None]
+    print("post-prep. how many made it though prep", len(traj_targets))
+    return tmp_data
+
+
+def create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs):
+    stacked_posvel = torch.Tensor(np.vstack(traj_targets_train_posvel))
+    scaler_traj = StandardScaler().fit(stacked_posvel)
+
+    pickle_scalar_name = os.path.join(model_save_path, f"{model_name_wo_epochs}_scalar.pickle")
+    with open(pickle_scalar_name, "wb") as o:
+        pickle.dump(scaler_traj, o)
+    return scaler_traj
+
+
+def plot_column_distributions(data, bins=30, cmap="tab10", column_names=None, data_path=""):
+    if data.ndim != 2:
+        raise ValueError("`data` must be a 2-D array (samples x columns).")
+
+    n_cols = data.shape[1]
+    max_per_row = 5
+    n_rows = int(np.ceil(n_cols / max_per_row))
+    n_cols_plot = min(n_cols, max_per_row)
+
+    fig, axes = plt.subplots(n_rows, n_cols_plot, figsize=(4 * n_cols_plot, 3 * n_rows), constrained_layout=True)
+
+    if n_rows == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    colors = plt.get_cmap(cmap).colors
+
+    for idx in range(data.shape[1]):
+        row = idx // max_per_row
+        col = idx % max_per_row
+        ax = axes[row, col]
+
+        ax.hist(data[:, idx], bins=bins, density=True, color=colors[idx % len(colors)], alpha=0.75, edgecolor="black")
+
+        if column_names is None:
+            ax.set_title(f"Column {idx}")
+        else:
+            ax.set_title(column_names[idx])
+        ax.set_xlabel("Value")
+        ax.set_ylabel("Density")
+
+    total_plots = n_rows * n_cols_plot
+    for empty_idx in range(data.shape[1], total_plots):
+        row = empty_idx // max_per_row
+        col = empty_idx % max_per_row
+        fig.delaxes(axes[row, col])
+
+    plt.suptitle("Column-wise Distributions", fontsize=16, y=1.02)
+    plt.savefig(data_path + "_feature_distribution.png")
+
+
+def plot_correlation_matrix(data, method="pearson", cmap="coolwarm", column_names=None, data_path=""):
+    if data.ndim != 2:
+        raise ValueError("`data` must be a 2-D array (samples x columns).")
+
+    if method == "pearson":
+        corr = np.corrcoef(data, rowvar=False)
+    elif method == "spearman":
+        from scipy.stats import spearmanr
+        corr, _ = spearmanr(data, axis=0)
+    else:
+        raise ValueError("Unsupported method; choose 'pearson' or 'spearman'.")
+
+    plt.figure(figsize=(0.6 * corr.shape[0] + 2, 0.6 * corr.shape[0] + 2))
+    sns.heatmap(
+        corr, annot=True, fmt=".2f", cmap=cmap, vmin=-1, vmax=1, square=True, cbar_kws={"shrink": 0.75}, linewidths=0.5
+    )
+    labels = [f"Col {i}" for i in range(corr.shape[0])]
+    if column_names is not None:
+        labels = column_names
+    plt.title(f"{method.title()} Correlation Matrix", fontsize=14, pad=12)
+    plt.xticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.yticks(ticks=np.arange(corr.shape[0]) + 0.5, labels=labels, rotation=0)
+    plt.tight_layout()
+    plt.savefig(data_path + "_correlation_matrix.png")
+
+
+def sbi_trajectory_prep(ecef_data_traj: tuple, phase_to_transform: str, trajectory_dt: float, args):
+    timeseries_to_transform = ecef_data_traj[0] if phase_to_transform == "boost" else ecef_data_traj[1]
+    if timeseries_to_transform.shape[0] < 10:
+        print(
+            "the shape of the timeseries to be transformed seems small. skipping this one",
+            timeseries_to_transform.shape,
+            timeseries_to_transform[-1],
+        )
+        return None
+    new_times = np.arange(
+        timeseries_to_transform[0, TIME_INDEX], timeseries_to_transform[-1, TIME_INDEX] + trajectory_dt, trajectory_dt
+    )
+    resampled_timeseries = np.hstack(
+        [np.atleast_2d(new_times).T]
+        + [
+            make_interp_spline(
+                timeseries_to_transform[:, TIME_INDEX],
+                timeseries_to_transform[:, 1:],
+                bc_type="not-a-knot",
+            )(new_times, extrapolate=True)
+        ]
+    )
+
+    ref_ecef = ecef_data_traj[2][-1, POS_SLICE]
+
+    if args.ref_ecef == "boost":
+        ref_ecef = ecef_data_traj[0][-1, POS_SLICE]
+    elif args.ref_ecef == "glide":
+        ref_ecef = ecef_data_traj[1][-1, POS_SLICE]
+
+    if args.frame == "dcu":
+        timeseries_in_next_frame, initial_point_heading, flip_c = ecef_to_next_dcu(resampled_timeseries, ref_ecef)
+    elif args.frame == "grdth":
+        timeseries_in_next_frame, initial_point_heading = ecef_to_next_grdth(resampled_timeseries, ref_ecef)
+    elif args.frame == "geodesic":
+        if getattr(args, "geodesic_mode", "original") == "original":
+            timeseries_in_next_frame = ecef_to_local_geodesic_vec(
+                resampled_timeseries[:, POS_SLICE],
+                resampled_timeseries[:, VEL_SLICE],
+                np.zeros_like(resampled_timeseries[:, VEL_SLICE]),
+                ref_ecef,
+            )
+            timeseries_in_next_frame = np.hstack(
+                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_in_next_frame[:, :6]]
+            )
+        else:  # integrated mode
+            timeseries_state, initial_azimuth = ecef_to_local_geodesic_vec_frame_trick(
+                resampled_timeseries[:, POS_SLICE],
+                resampled_timeseries[:, VEL_SLICE],
+                ref_ecef,
+            )
+            timeseries_in_next_frame = np.hstack(
+                [resampled_timeseries[:, TIME_INDEX][..., np.newaxis], timeseries_state]
+            )
+    else:
+        raise NotImplementedError("haven't gotten to adding this frame transform code for SBI")
+
+    return timeseries_in_next_frame
+
+
+def make_sliding_windows(trajs, window_size: int, window_stride: int):
+    windows = []
+    for traj in trajs:
+        if traj.shape[0] < window_size:
+            continue
+        for start in range(0, traj.shape[0] - window_size + 1, window_stride):
+            windows.append(traj[start : start + window_size])
+    return windows
+
+
+def augment_trajectory_segments(
+    traj_list,
+    segments_per_traj: int = 5,
+    min_segment_len: int = 12,
+    keep_full: bool = True,
+    seed: int = 0,
+):
+    """Generate additional sub-trajectories from each source trajectory.
+
+    The previous version emitted only SUFFIXES (traj[start:]) at deterministic
+    start points, so every generated segment shared the same terminal state and
+    the same handful of start indices. That limits the variety the encoder sees.
+
+    This version varies BOTH endpoints: each extra segment gets an independent
+    start and end, so the model sees a much wider range of initial conditions and
+    segment lengths from the same small source set. Randomization is seeded per
+    trajectory so runs remain reproducible.
+    """
+    rng = np.random.default_rng(seed)
+    out = []
+    for traj in traj_list:
+        T = traj.shape[0]
+        if keep_full:
+            out.append(traj)
+        n_extra = max(0, segments_per_traj - (1 if keep_full else 0))
+        if n_extra == 0 or T <= min_segment_len:
+            continue
+
+        for _ in range(n_extra):
+            # Sample a start in the first ~70% so a usable span remains.
+            max_start = max(1, min(int(0.7 * T), T - min_segment_len))
+            start = int(rng.integers(1, max_start + 1)) if max_start >= 1 else 1
+            min_end = start + min_segment_len
+            if min_end >= T:
+                continue
+            # Bias the end STRONGLY toward the trajectory end. The window-size
+            # sweep showed long-horizon coverage is the dominant accuracy factor,
+            # so most segments must retain a long span; only occasionally do we
+            # truncate early to add endpoint variety. (Uniform end sampling cut
+            # total training steps ~30% and produced near-useless short fragments.)
+            if rng.random() < 0.75:
+                end = T
+            else:
+                # truncate into the last quarter at most
+                lo = max(min_end, int(0.75 * T))
+                end = int(rng.integers(lo, T + 1)) if lo < T else T
+            seg = traj[start:end]
+            if seg.shape[0] >= min_segment_len:
+                out.append(seg)
     return out
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Training script for creating NEXT models",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--tgt-data-paths",
+        default=[],
+        type=str,
+        nargs="+",
+        help="A list of directories where training data can be found.",
+    )
+    parser.add_argument(
+        "--validation-data-paths",
+        default=[],
+        type=str,
+        nargs="+",
+        help="A list of directories where validation data can be found.",
+    )
+    parser.add_argument(
+        "--sr",
+        default=100000,
+        type=int,
+        help="The maximum slant range to trim data at. [meters]",
+    )
+    parser.add_argument(
+        "-o",
+        default="model_outputs",
+        type=str,
+        help="Directory to place checkpoints, ModelProto, and ONNX files.",
+    )
+    parser.add_argument(
+        "--use-scalar",
+        default=False,
+        action="store_true",
+        help="Enable training with a scalar",
+    )
+    parser.add_argument(
+        "--frame",
+        default="dcu",
+        choices=["dcu", "grdth", "geodesic"],
+        help="Select frame for data",
+    )
+    parser.add_argument(
+        "--geodesic-mode",
+        default="original",
+        choices=["original", "integrated"],
+        help="Geodesic frame mode: 'original' or 'integrated'.",
+    )
+    parser.add_argument(
+        "--sbi-phase",
+        default="boost",
+        choices=["boost", "glide"],
+        help="Select which SBI phase to train",
+    )
+    parser.add_argument(
+        "--nhidden",
+        default=200,
+        type=int,
+        help="The size of the hidden layers",
+    )
+    parser.add_argument(
+        "--aug",
+        default=0,
+        type=int,
+        help="The size of augmented zero dimensions",
+        dest="aug_dim",
+    )
+    parser.add_argument(
+        "--gpuidx",
+        default=0,
+        type=int,
+        help="The index of the gpu to use",
+        dest="gpu_index",
+    )
+    parser.add_argument(
+        "--model-type",
+        default="node",
+        choices=["node", "anode", "sonode", "latentode", "gruode", "gruode-min", "aphynity-gruode", "aphynity-node"],
+        help="Which ODE architecture to train: regular NODE, ANODE, SONODE, LatentODE, GRU-ODE, or APHYNITY-GRUODE",
+    )
+    parser.add_argument(
+        "--dt",
+        default=0.1,
+        type=float,
+        help="The delta time to use for resampling truth trajectories",
+    )
+    parser.add_argument(
+        "--ref-ecef",
+        default="impact",
+        choices=["boost", "glide", "impact"],
+        help="Reference point for frame transformations",
+    )
+    parser.add_argument(
+        "--window-size",
+        default=0,
+        type=int,
+        help="Train on fixed-length sliding windows (0 = full trajectories).",
+    )
+    parser.add_argument(
+        "--window-stride",
+        default=10,
+        type=int,
+        help="Stride between sliding training windows.",
+    )
+    parser.add_argument(
+        "--augment-segments",
+        default=3,
+        type=int,
+        help="Segment augmentation factor: each source trajectory also contributes "
+        "N-1 sub-trajectories with later start points (different initial conditions "
+        "and lengths). Applies with or without sliding windows. 1 disables. Valuable "
+        "when the source trajectory count is small.",
+    )
+    parser.add_argument(
+        "--pos-weight",
+        default=30.0,
+        type=float,
+        help="Position:velocity loss weight ratio. Original 80 gave the velocity/rate "
+        "channels only ~1.8%% of the loss; 30 gives ~5%%, 10 gives ~13%%. Lower trains "
+        "velocity harder (which drives long-horizon position accuracy) but shifts the "
+        "overall loss magnitude, so change it in steps.",
+    )
+    parser.add_argument(
+        "--temporal-weighting",
+        default="early",
+        choices=["early", "late", "flat"],
+        help="Timestep emphasis. 'early' (4->1) suits autoregressive rollouts since "
+        "early errors compound; 'late' (1->4) reproduces the original behaviour.",
+    )
+    parser.add_argument(
+        "--freeze-sindy",
+        action="store_true",
+        help="Keep the E-SINDy coefficients frozen (legacy behaviour). By default the "
+        "discovered coefficients are TRAINABLE within their sparsity pattern, which is "
+        "what APHYNITY's joint theta_p/theta_a optimization requires.",
+    )
+    parser.add_argument(
+        "--sindy-library",
+        default="polynomial",
+        choices=["polynomial", "physics", "physics-stable", "eom"],
+        help="Candidate basis for E-SINDy. 'eom' uses the KNOWN 3-DoF equations of "
+        "motion (gravity, drag, lift, curvature) and fits only the unknown aero "
+        "coefficients -- ~6-11 physically-derived columns instead of rediscovering "
+        "Newton from a polynomial library. 'physics' adds atmosphere/drag/curvature "
+        "terms; 'physics-stable' additionally FORBIDS positional positive-feedback "
+        "polynomials (h*h, h*v_s, s*v_s...) that fit one-step but diverge in rollout. "
+        "terms (rho(h)*V*v_i, rho(h)*V^2, v_s^2/(Re+h)) that a polynomial basis cannot "
+        "express. Evaluated in physical units (unscaled internally).",
+    )
+    parser.add_argument(
+        "--sindy-scale-heights",
+        default="7200",
+        type=str,
+        help="Comma-separated atmospheric scale height(s) in metres for --sindy-library "
+        "physics. Prefer ONE: nearby exponentials are collinear and bootstrap selection "
+        "will threshold all of them out. Use --sindy-scan-scale-heights to choose.",
+    )
+    parser.add_argument(
+        "--sindy-scan-scale-heights",
+        default="",
+        type=str,
+        help="Comma-separated scale heights to scan, each in a SEPARATE fit, reporting "
+        "which gives the strongest acceleration-channel coefficients. Use when the "
+        "generating atmosphere model is unknown, e.g. '5000,6500,7200,8500,10000,14000'.",
+    )
+    parser.add_argument(
+        "--aphynity-tau2",
+        default=0.05,
+        type=float,
+        help="Dual ascent rate: lambda += tau2 * L_traj. Scale-dependent (tune "
+        "against your L_traj magnitude, ~4e-3 here). Default 0.05 keeps lambda ~1, "
+        "i.e. the least-action constraint effectively OFF -- see "
+        "--aphynity-node-norm-mode for why. Use ~10 for the paper-faithful ramp.",
+    )
+    parser.add_argument(
+        "--aphynity-max-lambda", default=10.0, type=float,
+        help="Cap on the dual multiplier. The paper has no cap; this is a safety rail.",
+    )
+    parser.add_argument(
+        "--aphynity-node-weight", default=1.0, type=float,
+        help="Weight on ||F_a|| in the APHYNITY objective (paper uses 1.0).",
+    )
+    parser.add_argument(
+        "--aphynity-residual-type",
+        default="mlp",
+        choices=["mlp", "dissipative"],
+        help="Neural residual structure. 'mlp' keeps the unconstrained residual "
+        "(decode(h) for gruode, an MLP for node). 'dissipative' structures the "
+        "residual as -L L^T v so it can only REMOVE kinetic energy (power <= 0 by "
+        "construction), making positive-feedback rollout divergence impossible while "
+        "keeping full expressivity. For gruode the latent still supplies trajectory "
+        "context -- it parameterises the damping matrix instead of the force. "
+        "ONNX-safe (matrix ops only).",
+    )
+    parser.add_argument(
+        "--checkpoint-on-probe",
+        action="store_true",
+        help="Select the exported checkpoint by the DISCOUNTED free-rollout probe "
+        "instead of val_traj_loss. The two disagree (val_traj_loss is one-step; the "
+        "probe is the honest long-horizon metric), so the val-loss-selected export "
+        "can be a worse-rolling-out epoch than one seen earlier. With this flag the "
+        "probe-selected model is promoted to the deployed name and the val-loss one "
+        "is kept as <model>_valloss.pt for comparison. Only active at "
+        "data_fraction==1.0 (the final curriculum stage).",
+    )
+    parser.add_argument(
+        "--no-frame-transport",
+        dest="eom_frame_transport", action="store_false", default=True,
+        help="Disable the polar-transport / Coriolis columns in the eom library "
+        "(centripetal_s, transport_va, cor_along, cor_turn). These divide by s and "
+        "grow near the impact origin; use this to A/B whether they help or hurt the "
+        "trained rollout.",
+    )
+    parser.add_argument(
+        "--sindy-constrain-physics",
+        action="store_true", default=False,
+        help="Pin the coefficients that theory fixes exactly, instead of hoping SINDy "
+        "discovers them: transport_va=-2 and centripetal_s=+1 (exact polar kinematics). "
+        "Brunton's constrained-SINDy: enforce equality constraints at every "
+        "least-squares step. Unconstrained fitting has been returning badly wrong "
+        "values for these (-89.6 vs -2), so pinning them guarantees correct kinematics, "
+        "improves conditioning, and frees the regression for the unknown aerodynamics.",
+    )
+    parser.add_argument(
+        "--sindy-origin-lat", type=float, default=None,
+        help="Latitude (deg) of the frame origin/impact point. Enables the two "
+        "Coriolis constraints (cor_turn=+f, cor_along=-f with f=2*Omega*sin(lat)) "
+        "in addition to the purely kinematic ones. Omit to constrain kinematics only.",
+    )
+    parser.add_argument(
+        "--eom-flight-path-angle",
+        action="store_true", default=False,
+        help="Add flight-path-angle columns (gamma, sin gamma, cos gamma). Requested "
+        "by the flight-mechanics SMEs: 'those important coefficients effectively are "
+        "going to be your angles and angular rates fed directly into the model.' An "
+        "arctangent cannot be built from the existing columns, so this is genuinely "
+        "new expressive power. NOTE: true gamma-RATE is deliberately NOT offered -- it "
+        "needs accelerations, which are the quantities being solved for, so it would "
+        "be circular and would break linear-in-coefficients.",
+    )
+    parser.add_argument(
+        "--eom-guidance-terms",
+        action="store_true", default=False,
+        help="Add a proportional-navigation column (-v_s*v_alpha). In this "
+        "impact-centred frame the LOS rate is v_alpha and closing velocity is -v_s, so "
+        "ProNav's command is -N*v_s*v_alpha. Offered WITHOUT the 1/s that transport_va "
+        "carries, so guidance and kinematic transport get separate coefficients "
+        "(measured correlation 0.80, i.e. separable). If the vehicle flies ProNav this "
+        "column's coefficient magnitude should read out as the navigation constant N.",
+    )
+    parser.add_argument(
+        "--eom-mach-powers",
+        default="", type=str,
+        help="Comma-separated Mach powers for Mach-DEPENDENT aero coefficients, e.g. "
+        "'1' or '1,2'. Empty (default) keeps the original constant-coefficient aero. "
+        "Measured on the 28-trajectory set, the effective C_L varies with a "
+        "within-flight CV of 0.45 and ~53%% of that variation is state-predictable, so "
+        "a single constant cannot represent the lift. Each power k adds a "
+        "(base_aero * M^k) column, letting sparse regression build C(M)=c0+c1*M+..., "
+        "still linear in the coefficients so E-SINDy/APHYNITY/ONNX are unchanged. "
+        "The Mach factor is centred on a frozen training-set mean (raw M spans only "
+        "~8.5-10.3, so an uncentred column is 0.9999 collinear with its base).",
+    )
+    parser.add_argument(
+        "--eom-s-floor", type=float, default=5000.0,
+        help="Floor (m) on |s| in the eom transport columns, guarding the 1/s pole "
+        "near the impact origin. Larger values tame late-glide blow-up at the cost "
+        "of transport-term fidelity; try 20000-50000 if rollout diverges near impact.",
+    )
+    parser.add_argument(
+        "--probe-discount-gamma",
+        default=0.99,
+        type=float,
+        help="Discount gamma in [0.98, 0.995] for the rollout-probe checkpoint "
+        "metric: err = sum_k gamma^k * err_k / sum_k gamma^k. Lower gamma weights "
+        "early-horizon fidelity more; 0.99 balances early accuracy against "
+        "late-horizon divergence. Also changes the logged 'disc=' probe value.",
+    )
+    parser.add_argument(
+        "--aphynity-node-norm-mode",
+        default="sqnorm", choices=["norm", "sqnorm"],
+        help="'norm' = ||F_a|| (paper Eq. 4, constraint ACTIVE). 'sqnorm' = ||F_a||^2 "
+        "(~200x smaller, constraint effectively OFF) -- the DEFAULT, deliberately. "
+        "APHYNITY's least-action argument assumes F_p is a genuine low-dimensional "
+        "PHYSICAL model whose parameters are being identified; here F_p is ~81 "
+        "trainable regression coefficients (R2~0.68), so forcing f_node to defer to "
+        "it just moves capacity between two empirical fits and measurably costs "
+        "accuracy (val_traj_loss plateaued 0.0040 vs 0.0033 unconstrained). Switch "
+        "to 'norm' (with --aphynity-tau2 10) only once F_p is genuinely sparse and "
+        "physical -- e.g. a high --sindy-l1-threshold leaving ~5-10 drag/gravity "
+        "terms rather than the full polynomial basis.",
+    )
+    parser.add_argument(
+        "--sindy-l1-threshold",
+        default=0.01,
+        type=float,
+        help="STRidge sparsity threshold. This is the PRIMARY per-cell sparsity "
+        "control. 0.01 typically leaves the model ~60%% dense; raising it toward "
+        "0.05-0.2 usually recovers a genuinely sparse model at little R2 cost. "
+        "Sweep it with --sindy-scan-l1.",
+    )
+    parser.add_argument(
+        "--sindy-scan-l1",
+        default="",
+        type=str,
+        help="Comma-separated l1_threshold values to sweep, reporting active-term "
+        "count and R2 for each, e.g. '0.01,0.05,0.1,0.2,0.4'.",
+    )
+    parser.add_argument(
+        "--sindy-library-bagging",
+        action="store_true",
+        help="Enable E-SINDy library bagging (Algorithm 3): prune collinear/irrelevant "
+        "candidates before the final fit. Reduces the candidate SET; note it can "
+        "over-prune, so check R2.",
+    )
+    parser.add_argument(
+        "--sindy-fit-position-rows",
+        action="store_true",
+        help="Fit the position-derivative rows with SINDy instead of setting them "
+        "analytically. Default is analytic: those rows are known exactly and are "
+        "overwritten downstream, and fitting them attracts collinear surrogates.",
+    )
+    parser.add_argument(
+        "--sindy-only",
+        action="store_true",
+        help="Run Ensemble-SINDy discovery, print diagnostics, and exit without training. "
+        "Takes seconds; use it to check whether the library can express the dynamics.",
+    )
+    parser.add_argument(
+        "--solver-substeps",
+        default=4,
+        type=int,
+        help="RK4 sub-steps per dt during training. Must match the evaluator's "
+        "--sub-steps. Higher reduces integration truncation error (cost ~linear).",
+    )
+
+    args = parser.parse_args()
+
+    if args.window_size < 0:
+        raise ValueError("--window-size must be non-negative")
+    if args.window_stride <= 0:
+        raise ValueError("--window-stride must be positive")
+
+    model_states = 6
+    if args.frame == "grdth":
+        model_states = 5
+    elif args.frame == "geodesic" and args.geodesic_mode == "integrated":
+        model_states = 5
+
+    trajectory_dt = args.dt
+
+    seed = 47
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    target_strs = [Path(x).name for x in args.tgt_data_paths]
+    model_name_target_str = "+".join(target_strs)
+    model_path = args.o
+    model_save_path = os.path.join(model_path, model_name_target_str)
+
+    batch_size = 16
+    if HAVE_HIGH_MEMORY:
+        batch_size = 16
+
+    frame_tag = args.frame
+    if args.frame == "geodesic":
+        frame_tag = f"geodesic-{args.geodesic_mode}"
+    model_name_wo_epochs = f"NEXT_{model_name_target_str}_{frame_tag}_{args.sbi_phase}_{int(args.sr / 1000)}sr_{trajectory_dt}sec_{args.nhidden}hid_{args.aug_dim}aug_{batch_size}"
+    if args.use_scalar:
+        model_name_wo_epochs = model_name_wo_epochs + "_scalarOn"
+    if args.window_size > 0:
+        model_name_wo_epochs = model_name_wo_epochs + f"_{args.window_size}win_{args.window_stride}stride"
+
+    model_name = f"{model_name_wo_epochs}"
+
+    traj_targets_train = []
+    traj_targets_test = []
+    if len(args.validation_data_paths) == 0:
+        for tgt_data_path in args.tgt_data_paths:
+            traj_targets = load_data_dir(
+                tgt_data_path, trajectory_dt, args, do_prep=False
+            )
+            (
+                traj_targets_train_one_tgt,
+                traj_targets_test_one_tgt,
+            ) = train_test_split(traj_targets, test_size=0.2, random_state=26525)
+            traj_targets_train.extend(traj_targets_train_one_tgt)
+            traj_targets_test.extend(traj_targets_test_one_tgt)
+    else:
+        print("split already done")
+        for tgt_data_path in args.tgt_data_paths:
+            traj_targets_train.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+        for tgt_data_path in args.validation_data_paths:
+            traj_targets_test.extend(load_data_dir(tgt_data_path, trajectory_dt, args))
+
+    print(
+        f"There are {len(traj_targets_train)} training trajs and {len(traj_targets_test)} validation trajs."
+    )
+
+    traj_targets_train, traj_targets_train_traj_numbers = zip(*traj_targets_train)
+    traj_targets_test, traj_targets_test_traj_numbers = zip(*traj_targets_test)
+
+    split_dict = {
+        "train": traj_targets_train_traj_numbers,
+        "test": traj_targets_test_traj_numbers,
+    }
+    os.makedirs(os.path.join(model_path, model_name_target_str), exist_ok=True)
+    with open(
+        os.path.join(
+            model_path,
+            model_name_target_str,
+            f"{model_name_wo_epochs}_train_test_split.json",
+        ),
+        "w",
+        encoding="utf-8",
+    ) as f:
+        json.dump(split_dict, f)
+
+    phase_to_model = args.sbi_phase
+    traj_targets_train = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_train]
+    traj_targets_test = [sbi_trajectory_prep(x, phase_to_model, trajectory_dt, args) for x in traj_targets_test]
+
+    traj_targets_train = list(filter(lambda x: x is not None, traj_targets_train))
+    traj_targets_test = list(filter(lambda x: x is not None, traj_targets_test))
+
+    time_series_point_count = [x.shape[0] for x in traj_targets_train + traj_targets_test]
+    if any(x < 10 for x in time_series_point_count):
+        raise ValueError("Some training/validation data has fewer than 10 time steps.")
+
+    traj_targets_train_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_train]
+    traj_targets_test_posvel = [torch.Tensor(x[:, 1 : model_states + 1]) for x in traj_targets_test]
+
+    if any([torch.isnan(x).any() for x in traj_targets_train_posvel]) or any(
+        [torch.isnan(x).any() for x in traj_targets_test_posvel]
+    ):
+        raise ValueError("NaNs found in target data.")
+
+    stacked_posvel = np.vstack(traj_targets_train_posvel)
+    column_names = ["Down", "Cross", "Up", "dotD", "dotC", "dotU"]
+    if args.frame == "grdth":
+        column_names = ["GR", "Down", "dotGR", "dotD", "VTheta"]
+    elif args.frame == "geodesic":
+        if args.geodesic_mode == "integrated":
+            column_names = ["s", "h", "v_s", "v_alpha", "v_h"]
+        else:
+            column_names = ["s", "az", "h", "v_s", "v_alpha", "v_h"]
+
+    plot_column_distributions(
+        stacked_posvel,
+        column_names=column_names,
+        data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)),
+    )
+    plot_correlation_matrix(
+        stacked_posvel,
+        column_names=column_names,
+        data_path=str(Path(model_path, model_name_target_str, model_name_wo_epochs)),
+    )
+
+    scaler_traj = create_scalar(traj_targets_train_posvel, model_save_path, model_name_wo_epochs)
+
+    # Segment augmentation was previously DISABLED whenever window_size > 0, on the
+    # assumption that sliding windows already provide augmentation. They are in fact
+    # complementary: sliding windows all begin at ground-truth states on a fixed
+    # stride, whereas segment augmentation yields trajectories with different
+    # initial conditions AND different lengths, which is what teaches the encoder to
+    # seed h0 from a wider variety of states. With only ~22 source trajectories we
+    # cannot afford to leave either source of variety unused, so augmentation is now
+    # applied in both regimes (override with --augment-segments).
+    AUGMENT_SEGMENTS = int(getattr(args, "augment_segments", 0) or 0)
+    if AUGMENT_SEGMENTS <= 0:
+        AUGMENT_SEGMENTS = 3
+    if AUGMENT_SEGMENTS > 1:
+        n_before = len(traj_targets_train_posvel)
+        traj_targets_train_posvel = augment_trajectory_segments(
+            traj_targets_train_posvel,
+            segments_per_traj=AUGMENT_SEGMENTS,
+            min_segment_len=12,
+            keep_full=True,
+        )
+        print(
+            f"Segment augmentation: {n_before} -> {len(traj_targets_train_posvel)} training trajs"
+        )
+
+    (node, model_name) = train_NEXT(
+        model_name,
+        traj_targets_train_posvel,
+        traj_targets_test_posvel,
+        scaler_traj,
+        model_save_path,
+        trajectory_dt,
+        batch_size,
+        args.use_scalar,
+        model_states,
+        args.aug_dim,
+        args.nhidden,
+        args.gpu_index,
+        args.model_type,
+        args.frame,
+        args.window_size,
+        args.window_stride,
+        args.solver_substeps,
+        args.pos_weight,
+        args.temporal_weighting,
+        not args.freeze_sindy,
+        args.sindy_only,
+        args.sindy_library,
+        tuple(float(x) for x in args.sindy_scale_heights.split(",") if x.strip()),
+        tuple(float(x) for x in args.sindy_scan_scale_heights.split(",") if x.strip()),
+        args.sindy_l1_threshold,
+        args.sindy_library_bagging,
+        not args.sindy_fit_position_rows,
+        tuple(float(x) for x in args.sindy_scan_l1.split(",") if x.strip()),
+        args.aphynity_tau2,
+        args.aphynity_max_lambda,
+        args.aphynity_node_weight,
+        args.aphynity_node_norm_mode,
+        args.aphynity_residual_type,
+        args.checkpoint_on_probe,
+        args.probe_discount_gamma,
+        args.eom_frame_transport,
+        args.eom_s_floor,
+        _parse_mach_powers(args.eom_mach_powers),
+        args.eom_flight_path_angle,
+        args.eom_guidance_terms,
+        args.sindy_constrain_physics,
+        args.sindy_origin_lat,
+    )
+
+    if node is None:
+        # --sindy-only: discovery diagnostics printed, nothing further to do.
+        return
+
+
+if __name__ == "__main__":
+    main()

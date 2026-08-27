@@ -1,157 +1,319 @@
-(.venv) e471302@usmk2tqq3hkk2 next % python NEXT_training.py --tgt-data-paths trajectory_library/phases/LowE_555063a9_HGV --sr 100000000 --frame geodesic --geodesic-mode integrated --model-type aphynity-gruode --sbi-phase glide --use-scalar --window-size 150 --window-stride 5 --augment-segments 5 --solver-substeps 8 --nhidden 200 --dt 1 --gpuidx 0 -o model_outputs/SBI/esindy_aphynity_gruode_glide_lowe555_150winsize_5winstride_5augseg_8solvstep_again_2/GEODESIC/glide
-There are 22 training trajs and 6 validation trajs.
-Segment augmentation: 22 -> 110 training trajs
+Here are 2 more general aerodynamics functions that are common. Alt hold is a different guidance law that anyone who has flown on a plane has experienced. Phugoid is a mode of the aerobody resulting from the system dynamics, but can be represented as a forcing function. The phugoid might struggle because there is no adjustment for changes in atmospheric properties. Usually the altitude amplitude is small enough that those changes are negligible.
 
---- Running Ensemble-SINDy Governing Equation Discovery ---
-[FRAME-IDX] frame=geodesic states=5 -> h@1 v_s@2 v_al@3 v_h@4 h_sign=+1
-Discovered Physics Matrix Xi:
- [[-1.02761993e-02 -4.57250030e-03  7.50392151e-03  1.05633428e-03
-  -9.73235315e-03]
- [ 0.00000000e+00  0.00000000e+00  6.97574085e-04 -3.09073805e-03
-   2.89079996e-02]
- [ 0.00000000e+00  0.00000000e+00 -1.09538635e-02 -8.04415259e-04
-  -3.58166591e-02]
- [ 1.56237954e-03  0.00000000e+00 -1.52280399e-03 -8.74034545e-04
-  -1.52596155e-02]
- [ 0.00000000e+00  0.00000000e+00 -1.27182692e-03  5.01702838e-03
-  -1.38411937e-03]
- [ 0.00000000e+00  2.10312971e-02 -5.50537373e-03 -6.52924985e-04
-  -5.36407698e-04]
- [ 0.00000000e+00  0.00000000e+00 -1.45185146e-03  6.07960731e-05
-  -1.31194491e-02]
- [ 0.00000000e+00  0.00000000e+00 -1.66579630e-03  6.70657946e-04
-  -9.32909043e-03]
- [ 0.00000000e+00  0.00000000e+00 -5.54367180e-03 -3.33541644e-03
-  -3.68271324e-03]
- [ 0.00000000e+00  0.00000000e+00 -4.77597112e-03 -9.48245963e-03
-  -8.71708815e-04]
- [ 0.00000000e+00  0.00000000e+00  5.22446243e-03 -7.18068830e-05
-   7.67727504e-03]
- [ 0.00000000e+00  0.00000000e+00  7.46246897e-03 -1.01505011e-03
-   2.24718697e-02]
- [ 0.00000000e+00  0.00000000e+00  8.71935782e-03 -1.04537995e-03
-   2.63165976e-02]
- [ 0.00000000e+00  0.00000000e+00  5.01739150e-03  1.92216643e-02
-   2.60563376e-03]
- [ 0.00000000e+00  0.00000000e+00 -4.84750161e-03 -1.13857998e-03
-  -5.25237983e-03]
- [ 0.00000000e+00  0.00000000e+00 -1.35201970e-04 -3.13292414e-03
-   1.56524514e-02]
- [ 0.00000000e+00  0.00000000e+00  9.22809603e-05  5.29483683e-04
-   2.60929594e-03]
- [ 0.00000000e+00  0.00000000e+00 -6.41806491e-03 -1.51141014e-03
-   5.90374770e-03]
- [ 0.00000000e+00  0.00000000e+00 -9.81529741e-04 -2.52484802e-03
-   7.71100416e-03]
- [ 0.00000000e+00  0.00000000e+00 -1.14303683e-03 -1.48183783e-02
-   4.41702148e-03]
- [ 0.00000000e+00  0.00000000e+00  3.48686221e-04  1.97348801e-03
-  -1.12087565e-02]]
-[SINDy] active terms: 67/105 | max|coef| per target: [0.01028 0.02103 0.01095 0.01922 0.03582]
-[SINDy] R2 per target: [1.     1.     0.6137 0.5523 0.6449]
-[SINDy] mean R2 on acceleration/rate channels [2, 3, 4]: 0.6036 | max relative term contribution 0.8189
-[SINDy] library: polynomial | scale heights: [7200.0]
-[FRAME-FIT] frame=geodesic-5state library=polynomial meanR2(acc)=0.6036 perTarget=[1.0, 1.0, 0.614, 0.552, 0.645]
-[SINDy] physics coefficients trainable: True
+def altitude_hold(s, z_cmd, k_p=0.02, k_d=0.01):
+    """
+    PID‑style vertical control that targets a fixed altitude `z_cmd`.
+    Returns a 3‑vector acceleration; only the z‑component is non‑zero.
+    """
+    # State unpack
+    x, y, z, vx, vy, vz = s
+    # Position error (altitude)
+    e_z = z_cmd - z
+    # Derivative of error = negative vertical speed (since ė = -vz)
+    e_z_dot = -vz
+    # Simple PD (we skip the integral term for SINDy friendliness)
+    a_z = k_p * e_z + k_d * e_z_dot
+    return np.array([0.0, 0.0, a_z])
 
-Running length strategy: (0.1, 5000, <neural_ode_mod.EarlyStopper object at 0x16a63bd90>, 0.0001)
-[INFO] Epoch 5: loss: 0.0036315 pos_err: 852.4154663 vel_err: 103.0731888 traj_loss: 0.0033854 node_norm: 0.0002441 lambda: 1.0006189 val_loss: 0.0033210 val_pos_err: 924.0584717 val_vel_err: 126.9654999 val_traj_loss: 0.0030493 val_node_norm: 0.0002698 val_lambda: 1.0006195
-[INFO] Epoch 10: loss: 0.0035351 pos_err: 832.5523071 vel_err: 106.5936890 traj_loss: 0.0033225 node_norm: 0.0002081 lambda: 1.0013666 val_loss: 0.0031470 val_pos_err: 904.5882568 val_vel_err: 122.2860641 val_traj_loss: 0.0029271 val_node_norm: 0.0002159 val_lambda: 1.0013674
-[INFO] Epoch 15: loss: 0.0034920 pos_err: 828.2376709 vel_err: 106.8152084 traj_loss: 0.0032882 node_norm: 0.0001969 lambda: 1.0021029 val_loss: 0.0031223 val_pos_err: 900.9282837 val_vel_err: 123.7107162 val_traj_loss: 0.0029082 val_node_norm: 0.0002080 val_lambda: 1.0021034
-[INFO] Epoch 20: loss: 0.0034630 pos_err: 823.1062012 vel_err: 107.3997269 traj_loss: 0.0032639 node_norm: 0.0001899 lambda: 1.0028315 val_loss: 0.0031279 val_pos_err: 886.7200317 val_vel_err: 121.6104660 val_traj_loss: 0.0028946 val_node_norm: 0.0002251 val_lambda: 1.0028322
-[INFO] [rollout probe @ epoch 25] mean_pos_err=27166.4 disc=18302.8 worst=28474.0 finite=33%
-[INFO] Epoch 25: loss: 0.0034399 pos_err: 819.0310059 vel_err: 107.5036163 traj_loss: 0.0032400 node_norm: 0.0001884 lambda: 1.0035546 val_loss: 0.0031242 val_pos_err: 890.2069092 val_vel_err: 122.1903992 val_traj_loss: 0.0028631 val_node_norm: 0.0002510 val_lambda: 1.0035542 rollout_pos_err: 27166.4130859 rollout_pos_err_worst: 28473.9921875 rollout_pos_err_discounted: 18302.8338327 rollout_frac_finite: 0.3333333
-[INFO] Epoch 30: loss: 0.0034148 pos_err: 816.2446899 vel_err: 107.6567917 traj_loss: 0.0032171 node_norm: 0.0001839 lambda: 1.0042689 val_loss: 0.0031076 val_pos_err: 909.4857178 val_vel_err: 118.5031357 val_traj_loss: 0.0028707 val_node_norm: 0.0002247 val_lambda: 1.0042692
-[INFO] Epoch 35: loss: 0.0033930 pos_err: 812.0582275 vel_err: 107.9452057 traj_loss: 0.0031963 node_norm: 0.0001807 lambda: 1.0049896 val_loss: 0.0030838 val_pos_err: 898.6201172 val_vel_err: 119.1552429 val_traj_loss: 0.0028221 val_node_norm: 0.0002476 val_lambda: 1.0049893
-[INFO] Epoch 40: loss: 0.0033731 pos_err: 809.4135742 vel_err: 108.0648804 traj_loss: 0.0031776 node_norm: 0.0001774 lambda: 1.0056956 val_loss: 0.0031046 val_pos_err: 892.8679199 val_vel_err: 119.5634613 val_traj_loss: 0.0028287 val_node_norm: 0.0002598 val_lambda: 1.0056961
-[INFO] Epoch 45: loss: 0.0033554 pos_err: 807.6428833 vel_err: 108.3075180 traj_loss: 0.0031583 node_norm: 0.0001769 lambda: 1.0064085 val_loss: 0.0031386 val_pos_err: 891.0825806 val_vel_err: 122.5988007 val_traj_loss: 0.0028460 val_node_norm: 0.0002743 val_lambda: 1.0064081
-[INFO] [rollout probe @ epoch 50] mean_pos_err=23896.7 disc=17016.7 worst=26719.9 finite=67%
-[INFO] Epoch 50: loss: 0.0033367 pos_err: 804.0377808 vel_err: 108.8187561 traj_loss: 0.0031402 node_norm: 0.0001741 lambda: 1.0071220 val_loss: 0.0031205 val_pos_err: 893.4676514 val_vel_err: 118.6122208 val_traj_loss: 0.0028288 val_node_norm: 0.0002716 val_lambda: 1.0071223 rollout_pos_err: 23896.7260742 rollout_pos_err_worst: 26719.9199219 rollout_pos_err_discounted: 17016.6964939 rollout_frac_finite: 0.6666667
-[INFO] Epoch 55: loss: 0.0033221 pos_err: 800.1245728 vel_err: 109.1379089 traj_loss: 0.0031221 node_norm: 0.0001755 lambda: 1.0078309 val_loss: 0.0031347 val_pos_err: 894.5939941 val_vel_err: 119.7698975 val_traj_loss: 0.0028391 val_node_norm: 0.0002734 val_lambda: 1.0078305
-[INFO] Epoch 60: loss: 0.0033144 pos_err: 803.0971069 vel_err: 108.6912308 traj_loss: 0.0031110 node_norm: 0.0001768 lambda: 1.0085411 val_loss: 0.0031319 val_pos_err: 886.4759521 val_vel_err: 120.3478928 val_traj_loss: 0.0028198 val_node_norm: 0.0002880 val_lambda: 1.0085416
-[INFO] Epoch 65: loss: 0.0032931 pos_err: 796.9090576 vel_err: 109.5835648 traj_loss: 0.0030918 node_norm: 0.0001727 lambda: 1.0092475 val_loss: 0.0031369 val_pos_err: 904.3721924 val_vel_err: 117.6020813 val_traj_loss: 0.0028211 val_node_norm: 0.0002896 val_lambda: 1.0092480
-[INFO] Epoch 70: loss: 0.0032777 pos_err: 796.3214722 vel_err: 109.1935883 traj_loss: 0.0030732 node_norm: 0.0001739 lambda: 1.0099534 val_loss: 0.0031497 val_pos_err: 878.7046509 val_vel_err: 121.7373581 val_traj_loss: 0.0028306 val_node_norm: 0.0002909 val_lambda: 1.0099539
-[INFO] [rollout probe @ epoch 75] mean_pos_err=28738.6 disc=19653.7 worst=30719.8 finite=67%
-[INFO] Epoch 75: loss: 0.0032639 pos_err: 794.6141968 vel_err: 109.3103409 traj_loss: 0.0030614 node_norm: 0.0001699 lambda: 1.0106648 val_loss: 0.0031414 val_pos_err: 896.2283325 val_vel_err: 118.2730026 val_traj_loss: 0.0028195 val_node_norm: 0.0002918 val_lambda: 1.0106640 rollout_pos_err: 28738.6196289 rollout_pos_err_worst: 30719.7792969 rollout_pos_err_discounted: 19653.6950643 rollout_frac_finite: 0.6666667
-[INFO] Epoch 80: loss: 0.0032548 pos_err: 794.5759277 vel_err: 109.3975677 traj_loss: 0.0030506 node_norm: 0.0001696 lambda: 1.0113716 val_loss: 0.0031067 val_pos_err: 889.5294800 val_vel_err: 115.7141724 val_traj_loss: 0.0027787 val_node_norm: 0.0002964 val_lambda: 1.0113714
-[INFO] Early stopping triggered at 81
+def phugoid_mode(s, omega=0.03, k_ph=0.05):
+    """
+    A low‑frequency longitudinal “phugoid‑like” forcing term.
+    It injects an acceleration proportional to a sinusoid of the current
+    altitude error (or to the vertical speed) – a classic way to
+    reproduce the natural phugoid oscillation in a data‑driven model.
 
-Running length strategy: (0.3, 5000, <neural_ode_mod.EarlyStopper object at 0x13b9ce310>, 0.0001)
-[INFO] Epoch 5: loss: 0.0049845 pos_err: 1011.5438843 vel_err: 162.0861359 traj_loss: 0.0043814 node_norm: 0.0005946 lambda: 1.0019147 val_loss: 0.0086064 val_pos_err: 1852.9401855 val_vel_err: 208.0958252 val_traj_loss: 0.0076593 val_node_norm: 0.0009325 val_lambda: 1.0019144
-[INFO] Epoch 10: loss: 0.0048178 pos_err: 996.2551270 vel_err: 159.6477051 traj_loss: 0.0042070 node_norm: 0.0005950 lambda: 1.0037459 val_loss: 0.0078207 val_pos_err: 1779.3017578 val_vel_err: 200.8592072 val_traj_loss: 0.0067733 val_node_norm: 0.0010221 val_lambda: 1.0037459
-[INFO] Epoch 15: loss: 0.0046147 pos_err: 943.3400269 vel_err: 156.5977631 traj_loss: 0.0040176 node_norm: 0.0005761 lambda: 1.0052412 val_loss: 0.0072361 val_pos_err: 1773.0970459 val_vel_err: 194.3161621 val_traj_loss: 0.0062772 val_node_norm: 0.0009260 val_lambda: 1.0052404
-[INFO] Epoch 20: loss: 0.0045095 pos_err: 939.5836182 vel_err: 156.3905029 traj_loss: 0.0039176 node_norm: 0.0005655 lambda: 1.0067148 val_loss: 0.0065876 val_pos_err: 1656.7125244 val_vel_err: 191.1564941 val_traj_loss: 0.0056031 val_node_norm: 0.0009469 val_lambda: 1.0067157
-[INFO] [rollout probe @ epoch 25] mean_pos_err=11523.9 disc=7805.4 worst=20182.0 finite=50%
-[INFO] Epoch 25: loss: 0.0045611 pos_err: 929.3398438 vel_err: 155.5071564 traj_loss: 0.0039759 node_norm: 0.0005533 lambda: 1.0080069 val_loss: 0.0063955 val_pos_err: 1796.9896240 val_vel_err: 194.3863983 val_traj_loss: 0.0054068 val_node_norm: 0.0009455 val_lambda: 1.0080065 rollout_pos_err: 11523.8743490 rollout_pos_err_worst: 20182.0449219 rollout_pos_err_discounted: 7805.3697863 rollout_frac_finite: 0.5000000
-[INFO] Epoch 30: loss: 0.0044343 pos_err: 909.9483643 vel_err: 154.1224213 traj_loss: 0.0038509 node_norm: 0.0005474 lambda: 1.0093316 val_loss: 0.0057186 val_pos_err: 1514.3859863 val_vel_err: 168.4977417 val_traj_loss: 0.0048529 val_node_norm: 0.0008204 val_lambda: 1.0093321
-[INFO] Epoch 35: loss: 0.0044153 pos_err: 912.4992676 vel_err: 153.4990234 traj_loss: 0.0038286 node_norm: 0.0005464 lambda: 1.0105276 val_loss: 0.0058076 val_pos_err: 1595.9079590 val_vel_err: 179.0790405 val_traj_loss: 0.0048857 val_node_norm: 0.0008705 val_lambda: 1.0105268
-[INFO] Epoch 40: loss: 0.0044227 pos_err: 910.9883423 vel_err: 153.9428711 traj_loss: 0.0038324 node_norm: 0.0005452 lambda: 1.0117576 val_loss: 0.0054750 val_pos_err: 1517.6616211 val_vel_err: 179.1652679 val_traj_loss: 0.0045322 val_node_norm: 0.0008895 val_lambda: 1.0117581
-[INFO] Epoch 45: loss: 0.0043898 pos_err: 891.2808838 vel_err: 152.9098053 traj_loss: 0.0038026 node_norm: 0.0005381 lambda: 1.0129234 val_loss: 0.0052430 val_pos_err: 1475.4418945 val_vel_err: 175.6213531 val_traj_loss: 0.0043218 val_node_norm: 0.0008654 val_lambda: 1.0129229
-[INFO] [rollout probe @ epoch 50] mean_pos_err=427546179.4 disc=73373375.8 worst=1710156416.0 finite=67%
-[INFO] Epoch 50: loss: 0.0044601 pos_err: 901.5348511 vel_err: 152.9244843 traj_loss: 0.0038644 node_norm: 0.0005414 lambda: 1.0140382 val_loss: 0.0057740 val_pos_err: 1557.7847900 val_vel_err: 168.8201599 val_traj_loss: 0.0048973 val_node_norm: 0.0008079 val_lambda: 1.0140384 rollout_pos_err: 427546179.3530884 rollout_pos_err_worst: 1710156416.0000000 rollout_pos_err_discounted: 73373375.8196473 rollout_frac_finite: 0.6666667
-[INFO] Epoch 55: loss: 0.0043853 pos_err: 896.4920654 vel_err: 151.9577789 traj_loss: 0.0037915 node_norm: 0.0005362 lambda: 1.0151865 val_loss: 0.0054227 val_pos_err: 1451.7049561 val_vel_err: 170.5521240 val_traj_loss: 0.0045120 val_node_norm: 0.0008421 val_lambda: 1.0151873
-[INFO] Epoch 60: loss: 0.0044043 pos_err: 890.0599365 vel_err: 153.6656036 traj_loss: 0.0038102 node_norm: 0.0005318 lambda: 1.0163459 val_loss: 0.0052008 val_pos_err: 1462.7779541 val_vel_err: 167.0563965 val_traj_loss: 0.0042548 val_node_norm: 0.0008764 val_lambda: 1.0163455
-[INFO] Epoch 65: loss: 0.0043771 pos_err: 889.4003296 vel_err: 151.8614502 traj_loss: 0.0037828 node_norm: 0.0005284 lambda: 1.0174253 val_loss: 0.0056653 val_pos_err: 1579.8698730 val_vel_err: 179.3828583 val_traj_loss: 0.0047485 val_node_norm: 0.0008340 val_lambda: 1.0174246
-[INFO] Epoch 70: loss: 0.0044468 pos_err: 889.2454834 vel_err: 153.7972260 traj_loss: 0.0038452 node_norm: 0.0005303 lambda: 1.0185201 val_loss: 0.0056127 val_pos_err: 1563.2017822 val_vel_err: 167.3557129 val_traj_loss: 0.0046939 val_node_norm: 0.0008319 val_lambda: 1.0185195
-[INFO] [rollout probe @ epoch 75] mean_pos_err=12769.9 disc=8175.6 worst=23666.3 finite=67%
-[INFO] Epoch 75: loss: 0.0044075 pos_err: 894.9399414 vel_err: 152.2362061 traj_loss: 0.0038069 node_norm: 0.0005258 lambda: 1.0196533 val_loss: 0.0051486 val_pos_err: 1536.1948242 val_vel_err: 168.8849487 val_traj_loss: 0.0042179 val_node_norm: 0.0008478 val_lambda: 1.0196533 rollout_pos_err: 12769.8630981 rollout_pos_err_worst: 23666.3203125 rollout_pos_err_discounted: 8175.6045717 rollout_frac_finite: 0.6666667
-[INFO] Epoch 80: loss: 0.0043652 pos_err: 879.9317627 vel_err: 151.8356323 traj_loss: 0.0037693 node_norm: 0.0005177 lambda: 1.0207510 val_loss: 0.0053051 val_pos_err: 1389.8134766 val_vel_err: 170.7881165 val_traj_loss: 0.0043584 val_node_norm: 0.0008563 val_lambda: 1.0207500
-[INFO] Epoch 85: loss: 0.0043510 pos_err: 876.2745361 vel_err: 150.7073212 traj_loss: 0.0037493 node_norm: 0.0005198 lambda: 1.0218356 val_loss: 0.0053591 val_pos_err: 1453.3026123 val_vel_err: 179.4173584 val_traj_loss: 0.0044659 val_node_norm: 0.0007958 val_lambda: 1.0218360
-[INFO] Epoch 90: loss: 0.0044855 pos_err: 899.6807861 vel_err: 152.1407623 traj_loss: 0.0038725 node_norm: 0.0005239 lambda: 1.0229864 val_loss: 0.0052910 val_pos_err: 1132.8717041 val_vel_err: 173.7418213 val_traj_loss: 0.0043625 val_node_norm: 0.0008283 val_lambda: 1.0229856
-[INFO] Epoch 95: loss: 0.0043996 pos_err: 886.7911377 vel_err: 151.5403900 traj_loss: 0.0037957 node_norm: 0.0005124 lambda: 1.0241003 val_loss: 0.0051815 val_pos_err: 1498.9796143 val_vel_err: 160.5251007 val_traj_loss: 0.0042498 val_node_norm: 0.0008294 val_lambda: 1.0240998
-[INFO] [rollout probe @ epoch 100] mean_pos_err=14764.7 disc=9348.1 worst=22966.1 finite=83%
-[INFO] Epoch 100: loss: 0.0043596 pos_err: 886.6831055 vel_err: 152.0589142 traj_loss: 0.0037556 node_norm: 0.0005093 lambda: 1.0252044 val_loss: 0.0053136 val_pos_err: 1514.3847656 val_vel_err: 166.5236359 val_traj_loss: 0.0043971 val_node_norm: 0.0008057 val_lambda: 1.0252048 rollout_pos_err: 14764.6916016 rollout_pos_err_worst: 22966.0703125 rollout_pos_err_discounted: 9348.0637072 rollout_frac_finite: 0.8333333
-[INFO] Epoch 105: loss: 0.0043788 pos_err: 881.3424683 vel_err: 151.2745972 traj_loss: 0.0037654 node_norm: 0.0005142 lambda: 1.0263605 val_loss: 0.0051386 val_pos_err: 1436.1370850 val_vel_err: 163.7425385 val_traj_loss: 0.0042295 val_node_norm: 0.0007976 val_lambda: 1.0263612
-[INFO] Epoch 110: loss: 0.0044050 pos_err: 884.3779297 vel_err: 151.1616516 traj_loss: 0.0037930 node_norm: 0.0005079 lambda: 1.0274431 val_loss: 0.0051868 val_pos_err: 1295.8486328 val_vel_err: 163.2295227 val_traj_loss: 0.0042159 val_node_norm: 0.0008552 val_lambda: 1.0274434
-[INFO] Epoch 115: loss: 0.0043456 pos_err: 874.1686401 vel_err: 150.9053040 traj_loss: 0.0037328 node_norm: 0.0005062 lambda: 1.0285265 val_loss: 0.0052926 val_pos_err: 1491.2802734 val_vel_err: 169.9349823 val_traj_loss: 0.0043486 val_node_norm: 0.0008199 val_lambda: 1.0285271
-[INFO] Epoch 120: loss: 0.0043854 pos_err: 883.8769531 vel_err: 150.7798767 traj_loss: 0.0037625 node_norm: 0.0005114 lambda: 1.0296402 val_loss: 0.0051104 val_pos_err: 1226.4138184 val_vel_err: 167.3242188 val_traj_loss: 0.0041674 val_node_norm: 0.0008195 val_lambda: 1.0296401
-[INFO] [rollout probe @ epoch 125] mean_pos_err=17317.0 disc=10338.3 worst=25388.8 finite=67%
-[INFO] Epoch 125: loss: 0.0043467 pos_err: 876.5667114 vel_err: 150.2229614 traj_loss: 0.0037263 node_norm: 0.0005060 lambda: 1.0306970 val_loss: 0.0053410 val_pos_err: 1446.5783691 val_vel_err: 167.6985474 val_traj_loss: 0.0044287 val_node_norm: 0.0007763 val_lambda: 1.0306971 rollout_pos_err: 17317.0261230 rollout_pos_err_worst: 25388.7714844 rollout_pos_err_discounted: 10338.3493160 rollout_frac_finite: 0.6666667
-[INFO] Early stopping triggered at 128
+    Parameters
+    ----------
+    omega : float
+        Approximate phugoid natural frequency (rad/s). Typical values for
+        subsonic aircraft are 0.02–0.04 rad/s (≈ 0.3–0.6 Hz).
+    k_ph : float
+        Gain that scales the phugoid forcing term.
 
-Running length strategy: (0.5, 3000, <neural_ode_mod.EarlyStopper object at 0x13ba1c410>, 0.0001)
-[INFO] Epoch 5: loss: 0.0040937 pos_err: 1103.7349854 vel_err: 146.1501923 traj_loss: 0.0037313 node_norm: 0.0003571 lambda: 1.0014381 val_loss: 0.0070950 val_pos_err: 2411.6267090 val_vel_err: 180.1041107 val_traj_loss: 0.0064480 val_node_norm: 0.0006377 val_lambda: 1.0014385
-[INFO] Epoch 10: loss: 0.0042127 pos_err: 1126.1466064 vel_err: 147.0764618 traj_loss: 0.0038195 node_norm: 0.0003819 lambda: 1.0029564 val_loss: 0.0073716 val_pos_err: 2143.4123535 val_vel_err: 169.4036255 val_traj_loss: 0.0067098 val_node_norm: 0.0006420 val_lambda: 1.0029559
-[INFO] Epoch 15: loss: 0.0043040 pos_err: 1173.2825928 vel_err: 149.0192108 traj_loss: 0.0039008 node_norm: 0.0003862 lambda: 1.0043519 val_loss: 0.0066637 val_pos_err: 2310.3461914 val_vel_err: 177.6031952 val_traj_loss: 0.0060347 val_node_norm: 0.0006028 val_lambda: 1.0043514
-[INFO] Epoch 20: loss: 0.0040711 pos_err: 1071.8712158 vel_err: 146.8660278 traj_loss: 0.0036628 node_norm: 0.0003870 lambda: 1.0058129 val_loss: 0.0060968 val_pos_err: 2034.9614258 val_vel_err: 164.6065369 val_traj_loss: 0.0054310 val_node_norm: 0.0006343 val_lambda: 1.0058125
-[INFO] [rollout probe @ epoch 25] mean_pos_err=6176.4 disc=4412.2 worst=9321.9 finite=83%
-[INFO] Epoch 25: loss: 0.0042034 pos_err: 1098.7216797 vel_err: 148.2781677 traj_loss: 0.0037763 node_norm: 0.0003987 lambda: 1.0075380 val_loss: 0.0075729 val_pos_err: 1815.9328613 val_vel_err: 170.5101471 val_traj_loss: 0.0069048 val_node_norm: 0.0006161 val_lambda: 1.0075382 rollout_pos_err: 6176.4127930 rollout_pos_err_worst: 9321.8525391 rollout_pos_err_discounted: 4412.2146440 rollout_frac_finite: 0.8333333
-[INFO] Epoch 30: loss: 0.0040765 pos_err: 1074.0108643 vel_err: 145.8694611 traj_loss: 0.0036514 node_norm: 0.0003919 lambda: 1.0090787 val_loss: 0.0075795 val_pos_err: 2095.8618164 val_vel_err: 177.5093994 val_traj_loss: 0.0069243 val_node_norm: 0.0005923 val_lambda: 1.0090780
-[INFO] Epoch 35: loss: 0.0040770 pos_err: 1042.7978516 vel_err: 147.1977844 traj_loss: 0.0036421 node_norm: 0.0003963 lambda: 1.0106003 val_loss: 0.0074691 val_pos_err: 1990.9633789 val_vel_err: 177.2315369 val_traj_loss: 0.0067924 val_node_norm: 0.0006047 val_lambda: 1.0105999
-[INFO] Epoch 40: loss: 0.0041800 pos_err: 1105.7476807 vel_err: 148.6105499 traj_loss: 0.0037370 node_norm: 0.0003981 lambda: 1.0120203 val_loss: 0.0060188 val_pos_err: 2212.4133301 val_vel_err: 170.3121643 val_traj_loss: 0.0053043 val_node_norm: 0.0006508 val_lambda: 1.0120209
-[INFO] Epoch 45: loss: 0.0041735 pos_err: 1141.3813477 vel_err: 149.4842987 traj_loss: 0.0037307 node_norm: 0.0003931 lambda: 1.0133178 val_loss: 0.0073711 val_pos_err: 2385.9636230 val_vel_err: 166.1806030 val_traj_loss: 0.0066569 val_node_norm: 0.0006256 val_lambda: 1.0133182
-[INFO] [rollout probe @ epoch 50] mean_pos_err=9154.6 disc=6311.4 worst=19712.2 finite=100%
-[INFO] Epoch 50: loss: 0.0041771 pos_err: 1094.4362793 vel_err: 147.8313293 traj_loss: 0.0037279 node_norm: 0.0003945 lambda: 1.0146787 val_loss: 0.0062748 val_pos_err: 2016.0019531 val_vel_err: 171.9022980 val_traj_loss: 0.0055915 val_node_norm: 0.0006012 val_lambda: 1.0146782 rollout_pos_err: 9154.6225586 rollout_pos_err_worst: 19712.1503906 rollout_pos_err_discounted: 6311.3941810 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0041234 pos_err: 1092.2396240 vel_err: 147.3683929 traj_loss: 0.0036656 node_norm: 0.0003990 lambda: 1.0160398 val_loss: 0.0061793 val_pos_err: 2151.3203125 val_vel_err: 169.0140381 val_traj_loss: 0.0055077 val_node_norm: 0.0005833 val_lambda: 1.0160391
-[INFO] Epoch 60: loss: 0.0041217 pos_err: 1057.5672607 vel_err: 147.6862946 traj_loss: 0.0036611 node_norm: 0.0003965 lambda: 1.0174906 val_loss: 0.0073112 val_pos_err: 2240.9077148 val_vel_err: 176.0335999 val_traj_loss: 0.0065767 val_node_norm: 0.0006194 val_lambda: 1.0174913
-[INFO] Epoch 65: loss: 0.0041425 pos_err: 1110.0921631 vel_err: 147.6410980 traj_loss: 0.0036817 node_norm: 0.0003906 lambda: 1.0190465 val_loss: 0.0067633 val_pos_err: 2216.5251465 val_vel_err: 169.3268127 val_traj_loss: 0.0060568 val_node_norm: 0.0005912 val_lambda: 1.0190458
-[INFO] Epoch 70: loss: 0.0040768 pos_err: 1049.4486084 vel_err: 146.7203064 traj_loss: 0.0036106 node_norm: 0.0003920 lambda: 1.0205572 val_loss: 0.0062204 val_pos_err: 2161.8054199 val_vel_err: 172.8467407 val_traj_loss: 0.0054930 val_node_norm: 0.0006145 val_lambda: 1.0205566
-[INFO] [rollout probe @ epoch 75] mean_pos_err=12504.0 disc=8390.6 worst=34196.0 finite=100%
-[INFO] Epoch 75: loss: 0.0044155 pos_err: 1221.7403564 vel_err: 150.9589233 traj_loss: 0.0039336 node_norm: 0.0003957 lambda: 1.0219344 val_loss: 0.0070084 val_pos_err: 2218.8740234 val_vel_err: 169.8436890 val_traj_loss: 0.0062324 val_node_norm: 0.0006393 val_lambda: 1.0219343 rollout_pos_err: 12504.0379232 rollout_pos_err_worst: 34196.0117188 rollout_pos_err_discounted: 8390.5930941 rollout_frac_finite: 1.0000000
-[INFO] Epoch 80: loss: 0.0042080 pos_err: 1066.3651123 vel_err: 146.9143524 traj_loss: 0.0037262 node_norm: 0.0003948 lambda: 1.0233620 val_loss: 0.0068192 val_pos_err: 2231.6513672 val_vel_err: 175.4686432 val_traj_loss: 0.0060635 val_node_norm: 0.0006140 val_lambda: 1.0233625
-[INFO] Epoch 85: loss: 0.0041665 pos_err: 1088.1827393 vel_err: 147.5387878 traj_loss: 0.0036797 node_norm: 0.0003956 lambda: 1.0247763 val_loss: 0.0069887 val_pos_err: 2257.3405762 val_vel_err: 173.8367462 val_traj_loss: 0.0062137 val_node_norm: 0.0006210 val_lambda: 1.0247761
-[INFO] Epoch 90: loss: 0.0040461 pos_err: 1042.4343262 vel_err: 148.0277710 traj_loss: 0.0035567 node_norm: 0.0003961 lambda: 1.0262412 val_loss: 0.0065797 val_pos_err: 2268.0891113 val_vel_err: 175.3010712 val_traj_loss: 0.0058128 val_node_norm: 0.0006144 val_lambda: 1.0262412
-[INFO] Epoch 95: loss: 0.0041865 pos_err: 1078.2226562 vel_err: 147.5229645 traj_loss: 0.0036905 node_norm: 0.0003940 lambda: 1.0276377 val_loss: 0.0056628 val_pos_err: 2088.3735352 val_vel_err: 166.2228699 val_traj_loss: 0.0048934 val_node_norm: 0.0006342 val_lambda: 1.0276383
-[INFO] [rollout probe @ epoch 100] mean_pos_err=11272.4 disc=7326.7 worst=29691.0 finite=100%
-[INFO] Epoch 100: loss: 0.0040792 pos_err: 1053.4097900 vel_err: 145.8291168 traj_loss: 0.0035820 node_norm: 0.0003934 lambda: 1.0289688 val_loss: 0.0057239 val_pos_err: 1902.3968506 val_vel_err: 165.4665070 val_traj_loss: 0.0049422 val_node_norm: 0.0006385 val_lambda: 1.0289692 rollout_pos_err: 11272.4327799 rollout_pos_err_worst: 29690.9531250 rollout_pos_err_discounted: 7326.6917759 rollout_frac_finite: 1.0000000
-[INFO] Early stopping triggered at 104
+    Returns
+    -------
+    np.ndarray (3,)
+        Acceleration vector; only the z‑component is non‑zero.
+    """
+    # Extract vertical state
+    z  = s[2]                 # altitude
+    vz = s[5]                 # vertical speed
 
-Running length strategy: (0.7, 2000, <neural_ode_mod.EarlyStopper object at 0x13b802410>, 0.0001)
-[INFO] Epoch 5: loss: 0.0040082 pos_err: 1305.5885010 vel_err: 143.2043762 traj_loss: 0.0036759 node_norm: 0.0003258 lambda: 1.0017670 val_loss: 0.0102919 val_pos_err: 2648.1110840 val_vel_err: 166.5115356 val_traj_loss: 0.0098113 val_node_norm: 0.0004632 val_lambda: 1.0017675
-[INFO] Epoch 10: loss: 0.0041130 pos_err: 1358.4916992 vel_err: 143.4056702 traj_loss: 0.0037645 node_norm: 0.0003343 lambda: 1.0037994 val_loss: 0.0099190 val_pos_err: 2950.1035156 val_vel_err: 156.1549530 val_traj_loss: 0.0094050 val_node_norm: 0.0004782 val_lambda: 1.0037997
-[INFO] Epoch 15: loss: 0.0038570 pos_err: 1205.0894775 vel_err: 139.3258057 traj_loss: 0.0035015 node_norm: 0.0003342 lambda: 1.0060689 val_loss: 0.0086462 val_pos_err: 2739.8063965 val_vel_err: 152.9645996 val_traj_loss: 0.0081226 val_node_norm: 0.0004743 val_lambda: 1.0060683
-[INFO] Epoch 20: loss: 0.0039962 pos_err: 1277.6832275 vel_err: 139.9477539 traj_loss: 0.0036301 node_norm: 0.0003361 lambda: 1.0082819 val_loss: 0.0124286 val_pos_err: 3063.6042480 val_vel_err: 169.8717041 val_traj_loss: 0.0118557 val_node_norm: 0.0004747 val_lambda: 1.0082825
-[INFO] [rollout probe @ epoch 25] mean_pos_err=8322.8 disc=5714.0 worst=17099.2 finite=100%
-[INFO] Epoch 25: loss: 0.0038078 pos_err: 1216.7119141 vel_err: 139.8347626 traj_loss: 0.0034389 node_norm: 0.0003329 lambda: 1.0104522 val_loss: 0.0067160 val_pos_err: 2928.0893555 val_vel_err: 167.8565216 val_traj_loss: 0.0061889 val_node_norm: 0.0004625 val_lambda: 1.0104519 rollout_pos_err: 8322.7683919 rollout_pos_err_worst: 17099.2207031 rollout_pos_err_discounted: 5713.9956542 rollout_frac_finite: 1.0000000
-[INFO] Epoch 30: loss: 0.0038132 pos_err: 1171.6801758 vel_err: 139.1799011 traj_loss: 0.0034315 node_norm: 0.0003394 lambda: 1.0123107 val_loss: 0.0102668 val_pos_err: 2958.4702148 val_vel_err: 169.3694763 val_traj_loss: 0.0096738 val_node_norm: 0.0004739 val_lambda: 1.0123111
-[INFO] Epoch 35: loss: 0.0037613 pos_err: 1171.3651123 vel_err: 139.7416687 traj_loss: 0.0033776 node_norm: 0.0003350 lambda: 1.0144036 val_loss: 0.0091558 val_pos_err: 2851.8774414 val_vel_err: 161.9158936 val_traj_loss: 0.0085654 val_node_norm: 0.0004671 val_lambda: 1.0144032
-[INFO] Epoch 40: loss: 0.0042563 pos_err: 1293.8720703 vel_err: 141.2378845 traj_loss: 0.0038603 node_norm: 0.0003319 lambda: 1.0166090 val_loss: 0.0109302 val_pos_err: 4059.2878418 val_vel_err: 205.9271698 val_traj_loss: 0.0102917 val_node_norm: 0.0004675 val_lambda: 1.0166086
-[INFO] Epoch 45: loss: 0.0038510 pos_err: 1208.5482178 vel_err: 140.9109344 traj_loss: 0.0034464 node_norm: 0.0003390 lambda: 1.0190505 val_loss: 0.0078304 val_pos_err: 3279.9213867 val_vel_err: 165.8348541 val_traj_loss: 0.0072236 val_node_norm: 0.0004691 val_lambda: 1.0190501
-[INFO] [rollout probe @ epoch 50] mean_pos_err=7178.3 disc=5044.6 worst=15748.7 finite=100%
-[INFO] Epoch 50: loss: 0.0037351 pos_err: 1132.9129639 vel_err: 138.2824554 traj_loss: 0.0033305 node_norm: 0.0003339 lambda: 1.0212404 val_loss: 0.0111521 val_pos_err: 2662.3842773 val_vel_err: 162.9044495 val_traj_loss: 0.0104630 val_node_norm: 0.0004668 val_lambda: 1.0212405 rollout_pos_err: 7178.2660319 rollout_pos_err_worst: 15748.7363281 rollout_pos_err_discounted: 5044.5851365 rollout_frac_finite: 1.0000000
-[INFO] Epoch 55: loss: 0.0038279 pos_err: 1209.0616455 vel_err: 140.7546997 traj_loss: 0.0034133 node_norm: 0.0003338 lambda: 1.0236884 val_loss: 0.0079204 val_pos_err: 2876.7434082 val_vel_err: 156.5355682 val_traj_loss: 0.0072712 val_node_norm: 0.0004769 val_lambda: 1.0236882
-[INFO] Epoch 60: loss: 0.0039905 pos_err: 1244.7542725 vel_err: 141.7041779 traj_loss: 0.0035667 node_norm: 0.0003320 lambda: 1.0257446 val_loss: 0.0114501 val_pos_err: 3256.7954102 val_vel_err: 170.9818726 val_traj_loss: 0.0107175 val_node_norm: 0.0004567 val_lambda: 1.0257440
-[INFO] Epoch 65: loss: 0.0037713 pos_err: 1156.5920410 vel_err: 140.0431213 traj_loss: 0.0033408 node_norm: 0.0003368 lambda: 1.0280447 val_loss: 0.0089128 val_pos_err: 3147.7746582 val_vel_err: 165.9278107 val_traj_loss: 0.0082095 val_node_norm: 0.0004731 val_lambda: 1.0280442
-[INFO] Epoch 70: loss: 0.0038390 pos_err: 1185.2298584 vel_err: 140.1917267 traj_loss: 0.0033997 node_norm: 0.0003365 lambda: 1.0302055 val_loss: 0.0088052 val_pos_err: 3092.6994629 val_vel_err: 172.4805908 val_traj_loss: 0.0080942 val_node_norm: 0.0004665 val_lambda: 1.0302060
-[INFO] [rollout probe @ epoch 75] mean_pos_err=7780.8 disc=5647.6 worst=14045.0 finite=100%
-[INFO] Epoch 75: loss: 0.0037791 pos_err: 1187.1743164 vel_err: 140.7446594 traj_loss: 0.0033341 node_norm: 0.0003364 lambda: 1.0325775 val_loss: 0.0104808 val_pos_err: 3180.8750000 val_vel_err: 168.7916565 val_traj_loss: 0.0096919 val_node_norm: 0.0004732 val_lambda: 1.0325775 rollout_pos_err: 7780.8077596 rollout_pos_err_worst: 14044.9765625 rollout_pos_err_discounted: 5647.6136889 rollout_frac_finite: 1.0000000
+    # The phugoid is essentially a **coupled** oscillation between
+    # altitude and vertical speed.  One convenient representation is
+    # a second‑order linear system:
+    #
+    #   z̈ + 2ζω ż + ω² (z - z_eq) = 0
+    #
+    # where ζ is a small damping ratio (≈0.1).  To encode it as a
+    # candidate function we can return the left‑hand side as a forcing
+    # acceleration.  Here we treat ζ as an implicit constant and embed it
+    # into the gain `k_ph`.
+    #
+    #   a_ph = -k_ph * ( ω**2 * z + 2*ζ*ω * vz )
+    #
+    # For SINDy we only need a deterministic expression; we therefore
+    # drop the explicit equilibrium term and let the regression decide
+    # the offset.
+    #
+    # Choose a typical small damping ζ≈0.05 → 2ζω ≈ 0.1*ω.
+    damping_term = 0.1 * omega * vz
+    stiffness_term = omega**2 * z
+    a_z = -k_ph * (stiffness_term + damping_term)
+
+    return np.array([0.0, 0.0, a_z]) 
+
+Oh other thought that crossed my mind. SINDy should be working on the non-scaled data. All of the math is based on meters and meters/sec. Just blurting things out from my head.
+One other helpful nugget from the LLM. Tuning the guidance law gains. (this seems like a painful way to do it. maybe a better way would be hyperparameters?)
+
+If you want to parameter‑tune a guidance law (e.g., find the optimal navigation constant N), you can construct a family of functions with different constants using functools.partial before passing them to CustomLibrary.
+
+from functools import partial
+pn_N4   = partial(mg.pn_basic, N=4.0)
+pn_N5   = partial(mg.pn_basic, N=5.0)
+pn_N6   = partial(mg.pn_basic, N=6.0)
+
+# add them to the library list
+all_funcs.extend([pn_N4, pn_N5, pn_N6])
+
+When SINDy runs, the coefficients attached to pn_N4, pn_N5, pn_N6 will tell you which navigation constant best explains the data.
+
+Last few guidance laws and then I'm going to stop talking. Some of these are repeats sorry.
+
+# ------------------------------------------------------------
+# Missile‑Guidance function add‑on for pySINDy
+# ------------------------------------------------------------
+# All functions accept the *same* state vector:
+#     s = [x, y, z, vx, vy, vz]       # ownship (missile) Cartesian state
+# They return a 3‑vector acceleration (a_x, a_y, a_z) that would be
+# added to the missile’s equations of motion.
+# ------------------------------------------------------------
+
+import numpy as np
+from numpy.linalg import norm
+
+# ------------------------------------------------------------------
+# Helper utilities (shared by many missile laws)
+# ------------------------------------------------------------------
+def los_vector(s_target, s_own):
+    r = s_target[:3] - s_own[:3]
+    return r / norm(r)
+
+def los_rate(s_target, s_own):
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    return np.cross(r, v_rel) / (norm(r) ** 2)
+
+def closing_velocity(s_target, s_own):
+    """Positive when missile is closing on target."""
+    lam = los_vector(s_target, s_own)
+    v_rel = s_target[3:6] - s_own[3:6]
+    return -np.dot(v_rel, lam)      # Vc > 0 ⇒ closing
+
+# ------------------------------------------------------------------
+# 1) Classical Proportional Navigation (PN) – baseline
+# ------------------------------------------------------------------
+def pn_basic(s_own, s_target, N=4.0):
+    """
+    a = N * Vc * (λ̇ × λ̂)
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    Vc = closing_velocity(s_target, s_own)
+    # λ̇ is a vector; the cross product yields a vector orthogonal to LOS
+    a = N * Vc * np.cross(lam_dot, lam)
+    return a
+
+# ------------------------------------------------------------------
+# 2) Augmented PN (APN) – bias term to counteract target manoeuvres
+# ------------------------------------------------------------------
+def pn_augmented(s_own, s_target, N=4.5, k_bias=0.15):
+    """
+    a = N * Vc * (λ̇ × λ̂) + k_bias * λ̂
+    The bias term provides a small “lead” that helps when the target
+    performs a sudden turn.
+    """
+    a = pn_basic(s_own, s_target, N=N)
+    lam = los_vector(s_target, s_own)
+    a += k_bias * lam
+    return a
+
+# ------------------------------------------------------------------
+# 3) True‑Line‑of‑Sight (TLOS) – retain a constant LOS angle
+# ------------------------------------------------------------------
+def tlos(s_own, s_target, k_tlos=0.6):
+    """
+    a = -k_tlos * (λ̇ ⟂ λ̂) * Vc * λ̂
+    The term (λ̇ ⟂ λ̂) is the component of LOS rate orthogonal to LOS.
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    # Remove component parallel to λ̂
+    lam_dot_perp = lam_dot - np.dot(lam_dot, lam) * lam
+    Vc = closing_velocity(s_target, s_own)
+    a = -k_tlos * norm(lam_dot_perp) * Vc * lam
+    return a
+
+# ------------------------------------------------------------------
+# 4) Constant‑Bearing (CB) – zero bearing‑rate law
+# ------------------------------------------------------------------
+def constant_bearing(s_own, s_target, k_cb=0.5):
+    """
+    a = -k_cb * ω_b * Vc * λ̂
+    where ω_b is the magnitude of bearing‑rate (the orthogonal part of λ̇).
+    """
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    # Bearing‑rate magnitude (same as |λ̇_perp|)
+    bearing_rate = norm(lam_dot - np.dot(lam_dot, lam) * lam)
+    Vc = closing_velocity(s_target, s_own)
+    return -k_cb * bearing_rate * Vc * lam
+
+# ------------------------------------------------------------------
+# 5) Lead‑Angle Guidance (LA) – fixed lead ahead of LOS
+# ------------------------------------------------------------------
+def lead_angle(s_own, s_target, psi_lead=np.radians(12), k_la=0.35):
+    """
+    Rotate the LOS unit vector by a constant lead angle ψ_lead
+    in the LOS‑plane and accelerate toward that rotated direction.
+    """
+    lam = los_vector(s_target, s_own)
+
+    # Choose a reference direction that is not colinear with lam.
+    ref = np.array([1.0, 0.0, 0.0])
+    if np.allclose(np.cross(lam, ref), 0.0):
+        ref = np.array([0.0, 1.0, 0.0])
+    axis = np.cross(lam, ref)
+    axis = axis / norm(axis)
+
+    # Rodrigues rotation
+    c = np.cos(psi_lead)
+    s = np.sin(psi_lead)
+    lam_lead = (c * lam +
+                s * np.cross(axis, lam) +
+                (1 - c) * np.dot(lam, axis) * axis)
+
+    return k_la * lam_lead
+
+# ------------------------------------------------------------------
+# 6) Zero‑Effort‑Miss (ZEM) / Zero‑Effort‑Velocity (ZEV)
+# ------------------------------------------------------------------
+def zem_zev(s_own, s_target, t_go=4.0, k_zem=1.0):
+    """
+    a = -2 (r + v_rel·t_go) / t_go²
+    where r = target – missile position, v_rel = target – missile velocity.
+    """
+    r = s_target[:3] - s_own[:3]
+    v_rel = s_target[3:6] - s_own[3:6]
+    a = -2.0 * (r + v_rel * t_go) / (t_go ** 2)
+    return k_zem * a
+
+# ------------------------------------------------------------------
+# 7) Integrated Guidance (IG) – combines PN with a line‑of‑sight rate
+#    filter; useful when sensor noise is high.
+# ------------------------------------------------------------------
+def integrated_guidance(s_own, s_target,
+                       N=4.0, tau=0.3, k_i=0.1, state=None):
+    """
+    Implements a first‑order low‑pass filter on LOS rate:
+        λ̇_f = ( -λ̇_f + λ̇ ) / τ
+
+    The returned acceleration:
+        a = N * Vc * ( λ̇_f × λ̂ ) + k_i * ∫λ̇_f dt
+
+    `state` is a mutable dict that stores λ̇_f and the integral term.
+    It must be supplied by the caller (e.g., the integration loop) so that
+    the filter can retain memory between successive calls.
+    """
+    if state is None:
+        raise ValueError("IG requires a mutable state dict (e.g., {'lam_dot_f':np.zeros(3), 'int':np.zeros(3)})")
+
+    lam = los_vector(s_target, s_own)
+    lam_dot = los_rate(s_target, s_own)
+    Vc = closing_velocity(s_target, s_own)
+
+    # First‑order filter update (explicit Euler)
+    lam_dot_f = state["lam_dot_f"]
+    lam_dot_f[:] = lam_dot_f + (-lam_dot_f + lam_dot) * (1.0 / tau)
+
+    # Integral update
+    state["int"][:] = state["int"] + lam_dot_f * (1.0 / tau)   # dt≈1/τ for simplicity
+
+    a = N * Vc * np.cross(lam_dot_f, lam) + k_i * state["int"]
+    return a
+
+# ------------------------------------------------------------------
+# 8) Energy‑Based Missile Guidance (EBG)
+# ------------------------------------------------------------------
+def energy_based_guidance_missile(s_own, s_target,
+                                 k_e=0.04, V_des=300.0):
+    """
+    Controls the missile’s specific mechanical energy to drive the speed
+    toward a commanded cruise speed `V_des`.  This is useful for “end‑game”
+    where the missile wants to maintain a constant impact velocity.
+
+    a = -k_e * ( (|v|²/2) - V_des²/2 ) * v̂
+    """
+    v = s_own[3:6]
+    speed = norm(v) + 1e-6
+    e_spec = 0.5 * speed**2
+    e_ref = 0.5 * V_des**2
+    error = e_spec - e_ref
+    a = -k_e * error * v / speed
+    return a
+
+# ------------------------------------------------------------------
+# 9) Terminal‑Phase “Impact‑Angle” Guidance
+# ------------------------------------------------------------------
+def impact_angle_guidance(s_own, s_target,
+                         theta_imp=np.radians(30),
+                         k_imp=0.5):
+    """
+    Forces the missile to approach the target on a prescribed impact
+    angle θ_imp measured from the target‑centric local horizontal plane.
+    The law creates a lateral acceleration component that rotates the LOS
+    toward the desired impact geometry.
+
+    a = k_imp * ( λ̂_rot – λ̂ )
+    where λ̂_rot is the LOS vector rotated by θ_imp about the axis
+    perpendicular to the LOS‑plane and the target‑centered local vertical.
+    """
+    lam = los_vector(s_target, s_own)
+
+    # Define a target‑centric vertical (approximate) as the unit vector
+    # from target to Earth centre: for a high‑altitude missile we can take it as [0,0,1].
+    # If you have a more accurate model replace `z_hat` accordingly.
+    z_hat = np.array([0.0, 0.0, 1.0])
+    # Axis that is orthogonal to both LOS and the vertical
+    axis = np.cross(lam, z_hat)
+    if norm(axis) < 1e-6:                # LOS already aligned with vertical
+        axis = np.array([1.0, 0.0, 0.0])
+    axis = axis / norm(axis)
+
+    # Rotate LOS by the desired impact angle (away from vertical)
+    c = np.cos(theta_imp)
+    s = np.sin(theta_imp)
+    lam_rot = (c * lam +
+               s * np.cross(axis, lam) +
+               (1 - c) * np.dot(lam, axis) * axis)
+
+    a = k_imp * (lam_rot - lam)
+    return a
+
+# ------------------------------------------------------------------
+# Export list for pySINDy (optional)
+# ------------------------------------------------------------------
+missile_guidance_funcs = [
+    pn_basic, pn_augmented, tlos, constant_bearing,
+    lead_angle, zem_zev, integrated_guidance,
+    energy_based_guidance_missile, impact_angle_guidance
+]
+
+__all__ = [
+    # (existing names from guidance_lib.py stay there)
+    # add the missile‑specific ones
+    "pn_basic", "pn_augmented", "tlos", "constant_bearing",
+    "lead_angle", "zem_zev", "integrated_guidance",
+    "energy_based_guidance_missile", "impact_angle_guidance"
+]
+ 

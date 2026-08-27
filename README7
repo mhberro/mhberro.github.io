@@ -1,1 +1,615 @@
-https://www.youtube.com/watch?v=NxAn0oglMVw
+# ensemble_sindy.py
+"""Ensemble-SINDy discovery module for sparse physical vector fields."""
+
+from __future__ import annotations
+
+import itertools
+import numpy as np
+import torch
+from torch import nn
+
+
+class PolynomialLibrary:
+    def __init__(self, degree: int = 2, include_bias: bool = True):
+        self.degree = degree
+        self.include_bias = include_bias
+
+    def term_combos(self, n_features: int) -> list:
+        """Column layout: one tuple per term (empty tuple = bias)."""
+        combos = []
+        for d in range(0 if self.include_bias else 1, self.degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+        return combos
+
+    def fit_transform(self, Y: np.ndarray) -> np.ndarray:
+        n_samples, n_features = Y.shape
+        combos = []
+        for d in range(0 if self.include_bias else 1, self.degree + 1):
+            combos.extend(itertools.combinations_with_replacement(range(n_features), d))
+
+        library = np.empty((n_samples, len(combos)), dtype=Y.dtype)
+        for i, combo in enumerate(combos):
+            if len(combo) == 0:
+                library[:, i] = 1.0
+            else:
+                library[:, i] = np.prod(Y[:, combo], axis=1)
+        return library
+
+
+
+EARTH_OMEGA = 7.292115e-5  # rad/s, WGS-84
+
+
+def build_physics_constraints(term_names, library=None, target_names=None,
+                              origin_lat_deg=None, verbose=True):
+    """Build stridge `constraints` for coefficients THEORY fixes exactly.
+
+    Returns {(feature_idx, target_idx): value_in_library_units}.
+
+    The exact relations (see eom_library term docs):
+        transport_va  on dv_al/dt  = -2      (exact polar kinematics)
+        centripetal_s on dv_s/dt   = +1      (exact polar kinematics)
+        cor_turn      on dv_al/dt  = +f      f = 2*Omega*sin(lat0)   [needs latitude]
+        cor_along     on dv_s/dt   = -f                              [needs latitude]
+
+    IMPORTANT UNIT HANDLING: the library internally divides each column by its frozen
+    col_scale_, so a coefficient in "library units" is  physical * col_scale_[j].
+    stridge applies a further normalisation of its own and undoes it internally, so
+    what we hand it must be in LIBRARY units, not physical ones. Getting this wrong
+    silently pins the coefficient to the wrong number, so it is done here once rather
+    than at the call site.
+
+    The latitude-dependent Coriolis constraints are only emitted when
+    `origin_lat_deg` is supplied; the two purely kinematic ones need no extra input
+    and are always safe to apply.
+    """
+    names = list(term_names)
+    targets = list(target_names or DEFAULT_TARGET_NAMES)
+    col_scale = getattr(library, "col_scale_", None) if library is not None else None
+
+    wanted = [("transport_va", "dv_al/dt", -2.0, "exact polar kinematics"),
+              ("centripetal_s", "dv_s/dt", 1.0, "exact polar kinematics")]
+    if origin_lat_deg is not None:
+        f = 2.0 * EARTH_OMEGA * float(np.sin(np.radians(float(origin_lat_deg))))
+        wanted += [("cor_turn", "dv_al/dt", f, f"Coriolis f at lat {origin_lat_deg:.2f}"),
+                   ("cor_along", "dv_s/dt", -f, f"Coriolis -f at lat {origin_lat_deg:.2f}")]
+
+    out, msgs = {}, []
+    for term, tgt, val_phys, why in wanted:
+        if term not in names or tgt not in targets:
+            continue
+        j = names.index(term)
+        c = targets.index(tgt)
+        scale = 1.0
+        if col_scale is not None and j < len(col_scale):
+            try:
+                sv = float(col_scale[j])
+                if sv != 0.0:
+                    scale = sv
+            except (TypeError, ValueError):
+                pass
+        out[(j, c)] = val_phys * scale
+        msgs.append(f"    {tgt:<10} {term:<14} pinned to {val_phys:+.6g}   ({why})")
+
+    if verbose:
+        if out:
+            print("[SINDy] CONSTRAINED physics coefficients (exempt from thresholding):")
+            for m in msgs:
+                print(m)
+            if origin_lat_deg is None:
+                print("    (Coriolis constraints skipped -- pass origin latitude to enable)")
+        else:
+            print("[SINDy] no constrainable physics terms present in this library")
+    return out
+
+def stridge(
+    Theta: np.ndarray,
+    Ydot: np.ndarray,
+    l1_threshold: float = 0.01,
+    ridge_kw: float = 1e-3,
+    max_iter: int = 25,
+    normalize_targets: bool = True,
+    constraints: dict | None = None,
+) -> np.ndarray:
+    """Sequentially Thresholded Ridge regression, optionally with EQUALITY CONSTRAINTS.
+
+    `constraints` pins chosen coefficients to values fixed by theory:
+        {(feature_idx, target_idx): value_in_library_units}
+    Brunton's Part-5 lecture calls constrained SINDy "a huge innovation" -- you can
+    "say that some of the c's have to equal each other or be equal and opposite or be
+    multiples of each other", enforced at every least-squares step. We are unusually
+    well placed to use it because several coefficients here are known exactly from
+    first principles (polar transport = -2, centripetal = +1, Coriolis = +/-f), and
+    unconstrained fitting was returning badly wrong values for them (-89.6 vs -2).
+
+    Constraining these (a) guarantees the kinematics are physically exact, (b) removes
+    degrees of freedom and improves conditioning, and (c) frees the regression to spend
+    its capacity on the genuinely unknown aerodynamics instead of mis-fitting the known
+    terms.
+
+    Implemented by SUBSTITUTION rather than KKT: for pure "fix this coefficient"
+    constraints, moving the fixed terms to the right-hand side and solving for the
+    remainder is simpler and better conditioned than augmenting the normal equations.
+    Constrained coefficients are exempt from thresholding so they can never be zeroed.
+    """
+    n_features = Theta.shape[1]
+    n_targets = Ydot.shape[1]
+
+    col_norms = np.linalg.norm(Theta, axis=0)
+    col_norms[col_norms < 1e-8] = 1.0
+    Theta_norm = Theta / col_norms
+
+    # PER-TARGET normalisation. Theta's columns are normalised, but without this the
+    # TARGETS are not, so |Xi_norm| scales directly with each channel's magnitude and
+    # a single global l1_threshold means completely different things per channel.
+    # In the geodesic frame the targets span ~6 orders of magnitude
+    # (dv_h/dt ~ 1e-2 m/s^2 vs dv_alpha/dt ~ 1e-6 rad/s^2), so any threshold tuned for
+    # the large channels annihilates every term in the turn channel -- which is exactly
+    # the channel that fits worst. Normalising each target to unit RMS makes the
+    # threshold scale-free and comparable across channels; coefficients are rescaled
+    # back at the end so the returned Xi is in original units.
+    if normalize_targets:
+        tgt_scale = np.sqrt(np.mean(Ydot ** 2, axis=0))
+        tgt_scale[~np.isfinite(tgt_scale) | (tgt_scale < 1e-30)] = 1.0
+    else:
+        tgt_scale = np.ones(n_targets)
+    Ydot_n = Ydot / tgt_scale
+
+    # Translate library-unit constraints into the doubly-normalised space stridge
+    # works in:  Xi_norm[j,c] = Xi_lib[j,c] * col_norms[j] / tgt_scale[c]
+    fixed_by_target: dict[int, dict[int, float]] = {c: {} for c in range(n_targets)}
+    if constraints:
+        for (j, c), v_lib in constraints.items():
+            if 0 <= j < n_features and 0 <= c < n_targets:
+                fixed_by_target[c][j] = float(v_lib) * col_norms[j] / tgt_scale[c]
+
+    Xi_norm = np.linalg.lstsq(
+        Theta_norm.T @ Theta_norm + ridge_kw * np.eye(n_features),
+        Theta_norm.T @ Ydot_n,
+        rcond=None,
+    )[0]
+    for c, fx in fixed_by_target.items():
+        for j, v in fx.items():
+            Xi_norm[j, c] = v
+
+    for _ in range(max_iter):
+        small_inds = np.abs(Xi_norm) < l1_threshold
+        # never threshold away a constrained coefficient
+        for c, fx in fixed_by_target.items():
+            for j in fx:
+                small_inds[j, c] = False
+        Xi_norm[small_inds] = 0.0
+        for i in range(n_targets):
+            fx = fixed_by_target.get(i, {})
+            big_inds = ~small_inds[:, i]
+            free_inds = np.array([k for k in range(n_features)
+                                  if big_inds[k] and k not in fx], dtype=int)
+            # move the pinned terms to the right-hand side
+            rhs = Ydot_n[:, i].copy()
+            for j, v in fx.items():
+                rhs = rhs - v * Theta_norm[:, j]
+                Xi_norm[j, i] = v
+            if free_inds.size:
+                Theta_sub = Theta_norm[:, free_inds]
+                Xi_norm[free_inds, i] = np.linalg.lstsq(
+                    Theta_sub.T @ Theta_sub + ridge_kw * np.eye(free_inds.size),
+                    Theta_sub.T @ rhs,
+                    rcond=None,
+                )[0]
+
+    # undo BOTH normalisations -> Xi in original units
+    Xi = (Xi_norm * tgt_scale[None, :]) / col_norms[:, None]
+    return Xi
+
+
+class EnsembleSINDyDiscoverer:
+    def __init__(
+        self,
+        degree: int = 2,
+        n_bootstraps: int = 50,
+        # Paper (Sec. 3): "m new rows are sampled with replacement from the original
+        # m rows", giving the standard 1 - e^-1 ~= 0.632 coverage. A ratio of 0.7 with
+        # replacement yields only ~0.50 coverage, discarding information in an already
+        # data-starved regime. Default restored to 1.0.
+        subsample_ratio: float = 1.0,
+        l1_threshold: float = 0.01,
+        # Paper uses tol = 0.6 for b(r)agging; 0.4 is reserved for LIBRARY bagging,
+        # which is followed by a second bagging pass and so deliberately permissive.
+        # This class performs data-bootstrap b(r)agging, so 0.6 is the right default.
+        inclusion_prob_threshold: float = 0.60,
+        aggregation: str = "bragging",
+        pos_idx: list[int] | None = None,
+        vel_idx: list[int] | None = None,
+        pos_scale=None,
+        vel_scale=None,
+        vel_mean=None,
+        library=None,
+        # --- E-SINDy Algorithm 3: library bagging ---
+        # Samples l = library_fraction * D library TERMS without replacement per
+        # bootstrap, discards terms with low inclusion probability, then runs the
+        # normal data-bootstrap b(r)agging on the pruned library. The paper
+        # recommends this for large libraries and the low-data limit (it is the
+        # method behind their 21-point lynx-hare result), and it is the direct
+        # remedy for a dense, collinear solution.
+        library_bagging: bool = False,
+        library_fraction: float = 0.6,
+        # Paper uses tol = 0.4 for the library-pruning pass (deliberately permissive
+        # because a second bagging pass follows). Note a term is only *available* in
+        # ~library_fraction of bootstraps, so its inclusion probability is diluted by
+        # that factor -- 0.4 against an availability ceiling of 0.6 means "selected in
+        # ~2/3 of the bootstraps where it appeared".
+        library_inclusion_threshold: float = 0.4,
+        n_library_bootstraps: int | None = None,
+        # Position-derivative rows are known exactly and are overwritten downstream by
+        # the model's second-order index_copy. Setting them analytically removes two
+        # degenerate targets (which otherwise attract collinear surrogates such as
+        # curv_vs2 standing in for v_s) and keeps them out of the library-pruning vote.
+        analytic_position_rows: bool = True,
+        # Bootstrap resampling UNIT for data-bagging (paper Algorithm 2).
+        #   "trajectory" -- resample whole trajectories with replacement, then use
+        #       all rows of the chosen trajectories. This is the statistically
+        #       correct unit here: the paper's 1 - e^-1 coverage argument assumes
+        #       the m resampled rows are independent draws, but rows within one
+        #       glide are heavily autocorrelated. Resampling ~4400 correlated rows
+        #       as if independent collapses the bootstrap distribution -- every
+        #       candidate's inclusion probability saturates at ~1.0 and the
+        #       ip>threshold filter (the whole point of E-SINDy) prunes nothing.
+        #       Resampling the ~22 trajectories restores real between-flight
+        #       variability, so inclusion probabilities again separate robust terms
+        #       from flight-specific ones.
+        #   "row" -- original behaviour (resample individual rows). Kept for A/B.
+        # Requires trajectory boundaries to be passed to discover(); if they are
+        # not available it falls back to "row" with a one-time warning.
+        bootstrap_unit: str = "trajectory",
+        random_state: int | None = 0,
+    ):
+        self.degree = degree
+        self.n_bootstraps = n_bootstraps
+        self.subsample_ratio = subsample_ratio
+        self.l1_threshold = l1_threshold
+        self.inclusion_prob_threshold = inclusion_prob_threshold
+        self.aggregation = aggregation
+        self.pos_idx = pos_idx
+        self.vel_idx = vel_idx
+        # StandardScaler statistics for the position/velocity index pairs, needed to
+        # express the velocity identity correctly in scaled space (see fit()).
+        self.pos_scale = pos_scale
+        self.vel_scale = vel_scale
+        self.vel_mean = vel_mean
+        # `library` lets a physics-informed basis be supplied; defaults to the
+        # plain polynomial library for backwards compatibility.
+        self.library_builder = library if library is not None else PolynomialLibrary(
+            degree=degree, include_bias=True
+        )
+        self.library_bagging = bool(library_bagging)
+        self.library_fraction = float(library_fraction)
+        self.library_inclusion_threshold = float(library_inclusion_threshold)
+        self.n_library_bootstraps = n_library_bootstraps
+        self.analytic_position_rows = bool(analytic_position_rows)
+        self.bootstrap_unit = str(bootstrap_unit)
+        self.random_state = random_state
+
+    # ------------------------------------------------------------- ensembling
+
+    def _data_bag(self, Theta, Ydot, rng, groups=None, constraints=None):
+        """Data-bootstrap ensemble (paper Algorithm 2).
+
+        `groups`, when provided, is a list of index arrays -- one per trajectory --
+        partitioning the rows of Theta/Ydot. With bootstrap_unit="trajectory" the
+        ensemble resamples these GROUPS with replacement (a block bootstrap): each
+        bootstrap draws n_traj trajectories with replacement and concatenates their
+        rows. This is the correct unit when rows within a trajectory are
+        autocorrelated -- see the constructor note. With unit="row" (or no groups
+        available) it falls back to the original per-row resampling.
+        """
+        n_samples, n_terms = Theta.shape
+        n_targets = Ydot.shape[1]
+        coeffs = np.zeros((self.n_bootstraps, n_terms, n_targets))
+
+        use_traj = self.bootstrap_unit == "trajectory" and groups is not None and len(groups) >= 2
+        if self.bootstrap_unit == "trajectory" and not use_traj and not getattr(self, "_warned_row_fallback", False):
+            print(
+                "[E-SINDy] bootstrap_unit='trajectory' requested but trajectory "
+                "boundaries were unavailable; falling back to row resampling."
+            )
+            self._warned_row_fallback = True
+
+        if use_traj:
+            n_groups = len(groups)
+            for b in range(self.n_bootstraps):
+                pick = rng.choice(n_groups, size=n_groups, replace=True)
+                idx = np.concatenate([groups[g] for g in pick])
+                coeffs[b] = stridge(Theta[idx], Ydot[idx], l1_threshold=self.l1_threshold,
+                                    constraints=constraints)
+        else:
+            sub_size = max(2, int(n_samples * self.subsample_ratio))
+            for b in range(self.n_bootstraps):
+                idx = rng.choice(n_samples, size=sub_size, replace=True)
+                coeffs[b] = stridge(Theta[idx], Ydot[idx], l1_threshold=self.l1_threshold,
+                                    constraints=constraints)
+        return coeffs
+
+    def _library_bag_keep_mask(self, Theta, Ydot, vote_targets, rng, constraints=None):
+        """Library-term bootstrap (paper Algorithm 3): prune the candidate set."""
+        n_terms = Theta.shape[1]
+        n_targets = Ydot.shape[1]
+        q = int(self.n_library_bootstraps or self.n_bootstraps)
+        n_draw = max(2, int(round(self.library_fraction * n_terms)))
+        coeffs = np.zeros((q, n_terms, n_targets))
+        for b in range(q):
+            # Library terms are sampled WITHOUT replacement (paper Sec. 3).
+            cols = rng.choice(n_terms, size=n_draw, replace=False)
+            sub_con = None
+            if constraints:
+                pos = {j: k for k, j in enumerate(cols)}
+                sub_con = {(pos[j], c): v for (j, c), v in constraints.items() if j in pos}
+            coeffs[b][cols] = stridge(
+                Theta[:, cols], Ydot, l1_threshold=self.l1_threshold,
+                constraints=sub_con
+            )
+        ip = np.mean(np.abs(coeffs) > 1e-8, axis=0)
+        vote = ip[:, vote_targets] if len(vote_targets) else ip
+        keep = vote.max(axis=1) >= self.library_inclusion_threshold
+        if keep.sum() < 2:  # never prune everything away
+            keep = np.ones(n_terms, dtype=bool)
+        return keep, ip
+
+    def fit(self, Y_list: list[np.ndarray], dt: float) -> tuple[np.ndarray, np.ndarray]:
+        Y_all, Ydot_all = [], []
+
+        # Scaled-space conversion for the velocity identity (see below).
+        ratio = offset = None
+        if self.pos_scale is not None and self.vel_scale is not None:
+            ratio = np.asarray(self.vel_scale, dtype=float) / np.asarray(self.pos_scale, dtype=float)
+            offset = (
+                np.asarray(self.vel_mean, dtype=float) / np.asarray(self.pos_scale, dtype=float)
+                if self.vel_mean is not None
+                else np.zeros_like(ratio)
+            )
+
+        for Y in Y_list:
+            if len(Y) < 5:
+                continue
+            Ydot = np.gradient(Y, dt, axis=0)
+
+            # Enforce the exact velocity identity for position-derivative targets.
+            #
+            # IMPORTANT: when Y is in StandardScaler space (use_scalar=True), the
+            # identity is NOT Ydot[pos] = Y[vel]. It is
+            #     d(pos_scaled)/dt = vel_scaled*(sigma_vel/sigma_pos) + mu_vel/sigma_pos
+            # i.e. exactly the so_ratio / so_offset the predictor model applies.
+            # The previous unscaled form overstated the target by sigma_pos/sigma_vel
+            # (~1e2-1e3 for this geodesic frame), so SINDy was regressed against a
+            # target that was orders of magnitude wrong. It duly returned ~1.0 on the
+            # matching velocity term -- which is an artifact of the wrong target, not
+            # a discovery. Those rows are also discarded downstream by the model's
+            # second-order index_copy, so the mis-set targets only consumed fit budget.
+            #
+            # With no scaler supplied, ratio=1 / offset=0 recovers the original
+            # (correct, unscaled) behaviour.
+            if self.pos_idx is not None and self.vel_idx is not None:
+                for k, (p_i, v_i) in enumerate(zip(self.pos_idx, self.vel_idx)):
+                    if ratio is None:
+                        Ydot[:, p_i] = Y[:, v_i]
+                    else:
+                        Ydot[:, p_i] = Y[:, v_i] * ratio[k] + offset[k]
+
+            Y_all.append(Y[2:-2])
+            Ydot_all.append(Ydot[2:-2])
+
+        if len(Y_all) == 0:
+            raise ValueError("No valid trajectory samples provided to Ensemble-SINDy.")
+
+        # Row-index groups, one per trajectory, so the data bootstrap can resample
+        # whole trajectories rather than individual (autocorrelated) rows.
+        traj_groups = []
+        _row_cursor = 0
+        for _ya in Y_all:
+            _n = _ya.shape[0]
+            traj_groups.append(np.arange(_row_cursor, _row_cursor + _n))
+            _row_cursor += _n
+
+        Y_stacked = np.vstack(Y_all)
+        Ydot_stacked = np.vstack(Ydot_all)
+
+        Theta = self.library_builder.fit_transform(Y_stacked)
+        n_samples, n_terms = Theta.shape
+        n_targets = Ydot_stacked.shape[1]
+        n_features = Y_stacked.shape[1]
+        rng = np.random.default_rng(self.random_state)
+
+        # Stored for scale-aware diagnostics. Raw |coefficient| is NOT comparable
+        # across a library whose columns span many orders of magnitude (a physical
+        # drag column can be ~1e6 while a scaled polynomial column is ~1). The
+        # meaningful quantity is the term's CONTRIBUTION, |coef| * ||column||,
+        # optionally normalised by the target norm to be dimensionless.
+        self.column_norms_ = np.linalg.norm(Theta, axis=0)
+        self.target_norms_ = np.linalg.norm(Ydot_stacked, axis=0)
+
+        # Which targets are actually fit (position rows may be set analytically).
+        use_analytic = (
+            self.analytic_position_rows
+            and self.pos_idx is not None
+            and self.vel_idx is not None
+            and ratio is not None
+        )
+        pos_targets = list(self.pos_idx) if use_analytic else []
+        fit_targets = [t for t in range(n_targets) if t not in pos_targets]
+
+        # Physics equality constraints (indices refer to the FULL library here).
+        full_constraints = getattr(self, "physics_constraints", None) or None
+
+        # Stage 1 (optional): prune the candidate library.
+        if self.library_bagging:
+            keep, self.library_inclusion_probs_ = self._library_bag_keep_mask(
+                Theta, Ydot_stacked, fit_targets, rng, constraints=full_constraints
+            )
+        else:
+            keep = np.ones(n_terms, dtype=bool)
+            self.library_inclusion_probs_ = None
+        self.kept_terms_ = keep
+
+        # Stage 2: data-bootstrap b(r)agging on the (pruned) library.
+        # Remap constraint feature indices onto the KEPT subset; a constrained term
+        # that library-bagging pruned simply drops out of the constraint set.
+        kept_idx = np.flatnonzero(keep)
+        sub_constraints = None
+        if full_constraints:
+            pos = {int(j): k for k, j in enumerate(kept_idx)}
+            sub_constraints = {(pos[j], c): v for (j, c), v in full_constraints.items()
+                               if j in pos}
+        bootstrap_coeffs = self._data_bag(Theta[:, keep], Ydot_stacked, rng,
+                                          groups=traj_groups, constraints=sub_constraints)
+        active_masks = np.abs(bootstrap_coeffs) > 1e-8
+        ip_kept = np.mean(active_masks, axis=0)
+
+        if self.aggregation == "bragging":
+            Xi_kept = np.median(bootstrap_coeffs, axis=0)
+        else:
+            Xi_kept = np.mean(bootstrap_coeffs, axis=0)
+        Xi_kept[ip_kept < self.inclusion_prob_threshold] = 0.0
+        # Constrained coefficients are fixed by theory, so they must survive the
+        # inclusion-probability filter regardless of what the vote says. In practice
+        # every bootstrap pins the same nonzero value so ip is 1.0 and they would
+        # survive anyway, but relying on that would be fragile -- make it explicit.
+        if sub_constraints:
+            for (j, c), v in sub_constraints.items():
+                if 0 <= j < Xi_kept.shape[0] and 0 <= c < Xi_kept.shape[1]:
+                    Xi_kept[j, c] = v
+                    ip_kept[j, c] = 1.0
+
+        # Expand back to the full library layout.
+        Xi_agg = np.zeros((n_terms, n_targets))
+        inclusion_probs = np.zeros((n_terms, n_targets))
+        Xi_agg[keep] = Xi_kept
+        inclusion_probs[keep] = ip_kept
+
+        # Position rows set analytically: d(pos_scaled)/dt = vel_scaled*ratio + offset,
+        # i.e. `offset` on the bias term and `ratio` on the matching velocity term.
+        if use_analytic:
+            combos = self.library_builder.term_combos(n_features)
+            try:
+                bias_col = combos.index(())
+            except ValueError:
+                bias_col = None
+            for k, p_i in enumerate(self.pos_idx):
+                v_i = self.vel_idx[k]
+                try:
+                    vel_col = combos.index((v_i,))
+                except ValueError:
+                    continue
+                Xi_agg[:, p_i] = 0.0
+                inclusion_probs[:, p_i] = 0.0
+                Xi_agg[vel_col, p_i] = float(ratio[k])
+                inclusion_probs[vel_col, p_i] = 1.0
+                if bias_col is not None:
+                    Xi_agg[bias_col, p_i] = float(offset[k])
+                    inclusion_probs[bias_col, p_i] = 1.0
+
+        # Per-target coefficient of determination of the discovered model. This is
+        # the correct criterion for comparing LIBRARIES or hyper-parameters (e.g.
+        # scale height): term "contribution" is not, because collinear candidates
+        # trade coefficient mass among themselves and leave it roughly flat.
+        resid = Ydot_stacked - Theta @ Xi_agg
+        ss_res = np.sum(resid ** 2, axis=0)
+        ss_tot = np.sum((Ydot_stacked - Ydot_stacked.mean(axis=0)) ** 2, axis=0)
+        self.r2_ = 1.0 - ss_res / np.where(ss_tot > 0, ss_tot, 1.0)
+        return Xi_agg, inclusion_probs
+
+
+class SINDyPhysicsModel(nn.Module):
+    def __init__(
+        self,
+        Xi: np.ndarray,
+        state_vector_len: int = 5,
+        degree: int = 2,
+        trainable: bool = True,
+        library_spec: dict | None = None,
+    ):
+        """Sparse physics term F_p for the APHYNITY decomposition.
+
+        `trainable` (default True) makes the discovered coefficients LEARNABLE.
+
+        This matters: APHYNITY solves  min ||F_a||  s.t.  dX/dt = (F_p + F_a)(X)
+        jointly over the physical parameters theta_p AND the network theta_a. Its
+        existence/uniqueness results (Props. 1-2) are a metric projection of the
+        true F onto the set F_p, and the paper's headline parameter-identification
+        gains (e.g. 67.6% -> 2.3% error) come precisely from theta_p being corrected
+        by that joint optimization.
+
+        Previously Xi was a register_buffer, i.e. NOT in .parameters(), so theta_p
+        was frozen at whatever E-SINDy found on numerically-differentiated data.
+        With F_p fixed, F_a must supply all of (F - F_p), so ||F_a|| is bounded
+        below by a large constant and minimizing it merely fights the data term
+        instead of shifting work onto the physics. That is not the APHYNITY
+        algorithm; it is a fixed-residual model with a penalty.
+
+        The E-SINDy SPARSITY PATTERN is preserved via a non-trainable mask, so
+        thresholded-out library terms stay exactly zero and cannot creep back in.
+        A masked linear-in-parameters family is a finite-dimensional subspace,
+        which the APHYNITY paper notes is a Chebyshev set - so the uniqueness
+        guarantee still applies.
+        """
+        super().__init__()
+        self.degree = degree
+        self.state_vector_len = state_vector_len
+
+        Xi_t = torch.as_tensor(Xi, dtype=torch.float32)
+        # Sparsity pattern discovered by E-SINDy (inclusion-probability thresholded).
+        self.register_buffer("Xi_mask", (Xi_t != 0).to(torch.float32))
+        self.trainable = bool(trainable)
+        if self.trainable:
+            self.Xi_raw = nn.Parameter(Xi_t.clone())
+        else:
+            self.register_buffer("Xi_raw", Xi_t.clone())
+
+        # `library_spec` (from PhysicsInformedLibrary.library_spec()) selects the
+        # candidate basis. When omitted we fall back to the plain polynomial basis
+        # so existing checkpoints and callers behave exactly as before.
+        self.library_spec = library_spec
+        if library_spec is None:
+            combos = []
+            for d in range(degree + 1):
+                combos.extend(itertools.combinations_with_replacement(range(state_vector_len), d))
+            self.combos = combos
+        else:
+            self.combos = [tuple(c) for c in library_spec["poly_combos"]]
+
+    @property
+    def Xi(self) -> torch.Tensor:
+        """Effective coefficients: learnable values restricted to the sparse pattern."""
+        return self.Xi_raw * self.Xi_mask
+
+    def forward(self, y: torch.Tensor) -> torch.Tensor:
+        if self.library_spec is not None:
+            if self.library_spec.get("kind") == "eom":
+                from eom_library import evaluate_eom_library_torch
+
+                Theta = evaluate_eom_library_torch(y, self.library_spec)
+            else:
+                from physics_library import evaluate_library_torch
+
+                Theta = evaluate_library_torch(y, self.library_spec)
+            return torch.matmul(Theta, self.Xi)
+        return self._forward_polynomial(y)
+
+    def _forward_polynomial(self, y: torch.Tensor) -> torch.Tensor:
+        cols = []
+        for combo in self.combos:
+            if len(combo) == 0:
+                cols.append(torch.ones_like(y[..., :1]))
+            elif len(combo) == 1:
+                cols.append(y[..., combo[0] : combo[0] + 1])
+            elif len(combo) == 2:
+                cols.append(y[..., combo[0] : combo[0] + 1] * y[..., combo[1] : combo[1] + 1])
+            elif len(combo) == 3:
+                cols.append(
+                    y[..., combo[0] : combo[0] + 1]
+                    * y[..., combo[1] : combo[1] + 1]
+                    * y[..., combo[2] : combo[2] + 1]
+                )
+            else:
+                raise NotImplementedError("Polynomial degree > 3 not supported.")
+
+        Theta = torch.cat(cols, dim=-1)
+        return torch.matmul(Theta, self.Xi)
